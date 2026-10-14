@@ -697,6 +697,22 @@ export class BrowserShell {
     return plugin;
   }
 
+  // ANDROID NATIVE TAB WEBVIEW ENGINE (YayraOverlayPlugin.tabWeb* backed
+  // by YayraTabWebviewManager.kt): real WebViews layered INSIDE Yayra's
+  // own activity window - the Android equivalent of the desktop
+  // WebContentsView engine. A top-level WebView navigation has no
+  // iframe/X-Frame-Options restrictions, so frame-hostile sites (Google,
+  // YouTube, X, Facebook, ...) genuinely render IN the app instead of
+  // being handed off to Chrome Custom Tabs ("open in other app").
+  get capacitorTabWeb() {
+    if (typeof window === 'undefined') return null;
+    const capacitor = window.Capacitor;
+    if (!capacitor || typeof capacitor.isNativePlatform !== 'function' || !capacitor.isNativePlatform()) return null;
+    const plugin = capacitor.Plugins && capacitor.Plugins.YayraOverlay;
+    if (!plugin || typeof plugin.tabWebAttach !== 'function') return null;
+    return plugin;
+  }
+
   /**
    * Start the Android system-wide bubble so it floats over EVERY opened
    * app, not just inside Yayra. Called once shortly after startup and
@@ -877,10 +893,34 @@ export class BrowserShell {
     this._armConnectivityAwareness();
     // Local document workspace (Phase 1: PDF) - in-memory, local-first.
     this.documentStore = new DocumentStore();
+    // Android native tab webview engine bookkeeping (tab id -> engine).
+    this._androidTabWebIds = new Set();
+    this._androidTabWebResizeObservers = new Map();
     // Android: "installed site" home-screen shortcuts deep-link back into
     // Yayra via com.yayra.app:/browse?url=... - handle them on launch and
     // on every cold/warm reopen.
     this._handleAppModeLaunchUrls();
+    // Android native tab engine: engine events (loading, address changes,
+    // titles, nav state) + the hardware Back button (which must walk the
+    // NATIVE webview's history before it can exit the app).
+    this._unsubscribeTabWebEvents = null;
+    this._unsubscribeAndroidBackButton = null;
+    try {
+      const tabPlugin = this.capacitorTabWeb;
+      if (tabPlugin && typeof tabPlugin.addListener === 'function') {
+        const handle = tabPlugin.addListener('tabWebEvent', (evt) => this.handleAndroidTabWebEvent(evt));
+        this._unsubscribeTabWebEvents = () => {
+          try { Promise.resolve(handle).then((h) => h?.remove?.()).catch(() => {}); } catch { /* gone */ }
+        };
+      }
+      const app = typeof window !== 'undefined' ? window.Capacitor?.Plugins?.App : null;
+      if (app && typeof app.addListener === 'function') {
+        const backHandle = app.addListener('backButton', () => this.handleAndroidBackButton());
+        this._unsubscribeAndroidBackButton = () => {
+          try { Promise.resolve(backHandle).then((h) => h?.remove?.()).catch(() => {}); } catch { /* gone */ }
+        };
+      }
+    } catch { /* optional plugin surface */ }
     this.processPendingInstallOnLaunch().catch(() => {});
 
     if (this.settingsRepo) {
@@ -2160,6 +2200,9 @@ export class BrowserShell {
     this.syncNativeWebviewVisibility(activeTab.id, !isInternalPage && !overlayOpen, {
       captureActive: overlayOpen && !isInternalPage
     });
+    // Same rule for the Android native tab engine (its hide path captures
+    // the page frame natively, so the chrome keeps a page underneath it).
+    this.syncAndroidTabWebVisibility(activeTab.id, !isInternalPage && !overlayOpen);
 
     // LOCAL DOCUMENT TABS (yayra://doc/<id>): the integrated document
     // viewer - never the web frame path, never the native engine. This is
@@ -2451,6 +2494,13 @@ export class BrowserShell {
     // Known case: don't even attempt to embed it — avoids the raw browser
     // "refused to connect" error ever flashing inside the frame.
     if (this.isKnownFrameBlockedUrl(url)) {
+      // ANDROID NATIVE TAB ENGINE: frame-hostile sites render in Yayra's
+      // OWN native webview layer, inside the app - Google, YouTube, X,
+      // Facebook genuinely open IN Yayra, no "open in other app" handoff.
+      if (tabId && this.capacitorTabWeb) {
+        this.attachAndroidTabWebview(wrapper, tabId, url);
+        return { wrapper, iframe: null };
+      }
       // SEARCHES: no major engine allows embedded results anymore
       // (verified Oct 2026 - even DuckDuckGo's lite/html endpoints send
       // X-Frame-Options: SAMEORIGIN), so the old "render DuckDuckGo
@@ -2590,6 +2640,116 @@ export class BrowserShell {
       // one-shot placement plus the existing window resize handler.
       setTimeout(reportBounds, 0);
     }
+  }
+
+  /* -------------------------------------------------------------
+   * ANDROID NATIVE TAB WEBVIEW ENGINE (see get capacitorTabWeb)
+   * ----------------------------------------------------------- */
+  attachAndroidTabWebview(wrapper, tabId, url) {
+    wrapper.className += ' fb-android-tabweb-slot';
+    this._androidTabWebIds.add(tabId);
+    const plugin = this.capacitorTabWeb;
+
+    const reportBounds = () => {
+      try {
+        const rect = wrapper.getBoundingClientRect();
+        plugin.tabWebUpdate({
+          id: tabId,
+          x: rect.left,
+          y: rect.top,
+          width: rect.width,
+          height: rect.height
+        }).catch(() => {});
+      } catch (_err) {
+        // No layout engine (tests/headless) - nothing to position.
+      }
+    };
+
+    // Attach at a 1px placeholder; the ResizeObserver below reports the
+    // real DOM bounds the moment the wrapper is mounted.
+    plugin.tabWebAttach({ id: tabId, url, x: 0, y: 0, width: 1, height: 1 }).then((res) => {
+      if (res && res.ok === false) {
+        this._androidTabWebEngineUnavailable(wrapper, tabId, url);
+        return;
+      }
+      reportBounds();
+      // The render-time visibility sync ran BEFORE this attach (it is
+      // called at the top of the viewport render) - set the freshly
+      // attached surface's own visibility now, honouring overlays.
+      this.syncAndroidTabWebVisibility(tabId, !this.hasBlockingOverlay() && this.state.activeTabId === tabId);
+    }).catch(() => {
+      this._androidTabWebEngineUnavailable(wrapper, tabId, url);
+    });
+
+    const previousObserver = this._androidTabWebResizeObservers.get(tabId);
+    if (previousObserver) previousObserver.disconnect();
+    if (typeof ResizeObserver !== 'undefined') {
+      const observer = new ResizeObserver(reportBounds);
+      observer.observe(wrapper);
+      this._androidTabWebResizeObservers.set(tabId, observer);
+    } else {
+      setTimeout(reportBounds, 0);
+    }
+  }
+
+  /** The native engine could not be created (very old app shell): fall
+   *  back to the honest card + auto-open, exactly like a build without
+   *  the engine. */
+  _androidTabWebEngineUnavailable(wrapper, tabId, url) {
+    this._androidTabWebIds.delete(tabId);
+    const autoOpened = this.maybeAutoOpenBlockedExternally(url, tabId);
+    wrapper.appendChild(this.buildFrameBlockedFallback(url, { autoOpened }));
+  }
+
+  /** Mirrors syncNativeWebviewVisibility for the Android engine: only the
+   *  active tab's surface is visible; everything else is hidden (it is a
+   *  sibling native layer, it would otherwise float over the wrong page). */
+  syncAndroidTabWebVisibility(activeTabId, showActive) {
+    if (!this._androidTabWebIds || this._androidTabWebIds.size === 0) return;
+    const plugin = this.capacitorTabWeb;
+    if (!plugin) return;
+    for (const tabId of this._androidTabWebIds) {
+      plugin.tabWebSetVisible({ id: tabId, visible: tabId === activeTabId && Boolean(showActive) }).catch(() => {});
+    }
+  }
+
+  /** Normalizes the Android engine's tabWebEvent into the desktop engine's
+   *  event shape - one handler (handleNativeWebviewEvent) drives both. */
+  handleAndroidTabWebEvent(evt) {
+    if (!evt || !evt.id) return;
+    this.handleNativeWebviewEvent({
+      tabId: evt.id,
+      type: evt.type,
+      url: evt.url,
+      title: evt.title,
+      canGoBack: evt.canGoBack,
+      canGoForward: evt.canGoForward,
+      isLoading: evt.isLoading
+    });
+  }
+
+  /** Android hardware Back: inside a native-engine page it walks THAT
+   *  page's history first; otherwise the standard app exit. */
+  handleAndroidBackButton() {
+    const tab = this.getActiveTab();
+    if (tab && this._androidTabWebIds.has(tab.id)) {
+      if (tab.canGoBack) {
+        this.capacitorTabWeb?.tabWebGoBack({ id: tab.id }).catch(() => {});
+        return;
+      }
+    }
+    try { window.Capacitor?.Plugins?.App?.exitApp?.(); } catch { /* older builds */ }
+  }
+
+  destroyAndroidTabWebview(tabId) {
+    if (!this._androidTabWebIds || !this._androidTabWebIds.has(tabId)) return;
+    this._androidTabWebIds.delete(tabId);
+    const observer = this._androidTabWebResizeObservers.get(tabId);
+    if (observer) {
+      observer.disconnect();
+      this._androidTabWebResizeObservers.delete(tabId);
+    }
+    this.capacitorTabWeb?.tabWebRemove({ id: tabId }).catch(() => {});
   }
 
   /**
@@ -2739,6 +2899,7 @@ export class BrowserShell {
       // ones whose close paths can freeze - arm the return-to-window heal.
       this.ensureSurfaceHealOnReturn();
       this.syncNativeWebviewVisibility(tab.id, false, { captureActive: true });
+      this.syncAndroidTabWebVisibility(tab.id, false);
       if (typeof document !== 'undefined') {
         const slot = this.viewportElement?.querySelector('.fb-native-webview-slot');
         if (slot && !slot.querySelector('.fb-page-snapshot-img')) {
@@ -3419,6 +3580,9 @@ export class BrowserShell {
   }
 
   destroyNativeWebview(tabId) {
+    // The Android native tab engine rides the same teardown: whichever
+    // engine the tab used, its surface must go with the tab.
+    this.destroyAndroidTabWebview(tabId);
     if (!this._nativeWebviewTabIds.has(tabId)) return;
     this._nativeWebviewTabIds.delete(tabId);
     const observer = this._nativeWebviewResizeObservers.get(tabId);
@@ -12390,6 +12554,11 @@ export class BrowserShell {
     for (const tabId of Array.from(this._nativeWebviewTabIds || [])) {
       this.destroyNativeWebview(tabId);
     }
+    for (const tabId of Array.from(this._androidTabWebIds || [])) {
+      this.destroyAndroidTabWebview(tabId);
+    }
+    if (this._unsubscribeTabWebEvents) { this._unsubscribeTabWebEvents(); this._unsubscribeTabWebEvents = null; }
+    if (this._unsubscribeAndroidBackButton) { this._unsubscribeAndroidBackButton(); this._unsubscribeAndroidBackButton = null; }
     if (this.bubbleOverlay) {
       this.bubbleOverlay.remove();
     }

@@ -47,12 +47,12 @@ class YayraFloatingBrowserWindowView @JvmOverloads constructor(
     private lateinit var progressBar: ProgressBar
     private lateinit var webViewContainer: FrameLayout
     private lateinit var resizeHandle: View
-    private lateinit var btnBack: ImageButton
-    private lateinit var btnFwd: ImageButton
-    private lateinit var btnReload: ImageButton
-    private lateinit var btnMinimize: ImageButton
-    private lateinit var btnMaximize: ImageButton
-    private lateinit var btnClose: ImageButton
+    private lateinit var btnBack: TextView
+    private lateinit var btnFwd: TextView
+    private lateinit var btnReload: TextView
+    private lateinit var btnMinimize: TextView
+    private lateinit var btnMaximize: TextView
+    private lateinit var btnClose: TextView
 
     // Drag / Resize touch tracking
     private var lastTouchX = 0f
@@ -279,14 +279,18 @@ class YayraFloatingBrowserWindowView @JvmOverloads constructor(
         btnFwd.alpha = if (canForward) 1.0f else 0.4f
     }
 
-    private fun createTitleButton(label: String, color: Int, onClick: () -> Unit): ImageButton {
-        return ImageButton(context).apply {
-            val tv = TextView(context).apply {
-                text = label
-                setTextColor(color)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
-                typeface = Typeface.DEFAULT_BOLD
-            }
+    // REAL VISIBLE GLYPHS: this used to build an ImageButton and create a
+    // TextView with the label INSIDE apply {} - never attaching it to the
+    // button. A backgroundless ImageButton with no image is INVISIBLE, so
+    // the title-bar buttons (hide / expand / close) existed and clicked,
+    // but nobody could see them. The button IS the TextView now.
+    private fun createTitleButton(label: String, color: Int, onClick: () -> Unit): TextView {
+        return TextView(context).apply {
+            text = label
+            setTextColor(color)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
             background = null
             setPadding(dpToPx(8), dpToPx(4), dpToPx(8), dpToPx(4))
             layoutParams = LinearLayout.LayoutParams(dpToPx(32), dpToPx(28))
@@ -294,8 +298,14 @@ class YayraFloatingBrowserWindowView @JvmOverloads constructor(
         }
     }
 
-    private fun createNavButton(symbol: String, onClick: () -> Unit): ImageButton {
-        return ImageButton(context).apply {
+    // The `symbol` used to be silently ignored - the nav buttons rendered
+    // as empty rounded rectangles with no arrows at all.
+    private fun createNavButton(symbol: String, onClick: () -> Unit): TextView {
+        return TextView(context).apply {
+            text = symbol
+            setTextColor(Color.parseColor("#e2e8f0"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            gravity = Gravity.CENTER
             background = GradientDrawable().apply {
                 setColor(Color.argb(50, 255, 255, 255))
                 cornerRadius = dpToPx(6).toFloat()

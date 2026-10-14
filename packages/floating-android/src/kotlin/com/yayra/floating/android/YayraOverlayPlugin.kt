@@ -43,6 +43,113 @@ import com.getcapacitor.annotation.CapacitorPlugin
 @CapacitorPlugin(name = "YayraOverlay")
 class YayraOverlayPlugin : Plugin() {
 
+    // In-app native tab webview engine (see YayraTabWebviewManager): real
+    // WebViews layered inside Yayra's own window so frame-hostile sites
+    // (Google, YouTube, X, ...) render IN the app instead of handing off
+    // to Chrome Custom Tabs. No overlay permission required.
+    private var tabWebManager: YayraTabWebviewManager? = null
+
+    private fun tabWeb(): YayraTabWebviewManager? {
+        if (tabWebManager == null) {
+            try {
+                val activity = bridge?.activity ?: return null
+                tabWebManager = YayraTabWebviewManager(activity, bridge?.webView) { data ->
+                    notifyListeners("tabWebEvent", data)
+                }
+            } catch (_: Exception) {
+                return null
+            }
+        }
+        return tabWebManager
+    }
+
+    @PluginMethod
+    fun tabWebAttach(call: PluginCall) {
+        val id = call.getString("id")
+        if (id.isNullOrBlank()) { call.reject("id-required"); return }
+        val manager = tabWeb() ?: run { call.reject("engine-unavailable"); return }
+        val ok = manager.attach(
+            id,
+            call.getString("url"),
+            call.getDouble("x") ?: 0.0,
+            call.getDouble("y") ?: 0.0,
+            call.getDouble("width") ?: 0.0,
+            call.getDouble("height") ?: 0.0
+        )
+        call.resolve(JSObject().put("ok", ok))
+    }
+
+    @PluginMethod
+    fun tabWebUpdate(call: PluginCall) {
+        val id = call.getString("id")
+        if (id.isNullOrBlank()) { call.reject("id-required"); return }
+        tabWeb()?.update(
+            id,
+            call.getDouble("x") ?: 0.0,
+            call.getDouble("y") ?: 0.0,
+            call.getDouble("width") ?: 0.0,
+            call.getDouble("height") ?: 0.0
+        )
+        call.resolve(JSObject().put("ok", true))
+    }
+
+    @PluginMethod
+    fun tabWebSetVisible(call: PluginCall) {
+        val id = call.getString("id")
+        if (id.isNullOrBlank()) { call.reject("id-required"); return }
+        tabWeb()?.setVisible(id, call.getBoolean("visible", true))
+        call.resolve(JSObject().put("ok", true))
+    }
+
+    @PluginMethod
+    fun tabWebNavigate(call: PluginCall) {
+        val id = call.getString("id")
+        val url = call.getString("url")
+        if (id.isNullOrBlank() || url.isNullOrBlank()) { call.reject("id-and-url-required"); return }
+        tabWeb()?.navigate(id, url)
+        call.resolve(JSObject().put("ok", true))
+    }
+
+    @PluginMethod
+    fun tabWebGoBack(call: PluginCall) {
+        val id = call.getString("id")
+        if (id.isNullOrBlank()) { call.reject("id-required"); return }
+        tabWeb()?.goBack(id)
+        call.resolve(JSObject().put("ok", true))
+    }
+
+    @PluginMethod
+    fun tabWebGoForward(call: PluginCall) {
+        val id = call.getString("id")
+        if (id.isNullOrBlank()) { call.reject("id-required"); return }
+        tabWeb()?.goForward(id)
+        call.resolve(JSObject().put("ok", true))
+    }
+
+    @PluginMethod
+    fun tabWebReload(call: PluginCall) {
+        val id = call.getString("id")
+        if (id.isNullOrBlank()) { call.reject("id-required"); return }
+        tabWeb()?.reload(id)
+        call.resolve(JSObject().put("ok", true))
+    }
+
+    @PluginMethod
+    fun tabWebStop(call: PluginCall) {
+        val id = call.getString("id")
+        if (id.isNullOrBlank()) { call.reject("id-required"); return }
+        tabWeb()?.stop(id)
+        call.resolve(JSObject().put("ok", true))
+    }
+
+    @PluginMethod
+    fun tabWebRemove(call: PluginCall) {
+        val id = call.getString("id")
+        if (id.isNullOrBlank()) { call.reject("id-required"); return }
+        tabWeb()?.remove(id)
+        call.resolve(JSObject().put("ok", true))
+    }
+
     @PluginMethod
     fun isSupported(call: PluginCall) {
         val result = JSObject()
