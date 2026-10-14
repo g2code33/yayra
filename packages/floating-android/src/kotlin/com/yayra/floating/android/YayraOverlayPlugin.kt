@@ -129,7 +129,11 @@ class YayraOverlayPlugin : Plugin() {
             return
         }
         val title = (call.getString("title") ?: url).trim().ifEmpty { url }
-        val encoded = java.net.URLEncoder.encode(url, "UTF-8")
+        // RFC 3986, not application/x-www-form-urlencoded: URLEncoder
+        // encodes a space as '+', which the JS side's decodeURIComponent
+        // leaves as a literal '+', mangling the deep-linked site URL.
+        // Replacing the '+' with %20 makes the encoding round-trip exactly.
+        val encoded = java.net.URLEncoder.encode(url, "UTF-8").replace("+", "%20")
         val launchIntent = Intent(Intent.ACTION_VIEW, Uri.parse("com.yayra.app:/browse?url=$encoded")).apply {
             setPackage(context.packageName)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -189,6 +193,41 @@ class YayraOverlayPlugin : Plugin() {
                 }
             }
         }.start()
+    }
+
+    /**
+     * Opens a URL in YAYRA'S OWN native floating browser window (the real
+     * WebView session hosted by YayraFloatBubbleService). Used for
+     * "installed site" deep links on frame-hostile sites (Google, YouTube,
+     * X, ...) which can never render inside the in-shell iframe engine:
+     * a top-level native WebView navigation has no X-Frame-Options
+     * restrictions, so the site truly opens - inside Yayra, not in an
+     * external browser. Falls back honestly ({ok:false,
+     * reason:"overlay-permission"}) when the "Display over other apps"
+     * permission has not been granted, so the web layer can fall back to
+     * the in-shell tab + secure browser view.
+     */
+    @PluginMethod
+    fun openBrowserWindow(call: PluginCall) {
+        val url = call.getString("url")
+        if (url.isNullOrBlank()) {
+            call.reject("url-required")
+            return
+        }
+        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+            call.reject("invalid-url")
+            return
+        }
+        if (!YayraOverlayPermissionHelper.canDrawOverlays(context)) {
+            call.resolve(JSObject().put("ok", false).put("reason", "overlay-permission"))
+            return
+        }
+        try {
+            YayraFloatBubbleService.openBrowserWindow(context, url)
+            call.resolve(JSObject().put("ok", true).put("method", "floating-browser"))
+        } catch (err: Exception) {
+            call.reject("open-failed: ${err.message}")
+        }
     }
 
     /**

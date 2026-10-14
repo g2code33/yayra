@@ -22,12 +22,32 @@ class YayraFloatBubbleService : Service() {
         const val ACTION_STOP = "com.yayra.floating.action.STOP"
         const val ACTION_OPEN_BROWSER = "com.yayra.floating.action.OPEN_BROWSER"
         const val ACTION_MINIMIZE_BROWSER = "com.yayra.floating.action.MINIMIZE_BROWSER"
+        const val EXTRA_URL = "com.yayra.floating.extra.URL"
         const val NOTIFICATION_ID = 2001
         const val CHANNEL_ID = "yayra_floating_bubble_channel"
 
         fun startService(context: Context) {
             val intent = Intent(context, YayraFloatBubbleService::class.java).apply {
                 action = ACTION_START
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+
+        /**
+         * Opens the floating browser window STRAIGHT ON a URL (used by
+         * "installed site" home-screen shortcut deep links: the site must
+         * actually open - a real WebView has no iframe/X-Frame-Options
+         * restrictions, so Google, YouTube, X, ... all render fine here,
+         * inside Yayra's own surface).
+         */
+        fun openBrowserWindow(context: Context, url: String) {
+            val intent = Intent(context, YayraFloatBubbleService::class.java).apply {
+                action = ACTION_OPEN_BROWSER
+                putExtra(EXTRA_URL, url)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
@@ -83,6 +103,12 @@ class YayraFloatBubbleService : Service() {
 
         if (action == ACTION_OPEN_BROWSER) {
             restoreBrowserWindow()
+            // Deep-linked "installed site": open straight on the site, not
+            // on the yayra.app start page the persistent WebView boots on.
+            val target = intent?.getStringExtra(EXTRA_URL)
+            if (!target.isNullOrBlank()) {
+                navigateBrowser(target)
+            }
         } else {
             showBubbleOverlay()
         }

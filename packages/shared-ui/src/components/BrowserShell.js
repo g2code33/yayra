@@ -2254,8 +2254,9 @@ export class BrowserShell {
     const fallback = document.createElement('div');
     fallback.className = 'fb-frame-blocked-fallback';
     fallback.style.cssText = 'position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; background:#15171c; color:#d7dbe3; text-align:center; padding:24px; z-index:1;';
+    const surface = this.capacitorBrowser ? 'a secure browser view' : 'a new browser tab';
     const message = autoOpened
-      ? 'This site doesn\u2019t allow embedded browsing, so it was opened for you in a secure browser view.'
+      ? `This site doesn\u2019t allow embedded browsing, so it was opened for you in ${surface}.`
       : 'This site doesn\u2019t allow embedded browsing and must be opened in its own tab.';
     const buttonLabel = autoOpened ? 'Open again' : 'Open in new tab';
     fallback.innerHTML = `
@@ -2361,13 +2362,29 @@ export class BrowserShell {
    * auto-open happened for the fallback card's wording.
    */
   maybeAutoOpenBlockedExternally(url, tabId) {
-    if (!this.capacitorBrowser) return false;
     if (!this._autoExternalOpened) this._autoExternalOpened = new Set();
     const key = `${tabId || 'tab'}::${url}`;
     if (this._autoExternalOpened.has(key)) return true;
-    this._autoExternalOpened.add(key);
-    Promise.resolve(this.openExternally(url)).catch(() => {});
-    return true;
+    // Capacitor native apps: Chrome Custom Tab / SFSafariViewController.
+    if (this.capacitorBrowser && typeof this.capacitorBrowser.open === 'function') {
+      this._autoExternalOpened.add(key);
+      Promise.resolve(this.openExternally(url)).catch(() => {});
+      return true;
+    }
+    // Web/PWA: a web page physically cannot embed a frame-hostile site -
+    // the BEST it can do is actually OPEN the site. Try a real new
+    // browser tab while the user's activation is still live (they just
+    // typed/chose the URL); when the popup blocker wins, the honest
+    // card with its one-click button stays as the fallback.
+    if (typeof window !== 'undefined' && typeof window.open === 'function') {
+      this._autoExternalOpened.add(key);
+      try {
+        const opened = window.open(url, '_blank', 'noopener,noreferrer');
+        if (opened) return true;
+      } catch { /* popup blocked - the card's button covers it */ }
+      return false;
+    }
+    return false;
   }
 
   buildSystemBrowserHandoffFallback(url) {
@@ -6317,13 +6334,26 @@ export class BrowserShell {
     try {
       const app = typeof window !== 'undefined' ? window.Capacitor?.Plugins?.App : null;
       if (!app || typeof app.addListener !== 'function') return;
-      const handle = (raw) => {
+      const handle = async (raw) => {
         const url = String((raw && raw.url) || raw || '');
         const match = /^com\.yayra\.app:\/browse\?url=(.+)$/.exec(url);
         if (!match) return;
         let target = null;
         try { target = decodeURIComponent(match[1]); } catch { /* bad encoding */ }
         if (!target || !/^https?:\/\//i.test(target)) return;
+        // Frame-hostile sites (Google, YouTube, X, ...) are exactly the
+        // sites people install, and they can NEVER render in the in-shell
+        // iframe engine - before this fix, tapping an installed shortcut
+        // showed the "can't open site" card and jumped out to Chrome.
+        // Yayra's OWN native floating browser window (a real WebView, no
+        // iframe restrictions) opens them properly, inside Yayra.
+        const overlay = this.capacitorOverlay;
+        if (this.isKnownFrameBlockedUrl(target) && overlay && typeof overlay.openBrowserWindow === 'function') {
+          try {
+            const res = await overlay.openBrowserWindow({ url: target });
+            if (res && res.ok) return; // the site is open in Yayra's window
+          } catch { /* fall through to the in-shell tab */ }
+        }
         if (this.state.isMinimizedToBubble && typeof this.restoreFromBubble === 'function') {
           this.restoreFromBubble();
         }
