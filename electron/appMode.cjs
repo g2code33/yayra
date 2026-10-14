@@ -10,6 +10,8 @@
  * plan (writes files / shell.writeShortcutLink) and opens app windows.
  */
 
+const crypto = require('node:crypto');
+
 /** Extract a safe https?:// url from a `--app=<url>` argv flag, or null. */
 function parseAppModeUrl(argv) {
   for (const arg of argv || []) {
@@ -36,6 +38,26 @@ function sanitizeAppName(title, url) {
     .trim()
     .slice(0, 60);
   return name || fallback;
+}
+
+/**
+ * Stable per-URL window class for an installed site app. Used as the X11
+ * WM_CLASS of the window the app-mode launch opens (via Chromium's
+ * --class switch, set before app ready in electron/main.cjs) AND as the
+ * StartupWMClass of the .desktop entries buildInstallPlan writes - the
+ * two must match exactly, or GNOME/KDE show the site window with a
+ * GENERIC icon and never group it under its launcher. Keyed by the URL
+ * (not the display name) so the same site always maps to the same class
+ * no matter how the user renamed the install.
+ */
+function appWindowClass(url) {
+  try {
+    const normalized = new URL(String(url)).toString();
+    const hash = crypto.createHash('sha1').update(normalized).digest('hex').slice(0, 16);
+    return `yayra-app-${hash}`;
+  } catch {
+    return 'yayra-app';
+  }
 }
 
 /** Filesystem-safe slug for artifact filenames. */
@@ -71,7 +93,10 @@ function buildInstallPlan({ platform, execPath, url, title, desktopDir, applicat
       + 'Terminal=false\n'
       + (iconPath ? `Icon=${iconPath}\n` : '')
       + 'Categories=Network;WebBrowser;\n'
-      + `StartupWMClass=yayra-app-${slug}\n`;
+      // Must equal the window's real WM_CLASS (appWindowClass above +
+      // the --class switch in main.cjs) - a class no window ever has
+      // leaves the site window ungrouped with a generic dock icon.
+      + `StartupWMClass=${appWindowClass(normalized)}\n`;
     const artifacts = [
       { kind: 'file', path: join(desktopDir, `${name}.desktop`), contents, executable: true }
     ];
@@ -102,4 +127,4 @@ function buildInstallPlan({ platform, execPath, url, title, desktopDir, applicat
   return { ok: false, reason: 'unsupported-platform' };
 }
 
-module.exports = { parseAppModeUrl, sanitizeAppName, buildInstallPlan };
+module.exports = { parseAppModeUrl, sanitizeAppName, buildInstallPlan, appWindowClass };

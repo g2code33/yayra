@@ -4,7 +4,7 @@ import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 
 const require = createRequire(import.meta.url);
-const { parseAppModeUrl, sanitizeAppName, buildInstallPlan } = require('../electron/appMode.cjs');
+const { parseAppModeUrl, sanitizeAppName, buildInstallPlan, appWindowClass } = require('../electron/appMode.cjs');
 
 test('parseAppModeUrl extracts a valid https --app url', () => {
   assert.equal(
@@ -166,4 +166,73 @@ test('buildInstallPlan linux: a bare hicolor icon NAME is written verbatim (Icon
   assert.equal(plan.ok, true);
   assert.ok(plan.artifacts[0].contents.includes('Icon=yayra\n'));
   assert.ok(plan.artifacts[0].contents.includes('Exec="/home/me/Applications/yayra.AppImage" --app="https://music.youtube.com/"'));
+});
+
+
+/* ------------------------------------------------------------------ */
+/* Desktop install-as-app fixes (Ubuntu/Linux + Windows)               */
+/* ------------------------------------------------------------------ */
+
+test('appWindowClass: stable per site URL, normalized, distinct per site', () => {
+  const a = appWindowClass('https://music.youtube.com/');
+  assert.equal(a, appWindowClass('https://music.youtube.com'), 'URL normalization cannot split one site into two classes');
+  assert.match(a, /^yayra-app-[0-9a-f]{16}$/, 'safe, deterministic class name');
+  assert.notEqual(a, appWindowClass('https://x.com/'), 'different sites get different classes');
+  assert.equal(appWindowClass('not a url'), 'yayra-app', 'degrades safely');
+});
+
+test('buildInstallPlan linux: StartupWMClass matches the class the real window will have', () => {
+  const url = 'https://music.youtube.com/';
+  const plan = buildInstallPlan({
+    platform: 'linux',
+    execPath: '/opt/yayra/yayra',
+    url,
+    title: 'YouTube Music',
+    desktopDir: '/home/me/Desktop',
+    applicationsDir: '/home/me/.local/share/applications'
+  });
+  const expected = `StartupWMClass=${appWindowClass(url)}`;
+  for (const artifact of plan.artifacts) {
+    assert.ok(artifact.contents.includes(expected), `${artifact.path} declares the real window class`);
+  }
+});
+
+test('main.cjs (source pin): the Wayland self-heal handover CARRIES the --app url of the clicked shortcut', () => {
+  const src = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
+  const start = src.indexOf("app.on('second-instance'");
+  const block = src.slice(start, start + 3000);
+  assert.ok(start > -1, 'second-instance handler exists');
+  assert.match(block, /const appUrl = parseAppModeUrl\(argv \|\| \[\]\);/, 'the app url is parsed FIRST, before any handover');
+  assert.match(block, /--ozone-platform=x11\$\{appArg\}/, 'the handover command includes the --app url');
+  assert.match(block, /const appArg = appUrl \? ` --app="\$\{appUrl\}"` : '';/, 'built from the parsed url, never dropped');
+});
+
+test('main.cjs (source pin): launching the same installed app again FOCUSES its window instead of stacking duplicates', () => {
+  const src = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
+  const start = src.indexOf('const appModeWindows = new Map()');
+  const block = src.slice(start, start + 2000);
+  assert.ok(start > -1, 'app windows are tracked');
+  assert.match(block, /const existing = appModeWindows\.get\(normalized\);/, 'looked up by normalized url');
+  assert.match(block, /existing\.isMinimized\(\)\) existing\.restore\(\)/, 'restored when minimized');
+  assert.match(block, /existing\.show\(\);/, 'shown');
+  assert.match(block, /existing\.focus\(\);/, 'focused');
+  assert.match(block, /win\.on\('closed', \(\) => \{ appModeWindows\.delete\(normalized\); \}\);/, 'tracked windows are released on close');
+});
+
+test('main.cjs (source pin): cold app-mode launches set the real X11 window class (and the Windows AUMID)', () => {
+  const src = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
+  const start = src.indexOf('const appModeLaunchUrl = parseAppModeUrl(process.argv);');
+  const block = src.slice(start, start + 900);
+  assert.ok(start > -1);
+  assert.match(block, /appendSwitch\('class', appWindowClass\(appModeLaunchUrl\)\)/, 'the --class switch matches the .desktop StartupWMClass');
+  assert.match(block, /app\.setAppUserModelId\(appWindowClass\(appModeLaunchUrl\)\)/, 'Windows taskbar grouping key set');
+});
+
+test('main.cjs (source pin): written .desktop launchers are marked TRUSTED for GNOME (gio metadata::trusted)', () => {
+  const src = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
+  const start = src.indexOf("ipcMain.handle('yayra:install-page-as-app'");
+  const block = src.slice(start, start + 4500);
+  assert.ok(start > -1);
+  assert.match(block, /'metadata::trusted', 'true'/, 'gvfs trust metadata is set');
+  assert.match(block, /spawn\('gio', \['set', artifact\.path/, 'via the gio binary, best-effort');
 });

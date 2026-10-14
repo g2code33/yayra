@@ -8,7 +8,7 @@ const crypto = require('node:crypto');
 const { pathToFileURL } = require('node:url');
 const { registerDesktopUpdateHandlers } = require('./desktopUpdater.cjs');
 const { createWebviewBridge, buildContextMenuTemplate, buildBrowserUserAgent } = require('./webviewBridge.cjs');
-const { parseAppModeUrl, buildInstallPlan } = require('./appMode.cjs');
+const { parseAppModeUrl, buildInstallPlan, appWindowClass } = require('./appMode.cjs');
 const { extractManifestLink, extractIconLink, parseManifest, pickInstallIdentity, isPngBuffer, isIcoBuffer, pngToIco } = require('./pwaManifest.cjs');
 const { startGlobalHotkeys } = require('./globalHotkeys.cjs');
 const { createAuthBridge } = require('./authBridge.cjs');
@@ -189,6 +189,10 @@ if (relaunchingForX11) {
   app.quit();
 } else {
   app.on('second-instance', (_event, argv, _workingDir, additionalData) => {
+    // An installed site-app shortcut was launched while Yayra is already
+    // running - computed FIRST so even the Wayland self-heal handover
+    // below carries it through instead of swallowing the site.
+    const appUrl = parseAppModeUrl(argv || []);
     // SELF-HEAL: if THIS resident instance is stuck on native Wayland
     // (bubble frozen, not on top - e.g. autostart ran before XWayland
     // exported $DISPLAY at login) and the user just launched Yayra from
@@ -204,7 +208,14 @@ if (relaunchingForX11) {
       if (selfOnWayland && newDisplay !== '') {
         let launcher = '/usr/bin/yayra';
         try { if (!fs.existsSync(launcher)) launcher = process.execPath; } catch { launcher = process.execPath; }
-        const handover = spawn('/bin/sh', ['-c', `sleep 1; exec "${launcher}" --ozone-platform=x11`], {
+        // The handover must carry the --app url of the shortcut that was
+        // clicked - dropping it opened the full browser instead of the
+        // installed site's own window (the "install as app is broken on
+        // Ubuntu" bug: Ubuntu sessions are Wayland, and installed-site
+        // .desktop entries launch /opt/yayra/yayra directly, so a
+        // Wayland-stranded resident is a common state).
+        const appArg = appUrl ? ` --app="${appUrl}"` : '';
+        const handover = spawn('/bin/sh', ['-c', `sleep 1; exec "${launcher}" --ozone-platform=x11${appArg}`], {
           detached: true,
           stdio: 'ignore',
           env: { ...process.env, DISPLAY: newDisplay }
@@ -217,7 +228,6 @@ if (relaunchingForX11) {
     } catch { /* healing is best-effort - normal focusing below */ }
     // An installed site-app shortcut was launched while Yayra is already
     // running: open THAT site's app window, not the browser.
-    const appUrl = parseAppModeUrl(argv || []);
     if (appUrl) { createAppModeWindow(appUrl); return; }
     if (overlayBridge) overlayBridge.restoreMainWindow();
     else if (mainWindow && !mainWindow.isDestroyed()) { mainWindow.show(); mainWindow.focus(); }
@@ -229,13 +239,40 @@ if (relaunchingForX11) {
 // (`yayra --app=<url>`)? Then this process opens ONLY the site's own
 // minimal app window - exactly like chrome --app=<url>.
 const appModeLaunchUrl = parseAppModeUrl(process.argv);
+if (appModeLaunchUrl) {
+  // The installed site's window must carry the SAME class its .desktop
+  // entry declares as StartupWMClass (see appWindowClass), or GNOME/KDE
+  // give it a generic dock icon and never group it under its launcher.
+  // The --class switch only takes effect before the app is ready.
+  try { app.commandLine.appendSwitch('class', appWindowClass(appModeLaunchUrl)); } catch { /* pre-ready only */ }
+  // Windows taskbar grouping/pinning key for this site's app window.
+  if (process.platform === 'win32') {
+    try { app.setAppUserModelId(appWindowClass(appModeLaunchUrl)); } catch { /* best effort */ }
+  }
+}
 
 /**
  * Chrome-style app window for an installed site: the page IS the window
  * (own taskbar presence, no tabs/omnibox). Popups/external links go to
  * the user's default browser, like Chrome app windows hand them off.
  */
+const appModeWindows = new Map(); // normalized url -> open site-app window
+
 function createAppModeWindow(url) {
+  let normalized = url;
+  try { normalized = new URL(url).toString(); } catch { /* keep raw */ }
+  // Clicking the same installed app again must FOCUS its window, not
+  // stack a duplicate per click (the classic "every launch opens another
+  // window" complaint about site shortcuts).
+  const existing = appModeWindows.get(normalized);
+  if (existing && !existing.isDestroyed()) {
+    try {
+      if (existing.isMinimized()) existing.restore();
+      existing.show();
+      existing.focus();
+    } catch { /* race with close */ }
+    return existing;
+  }
   let hostname = 'app';
   try { hostname = new URL(url).hostname; } catch { /* keep default */ }
   const win = new BrowserWindow({
@@ -263,6 +300,8 @@ function createAppModeWindow(url) {
     try { win.setTitle(pageTitle || hostname); } catch { /* closing */ }
   });
   win.loadURL(url);
+  appModeWindows.set(normalized, win);
+  win.on('closed', () => { appModeWindows.delete(normalized); });
   return win;
 }
 
@@ -723,6 +762,20 @@ function registerIpcBridges() {
         }
       }
       if (!primaryPath) return { ok: false, reason: 'write-failed' };
+      // Ubuntu/GNOME keeps self-written .desktop launchers UNTRUSTED
+      // until gvfs marks them so - without this, the first double-click
+      // of the freshly installed site icon shows "Untrusted application
+      // launcher" (or nothing at all on stricter setups) and the install
+      // looks broken. Best-effort: gio lives on every GNOME/KDE box, and
+      // the executable bit above already covers the rest.
+      if (process.platform === 'linux') {
+        for (const artifact of plan.artifacts) {
+          try {
+            const gio = spawn('gio', ['set', artifact.path, 'metadata::trusted', 'true'], { detached: true, stdio: 'ignore' });
+            gio.unref();
+          } catch { /* best effort */ }
+        }
+      }
       return { ok: true, name: plan.name, path: primaryPath, inLauncher: plan.inLauncher, pwa: identity.pwa, edited: installName !== identity.name };
     } catch (err) {
       console.error('[yayra] install page as app failed', err);
