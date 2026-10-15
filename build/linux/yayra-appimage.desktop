@@ -6,3 +6,4 @@ Type=Application
 Icon=yayra
 StartupWMClass=yayra-appimage
 Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;application/pdf;x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/yayra;

@@ -921,6 +921,20 @@ export class BrowserShell {
         };
       }
     } catch { /* optional plugin surface */ }
+    // Desktop "Open with > yayra" launches: the main process pushes the
+    // chosen file's bytes - open them straight in the document viewer.
+    this._unsubscribeOpenPdfFile = null;
+    try {
+      const docBridge = this.systemBridge && this.systemBridge.documents;
+      if (docBridge && typeof docBridge.onOpenPdfFile === 'function') {
+        this._unsubscribeOpenPdfFile = docBridge.onOpenPdfFile(({ name, data } = {}) => {
+          if (!data) return;
+          this.addDocumentTab({ name: name || 'document.pdf', bytes: data });
+        });
+      }
+    } catch { /* optional bridge */ }
+    // Drag any PDF onto ANY part of Yayra -> it opens in the viewer.
+    this._armPdfDropZone();
     this.processPendingInstallOnLaunch().catch(() => {});
 
     if (this.settingsRepo) {
@@ -4925,7 +4939,7 @@ export class BrowserShell {
           <!-- List View -->
           <div class="fb-downloads-list-layout" style="display:flex; flex-direction:column; gap:8px;">
             ${items.length > 0 ? items.map((dl) => `
-              <div class="fb-download-item-row" style="display:flex; align-items:center; justify-content:space-between; padding:12px 16px; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:10px;">
+              <div class="fb-download-item-row" data-dl-id="${dl.id}" style="display:flex; align-items:center; justify-content:space-between; padding:12px 16px; background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:10px;">
                 <div style="display:flex; align-items:center; gap:12px;">
                   <span style="color:var(--fb-accent-primary);">${Icons.download}</span>
                   <div>
@@ -4989,6 +5003,18 @@ export class BrowserShell {
     // Requirement 11: Visit Location Button - now a real OS "reveal in file
     // manager" call (electron shell.showItemInFolder) instead of a
     // clipboard+alert placeholder.
+    // RIGHT-CLICK anywhere on a download row (list view): the same
+    // per-download menu as the toolbar dropdown ("Open in Yayra"...).
+    page.querySelectorAll('[data-dl-id]').forEach((row) => {
+      const rowId = (row.dataset && row.dataset.dlId) || row.getAttribute?.('data-dl-id');
+      const item = (this.state.downloadsItems || []).find((it) => it.id === rowId);
+      if (!item) return;
+      row.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        this.showDownloadsContextMenu(e, item);
+      });
+    });
+
     page.querySelectorAll('.fb-in-dl-location-btn').forEach((btn) => {
       btn.addEventListener('click', async (e) => {
         e.stopPropagation();
@@ -11588,6 +11614,104 @@ export class BrowserShell {
     </span>`;
   }
 
+  /* -------------------------------------------------------------
+   * PDF EVERYWHERE (user request): drag-and-drop, OS "Open with",
+   * downloads right-click "Open in Yayra".
+   * ----------------------------------------------------------- */
+  /** One global drop zone: any PDF dropped anywhere in Yayra opens in
+   *  the document viewer. Non-PDF files get the honest roadmap notice. */
+  _armPdfDropZone() {
+    if (this._pdfDropArmed || typeof document === 'undefined') return;
+    this._pdfDropArmed = true;
+    const isFileDrag = (e) => {
+      try { return Array.from(e.dataTransfer?.types || []).includes('Files'); } catch { return false; }
+    };
+    this._pdfDropHandlers = {
+      dragover: (e) => {
+        if (!isFileDrag(e)) return;
+        e.preventDefault(); // without it the browser would navigate away
+        try { e.dataTransfer.dropEffect = 'copy'; } catch { /* shim */ }
+      },
+      drop: (e) => {
+        if (!isFileDrag(e)) return;
+        // Drops aimed at a real file input belong to that input.
+        if (e.target && typeof e.target === 'object' && String(e.target.tagName || '').toUpperCase() === 'INPUT') return;
+        e.preventDefault();
+        const files = Array.from(e.dataTransfer.files || []);
+        if (files.length) this._openDroppedPdfFiles(files);
+      }
+    };
+    // Optional-call style (older shims/test environments): the handlers
+    // exist either way - only the live attachment needs the DOM.
+    document.addEventListener?.('dragover', this._pdfDropHandlers.dragover);
+    document.addEventListener?.('drop', this._pdfDropHandlers.drop);
+  }
+
+  async _openDroppedPdfFiles(files) {
+    const pdfs = files.filter((f) => classifyDocument(f && f.name) === 'pdf');
+    if (!pdfs.length) {
+      this.showTransientNotice('Only PDF documents open in Yayra right now - Word, Excel and PowerPoint are on the roadmap.');
+      return;
+    }
+    for (const file of pdfs.slice(0, 8)) {
+      try {
+        const bytes = await this._readFileBytes(file);
+        this.addDocumentTab({ name: file.name, bytes });
+      } catch { this.showTransientNotice(`Couldn\u2019t read \u201C${file.name}\u201D.`); }
+    }
+  }
+
+  _readFileBytes(file) {
+    if (typeof file.arrayBuffer === 'function') return file.arrayBuffer();
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error || new Error('read-failed'));
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  isPdfDownload(item) {
+    return Boolean(item) && (/\.pdf$/i.test(String(item.filename || item.name || ''))
+      || String(item.mime || item.mimeType || '') === 'application/pdf'
+      || (/\.pdf$/i.test(String(item.path || ''))));
+  }
+
+  /** Right-click menu for a download: "Open in Yayra" for PDFs (the
+   *  in-app viewer), plus the OS open / reveal / copy actions. */
+  showDownloadsContextMenu(evt, item) {
+    if (typeof document === 'undefined' || !document.body || !item) return;
+    document.getElementById('yayra-dl-context-menu')?.remove();
+    const menu = document.createElement('div');
+    menu.id = 'yayra-dl-context-menu';
+    menu.className = 'fb-dl-context-menu';
+    menu.style.cssText = `position:fixed; z-index:100000; min-width:200px; background:var(--fb-bg-elevated,#171a22); border:1px solid rgba(255,255,255,0.12); border-radius:10px; padding:6px; box-shadow:0 16px 48px rgba(0,0,0,0.55); left:${Math.max(8, (evt.clientX || 60) - 24)}px; top:${Math.max(8, evt.clientY || 60)}px; font-size:0.82rem; color:var(--fb-text-primary,#f3f4f6);`;
+    const dismiss = () => { try { menu.remove(); } catch { /* gone */ } };
+    const entry = (label, fn) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      b.className = 'fb-dl-ctx-entry';
+      b.style.cssText = 'display:block; width:100%; text-align:left; padding:8px 10px; border:none; border-radius:7px; background:transparent; color:inherit; font-size:0.82rem; cursor:pointer;';
+      b.addEventListener('click', () => { dismiss(); fn(); });
+      menu.appendChild(b);
+    };
+    if (this.isPdfDownload(item)) entry('Open in Yayra', () => this.performDownloadAction(item.id, 'open-in-yayra'));
+    if (this.downloadsBridge) {
+      entry('Open (desktop app)', () => this.performDownloadAction(item.id, 'open'));
+      entry('Show in folder', () => this.performDownloadAction(item.id, 'show'));
+    }
+    if (item.path) entry('Copy file path', () => this.performDownloadAction(item.id, 'copy-path'));
+    if (item.url) entry('Copy download address', () => this.performDownloadAction(item.id, 'copy-url'));
+    if (!menu.children || menu.children.length === 0) return;
+    document.body.appendChild(menu);
+    setTimeout(() => {
+      if (typeof document.addEventListener !== 'function') return; // shim
+      const away = () => { dismiss(); document.removeEventListener('click', away, true); };
+      document.addEventListener('click', away, true);
+    }, 0);
+  }
+
   renderDownloadsDropdown(root) {
     this.appendDropdownScrim(root, () => {
       this.state.isDownloadsDropdownOpen = false;
@@ -11631,6 +11755,13 @@ export class BrowserShell {
 
     for (const row of dropdown.querySelectorAll('.fb-dl-item')) {
       const id = (row.dataset && row.dataset.dlId) || row.getAttribute?.('data-dl-id');
+      // RIGHT-CLICK: the per-download menu ("Open in Yayra" for PDFs,
+      // OS open / reveal / copy actions).
+      row.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        const item = (this.state.downloadsItems || []).find((it) => it.id === id);
+        this.showDownloadsContextMenu(e, item);
+      });
       for (const btn of row.querySelectorAll('.fb-dl-act')) {
         btn.addEventListener('click', (e) => {
           e.stopPropagation();
@@ -11672,6 +11803,20 @@ export class BrowserShell {
       case 'copy-url':
         if (item.url) copy(item.url, 'Download address copied');
         break;
+      case 'open-in-yayra': {
+        if (!bridge || typeof bridge.openPdf !== 'function') {
+          this.showTransientNotice('Opening downloads inside Yayra needs the desktop app.');
+          break;
+        }
+        this.state.isDownloadsDropdownOpen = false;
+        const res = await bridge.openPdf(id);
+        if (res && res.ok) {
+          this.addDocumentTab({ name: res.name, bytes: res.data });
+        } else {
+          this.showTransientNotice(`Couldn't open it in Yayra${res && res.reason ? ` (${res.reason})` : ''}.`);
+        }
+        break;
+      }
       case 'open-url':
         if (item.url) {
           this.state.isDownloadsDropdownOpen = false;
@@ -12160,6 +12305,20 @@ export class BrowserShell {
     bar.appendChild(mkBtn('+', 'Zoom in', () => this._activeDocViewer?.viewer.setZoom((tab.docState?.zoom || 1.25) + 0.25)));
     bar.appendChild(searchInput);
     bar.appendChild(matchLabel);
+    // "Use the desktop PDF app instead": the honest escape hatch from the
+    // in-Yayra viewer (main process writes a temp file + OS open-with).
+    if (this.systemBridge && this.systemBridge.documents && typeof this.systemBridge.documents.openExternal === 'function') {
+      bar.appendChild(mkBtn('Desktop app', 'Open this PDF with your desktop PDF app instead', async () => {
+        const d = this.documentStore.get(tab.docId);
+        if (!d) return;
+        try {
+          const res = await this.systemBridge.documents.openExternal({ name: d.name, data: d.bytes });
+          this.showTransientNotice(res && res.ok
+            ? `Opening \u201C${d.name}\u201D with your desktop PDF app...`
+            : `Couldn\u2019t open it externally${res && res.reason ? ` (${res.reason})` : ''}.`);
+        } catch { this.showTransientNotice('Couldn\u2019t open it externally.'); }
+      }));
+    }
     const spacer = document.createElement('span');
     spacer.style.cssText = 'flex:1;';
     bar.appendChild(spacer);
@@ -12587,6 +12746,13 @@ export class BrowserShell {
     }
     if (this._unsubscribeTabWebEvents) { this._unsubscribeTabWebEvents(); this._unsubscribeTabWebEvents = null; }
     if (this._unsubscribeAndroidBackButton) { this._unsubscribeAndroidBackButton(); this._unsubscribeAndroidBackButton = null; }
+    if (this._unsubscribeOpenPdfFile) { try { this._unsubscribeOpenPdfFile(); } catch { /* gone */ } this._unsubscribeOpenPdfFile = null; }
+    if (this._pdfDropHandlers && typeof document !== 'undefined') {
+      document.removeEventListener?.('dragover', this._pdfDropHandlers.dragover);
+      document.removeEventListener?.('drop', this._pdfDropHandlers.drop);
+      this._pdfDropHandlers = null;
+    }
+    this._pdfDropArmed = false;
     if (this.bubbleOverlay) {
       this.bubbleOverlay.remove();
     }

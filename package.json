@@ -132,7 +132,16 @@
     "appImage": {
       "artifactName": "yayra-${version}.${ext}"
     },
-    "electronVersion": "44.5.1"
+    "electronVersion": "44.5.1",
+    "fileAssociations": [
+      {
+        "ext": "pdf",
+        "name": "PDF document",
+        "description": "PDF document",
+        "role": "Viewer",
+        "isPackaged": true
+      }
+    ]
   },
   "author": {
     "name": "g2code33",

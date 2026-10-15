@@ -101,6 +101,9 @@ const api = {
     clear: () => ipcRenderer.invoke('yayra:downloads-clear'),
     remove: (id) => ipcRenderer.invoke('yayra:downloads-remove', { id }),
     open: (id) => ipcRenderer.invoke('yayra:downloads-open', { id }),
+    // "Open in Yayra": read a COMPLETED pdf download's bytes so the
+    // in-app document viewer can show it (bytes only - never a path).
+    openPdf: (id) => ipcRenderer.invoke('yayra:downloads-open-pdf', { id }),
     showInFolder: (id) => ipcRenderer.invoke('yayra:downloads-show-in-folder', { id }),
     getRoot: () => ipcRenderer.invoke('yayra:downloads-get-root'),
     chooseRoot: () => ipcRenderer.invoke('yayra:downloads-choose-root'),
@@ -184,7 +187,17 @@ const api = {
     // Local document workspace: open ONE user-picked PDF; the renderer
     // receives only the bytes (never a filesystem path).
     documents: {
-      openPdf: () => ipcRenderer.invoke('yayra:doc-open')
+      openPdf: () => ipcRenderer.invoke('yayra:doc-open'),
+      // "Open with desktop app": hand the CURRENT document's bytes to the
+      // OS default pdf reader (main process writes a temp file).
+      openExternal: ({ name, data } = {}) => ipcRenderer.invoke('yayra:doc-open-externally', { name, data }),
+      // OS "Open with > yayra" launches: the main process pushes the
+      // user-chosen file's bytes; the shell opens them in its viewer.
+      onOpenPdfFile: (callback) => {
+        const listener = (_event, payload) => { try { callback(payload); } catch { /* shell not ready */ } };
+        ipcRenderer.on('yayra:open-pdf-file', listener);
+        return () => { try { ipcRenderer.removeListener('yayra:open-pdf-file', listener); } catch { /* gone */ } };
+      }
     },
     // Real Chromium cache/site-data clearing across all Yayra sessions.
     clearBrowsingData: ({ cache = true, cookies = false } = {}) => ipcRenderer.invoke('yayra:clear-browsing-data', { cache, cookies })

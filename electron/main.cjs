@@ -226,6 +226,14 @@ if (relaunchingForX11) {
         return;
       }
     } catch { /* healing is best-effort - normal focusing below */ }
+    // A PDF was opened WITH Yayra from the desktop while it is already
+    // running: hand its bytes to the shell's document viewer.
+    const pdfFile = parsePdfFileArg(argv || []);
+    if (pdfFile) {
+      if (!mainWindow || mainWindow.isDestroyed()) createWindow();
+      deliverPdfFile(pdfFile);
+      return;
+    }
     // An installed site-app shortcut was launched while Yayra is already
     // running: open THAT site's app window, not the browser.
     if (appUrl) { createAppModeWindow(appUrl); return; }
@@ -303,6 +311,53 @@ function createAppModeWindow(url) {
   appModeWindows.set(normalized, win);
   win.on('closed', () => { appModeWindows.delete(normalized); });
   return win;
+}
+
+/**
+ * PDF "Open With" handling: the OS launched Yayra on a .pdf file (or a
+ * file was dragged onto the app icon). Only real, existing .pdf files are
+ * accepted (extension checked, flags ignored) - the bytes are read in the
+ * MAIN process and handed to the renderer, exactly like the in-app
+ * document picker: the renderer never receives a filesystem path it did
+ * not choose itself, and nothing outside that one file is readable.
+ */
+function parsePdfFileArg(argv) {
+  for (const arg of argv || []) {
+    if (typeof arg !== 'string' || arg === '' || arg.startsWith('--')) continue;
+    const raw = arg.replace(/^["']|["']$/g, '');
+    if (!/\.pdf$/i.test(raw)) continue;
+    try {
+      const abs = path.resolve(raw);
+      if (fs.existsSync(abs) && fs.statSync(abs).isFile()) return abs;
+    } catch { /* not a real path - keep scanning */ }
+  }
+  return null;
+}
+
+const pendingPdfFiles = []; // queued until the shell renderer is listening
+
+function deliverPdfFile(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile() || stat.size > 150 * 1024 * 1024) return false;
+    const data = fs.readFileSync(filePath);
+    const payload = { name: path.basename(filePath), size: stat.size, data };
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('yayra:open-pdf-file', payload);
+    } else {
+      pendingPdfFiles.push(payload);
+    }
+    return true;
+  } catch (err) {
+    console.error('[yayra] pdf open-with delivery failed', err);
+    return false;
+  }
+}
+
+function flushPendingPdfFiles() {
+  while (pendingPdfFiles.length > 0 && mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('yayra:open-pdf-file', pendingPdfFiles.shift());
+  }
 }
 
 /**
@@ -437,6 +492,13 @@ app.whenReady().then(async () => {
   const isSmokeStartup = process.env.YAYRA_SMOKE === '1' || process.env.IBROWSE_SMOKE === '1';
   // Launched from an installed site-app shortcut: only the site's own
   // app window opens - no browser window, like chrome --app=<url>.
+  // Launched via the desktop's "Open with > yayra" on a PDF (the .desktop
+  // entries and the Windows file association pass the file path as argv):
+  // queue it - createWindow()'s did-finish-load flush delivers it to the
+  // document viewer.
+  const coldPdfFile = parsePdfFileArg(process.argv);
+  if (coldPdfFile && !isSmokeStartup) deliverPdfFile(coldPdfFile);
+
   if (appModeLaunchUrl && !isSmokeStartup) {
     createAppModeWindow(appModeLaunchUrl);
   } else if (!isAutostartLaunch || isSmokeStartup) {
@@ -810,6 +872,30 @@ function registerIpcBridges() {
     }
   });
 
+  // DOCUMENT WORKSPACE: "Open with desktop app" - the in-viewer escape
+  // hatch for users who want their OS pdf reader (Acrobat, Evince,
+  // Edge...). The bytes come FROM the renderer (they are the same bytes
+  // the viewer holds); a sanitized temp file is written and opened with
+  // the OS default handler. Nothing else on disk is touched.
+  ipcMain.handle('yayra:doc-open-externally', async (_event, { name, data } = {}) => {
+    try {
+      if (!data) return { ok: false, reason: 'no-data' };
+      const safeName = String(name || 'document.pdf').replace(/[\\/:*?"<>|]+/g, '-').slice(0, 80) || 'document.pdf';
+      const dir = path.join(app.getPath('temp'), 'yayra-docs');
+      fs.mkdirSync(dir, { recursive: true });
+      const filePath = path.join(dir, `${Date.now().toString(36)}-${safeName}`);
+      const bytes = data.byteLength !== undefined ? Buffer.from(data) : Buffer.from(new Uint8Array(0));
+      if (bytes.length === 0 || bytes.length > 150 * 1024 * 1024) return { ok: false, reason: 'bad-size' };
+      fs.writeFileSync(filePath, bytes);
+      const result = await shell.openPath(filePath);
+      if (result !== '') return { ok: false, reason: String(result) };
+      return { ok: true };
+    } catch (err) {
+      console.error('[yayra] doc-open-externally failed', err);
+      return { ok: false, reason: 'failed' };
+    }
+  });
+
   // Menu > Save and share > Create shortcut...: a REAL shortcut file on
   // the user's desktop that opens the page in the default browser
   // (.desktop on Linux, .url on Windows, .webloc on macOS).
@@ -893,6 +979,21 @@ function registerIpcBridges() {
   // happen in the shared "persist:yayra-webview" session that regular
   // (non-private) tabs use, plus Yayra's own windows, and lets the user pick
   // where new downloads are saved.
+  ipcMain.handle('yayra:downloads-open-pdf', async (_event, { id } = {}) => {
+    try {
+      const item = (downloadsStore.load().items || []).find((it) => it.id === id);
+      if (!item || !item.path) return { ok: false, reason: 'not-found' };
+      const stat = await fs.promises.stat(item.path);
+      if (!stat.isFile()) return { ok: false, reason: 'not-a-file' };
+      if (stat.size > 150 * 1024 * 1024) return { ok: false, reason: 'file-too-large' };
+      const data = await fs.promises.readFile(item.path);
+      return { ok: true, name: path.basename(item.path), size: stat.size, data };
+    } catch (err) {
+      console.error('[yayra] downloads-open-pdf failed', err);
+      return { ok: false, reason: 'read-failed' };
+    }
+  });
+
   const downloadsStore = createDownloadsStore({
     fs,
     userDataDir: app.getPath('userData'),
@@ -1029,6 +1130,11 @@ function createWindow() {
       sandbox: true
     }
   });
+
+  // PDFs queued before the window existed (OS "Open With" at cold start)
+  // are delivered the moment the shell renderer finished loading - the
+  // preload's listener is attached before any page script runs.
+  win.webContents.on('did-finish-load', () => flushPendingPdfFiles());
 
   // Chrome-equivalent native right-click menu for Yayra's OWN chrome (the
   // omnibox, side drawer, settings forms, etc.) - this is a different
