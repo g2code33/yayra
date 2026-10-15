@@ -278,3 +278,26 @@ async function bootShell() {
   shell.render(container);
   return { shell, container };
 }
+
+test('PDF FONTS: standard-14 font data and CJK cmaps are vendored and wired into every getDocument call', async () => {
+  const { existsSync, readdirSync } = await import('node:fs');
+  const fontsDir = new URL('../packages/shared-ui/src/vendor/pdfjs/standard_fonts/', import.meta.url);
+  const cmapsDir = new URL('../packages/shared-ui/src/vendor/pdfjs/cmaps/', import.meta.url);
+  assert.ok(existsSync(fontsDir), 'standard_fonts vendored');
+  const fonts = readdirSync(fontsDir);
+  assert.ok(fonts.includes('FoxitSerif.pfb'), 'the Foxit standard-14 faces are present');
+  assert.ok(fonts.includes('LiberationSans-Regular.ttf'), 'the Liberation fallback faces are present');
+  assert.ok(fonts.length >= 14, `the standard font set is complete (${fonts.length})`);
+  assert.ok(existsSync(cmapsDir), 'cmaps vendored');
+  assert.ok(readdirSync(cmapsDir).length >= 100, 'CJK cmap tables present');
+
+  // The shell wraps the vendored engine so text renders even in PDFs that
+  // rely on non-embedded standard fonts (very common in the wild).
+  const src = readFileSync(new URL('../packages/shared-ui/src/components/BrowserShell.js', import.meta.url), 'utf8');
+  assert.match(src, /standardFontDataUrl: stdFontUrl/, 'standardFontDataUrl is passed');
+  assert.match(src, /cMapUrl,/, 'cMapUrl is passed');
+  assert.match(src, /cMapPacked: true/, 'cmaps are packed (bcmap)');
+  // The wrapped module keeps the worker assignment and the engine surface.
+  assert.match(src, /GlobalWorkerOptions\.workerSrc = new URL\('\.\.\/vendor\/pdfjs\/pdf\.worker\.mjs'/, 'worker still set on the real module');
+}
+);

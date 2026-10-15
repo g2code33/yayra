@@ -202,8 +202,19 @@ class YayraFloatBubbleService : Service() {
                 restoreBrowserWindow()
             }
             YayraQuickActionsView.QuickAction.SETTINGS -> {
-                persistentWebView?.loadUrl("yayra://settings")
-                restoreBrowserWindow()
+                // The settings UI lives in the APP, not in a raw WebView -
+                // yayra:// is an in-app scheme a native WebView can never
+                // resolve (it used to land on a "web page not available"
+                // error). Bring the real app forward instead.
+                try {
+                    val launch = packageManager.getLaunchIntentForPackage(packageName)
+                    if (launch != null) {
+                        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        startActivity(launch)
+                    }
+                } catch (_: Exception) {
+                    restoreBrowserWindow()
+                }
             }
             YayraQuickActionsView.QuickAction.CLOSE_BUBBLE -> {
                 stopFloatingExperience()

@@ -2731,6 +2731,19 @@ export class BrowserShell {
   /** Android hardware Back: inside a native-engine page it walks THAT
    *  page's history first; otherwise the standard app exit. */
   handleAndroidBackButton() {
+    // Standard Android back-stack, outermost chrome first: an open side
+    // drawer closes, then the floating mini window, then the page's own
+    // history walks, and only at the page root does Back leave the app.
+    if (this.state.isSideDrawerOpen) {
+      this.state.isSideDrawerOpen = false;
+      this.render();
+      return;
+    }
+    if (this.state.isFloatingMiniOpen) {
+      this.state.isFloatingMiniOpen = false;
+      this.render();
+      return;
+    }
     const tab = this.getActiveTab();
     if (tab && this._androidTabWebIds.has(tab.id)) {
       if (tab.canGoBack) {
@@ -6566,7 +6579,7 @@ export class BrowserShell {
       try {
         const res = await overlay.installSiteAsApp({ url: tab.url, title: shortcutName });
         if (res && res.ok) {
-          this.showTransientNotice(`Added \u201C${title}\u201D to your home screen - tap it to open Yayra straight on the site.`);
+          this.showTransientNotice(`Added \u201C${shortcutName}\u201D to your home screen - tap it to open Yayra straight on the site.`);
           return;
         }
         this.showTransientNotice(`Couldn\u2019t add the site to your home screen${res && res.reason ? ` (${res.reason})` : ''}.`);
@@ -12062,10 +12075,25 @@ export class BrowserShell {
    *  main-thread parsing automatically. */
   async _pdfjsModule() {
     if (this._pdfjsLib) return this._pdfjsLib;
-    this._pdfjsLib = await import('../vendor/pdfjs/pdf.mjs');
+    const lib = await import('../vendor/pdfjs/pdf.mjs');
     try {
-      this._pdfjsLib.GlobalWorkerOptions.workerSrc = new URL('../vendor/pdfjs/pdf.worker.mjs', import.meta.url).toString();
+      lib.GlobalWorkerOptions.workerSrc = new URL('../vendor/pdfjs/pdf.worker.mjs', import.meta.url).toString();
     } catch { /* older embedders - PDF.js self-heals to main-thread */ }
+    // Standard-14 font data + CJK cmaps (vendored, offline): without
+    // these, PDFs that rely on non-embedded standard fonts (very common
+    // in simple/older documents) render with missing/degraded text, and
+    // CJK documents fail outright. Wrapped so every getDocument call the
+    // viewer makes carries them without the viewer knowing.
+    const stdFontUrl = new URL('../vendor/pdfjs/standard_fonts/', import.meta.url).toString();
+    const cMapUrl = new URL('../vendor/pdfjs/cmaps/', import.meta.url).toString();
+    const wrapped = Object.create(lib);
+    wrapped.getDocument = (params = {}) => lib.getDocument({
+      standardFontDataUrl: stdFontUrl,
+      cMapUrl,
+      cMapPacked: true,
+      ...params
+    });
+    this._pdfjsLib = wrapped;
     return this._pdfjsLib;
   }
 

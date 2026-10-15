@@ -308,3 +308,48 @@ test('KOTLIN PIN (mini window): the title-bar and nav buttons RENDER their glyph
   assert.ok(view.includes('btnMaximize = createTitleButton'), 'expand button');
   assert.ok(view.includes('btnClose = createTitleButton'), 'close button');
 });
+
+test('ANDROID: hardware Back closes the side drawer FIRST, then the mini window, then walks page history, then exits', async () => {
+  const android = fakeAndroid();
+  const { shell } = await makeShell();
+  try {
+    // Drawer open -> Back closes the drawer, nothing else.
+    shell.state.isSideDrawerOpen = true;
+    android.pressBack();
+    assert.equal(shell.state.isSideDrawerOpen, false, 'drawer closed');
+    assert.equal(android.calls.exitApp, 0, 'app did not exit');
+    assert.equal(android.calls.goBack.length, 0, 'page history untouched');
+
+    // Mini window open -> Back closes it.
+    shell.state.isFloatingMiniOpen = true;
+    android.pressBack();
+    assert.equal(shell.state.isFloatingMiniOpen, false, 'mini window closed');
+    assert.equal(android.calls.exitApp, 0, 'app did not exit');
+
+    // Native page with history -> Back walks the page.
+    shell.state.tabs[0].id = 'tab-bx';
+    shell.state.activeTabId = 'tab-bx';
+    shell.createWebContentFrame('https://www.google.com/', { tabId: 'tab-bx', allowNative: false });
+    await flush();
+    shell.state.tabs[0].canGoBack = true;
+    android.pressBack();
+    assert.equal(android.calls.goBack.length, 1, 'page history walked');
+    assert.equal(android.calls.exitApp, 0, 'app did not exit');
+
+    // Page root -> Back exits (standard Android).
+    shell.state.tabs[0].canGoBack = false;
+    android.pressBack();
+    assert.equal(android.calls.exitApp, 1, 'exit at the page root');
+  } finally {
+    shell.destroy();
+    delete window.Capacitor;
+    delete globalThis.localStorage;
+  }
+});
+
+test('KOTLIN PIN (bubble): the Settings quick action launches the real app - never a yayra:// URL in a raw WebView', () => {
+  const service = readFileSync(new URL('../packages/floating-android/src/kotlin/com/yayra/floating/android/YayraFloatBubbleService.kt', import.meta.url), 'utf8');
+  const block = service.slice(service.indexOf('QuickAction.SETTINGS ->'), service.indexOf('QuickAction.CLOSE_BUBBLE ->'));
+  assert.ok(block.includes('getLaunchIntentForPackage'), 'the app own launch intent is used');
+  assert.ok(!block.includes('yayra://settings'), 'the unresolvable in-app scheme is gone');
+});
