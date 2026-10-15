@@ -5876,3 +5876,85 @@ html {
   from { transform: translateY(14px); opacity: 0; }
   to { transform: translateY(0); opacity: 1; }
 }
+
+/* =============================================================
+   POINTER SETTINGS (Settings > Pointer)
+   ============================================================= */
+/* Users can customize the pointer inside Yayra. "System" (default)
+   requests ONLY native system cursors, so the pointer always matches
+   the OS pointer size (Windows Settings > Accessibility > Mouse
+   pointer; see tests/native-cursor-size.test.mjs). The custom themes
+   below replace the arrow + hand with SVG cursors in three sizes.
+
+   Scope, honestly: custom themes style YAYRA'S OWN interface. Content
+   inside web pages (iframes/native engine) keeps the site's own
+   pointer behavior - a browser must not repaint the web.
+
+   The application rules need !important because most of the app's
+   cursor styling is inline (style="...cursor:pointer...") and inline
+   styles otherwise beat any stylesheet rule. Text fields keep the
+   NATIVE text cursor: it follows the OS pointer size, and an SVG
+   I-beam renders worse than the real one. */
+
+/* Theme shapes (24px base; one SVG per shape, scaled by width/height) */
+[data-fb-pointer='yayra'] {
+  --fb-ptr-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath d='M5 2l14 10-6 1 3.5 7-2.6 1.2L10.5 14 5 18z' fill='%236d5df2' stroke='%23ffffff' stroke-width='1.6' stroke-linejoin='round'/%3E%3C/svg%3E") 4 2, auto;
+  --fb-ptr-hand: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath d='M9 11V4.5a1.5 1.5 0 0 1 3 0V10l4.6.9c1.1.2 1.9 1.2 1.9 2.3v3.3c0 2.5-2 4.5-4.5 4.5h-3.4c-1.3 0-2.6-.6-3.4-1.7L4 15.5c-.6-.9-.4-2 .5-2.6.8-.5 1.9-.3 2.5.5l2 2.6z' fill='%236d5df2' stroke='%23ffffff' stroke-width='1.6' stroke-linejoin='round'/%3E%3C/svg%3E") 9 2, pointer;
+}
+[data-fb-pointer='yayra'][data-fb-pointer-size='large'] {
+  --fb-ptr-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='36' height='36' viewBox='0 0 24 24'%3E%3Cpath d='M5 2l14 10-6 1 3.5 7-2.6 1.2L10.5 14 5 18z' fill='%236d5df2' stroke='%23ffffff' stroke-width='1.4' stroke-linejoin='round'/%3E%3C/svg%3E") 6 3, auto;
+  --fb-ptr-hand: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='36' height='36' viewBox='0 0 24 24'%3E%3Cpath d='M9 11V4.5a1.5 1.5 0 0 1 3 0V10l4.6.9c1.1.2 1.9 1.2 1.9 2.3v3.3c0 2.5-2 4.5-4.5 4.5h-3.4c-1.3 0-2.6-.6-3.4-1.7L4 15.5c-.6-.9-.4-2 .5-2.6.8-.5 1.9-.3 2.5.5l2 2.6z' fill='%236d5df2' stroke='%23ffffff' stroke-width='1.4' stroke-linejoin='round'/%3E%3C/svg%3E") 13 3, pointer;
+}
+[data-fb-pointer='yayra'][data-fb-pointer-size='xlarge'] {
+  --fb-ptr-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='48' height='48' viewBox='0 0 24 24'%3E%3Cpath d='M5 2l14 10-6 1 3.5 7-2.6 1.2L10.5 14 5 18z' fill='%236d5df2' stroke='%23ffffff' stroke-width='1.2' stroke-linejoin='round'/%3E%3C/svg%3E") 8 4, auto;
+  --fb-ptr-hand: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='48' height='48' viewBox='0 0 24 24'%3E%3Cpath d='M9 11V4.5a1.5 1.5 0 0 1 3 0V10l4.6.9c1.1.2 1.9 1.2 1.9 2.3v3.3c0 2.5-2 4.5-4.5 4.5h-3.4c-1.3 0-2.6-.6-3.4-1.7L4 15.5c-.6-.9-.4-2 .5-2.6.8-.5 1.9-.3 2.5.5l2 2.6z' fill='%236d5df2' stroke='%23ffffff' stroke-width='1.2' stroke-linejoin='round'/%3E%3C/svg%3E") 18 4, pointer;
+}
+
+/* High-visibility (accessibility): thick black shape with a yellow
+   ring - readable on any background, dark or light. */
+[data-fb-pointer='high-visibility'] {
+  --fb-ptr-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath d='M5 2l14 10-6 1 3.5 7-2.6 1.2L10.5 14 5 18z' fill='%23111a2e' stroke='%23ffd400' stroke-width='2.4' stroke-linejoin='round'/%3E%3C/svg%3E") 4 2, auto;
+  --fb-ptr-hand: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath d='M9 11V4.5a1.5 1.5 0 0 1 3 0V10l4.6.9c1.1.2 1.9 1.2 1.9 2.3v3.3c0 2.5-2 4.5-4.5 4.5h-3.4c-1.3 0-2.6-.6-3.4-1.7L4 15.5c-.6-.9-.4-2 .5-2.6.8-.5 1.9-.3 2.5.5l2 2.6z' fill='%23111a2e' stroke='%23ffd400' stroke-width='2.4' stroke-linejoin='round'/%3E%3C/svg%3E") 9 2, pointer;
+}
+[data-fb-pointer='high-visibility'][data-fb-pointer-size='large'] {
+  --fb-ptr-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='36' height='36' viewBox='0 0 24 24'%3E%3Cpath d='M5 2l14 10-6 1 3.5 7-2.6 1.2L10.5 14 5 18z' fill='%23111a2e' stroke='%23ffd400' stroke-width='2.2' stroke-linejoin='round'/%3E%3C/svg%3E") 6 3, auto;
+  --fb-ptr-hand: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='36' height='36' viewBox='0 0 24 24'%3E%3Cpath d='M9 11V4.5a1.5 1.5 0 0 1 3 0V10l4.6.9c1.1.2 1.9 1.2 1.9 2.3v3.3c0 2.5-2 4.5-4.5 4.5h-3.4c-1.3 0-2.6-.6-3.4-1.7L4 15.5c-.6-.9-.4-2 .5-2.6.8-.5 1.9-.3 2.5.5l2 2.6z' fill='%23111a2e' stroke='%23ffd400' stroke-width='2.2' stroke-linejoin='round'/%3E%3C/svg%3E") 13 3, pointer;
+}
+[data-fb-pointer='high-visibility'][data-fb-pointer-size='xlarge'] {
+  --fb-ptr-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='48' height='48' viewBox='0 0 24 24'%3E%3Cpath d='M5 2l14 10-6 1 3.5 7-2.6 1.2L10.5 14 5 18z' fill='%23111a2e' stroke='%23ffd400' stroke-width='2' stroke-linejoin='round'/%3E%3C/svg%3E") 8 4, auto;
+  --fb-ptr-hand: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='48' height='48' viewBox='0 0 24 24'%3E%3Cpath d='M9 11V4.5a1.5 1.5 0 0 1 3 0V10l4.6.9c1.1.2 1.9 1.2 1.9 2.3v3.3c0 2.5-2 4.5-4.5 4.5h-3.4c-1.3 0-2.6-.6-3.4-1.7L4 15.5c-.6-.9-.4-2 .5-2.6.8-.5 1.9-.3 2.5.5l2 2.6z' fill='%23111a2e' stroke='%23ffd400' stroke-width='2' stroke-linejoin='round'/%3E%3C/svg%3E") 18 4, pointer;
+}
+
+/* Application (custom themes only - 'system' sets no attribute). */
+[data-fb-pointer='yayra'] *,
+[data-fb-pointer='high-visibility'] * {
+  cursor: var(--fb-ptr-arrow, auto) !important;
+}
+[data-fb-pointer='yayra'] button,
+[data-fb-pointer='yayra'] a,
+[data-fb-pointer='yayra'] [role='button'],
+[data-fb-pointer='yayra'] [role='tab'],
+[data-fb-pointer='yayra'] [role='menuitem'],
+[data-fb-pointer='yayra'] select,
+[data-fb-pointer='yayra'] summary,
+[data-fb-pointer='yayra'] label.fb-setting-row,
+[data-fb-pointer='high-visibility'] button,
+[data-fb-pointer='high-visibility'] a,
+[data-fb-pointer='high-visibility'] [role='button'],
+[data-fb-pointer='high-visibility'] [role='tab'],
+[data-fb-pointer='high-visibility'] [role='menuitem'],
+[data-fb-pointer='high-visibility'] select,
+[data-fb-pointer='high-visibility'] summary,
+[data-fb-pointer='high-visibility'] label.fb-setting-row {
+  cursor: var(--fb-ptr-hand, pointer) !important;
+}
+/* Text entry keeps the NATIVE I-beam (follows the OS pointer size). */
+[data-fb-pointer] input[type='text'],
+[data-fb-pointer] input[type='search'],
+[data-fb-pointer] input[type='url'],
+[data-fb-pointer] input[type='password'],
+[data-fb-pointer] input[type='number'],
+[data-fb-pointer] textarea,
+[data-fb-pointer] [contenteditable='true'] {
+  cursor: text !important;
+}

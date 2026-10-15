@@ -194,11 +194,9 @@ test('TAB INTEGRATION: the Close button closes the document tab and returns to b
     const before = shell.state.tabs.length;
     shell.addDocumentTab({ name: 'close-me.pdf', bytes: new Uint8Array([9]) });
     assert.equal(shell.state.tabs.length, before + 1);
-    const closeBtn = shell.viewportElement.querySelector('.fb-doc-btn');
-    assert.ok(closeBtn, 'toolbar buttons exist');
-    // The close control is the last toolbar button.
-    const allBtns = shell.viewportElement.querySelectorAll('.fb-doc-btn');
-    allBtns[allBtns.length - 1].click();
+    const closeBtn = shell.viewportElement.querySelector('.fb-doc-close-btn');
+    assert.ok(closeBtn, 'the dedicated close control exists');
+    closeBtn.click();
     assert.equal(shell.state.tabs.length, before, 'document tab closed');
     assert.equal(shell.state.tabs.every((t) => !t.isDocument), true);
   } finally {

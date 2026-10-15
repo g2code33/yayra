@@ -18,7 +18,7 @@
 
 import { Icons } from '../icons/icons.js';
 import qrcode from '../vendor/qrcode.js';
-import { classifyDocument, DocumentStore, createPdfViewer, DOCUMENT_ENGINES } from '../services/documentWorkspace.js';
+import { classifyDocument, DocumentStore, createPdfViewer, createDocumentViewerState, DOCUMENT_ENGINES } from '../services/documentWorkspace.js';
 import { PasswordManager } from '../../../persistence/src/PasswordManager.js';
 import { PasskeyService } from '../services/passkeyService.js';
 import { ProfileService } from '../services/profileService.js';
@@ -336,6 +336,11 @@ export class BrowserShell {
         clearHistoryOnExit: false,
         restoreSessionOnLaunch: true,
         showBookmarksBar: false,
+        // Pointer customization (Settings > Pointer): 'system' keeps the
+        // native OS cursors (always the OS pointer size); custom themes
+        // swap in SVG cursors at a chosen size. See applyPointerTheme().
+        pointerTheme: 'system',
+        pointerSize: 'normal',
         ...locallyPersistedSettings,
         ...options.initialSettings
       },
@@ -1205,6 +1210,9 @@ export class BrowserShell {
   }
 
   render(container = null) {
+    // Pointer theme: applied on every render (idempotent, one attribute
+    // set) so any settings change shows up immediately everywhere.
+    try { this.applyPointerTheme(); } catch { /* headless */ }
     const target = container || this.container || (this.rootElement && this.rootElement.parentElement);
     if (!target) return null;
 
@@ -4089,6 +4097,9 @@ export class BrowserShell {
         <button class="fb-settings-nav-item ${activeCat === 'appearance' ? 'active' : ''}" data-cat="appearance" data-category="appearance">
           ${Icons.moon} <span>Appearance</span>
         </button>
+        <button class="fb-settings-nav-item ${activeCat === 'pointer' ? 'active' : ''}" data-cat="pointer" data-category="pointer">
+          ${Icons.lens} <span>Pointer</span>
+        </button>
         <button class="fb-settings-nav-item ${activeCat === 'privacy' ? 'active' : ''}" data-cat="privacy" data-category="privacy">
           ${Icons.shield} <span>Privacy & Security</span>
         </button>
@@ -4312,6 +4323,37 @@ export class BrowserShell {
           </section>
 
           <!-- Privacy & Security -->
+          <section class="fb-settings-group-card" id="sec-pointer" style="${activeCat === 'pointer' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
+            <h3 class="fb-settings-group-title">${Icons.lens} Pointer</h3>
+            <div class="fb-setting-row">
+              <label>Pointer style</label>
+              <select id="fb-in-set-pointer-theme" class="fb-select">
+                <option value="system" ${(this.state.settings.pointerTheme || 'system') === 'system' ? 'selected' : ''}>System (native, recommended)</option>
+                <option value="yayra" ${this.state.settings.pointerTheme === 'yayra' ? 'selected' : ''}>Yayra accent</option>
+                <option value="high-visibility" ${this.state.settings.pointerTheme === 'high-visibility' ? 'selected' : ''}>High visibility</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label>Pointer size <small style="color:var(--fb-text-muted);">(custom styles)</small></label>
+              <select id="fb-in-set-pointer-size" class="fb-select">
+                <option value="normal" ${(this.state.settings.pointerSize || 'normal') === 'normal' ? 'selected' : ''}>Normal</option>
+                <option value="large" ${this.state.settings.pointerSize === 'large' ? 'selected' : ''}>Large</option>
+                <option value="xlarge" ${this.state.settings.pointerSize === 'xlarge' ? 'selected' : ''}>Extra large</option>
+              </select>
+            </div>
+            <div class="fb-pointer-preview" id="fb-pointer-preview" style="margin-top:10px; padding:14px; border:1px dashed rgba(255,255,255,0.18); border-radius:10px; background:rgba(255,255,255,0.03);">
+              <div style="font-size:0.78rem; color:var(--fb-text-muted); margin-bottom:8px;">Live preview - move your pointer over this area:</div>
+              <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
+                <button type="button" class="fb-btn fb-btn-secondary" style="padding:6px 12px;">A button</button>
+                <a href="#" onclick="return false;" style="color:var(--fb-accent-primary);">A link</a>
+                <input type="text" placeholder="A text field" style="padding:6px 10px; border-radius:8px; border:1px solid rgba(255,255,255,0.14); background:#101218; color:inherit;" />
+              </div>
+            </div>
+            <p style="font-size:0.75rem; color:var(--fb-text-muted); margin:10px 0 0; line-height:1.5;">
+              Custom styles apply to Yayra's own interface. Web pages keep their own pointer behavior, and the
+              System style always follows your operating system's pointer size (including Windows' large pointer setting).
+            </p>
+          </section>
           <section class="fb-settings-group-card" id="sec-privacy" style="${activeCat === 'privacy' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
             <h3 class="fb-settings-group-title">${Icons.shield} Privacy & Security</h3>
             <div class="fb-setting-toggle-row">
@@ -4546,6 +4588,16 @@ export class BrowserShell {
         this.render();
       });
     };
+
+    // POINTER SETTINGS: immediate-apply, persisted, live everywhere.
+    bindSelect('#fb-in-set-pointer-theme', (value) => {
+      this.state.settings.pointerTheme = value;
+      this.applyPointerTheme();
+    });
+    bindSelect('#fb-in-set-pointer-size', (value) => {
+      this.state.settings.pointerSize = value;
+      this.applyPointerTheme();
+    });
 
     const bindToggle = (selector, apply) => {
       const el = page.querySelector(selector);
@@ -6314,6 +6366,30 @@ export class BrowserShell {
   }
 
   /** window.yayra.system (Electron): app metrics + desktop shortcuts. */
+  /**
+   * POINTER SETTINGS application. Sets data-fb-pointer / -size on
+   * <body> (everything Yayra renders lives under it: the shell, the
+   * mini window, dropdowns, modals). 'system' removes the attribute
+   * entirely - native cursors only, so the OS pointer size always
+   * rules (see design-system.css "POINTER SETTINGS" + the
+   * native-cursor-size test). Page content inside iframes/native
+   * engines keeps its own pointer behavior - Yayra never repaints
+   * the web.
+   */
+  applyPointerTheme() {
+    if (typeof document === 'undefined' || !document.body) return;
+    const theme = this.state.settings.pointerTheme || 'system';
+    if (theme === 'system' || theme === 'yayra' || theme === 'high-visibility') {
+      if (theme === 'system') {
+        document.body.removeAttribute?.('data-fb-pointer');
+        document.body.removeAttribute?.('data-fb-pointer-size');
+      } else {
+        document.body.setAttribute?.('data-fb-pointer', theme);
+        document.body.setAttribute?.('data-fb-pointer-size', this.state.settings.pointerSize || 'normal');
+      }
+    }
+  }
+
   get systemBridge() {
     if (typeof window === 'undefined') return null;
     return (window.yayra && window.yayra.system) || (window.ibrowse && window.ibrowse.system) || null;
@@ -12248,44 +12324,16 @@ export class BrowserShell {
   renderDocumentViewer(viewport, tab) {
     const wrap = document.createElement('div');
     wrap.className = 'fb-doc-viewer';
-    wrap.style.cssText = 'flex:1; min-height:0; display:flex; flex-direction:column; background:#191c23;';
+    wrap.style.cssText = 'flex:1; min-height:0; display:flex; flex-direction:column; background:#191c23; outline:none;';
+    // Keyboard shortcuts (see createPdfViewer.handleKeydown) need the
+    // viewer itself focusable.
+    wrap.setAttribute('tabindex', '0');
 
-    const bar = document.createElement('div');
-    bar.className = 'fb-doc-toolbar';
-    bar.style.cssText = 'flex:none; display:flex; align-items:center; gap:6px; padding:6px 10px; background:#141824; border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.8rem; color:#dfe4ee;';
     const btnCss = 'padding:5px 9px; border:none; border-radius:7px; background:rgba(255,255,255,0.07); color:inherit; cursor:pointer; font-size:0.8rem;';
-    const nameEl = document.createElement('span');
-    nameEl.textContent = tab.title || 'Document';
-    nameEl.style.cssText = 'max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600;';
-    bar.appendChild(nameEl);
-
-    const pageLabel = document.createElement('span');
-    pageLabel.className = 'fb-doc-page-label';
-    pageLabel.style.cssText = 'min-width:64px; text-align:center; color:#9aa3b2;';
-    pageLabel.textContent = '- / -';
-
-    const searchInput = document.createElement('input');
-    searchInput.type = 'text';
-    searchInput.className = 'fb-doc-search-input';
-    searchInput.placeholder = 'Find in document';
-    searchInput.setAttribute('aria-label', 'Find in document');
-    searchInput.style.cssText = 'width:150px; padding:5px 9px; border-radius:7px; border:1px solid rgba(255,255,255,0.12); background:#101218; color:inherit; font-size:0.78rem;';
-    const matchLabel = document.createElement('span');
-    matchLabel.className = 'fb-doc-match-label';
-    matchLabel.style.cssText = 'min-width:52px; color:#9aa3b2; font-size:0.72rem;';
-
-    const host = document.createElement('div');
-    host.className = 'fb-doc-host';
-    host.style.cssText = 'flex:1; min-height:0; overflow:auto; display:flex; flex-direction:column; align-items:center; gap:12px; padding:16px;';
-
-    const statusEl = document.createElement('div');
-    statusEl.className = 'fb-doc-status';
-    statusEl.style.cssText = 'position:absolute; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center; gap:10px; background:#191c23; color:#d7dbe3; text-align:center; padding:24px; font-size:0.9rem; z-index:2;';
-
-    const mkBtn = (label, title, fn) => {
+    const mkBtn = (label, title, fn, extraClass = '') => {
       const b = document.createElement('button');
       b.type = 'button';
-      b.className = 'fb-doc-btn';
+      b.className = `fb-doc-btn ${extraClass}`;
       b.textContent = label;
       b.title = title;
       b.setAttribute('aria-label', title);
@@ -12294,17 +12342,17 @@ export class BrowserShell {
       return b;
     };
 
-    bar.appendChild(mkBtn('\u2039', 'Previous page', () => this._activeDocViewer?.viewer.prevPage()));
-    bar.appendChild(pageLabel);
-    bar.appendChild(mkBtn('\u203a', 'Next page', () => this._activeDocViewer?.viewer.nextPage()));
-    bar.appendChild(mkBtn('\u2212', 'Zoom out', () => this._activeDocViewer?.viewer.setZoom((tab.docState?.zoom || 1.25) - 0.25)));
-    const zoomLabel = document.createElement('span');
-    zoomLabel.className = 'fb-doc-zoom-label';
-    zoomLabel.style.cssText = 'min-width:40px; text-align:center; color:#9aa3b2;';
-    bar.appendChild(zoomLabel);
-    bar.appendChild(mkBtn('+', 'Zoom in', () => this._activeDocViewer?.viewer.setZoom((tab.docState?.zoom || 1.25) + 0.25)));
-    bar.appendChild(searchInput);
-    bar.appendChild(matchLabel);
+    // ---- Row A: identity + the big actions -----------------------------
+    const bar = document.createElement('div');
+    bar.className = 'fb-doc-toolbar';
+    bar.style.cssText = 'flex:none; display:flex; align-items:center; gap:6px; padding:6px 10px; background:#141824; border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.8rem; color:#dfe4ee;';
+    const nameEl = document.createElement('span');
+    nameEl.textContent = tab.title || 'Document';
+    nameEl.style.cssText = 'max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600;';
+    bar.appendChild(nameEl);
+    const spacerA = document.createElement('span');
+    spacerA.style.cssText = 'flex:1;';
+    bar.appendChild(spacerA);
     // "Use the desktop PDF app instead": the honest escape hatch from the
     // in-Yayra viewer (main process writes a temp file + OS open-with).
     if (this.systemBridge && this.systemBridge.documents && typeof this.systemBridge.documents.openExternal === 'function') {
@@ -12319,26 +12367,191 @@ export class BrowserShell {
         } catch { this.showTransientNotice('Couldn\u2019t open it externally.'); }
       }));
     }
-    const spacer = document.createElement('span');
-    spacer.style.cssText = 'flex:1;';
-    bar.appendChild(spacer);
-    bar.appendChild(mkBtn('\u2715 Close', 'Close the document and return to browsing', () => this.closeTab(tab.id)));
+    bar.appendChild(mkBtn('\u2715 Close', 'Close the document and return to browsing', () => this.closeTab(tab.id), 'fb-doc-close-btn'));
+
+    // ---- Row B: pages, zoom, fit, rotate, night, outline, search -------
+    const bar2 = document.createElement('div');
+    bar2.className = 'fb-doc-toolbar fb-doc-toolbar2';
+    bar2.style.cssText = 'flex:none; display:flex; align-items:center; gap:6px; padding:5px 10px; background:#11141d; border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.78rem; color:#dfe4ee; flex-wrap:wrap;';
+
+    bar2.appendChild(mkBtn('\u2039', 'Previous page (Left)', () => this._activeDocViewer?.viewer.prevPage()));
+    const pageInput = document.createElement('input');
+    pageInput.type = 'number';
+    pageInput.className = 'fb-doc-page-input';
+    pageInput.min = '1';
+    pageInput.setAttribute('aria-label', 'Page number');
+    pageInput.style.cssText = 'width:52px; padding:4px 6px; border-radius:6px; border:1px solid rgba(255,255,255,0.12); background:#101218; color:inherit; font-size:0.78rem; text-align:center;';
+    const pageLabel = document.createElement('span');
+    pageLabel.className = 'fb-doc-page-label';
+    pageLabel.style.cssText = 'color:#9aa3b2;';
+    pageLabel.textContent = '/ -';
+    const gotoPage = () => {
+      const n = parseInt(pageInput.value, 10);
+      if (Number.isFinite(n)) this._activeDocViewer?.viewer.setPage(n);
+    };
+    pageInput.addEventListener('change', gotoPage);
+    pageInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { gotoPage(); wrap.focus?.(); } });
+    bar2.appendChild(pageInput);
+    bar2.appendChild(pageLabel);
+    bar2.appendChild(mkBtn('\u203a', 'Next page (Right)', () => this._activeDocViewer?.viewer.nextPage()));
+
+    bar2.appendChild(mkBtn('\u2212', 'Zoom out (-)', () => this._activeDocViewer?.viewer.setZoom((tab.docState?.zoom || 1.25) - 0.25)));
+    const zoomLabel = document.createElement('span');
+    zoomLabel.className = 'fb-doc-zoom-label';
+    zoomLabel.style.cssText = 'min-width:40px; text-align:center; color:#9aa3b2;';
+    bar2.appendChild(zoomLabel);
+    bar2.appendChild(mkBtn('+', 'Zoom in (+)', () => this._activeDocViewer?.viewer.setZoom((tab.docState?.zoom || 1.25) + 0.25)));
+
+    bar2.appendChild(mkBtn('\u2194 Fit', 'Fit the page to the window width (F)', () => this._activeDocViewer?.viewer.fitToWidth(), 'fb-doc-btn-fitw'));
+    bar2.appendChild(mkBtn('\u29c9 Page', 'Show the whole page at once', () => this._activeDocViewer?.viewer.fitToPage(), 'fb-doc-btn-fitp'));
+    bar2.appendChild(mkBtn('\u21bb', 'Rotate 90\u00b0 (R)', () => this._activeDocViewer?.viewer.rotate(90), 'fb-doc-btn-rotate'));
+    bar2.appendChild(mkBtn('\u263d', 'Night reading mode - invert colors (N)', () => { this._activeDocViewer?.viewer.setNight(!tab.docState?.night); }, 'fb-doc-btn-night'));
+    bar2.appendChild(mkBtn('\u2630', 'Outline and page thumbnails', () => {
+      tab.docState.sidebarOpen = !tab.docState.sidebarOpen;
+      if (this._activeDocViewer && this._activeDocViewer.tabId === tab.id) this._activeDocViewer.rerenderSidebar?.();
+      else this.render();
+    }, 'fb-doc-btn-outline'));
+
+    const searchInput = document.createElement('input');
+    searchInput.type = 'text';
+    searchInput.className = 'fb-doc-search-input';
+    searchInput.placeholder = 'Find in document (Ctrl+F)';
+    searchInput.setAttribute('aria-label', 'Find in document');
+    searchInput.style.cssText = 'width:160px; padding:5px 9px; border-radius:7px; border:1px solid rgba(255,255,255,0.12); background:#101218; color:inherit; font-size:0.78rem;';
+    let searchTimer = null;
+    searchInput.addEventListener('input', () => {
+      if (searchTimer) clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => { this._activeDocViewer?.viewer.search(searchInput.value); }, 350);
+    });
+    bar2.appendChild(searchInput);
+    const matchLabel = document.createElement('span');
+    matchLabel.className = 'fb-doc-match-label';
+    matchLabel.title = 'Show the list of matches';
+    matchLabel.style.cssText = 'min-width:56px; color:#9aa3b2; font-size:0.72rem; cursor:pointer;';
+    bar2.appendChild(matchLabel);
+
+    // ---- Sidebar: outline + thumbnails ---------------------------------
+    const sidebar = document.createElement('div');
+    sidebar.className = 'fb-doc-sidebar';
+    sidebar.style.cssText = 'flex:none; width:210px; min-height:0; overflow:auto; background:#141722; border-right:1px solid rgba(255,255,255,0.07); padding:8px; display:none;';
+    const sidebarTabs = document.createElement('div');
+    sidebarTabs.style.cssText = 'display:flex; gap:6px; margin-bottom:8px;';
+    const mkTabBtn = (label, tabName) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = `fb-doc-sidebar-tab fb-doc-sidebar-tab-${tabName}`;
+      b.textContent = label;
+      b.style.cssText = 'flex:1; padding:5px 8px; border:none; border-radius:7px; background:rgba(255,255,255,0.07); color:inherit; cursor:pointer; font-size:0.75rem;';
+      b.addEventListener('click', () => {
+        tab.docState.sidebarTab = tabName;
+        this._activeDocViewer?.rerenderSidebar?.();
+      });
+      return b;
+    };
+    sidebarTabs.appendChild(mkTabBtn('Outline', 'outline'));
+    sidebarTabs.appendChild(mkTabBtn('Pages', 'thumbnails'));
+    const sidebarBody = document.createElement('div');
+    sidebarBody.className = 'fb-doc-sidebar-body';
+    sidebar.appendChild(sidebarTabs);
+    sidebar.appendChild(sidebarBody);
+
+    // ---- Host + status --------------------------------------------------
+    const host = document.createElement('div');
+    host.className = 'fb-doc-host';
+    host.style.cssText = 'flex:1; min-height:0; overflow:auto; display:flex; flex-direction:column; align-items:center; gap:12px; padding:16px;';
+    const statusEl = document.createElement('div');
+    statusEl.className = 'fb-doc-status';
+    statusEl.style.cssText = 'position:absolute; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center; gap:10px; background:#191c23; color:#d7dbe3; text-align:center; padding:24px; font-size:0.9rem; z-index:2;';
+
+    // ---- Match list panel ----------------------------------------------
+    const matchPanel = document.createElement('div');
+    matchPanel.className = 'fb-doc-match-panel';
+    matchPanel.style.cssText = 'position:absolute; top:0; right:0; bottom:0; width:260px; max-width:70%; overflow:auto; background:rgba(17,20,29,0.97); border-left:1px solid rgba(255,255,255,0.1); padding:8px; display:none; z-index:3; font-size:0.75rem; color:#dfe4ee;';
 
     const rel = document.createElement('div');
-    rel.style.cssText = 'position:relative; flex:1; min-height:0; display:flex; flex-direction:column;';
-    rel.appendChild(host);
-    rel.appendChild(statusEl);
+    rel.style.cssText = 'position:relative; flex:1; min-height:0; display:flex; flex-direction:row;';
+    const relCol = document.createElement('div');
+    relCol.style.cssText = 'position:relative; flex:1; min-height:0; display:flex; flex-direction:column;';
+    relCol.appendChild(host);
+    relCol.appendChild(statusEl);
+    relCol.appendChild(matchPanel);
+    rel.appendChild(sidebar);
+    rel.appendChild(relCol);
+
     wrap.appendChild(bar);
+    wrap.appendChild(bar2);
     wrap.appendChild(rel);
     viewport.appendChild(wrap);
+    try { wrap.focus?.(); } catch { /* shim */ }
 
     const doc = this.documentStore.get(tab.docId);
-    const state = tab.docState || (tab.docState = { status: 'loading', numPages: 0, page: 1, zoom: 1.25, query: '', matches: [], matchIndex: -1, error: null });
+    const state = tab.docState || (tab.docState = createDocumentViewerState());
+    // Fresh mounts of an old tab state get the new fields.
+    for (const [k, v] of Object.entries(createDocumentViewerState())) {
+      if (state[k] === undefined) state[k] = v;
+    }
+
+    const renderSidebar = () => {
+      sidebarBody.innerHTML = '';
+      try {
+        sidebar.style.display = state.sidebarOpen ? 'block' : 'none';
+        if (!state.sidebarOpen) return;
+        for (const b of sidebarTabs.querySelectorAll('.fb-doc-sidebar-tab')) {
+          b.style.background = 'rgba(255,255,255,0.07)';
+        }
+        const activeTabBtn = sidebarTabs.querySelector(`.fb-doc-sidebar-tab-${state.sidebarTab}`);
+        if (activeTabBtn) activeTabBtn.style.background = 'rgba(109,93,242,0.35)';
+        if (state.sidebarTab === 'thumbnails') {
+          const count = Math.min(state.numPages || 0, 60);
+          if (!count) {
+            sidebarBody.innerHTML = '<div style="color:#9aa3b2; padding:8px;">No pages yet.</div>';
+            return;
+          }
+          for (let p = 1; p <= count; p += 1) {
+            const thumb = document.createElement('div');
+            thumb.className = 'fb-doc-thumb';
+            thumb.dataset.page = String(p);
+            thumb.setAttribute('role', 'button');
+            thumb.setAttribute('aria-label', `Go to page ${p}`);
+            thumb.style.cssText = `margin:0 auto 10px; width:130px; padding:4px; border:1px solid ${p === state.page ? 'var(--fb-accent-primary,#6d5df2)' : 'rgba(255,255,255,0.12)'}; border-radius:6px; cursor:pointer; text-align:center; background:#0e111a;`;
+            const label = document.createElement('div');
+            label.textContent = String(p);
+            label.style.cssText = 'padding:2px 0; color:#9aa3b2; font-size:0.7rem;';
+            thumb.appendChild(label);
+            thumb.addEventListener('click', () => this._activeDocViewer?.viewer.setPage(p));
+            sidebarBody.appendChild(thumb);
+          }
+          return;
+        }
+        if (!state.outline.length) {
+          sidebarBody.innerHTML = '<div style="color:#9aa3b2; padding:8px; line-height:1.5;">This PDF has no table of contents. Use the Pages tab to jump between pages.</div>';
+          return;
+        }
+        for (const item of state.outline) {
+          const row = document.createElement('div');
+          row.className = 'fb-doc-outline-item';
+          row.textContent = item.title;
+          if (item.page) {
+            row.title = `Go to page ${item.page}`;
+            row.addEventListener('click', () => this._activeDocViewer?.viewer.setPage(item.page));
+          }
+          row.style.cssText = `padding:6px 8px; margin-bottom:2px; border-radius:6px; cursor:${item.page ? 'pointer' : 'default'}; background:${item.page ? 'rgba(255,255,255,0.04)' : 'transparent'}; color:${item.page ? '#dfe4ee' : '#9aa3b2'}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-left:${(item.depth || 0) * 12}px;`;
+          sidebarBody.appendChild(row);
+        }
+      } catch { /* shim */ }
+    };
+
     const sync = () => {
       try {
-        pageLabel.textContent = state.numPages ? `${state.page} / ${state.numPages}` : '- / -';
+        pageInput.value = String(state.page || 1);
+        pageInput.max = String(state.numPages || 1);
+        pageLabel.textContent = `/ ${state.numPages || '-'}`;
         zoomLabel.textContent = `${Math.round((state.zoom || 1) * 100)}%`;
-        matchLabel.textContent = state.query ? `${state.matches.length} found` : '';
+        matchLabel.textContent = state.query
+          ? (state.matches.length ? `${state.matches.length} found \u25be` : '0 found')
+          : '';
+        const nightBtn = bar2.querySelector('.fb-doc-btn-night');
+        if (nightBtn) nightBtn.style.background = state.night ? 'rgba(109,93,242,0.45)' : 'rgba(255,255,255,0.07)';
         if (state.status === 'ready') { statusEl.style.display = 'none'; }
         else {
           statusEl.style.display = 'flex';
@@ -12346,8 +12559,47 @@ export class BrowserShell {
             ? 'Opening document...'
             : (state.error || 'This document can\u2019t be displayed.');
         }
+        // Match list panel.
+        if (state.showMatchList && state.matches.length) {
+          matchPanel.style.display = 'block';
+          matchPanel.innerHTML = '';
+          const head = document.createElement('div');
+          head.style.cssText = 'font-weight:600; margin:4px 0 8px; color:#dfe4ee;';
+          head.textContent = `${state.matches.length} matches for \u201C${state.query}\u201D`;
+          matchPanel.appendChild(head);
+          state.matches.forEach((m, i) => {
+            const row = document.createElement('div');
+            row.className = 'fb-doc-match-row';
+            row.style.cssText = `padding:6px 8px; margin-bottom:4px; border-radius:6px; cursor:pointer; background:${i === state.matchIndex ? 'rgba(109,93,242,0.35)' : 'rgba(255,255,255,0.04)'}; line-height:1.4;`;
+            row.innerHTML = `<strong style="color:#9aa3b2;">p.${m.page}</strong> \u2014 ${String(m.snippet || '').slice(0, 90)}`;
+            row.addEventListener('click', () => { this._activeDocViewer?.viewer.setPage(m.page); });
+            matchPanel.appendChild(row);
+          });
+        } else {
+          matchPanel.style.display = 'none';
+        }
+        renderSidebar();
       } catch { /* shim */ }
     };
+    matchLabel.addEventListener('click', () => {
+      state.showMatchList = !state.showMatchList && state.matches.length > 0;
+      sync();
+    });
+
+    // Keyboard: page/zoom/rotate/night/fit + Ctrl+F focus search.
+    wrap.addEventListener('keydown', (e) => {
+      const active = this._activeDocViewer;
+      if (!active || active.tabId !== tab.id) return;
+      const action = active.viewer.handleKeydown(e);
+      if (action === 'focus-search') {
+        if (typeof e.preventDefault === 'function') e.preventDefault();
+        searchInput.focus?.();
+        searchInput.select?.();
+      } else if (action) {
+        if (typeof e.preventDefault === 'function') e.preventDefault();
+      }
+    });
+
     sync();
 
     if (!doc) {
@@ -12364,8 +12616,11 @@ export class BrowserShell {
       const engine = this._docEngineOverride || await this._pdfjsModule();
       if (this._activeDocViewer?.tabId === tab.id) return; // a newer render won
       const viewer = createPdfViewer({ pdfjs: engine, container: host, state, onStateChange: sync });
-      this._activeDocViewer = { tabId: tab.id, viewer, sync };
-      viewer.load(doc.bytes);
+      this._activeDocViewer = { tabId: tab.id, viewer, sync, rerenderSidebar: renderSidebar };
+      await viewer.load(doc.bytes);
+      // Table of contents (when the PDF carries one) + first sidebar paint.
+      await viewer.loadOutline();
+      sync();
     })();
   }
 

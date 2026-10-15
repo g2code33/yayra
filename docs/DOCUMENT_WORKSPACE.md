@@ -126,10 +126,10 @@ Key decisions:
 
 ## 6. Known limitations (Phase 1, stated honestly)
 
-- PDFs only; Word/Excel/PowerPoint are roadmap (§7) — the UI says so.
+- PDFs only; Word/Excel/PowerPoint are roadmap (§7) — the UI says so. Thumbnails are capped at the first 60 pages (large documents stay fast).
 - Encrypted PDFs show an honest "password-protected" state (unlocking = Phase 2).
 - Non-embedded fonts render with fallbacks (bundling `standardFontDataUrl` +
-  cmaps is a Phase 2 polish item).
+  cmaps is vendored and wired - DONE).
 - Document bytes live in memory for the tab's lifetime; closing the tab (or
   restarting) drops them — reopening is one menu click. No annotations, no
   printing, no export yet — no buttons pretend otherwise.
@@ -138,7 +138,7 @@ Key decisions:
 
 ## 7. Phased plan (roadmap, not implemented)
 
-- **Phase 2 — PDF workspace:** annotation layer (PDF.js annotation editor /
+- **Phase 2 — DELIVERED viewer upgrade:** rotation, night reading mode, outline/TOC sidebar, page thumbnails, fit-width/fit-page, direct page jumps, search match list, full keyboard control (←/→, +/−, 0, R, N, F, Home/End, Ctrl+F), standard font + CJK cmap packaging, open-from-downloads (right-click "Open in Yayra"), OS "Open with > yayra" registration, drag & drop, and the "Desktop app" escape hatch. **Remaining Phase 2:** annotation layer (PDF.js annotation editor /
   `saveDocument`), printing (Electron `webContents.print`), font/cmap data
   packaging, virtualized page rendering for very large files, recent-documents
   list (in `packages/persistence`), open-from-downloads.

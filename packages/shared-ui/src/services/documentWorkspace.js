@@ -25,17 +25,21 @@ export const DOCUMENT_ENGINES = Object.freeze({
     label: 'PDF document',
     extensions: Object.freeze(['pdf']),
     mimeTypes: Object.freeze(['application/pdf']),
-    /** What the PDF engine can HONESTLY do in Phase 1. */
+    /** What the PDF engine can HONESTLY do (updated Phase 2 viewer). */
     capabilities: Object.freeze({
       view: true,       // full-page rendering with zoom
       search: true,     // text search across pages (text layer extraction)
       zoom: true,
       pageNavigation: true,
-      annotate: false,  // Phase 2 roadmap
+      rotate: true,     // 90-degree rotation steps
+      nightMode: true,  // inverted reading mode for the dark
+      outline: true,    // document table of contents (when the PDF has one)
+      thumbnails: true, // page thumbnail sidebar
+      annotate: false,  // roadmap
       edit: false,      // not applicable to PDF in this architecture
       save: false,
       export: false,
-      print: false      // Phase 2 roadmap (Electron printToPDF/toPrinter)
+      print: false      // roadmap (Electron printToPDF/toPrinter)
     })
   })
 });
@@ -102,6 +106,19 @@ export class DocumentStore {
   }
 }
 
+/** Default state shape for a document viewer instance. */
+export function createDocumentViewerState() {
+  return {
+    status: 'idle', numPages: 0, page: 1, zoom: 1.25,
+    query: '', matches: [], matchIndex: -1, error: null,
+    rotation: 0,          // 0 | 90 | 180 | 270 (user rotation steps)
+    night: false,         // inverted reading mode
+    outline: [],          // flattened TOC: [{ title, page, depth }]
+    sidebarOpen: false,
+    sidebarTab: 'outline' // 'outline' | 'thumbnails'
+  };
+}
+
 /**
  * PDF viewer controller. Renders into a container via the INJECTED
  * pdfjs module (the vendored PDF.js build in production, a fake in
@@ -113,7 +130,7 @@ export class DocumentStore {
  *   { status, numPages, page, zoom, query, matches, matchIndex, error }
  */
 export function createPdfViewer({ pdfjs, container, state, onStateChange = null } = {}) {
-  const viewerState = state || { status: 'idle', numPages: 0, page: 1, zoom: 1.25, query: '', matches: [], matchIndex: -1, error: null };
+  const viewerState = state || createDocumentViewerState();
   let pdfDoc = null;
   let loadToken = 0;
 
@@ -159,7 +176,9 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null 
     try {
       const page = await pdfDoc.getPage(pageNum);
       const scale = Math.min(4, Math.max(0.5, viewerState.zoom));
-      const viewport = page.getViewport({ scale });
+      // User rotation adds to the page's own default rotation.
+      const rotation = ((page.rotate || 0) + (viewerState.rotation || 0)) % 360;
+      const viewport = page.getViewport({ scale, rotation });
       // Paint only where a real canvas exists (skipped in headless tests).
       if (container && typeof container.ownerDocument !== 'undefined' && viewerState.status === 'ready') {
         try {
@@ -167,7 +186,11 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null 
           if (typeof canvas.getContext === 'function') {
             canvas.width = Math.floor(viewport.width);
             canvas.height = Math.floor(viewport.height);
-            canvas.style.cssText = `max-width:100%; height:auto; box-shadow:0 8px 30px rgba(0,0,0,0.5); background:#fff;`;
+            // Night reading mode: invert luminance but keep hues usable
+            // (the classic dark-PDF trick - white pages become near-black
+            // without mangling colored diagrams).
+            canvas.style.cssText = 'max-width:100%; height:auto; box-shadow:0 8px 30px rgba(0,0,0,0.5); background:#fff;'
+              + (viewerState.night ? ' filter:invert(1) hue-rotate(180deg);' : '');
             const ctx = canvas.getContext('2d');
             if (ctx) {
               const prev = container.querySelector ? container.querySelector('.fb-doc-canvas') : null;
@@ -196,6 +219,116 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null 
     setState({ zoom });
     await renderCurrent();
     return viewerState;
+  }
+
+  /** Rotate the view in 90-degree steps (cumulative, wraps at 360). */
+  async function rotate(delta = 90) {
+    setState({ rotation: (((viewerState.rotation || 0) + delta) % 360 + 360) % 360 });
+    await renderCurrent();
+    return viewerState;
+  }
+
+  /** Night reading mode (inverted canvas). */
+  async function setNight(enabled) {
+    if (viewerState.night === Boolean(enabled)) return viewerState;
+    setState({ night: Boolean(enabled) });
+    await renderCurrent();
+    return viewerState;
+  }
+
+  /**
+   * Loads the document's table of contents (outline), flattened with
+   * depth for indentation and best-effort page numbers resolved from
+   * each destination. PDFs without an outline get an empty list - the
+   * sidebar shows the honest empty state.
+   */
+  async function loadOutline() {
+    if (!pdfDoc || typeof pdfDoc.getOutline !== 'function') return [];
+    let raw = [];
+    try { raw = await pdfDoc.getOutline(); } catch { raw = []; }
+    const out = [];
+    const walk = async (items, depth) => {
+      for (const item of raw ? items : []) {
+        if (!item) continue;
+        let pageNumber = null;
+        try {
+          let dest = item.dest;
+          if (typeof dest === 'string' && typeof pdfDoc.getDestination === 'function') {
+            dest = await pdfDoc.getDestination(dest);
+          }
+          if (Array.isArray(dest) && dest[0] !== undefined && typeof pdfDoc.getPageIndex === 'function') {
+            pageNumber = (await pdfDoc.getPageIndex(dest[0])) + 1;
+          }
+        } catch { /* unresolvable destination - keep the title, no jump */ }
+        out.push({ title: String(item.title || 'Section'), page: pageNumber, depth });
+        if (Array.isArray(item.items) && item.items.length && depth < 8) await walk(item.items, depth + 1);
+      }
+    };
+    await walk(raw || [], 0);
+    setState({ outline: out });
+    return out;
+  }
+
+  /** Fit the page to the container's width (accounting for rotation). */
+  async function fitToWidth() {
+    const width = container && (container.clientWidth || (container.parentElement && container.parentElement.clientWidth));
+    if (!width || !pdfDoc) return viewerState;
+    try {
+      const page = await pdfDoc.getPage(viewerState.page);
+      const rotation = ((page.rotate || 0) + (viewerState.rotation || 0)) % 360;
+      const base = page.getViewport({ scale: 1, rotation });
+      const target = Math.max(0.5, Math.min(4, (width - 32) / base.width));
+      setState({ zoom: target });
+      await renderCurrent();
+    } catch { /* headless - nothing to fit */ }
+    return viewerState;
+  }
+
+  /** Fit the whole page inside the container (width AND height). */
+  async function fitToPage() {
+    const box = container && (container.parentElement || container);
+    const width = box && (box.clientWidth || (box.parentElement && box.parentElement.clientWidth));
+    const height = box && (box.clientHeight || (box.parentElement && box.parentElement.clientHeight));
+    if (!width || !height || !pdfDoc) return viewerState;
+    try {
+      const page = await pdfDoc.getPage(viewerState.page);
+      const rotation = ((page.rotate || 0) + (viewerState.rotation || 0)) % 360;
+      const base = page.getViewport({ scale: 1, rotation });
+      const target = Math.max(0.5, Math.min(4, Math.min((width - 32) / base.width, (height - 32) / base.height)));
+      setState({ zoom: target });
+      await renderCurrent();
+    } catch { /* headless - nothing to fit */ }
+    return viewerState;
+  }
+
+  /**
+   * Keyboard map for the focused viewer. Returns the action taken so the
+   * host can do the parts that need DOM focus (e.g. focusing search).
+   *   ArrowRight/PageDown/Space -> next page; ArrowLeft/PageUp -> prev
+   *   Home/End -> first/last page; +/=/- and 0 -> zoom
+   *   r -> rotate 90deg; n -> night mode; f -> fit width
+   *   Ctrl/Cmd+F -> focus the search field
+   */
+  function handleKeydown(e) {
+    if (!e) return null;
+    const tag = String((e.target && e.target.tagName) || '').toUpperCase();
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return null;
+    const key = String(e.key || '');
+    if ((e.ctrlKey || e.metaKey) && (key === 'f' || key === 'F')) return 'focus-search';
+    if (e.ctrlKey || e.metaKey || e.altKey) return null;
+    switch (key) {
+      case 'ArrowRight': case 'PageDown': case ' ': nextPage(); return 'page';
+      case 'ArrowLeft': case 'PageUp': prevPage(); return 'page';
+      case 'Home': setPage(1); return 'page';
+      case 'End': setPage(viewerState.numPages || 1); return 'page';
+      case '+': case '=': setZoom((viewerState.zoom || 1) + 0.25); return 'zoom';
+      case '-': case '_': setZoom((viewerState.zoom || 1) - 0.25); return 'zoom';
+      case '0': setZoom(1); return 'zoom';
+      case 'r': case 'R': rotate(90); return 'rotate';
+      case 'n': case 'N': setNight(!viewerState.night); return 'night';
+      case 'f': case 'F': fitToWidth(); return 'fit';
+      default: return null;
+    }
   }
 
   /** Text search across every page (case-insensitive). Returns all
@@ -242,6 +375,7 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null 
 
   return {
     get state() { return viewerState; },
-    load, setPage, nextPage, prevPage, setZoom, search, nextMatch, renderCurrent, destroy
+    load, setPage, nextPage, prevPage, setZoom, search, nextMatch, renderCurrent, destroy,
+    rotate, setNight, loadOutline, fitToWidth, fitToPage, handleKeydown
   };
 }
