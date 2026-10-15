@@ -68,7 +68,10 @@ class YayraOverlayPlugin : Plugin() {
         val id = call.getString("id")
         if (id.isNullOrBlank()) { call.reject("id-required"); return }
         val manager = tabWeb() ?: run { call.reject("engine-unavailable"); return }
-        val ok = manager.attach(
+        // attach() always creates/updates the engine (failures surface as
+        // tabWebEvent engine-error notifications) - never capture its Unit
+        // return as a value.
+        manager.attach(
             id,
             call.getString("url"),
             call.getDouble("x") ?: 0.0,
@@ -76,7 +79,7 @@ class YayraOverlayPlugin : Plugin() {
             call.getDouble("width") ?: 0.0,
             call.getDouble("height") ?: 0.0
         )
-        call.resolve(JSObject().put("ok", ok))
+        call.resolve(JSObject().put("ok", true))
     }
 
     @PluginMethod

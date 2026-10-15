@@ -355,7 +355,41 @@ jobs:
             echo "ANDROID_KEYSTORE_TYPE=${ANDROID_KEYSTORE_TYPE:-PKCS12}" >> "$GITHUB_ENV"
             echo "signed=true" >> "$GITHUB_OUTPUT"
           fi
-      - run: npm run build:android
+      # The Android build is the flakiest leg of the release (generated
+      # platform + Kotlin + gradle + SDK toolchain). Raw CI logs are not
+      # always reachable when debugging (API log redirects), so the build
+      # output is tee'd and, on failure, the actionable gradle error lines
+      # are re-emitted as ::error annotations - those ARE readable through
+      # the checks/annotations API without log access.
+      - name: build:android (captured)
+        run: |
+          set -o pipefail
+          npm run build:android 2>&1 | tee /tmp/android-build.log
+      - name: Report Android build failure diagnostics
+        if: failure()
+        run: |
+          LOG=/tmp/android-build.log
+          [ -f "$LOG" ] || { echo "::error::android build produced no captured log"; exit 0; }
+          # Actionable lines: Kotlin compile errors (e:), javac errors,
+          # gradle task failures, causes, and the FAILURE summary block.
+          {
+            grep -E "^e: |error: |^> Task .* FAILED|Execution failed for task|What went wrong|Caused by:|^FAILURE" "$LOG" | head -40
+          } > /tmp/android-errors.txt || true
+          {
+            echo "### Android build failure diagnostics"
+            echo '```'
+            cat /tmp/android-errors.txt
+            echo "--- last 60 lines ---"
+            tail -n 60 "$LOG"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY" || true
+          i=0
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            i=$((i+1))
+            echo "::error::${line}"
+            [ "$i" -ge 12 ] && break
+          done < /tmp/android-errors.txt
       - name: Verify Android release is actually signed
         if: steps.signing.outputs.signed == 'true'
         shell: bash
@@ -490,7 +524,13 @@ jobs:
     name: draft release, verify assets, publish live
     runs-on: ubuntu-latest
     needs: [web, cloudflare-pages, desktop-linux, desktop-win, android, ios]
-    if: always() && needs.web.result == 'success' && needs['cloudflare-pages'].result != 'failure' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish == true))
+    # Publish ONLY when every platform leg succeeded (or was legitimately
+    # skipped for this dispatch's targets). The old condition checked only
+    # web + cloudflare, so v1.0.39 published LIVE with the Android APK job
+    # failed - a release missing an entire platform and failing its own
+    # manifest contract. '!= failure' still allows workflow_dispatch runs
+    # that intentionally target a subset (skipped jobs are not failures).
+    if: always() && needs.web.result == 'success' && needs['cloudflare-pages'].result != 'failure' && needs.android.result != 'failure' && needs.ios.result != 'failure' && needs['desktop-linux'].result != 'failure' && needs['desktop-win'].result != 'failure' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish == true))
     environment: release
     steps:
       - uses: actions/checkout@v4
