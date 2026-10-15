@@ -143,7 +143,36 @@ jobs:
               echo "Android PR build-only APK is unsigned."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
-      - run: npm run build:android
+      # Same capture + annotation diagnostics as the release workflow: raw
+      # run logs are not always reachable when debugging, but ::error
+      # annotations are readable through the checks/annotations API.
+      - name: build:android (captured)
+        run: |
+          set -o pipefail
+          npm run build:android 2>&1 | tee /tmp/android-build.log
+      - name: Report Android build failure diagnostics
+        if: failure()
+        run: |
+          LOG=/tmp/android-build.log
+          [ -f "$LOG" ] || { echo "::error::android build produced no captured log"; exit 0; }
+          {
+            grep -E "^e: |error: |^> Task .* FAILED|Execution failed for task|What went wrong|Caused by:|^FAILURE" "$LOG" | head -40
+          } > /tmp/android-errors.txt || true
+          {
+            echo "### Android build failure diagnostics"
+            echo '```'
+            cat /tmp/android-errors.txt
+            echo "--- last 60 lines ---"
+            tail -n 60 "$LOG"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY" || true
+          i=0
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            i=$((i+1))
+            echo "::error::${line}"
+            [ "$i" -ge 12 ] && break
+          done < /tmp/android-errors.txt
 
   ios:
     name: iOS archive build-only
