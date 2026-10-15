@@ -2318,7 +2318,7 @@ export class BrowserShell {
   buildFrameBlockedFallback(url, { autoOpened = false } = {}) {
     const fallback = document.createElement('div');
     fallback.className = 'fb-frame-blocked-fallback';
-    fallback.style.cssText = 'position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; background:#15171c; color:#d7dbe3; text-align:center; padding:24px; z-index:1;';
+    fallback.style.cssText = 'position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; background:var(--fb-bg-elevated,#15171c); color:var(--fb-text-primary,#d7dbe3); text-align:center; padding:24px; z-index:1;';
     const surface = this.capacitorBrowser ? 'a secure browser view' : 'a new browser tab';
     const message = autoOpened
       ? `This site doesn\u2019t allow embedded browsing, so it was opened for you in ${surface}.`
@@ -2404,7 +2404,7 @@ export class BrowserShell {
     ));
     const fallback = document.createElement('div');
     fallback.className = 'fb-frame-blocked-fallback fb-serp-handoff-fallback';
-    fallback.style.cssText = 'position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; background:#15171c; color:#d7dbe3; text-align:center; padding:24px; z-index:1;';
+    fallback.style.cssText = 'position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; background:var(--fb-bg-elevated,#15171c); color:var(--fb-text-primary,#d7dbe3); text-align:center; padding:24px; z-index:1;';
     const message = autoOpened
       ? `${intent.engine} doesn\u2019t allow its results inside other apps, so your search for \u201C${escapeHtml(intent.query)}\u201D opened in your browser.`
       : `${intent.engine} doesn\u2019t allow its results inside other apps.`;
@@ -2455,7 +2455,7 @@ export class BrowserShell {
   buildSystemBrowserHandoffFallback(url) {
     const fallback = document.createElement('div');
     fallback.className = 'fb-frame-blocked-fallback fb-auth-handoff-fallback';
-    fallback.style.cssText = 'position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; background:#15171c; color:#d7dbe3; text-align:center; padding:24px; z-index:1;';
+    fallback.style.cssText = 'position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; background:var(--fb-bg-elevated,#15171c); color:var(--fb-text-primary,#d7dbe3); text-align:center; padding:24px; z-index:1;';
     fallback.innerHTML = `
       <div style="font-size:0.9rem; max-width:360px; line-height:1.5;">For your security, sign-in opens in your browser and never inside an embedded view.</div>
       <button type="button" class="fb-btn fb-auth-handoff-open-btn" style="padding:8px 16px; border-radius:8px; border:none; background:#3b82f6; color:#fff; cursor:pointer; font-size:0.875rem;">Continue sign-in</button>
@@ -2611,7 +2611,7 @@ export class BrowserShell {
       still.className = 'fb-page-snapshot-img';
       still.dataset.tabId = tabId;
       still.alt = '';
-      still.style.cssText = 'position:absolute; inset:0; width:100%; height:100%; object-fit:cover; object-position:top left; background:#101218;';
+      still.style.cssText = 'position:absolute; inset:0; width:100%; height:100%; object-fit:cover; object-position:top left; background:var(--fb-bg-glass-input,#101218);';
       if (snapshot) still.src = snapshot;
       wrapper.appendChild(still);
     }
@@ -2942,7 +2942,7 @@ export class BrowserShell {
           still.className = 'fb-page-snapshot-img';
           still.dataset.tabId = tab.id;
           still.alt = '';
-          still.style.cssText = 'position:absolute; inset:0; width:100%; height:100%; object-fit:cover; object-position:top left; background:#101218;';
+          still.style.cssText = 'position:absolute; inset:0; width:100%; height:100%; object-fit:cover; object-position:top left; background:var(--fb-bg-glass-input,#101218);';
           const snapshot = this._pageSnapshots.get(tab.id);
           if (snapshot) still.src = snapshot;
           slot.appendChild(still);
@@ -4346,7 +4346,7 @@ export class BrowserShell {
               <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
                 <button type="button" class="fb-btn fb-btn-secondary" style="padding:6px 12px;">A button</button>
                 <a href="#" onclick="return false;" style="color:var(--fb-accent-primary);">A link</a>
-                <input type="text" placeholder="A text field" style="padding:6px 10px; border-radius:8px; border:1px solid rgba(255,255,255,0.14); background:#101218; color:inherit;" />
+                <input type="text" placeholder="A text field" style="padding:6px 10px; border-radius:8px; border:1px solid rgba(255,255,255,0.14); background:var(--fb-bg-glass-input,#101218); color:inherit;" />
               </div>
             </div>
             <p style="font-size:0.75rem; color:var(--fb-text-muted); margin:10px 0 0; line-height:1.5;">
@@ -6230,10 +6230,10 @@ export class BrowserShell {
     overlay.style.cssText = 'position:fixed;inset:0;z-index:100000;background:rgba(10,12,20,0.55);display:flex;align-items:center;justify-content:center;';
     overlay.innerHTML = `
       <div style="width:min(440px,92vw);background:var(--fb-surface,#161923);border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:18px;box-shadow:0 18px 60px rgba(0,0,0,0.5);">
-        <div style="font:600 15px/1.3 system-ui;color:var(--fb-text,#f2f4f8);margin-bottom:10px;">Quick Notes</div>
-        <textarea id="yayra-quick-notes-text" style="width:100%;min-height:160px;resize:vertical;border-radius:10px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.04);color:var(--fb-text,#f2f4f8);padding:10px;font:400 13px/1.5 system-ui;box-sizing:border-box;" placeholder="Jot something down - it stays on this profile."></textarea>
+        <div style="font:600 15px/1.3 system-ui;color:var(--fb-text-primary,#f2f4f8);margin-bottom:10px;">Quick Notes</div>
+        <textarea id="yayra-quick-notes-text" style="width:100%;min-height:160px;resize:vertical;border-radius:10px;border:1px solid var(--fb-border-glass,rgba(255,255,255,0.12));background:rgba(255,255,255,0.04);color:var(--fb-text-primary,#f2f4f8);padding:10px;font:400 13px/1.5 system-ui;box-sizing:border-box;" placeholder="Jot something down - it stays on this profile."></textarea>
         <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">
-          <button id="yayra-quick-notes-cancel" style="padding:8px 14px;border-radius:9px;border:1px solid rgba(255,255,255,0.14);background:transparent;color:var(--fb-text,#f2f4f8);cursor:pointer;">Cancel</button>
+          <button id="yayra-quick-notes-cancel" style="padding:8px 14px;border-radius:9px;border:1px solid rgba(255,255,255,0.14);background:transparent;color:var(--fb-text-primary,#f2f4f8);cursor:pointer;">Cancel</button>
           <button id="yayra-quick-notes-save" style="padding:8px 14px;border-radius:9px;border:none;background:#4f7cff;color:#fff;cursor:pointer;font-weight:600;">Save note</button>
         </div>
       </div>`;
@@ -6310,17 +6310,17 @@ export class BrowserShell {
     overlay.style.cssText = 'position:fixed;inset:0;z-index:100000;background:rgba(10,12,20,0.55);display:flex;align-items:center;justify-content:center;';
     const rowsHtml = rows.map(({ tab, audible, muted, hasState }) => `
       <div style="display:flex;align-items:center;gap:10px;padding:9px 6px;border-bottom:1px solid rgba(255,255,255,0.06);">
-        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fb-text,#f2f4f8);font:500 13px/1.3 system-ui;">
+        <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fb-text-primary,#f2f4f8);font:500 13px/1.3 system-ui;">
           ${audible ? '🔊 ' : (muted ? '🔇 ' : '')}${(tab.title || tab.url || 'Tab').replace(/</g, '&lt;')}
         </span>
-        ${hasState ? `<button data-media-mute="${tab.id}" data-muted="${muted ? '1' : '0'}" style="padding:5px 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.14);background:transparent;color:var(--fb-text,#f2f4f8);cursor:pointer;font:500 12px system-ui;">${muted ? 'Unmute' : 'Mute'}</button>` : ''}
+        ${hasState ? `<button data-media-mute="${tab.id}" data-muted="${muted ? '1' : '0'}" style="padding:5px 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.14);background:transparent;color:var(--fb-text-primary,#f2f4f8);cursor:pointer;font:500 12px system-ui;">${muted ? 'Unmute' : 'Mute'}</button>` : ''}
         <button data-media-goto="${tab.id}" style="padding:5px 10px;border-radius:8px;border:none;background:#4f7cff;color:#fff;cursor:pointer;font:500 12px system-ui;">Go to tab</button>
       </div>`).join('');
     overlay.innerHTML = `
       <div style="width:min(480px,94vw);max-height:70vh;overflow:auto;background:var(--fb-surface,#161923);border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:16px;box-shadow:0 18px 60px rgba(0,0,0,0.5);">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
-          <div style="font:600 15px system-ui;color:var(--fb-text,#f2f4f8);">Media Controller</div>
-          <button id="yayra-media-close" style="border:none;background:transparent;color:var(--fb-text,#f2f4f8);font-size:18px;cursor:pointer;">×</button>
+          <div style="font:600 15px system-ui;color:var(--fb-text-primary,#f2f4f8);">Media Controller</div>
+          <button id="yayra-media-close" style="border:none;background:transparent;color:var(--fb-text-primary,#f2f4f8);font-size:18px;cursor:pointer;">×</button>
         </div>
         ${canAudio ? '' : '<div style="font:400 12px/1.4 system-ui;color:rgba(242,244,248,0.6);margin-bottom:8px;">Per-tab mute needs the desktop app - this build lists your tabs only.</div>'}
         ${rowsHtml || '<div style="color:rgba(242,244,248,0.6);font:400 13px system-ui;padding:8px 0;">No open tabs.</div>'}
@@ -6567,13 +6567,13 @@ export class BrowserShell {
   buildOfflineFallback(url) {
     const fallback = document.createElement('div');
     fallback.className = 'fb-frame-blocked-fallback fb-offline-fallback';
-    fallback.style.cssText = 'position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; background:#15171c; color:#d7dbe3; text-align:center; padding:24px; z-index:1;';
+    fallback.style.cssText = 'position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; background:var(--fb-bg-elevated,#15171c); color:var(--fb-text-primary,#d7dbe3); text-align:center; padding:24px; z-index:1;';
     fallback.innerHTML = `
       <div style="font-size:1.4rem;">\u26A1</div>
       <div style="font-size:0.95rem; font-weight:700;">You\u2019re offline</div>
       <div style="font-size:0.9rem; max-width:380px; line-height:1.5;">There\u2019s no internet connection, so \u201C${String(url).replace(/</g, '&lt;').slice(0, 80)}\u201D can\u2019t load. Pages you already have open keep working.</div>
       <button type="button" class="fb-btn fb-offline-retry-btn" style="padding:8px 16px; border-radius:8px; border:none; background:#3b82f6; color:#fff; cursor:pointer; font-size:0.875rem;">Retry</button>
-      <div style="font-size:0.75rem; color:#9aa3b2;">Yayra reloads it automatically once you\u2019re back online.</div>
+      <div style="font-size:0.75rem; color:var(--fb-text-secondary,#9aa3b2);">Yayra reloads it automatically once you\u2019re back online.</div>
     `;
     fallback.querySelector('.fb-offline-retry-btn')?.addEventListener('click', () => {
       if (this._onLine()) {
@@ -11023,6 +11023,33 @@ export class BrowserShell {
       this.navigationController.navigate(targetUrl);
     }
 
+    // WEB/PWA (no native engines available): frame-hostile sites (Google,
+    // YouTube, X, ...) can never embed, and no search engine allows
+    // embedded results. Open them in a REAL browser tab RIGHT HERE -
+    // synchronously inside the user's Enter-key activation. The old path
+    // (window.open from the async render) had lost the activation, so
+    // popup blockers ate it and the user landed on the dead "can't open"
+    // card: the "google error in web". The render below then shows the
+    // honest already-opened state; the per tab+url keys keep the render
+    // path from opening a second tab.
+    if (/^https?:\/\//i.test(targetUrl)
+      && !this.nativeWebview && !this.capacitorBrowser && !this.capacitorTabWeb
+      && !this.isSystemBrowserAuthHost(targetUrl) // sign-in hosts have their OWN single handoff
+      && typeof window !== 'undefined' && typeof window.open === 'function') {
+      const serp = typeof this.getSearchIntent === 'function' ? this.getSearchIntent(targetUrl) : null;
+      const blocked = this.isKnownFrameBlockedUrl(targetUrl);
+      if (serp || blocked) {
+        try {
+          const opened = window.open(targetUrl, '_blank', 'noopener,noreferrer');
+          if (opened) {
+            if (!this._autoExternalOpened) this._autoExternalOpened = new Set();
+            if (serp) this._autoExternalOpened.add(`${activeTab.id}::serp::${targetUrl}`);
+            if (blocked) this._autoExternalOpened.add(`${activeTab.id}::${targetUrl}`);
+          }
+        } catch { /* popup blocked - the honest card's button covers it */ }
+      }
+    }
+
     this.render();
 
     // Auto-complete loading for internal pages
@@ -11761,7 +11788,7 @@ export class BrowserShell {
     const menu = document.createElement('div');
     menu.id = 'yayra-dl-context-menu';
     menu.className = 'fb-dl-context-menu';
-    menu.style.cssText = `position:fixed; z-index:100000; min-width:200px; background:var(--fb-bg-elevated,#171a22); border:1px solid rgba(255,255,255,0.12); border-radius:10px; padding:6px; box-shadow:0 16px 48px rgba(0,0,0,0.55); left:${Math.max(8, (evt.clientX || 60) - 24)}px; top:${Math.max(8, evt.clientY || 60)}px; font-size:0.82rem; color:var(--fb-text-primary,#f3f4f6);`;
+    menu.style.cssText = `position:fixed; z-index:100000; min-width:200px; background:var(--fb-bg-elevated,#171a22); border:1px solid var(--fb-border-glass,rgba(255,255,255,0.12)); border-radius:10px; padding:6px; box-shadow:0 16px 48px rgba(0,0,0,0.55); left:${Math.max(8, (evt.clientX || 60) - 24)}px; top:${Math.max(8, evt.clientY || 60)}px; font-size:0.82rem; color:var(--fb-text-primary,#f3f4f6);`;
     const dismiss = () => { try { menu.remove(); } catch { /* gone */ } };
     const entry = (label, fn) => {
       const b = document.createElement('button');
@@ -12324,12 +12351,12 @@ export class BrowserShell {
   renderDocumentViewer(viewport, tab) {
     const wrap = document.createElement('div');
     wrap.className = 'fb-doc-viewer';
-    wrap.style.cssText = 'flex:1; min-height:0; display:flex; flex-direction:column; background:#191c23; outline:none;';
+    wrap.style.cssText = 'flex:1; min-height:0; display:flex; flex-direction:column; background:var(--fb-bg-app,#191c23); outline:none;';
     // Keyboard shortcuts (see createPdfViewer.handleKeydown) need the
     // viewer itself focusable.
     wrap.setAttribute('tabindex', '0');
 
-    const btnCss = 'padding:5px 9px; border:none; border-radius:7px; background:rgba(255,255,255,0.07); color:inherit; cursor:pointer; font-size:0.8rem;';
+    const btnCss = 'padding:5px 9px; border:none; border-radius:7px; background:var(--fb-bg-glass-input,rgba(255,255,255,0.07)); color:inherit; cursor:pointer; font-size:0.8rem;';
     const mkBtn = (label, title, fn, extraClass = '') => {
       const b = document.createElement('button');
       b.type = 'button';
@@ -12345,7 +12372,7 @@ export class BrowserShell {
     // ---- Row A: identity + the big actions -----------------------------
     const bar = document.createElement('div');
     bar.className = 'fb-doc-toolbar';
-    bar.style.cssText = 'flex:none; display:flex; align-items:center; gap:6px; padding:6px 10px; background:#141824; border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.8rem; color:#dfe4ee;';
+    bar.style.cssText = 'flex:none; display:flex; align-items:center; gap:6px; padding:6px 10px; background:var(--fb-bg-elevated,#141824); border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.8rem; color:var(--fb-text-primary,#dfe4ee);';
     const nameEl = document.createElement('span');
     nameEl.textContent = tab.title || 'Document';
     nameEl.style.cssText = 'max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600;';
@@ -12372,7 +12399,7 @@ export class BrowserShell {
     // ---- Row B: pages, zoom, fit, rotate, night, outline, search -------
     const bar2 = document.createElement('div');
     bar2.className = 'fb-doc-toolbar fb-doc-toolbar2';
-    bar2.style.cssText = 'flex:none; display:flex; align-items:center; gap:6px; padding:5px 10px; background:#11141d; border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.78rem; color:#dfe4ee; flex-wrap:wrap;';
+    bar2.style.cssText = 'flex:none; display:flex; align-items:center; gap:6px; padding:5px 10px; background:var(--fb-bg-surface,#11141d); border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.78rem; color:var(--fb-text-primary,#dfe4ee); flex-wrap:wrap;';
 
     bar2.appendChild(mkBtn('\u2039', 'Previous page (Left)', () => this._activeDocViewer?.viewer.prevPage()));
     const pageInput = document.createElement('input');
@@ -12380,10 +12407,10 @@ export class BrowserShell {
     pageInput.className = 'fb-doc-page-input';
     pageInput.min = '1';
     pageInput.setAttribute('aria-label', 'Page number');
-    pageInput.style.cssText = 'width:52px; padding:4px 6px; border-radius:6px; border:1px solid rgba(255,255,255,0.12); background:#101218; color:inherit; font-size:0.78rem; text-align:center;';
+    pageInput.style.cssText = 'width:52px; padding:4px 6px; border-radius:6px; border:1px solid var(--fb-border-glass,rgba(255,255,255,0.12)); background:var(--fb-bg-glass-input,#101218); color:inherit; font-size:0.78rem; text-align:center;';
     const pageLabel = document.createElement('span');
     pageLabel.className = 'fb-doc-page-label';
-    pageLabel.style.cssText = 'color:#9aa3b2;';
+    pageLabel.style.cssText = 'color:var(--fb-text-secondary,#9aa3b2);';
     pageLabel.textContent = '/ -';
     const gotoPage = () => {
       const n = parseInt(pageInput.value, 10);
@@ -12398,7 +12425,7 @@ export class BrowserShell {
     bar2.appendChild(mkBtn('\u2212', 'Zoom out (-)', () => this._activeDocViewer?.viewer.setZoom((tab.docState?.zoom || 1.25) - 0.25)));
     const zoomLabel = document.createElement('span');
     zoomLabel.className = 'fb-doc-zoom-label';
-    zoomLabel.style.cssText = 'min-width:40px; text-align:center; color:#9aa3b2;';
+    zoomLabel.style.cssText = 'min-width:40px; text-align:center; color:var(--fb-text-secondary,#9aa3b2);';
     bar2.appendChild(zoomLabel);
     bar2.appendChild(mkBtn('+', 'Zoom in (+)', () => this._activeDocViewer?.viewer.setZoom((tab.docState?.zoom || 1.25) + 0.25)));
 
@@ -12417,7 +12444,7 @@ export class BrowserShell {
     searchInput.className = 'fb-doc-search-input';
     searchInput.placeholder = 'Find in document (Ctrl+F)';
     searchInput.setAttribute('aria-label', 'Find in document');
-    searchInput.style.cssText = 'width:160px; padding:5px 9px; border-radius:7px; border:1px solid rgba(255,255,255,0.12); background:#101218; color:inherit; font-size:0.78rem;';
+    searchInput.style.cssText = 'width:160px; padding:5px 9px; border-radius:7px; border:1px solid var(--fb-border-glass,rgba(255,255,255,0.12)); background:var(--fb-bg-glass-input,#101218); color:inherit; font-size:0.78rem;';
     let searchTimer = null;
     searchInput.addEventListener('input', () => {
       if (searchTimer) clearTimeout(searchTimer);
@@ -12427,13 +12454,13 @@ export class BrowserShell {
     const matchLabel = document.createElement('span');
     matchLabel.className = 'fb-doc-match-label';
     matchLabel.title = 'Show the list of matches';
-    matchLabel.style.cssText = 'min-width:56px; color:#9aa3b2; font-size:0.72rem; cursor:pointer;';
+    matchLabel.style.cssText = 'min-width:56px; color:var(--fb-text-secondary,#9aa3b2); font-size:0.72rem; cursor:pointer;';
     bar2.appendChild(matchLabel);
 
     // ---- Sidebar: outline + thumbnails ---------------------------------
     const sidebar = document.createElement('div');
     sidebar.className = 'fb-doc-sidebar';
-    sidebar.style.cssText = 'flex:none; width:210px; min-height:0; overflow:auto; background:#141722; border-right:1px solid rgba(255,255,255,0.07); padding:8px; display:none;';
+    sidebar.style.cssText = 'flex:none; width:210px; min-height:0; overflow:auto; background:var(--fb-bg-elevated,#141722); border-right:1px solid var(--fb-border-glass,rgba(255,255,255,0.07)); padding:8px; display:none;';
     const sidebarTabs = document.createElement('div');
     sidebarTabs.style.cssText = 'display:flex; gap:6px; margin-bottom:8px;';
     const mkTabBtn = (label, tabName) => {
@@ -12441,7 +12468,7 @@ export class BrowserShell {
       b.type = 'button';
       b.className = `fb-doc-sidebar-tab fb-doc-sidebar-tab-${tabName}`;
       b.textContent = label;
-      b.style.cssText = 'flex:1; padding:5px 8px; border:none; border-radius:7px; background:rgba(255,255,255,0.07); color:inherit; cursor:pointer; font-size:0.75rem;';
+      b.style.cssText = 'flex:1; padding:5px 8px; border:none; border-radius:7px; background:var(--fb-bg-glass-input,rgba(255,255,255,0.07)); color:inherit; cursor:pointer; font-size:0.75rem;';
       b.addEventListener('click', () => {
         tab.docState.sidebarTab = tabName;
         this._activeDocViewer?.rerenderSidebar?.();
@@ -12461,12 +12488,12 @@ export class BrowserShell {
     host.style.cssText = 'flex:1; min-height:0; overflow:auto; display:flex; flex-direction:column; align-items:center; gap:12px; padding:16px;';
     const statusEl = document.createElement('div');
     statusEl.className = 'fb-doc-status';
-    statusEl.style.cssText = 'position:absolute; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center; gap:10px; background:#191c23; color:#d7dbe3; text-align:center; padding:24px; font-size:0.9rem; z-index:2;';
+    statusEl.style.cssText = 'position:absolute; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center; gap:10px; background:var(--fb-bg-app,#191c23); color:var(--fb-text-primary,#d7dbe3); text-align:center; padding:24px; font-size:0.9rem; z-index:2;';
 
     // ---- Match list panel ----------------------------------------------
     const matchPanel = document.createElement('div');
     matchPanel.className = 'fb-doc-match-panel';
-    matchPanel.style.cssText = 'position:absolute; top:0; right:0; bottom:0; width:260px; max-width:70%; overflow:auto; background:rgba(17,20,29,0.97); border-left:1px solid rgba(255,255,255,0.1); padding:8px; display:none; z-index:3; font-size:0.75rem; color:#dfe4ee;';
+    matchPanel.style.cssText = 'position:absolute; top:0; right:0; bottom:0; width:260px; max-width:70%; overflow:auto; background:var(--fb-bg-elevated,rgba(17,20,29,0.97)); border-left:1px solid var(--fb-border-glass,rgba(255,255,255,0.1)); padding:8px; display:none; z-index:3; font-size:0.75rem; color:var(--fb-text-primary,#dfe4ee);';
 
     const rel = document.createElement('div');
     rel.style.cssText = 'position:relative; flex:1; min-height:0; display:flex; flex-direction:row;';
@@ -12497,14 +12524,14 @@ export class BrowserShell {
         sidebar.style.display = state.sidebarOpen ? 'block' : 'none';
         if (!state.sidebarOpen) return;
         for (const b of sidebarTabs.querySelectorAll('.fb-doc-sidebar-tab')) {
-          b.style.background = 'rgba(255,255,255,0.07)';
+          b.style.background = 'var(--fb-bg-glass-input,rgba(255,255,255,0.07))';
         }
         const activeTabBtn = sidebarTabs.querySelector(`.fb-doc-sidebar-tab-${state.sidebarTab}`);
         if (activeTabBtn) activeTabBtn.style.background = 'rgba(109,93,242,0.35)';
         if (state.sidebarTab === 'thumbnails') {
           const count = Math.min(state.numPages || 0, 60);
           if (!count) {
-            sidebarBody.innerHTML = '<div style="color:#9aa3b2; padding:8px;">No pages yet.</div>';
+            sidebarBody.innerHTML = '<div style="color:var(--fb-text-secondary,#9aa3b2); padding:8px;">No pages yet.</div>';
             return;
           }
           for (let p = 1; p <= count; p += 1) {
@@ -12513,10 +12540,10 @@ export class BrowserShell {
             thumb.dataset.page = String(p);
             thumb.setAttribute('role', 'button');
             thumb.setAttribute('aria-label', `Go to page ${p}`);
-            thumb.style.cssText = `margin:0 auto 10px; width:130px; padding:4px; border:1px solid ${p === state.page ? 'var(--fb-accent-primary,#6d5df2)' : 'rgba(255,255,255,0.12)'}; border-radius:6px; cursor:pointer; text-align:center; background:#0e111a;`;
+            thumb.style.cssText = `margin:0 auto 10px; width:130px; padding:4px; border:1px solid ${p === state.page ? 'var(--fb-accent-primary,#6d5df2)' : 'var(--fb-border-glass,rgba(255,255,255,0.12))'}; border-radius:6px; cursor:pointer; text-align:center; background:var(--fb-bg-glass-input,#0e111a);`;
             const label = document.createElement('div');
             label.textContent = String(p);
-            label.style.cssText = 'padding:2px 0; color:#9aa3b2; font-size:0.7rem;';
+            label.style.cssText = 'padding:2px 0; color:var(--fb-text-secondary,#9aa3b2); font-size:0.7rem;';
             thumb.appendChild(label);
             thumb.addEventListener('click', () => this._activeDocViewer?.viewer.setPage(p));
             sidebarBody.appendChild(thumb);
@@ -12524,7 +12551,7 @@ export class BrowserShell {
           return;
         }
         if (!state.outline.length) {
-          sidebarBody.innerHTML = '<div style="color:#9aa3b2; padding:8px; line-height:1.5;">This PDF has no table of contents. Use the Pages tab to jump between pages.</div>';
+          sidebarBody.innerHTML = '<div style="color:var(--fb-text-secondary,#9aa3b2); padding:8px; line-height:1.5;">This PDF has no table of contents. Use the Pages tab to jump between pages.</div>';
           return;
         }
         for (const item of state.outline) {
@@ -12535,7 +12562,7 @@ export class BrowserShell {
             row.title = `Go to page ${item.page}`;
             row.addEventListener('click', () => this._activeDocViewer?.viewer.setPage(item.page));
           }
-          row.style.cssText = `padding:6px 8px; margin-bottom:2px; border-radius:6px; cursor:${item.page ? 'pointer' : 'default'}; background:${item.page ? 'rgba(255,255,255,0.04)' : 'transparent'}; color:${item.page ? '#dfe4ee' : '#9aa3b2'}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-left:${(item.depth || 0) * 12}px;`;
+          row.style.cssText = `padding:6px 8px; margin-bottom:2px; border-radius:6px; cursor:${item.page ? 'pointer' : 'default'}; background:${item.page ? 'rgba(255,255,255,0.04)' : 'transparent'}; color:${item.page ? 'var(--fb-text-primary,#dfe4ee)' : 'var(--fb-text-secondary,#9aa3b2)'}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-left:${(item.depth || 0) * 12}px;`;
           sidebarBody.appendChild(row);
         }
       } catch { /* shim */ }
@@ -12564,14 +12591,14 @@ export class BrowserShell {
           matchPanel.style.display = 'block';
           matchPanel.innerHTML = '';
           const head = document.createElement('div');
-          head.style.cssText = 'font-weight:600; margin:4px 0 8px; color:#dfe4ee;';
+          head.style.cssText = 'font-weight:600; margin:4px 0 8px; color:var(--fb-text-primary,#dfe4ee);';
           head.textContent = `${state.matches.length} matches for \u201C${state.query}\u201D`;
           matchPanel.appendChild(head);
           state.matches.forEach((m, i) => {
             const row = document.createElement('div');
             row.className = 'fb-doc-match-row';
             row.style.cssText = `padding:6px 8px; margin-bottom:4px; border-radius:6px; cursor:pointer; background:${i === state.matchIndex ? 'rgba(109,93,242,0.35)' : 'rgba(255,255,255,0.04)'}; line-height:1.4;`;
-            row.innerHTML = `<strong style="color:#9aa3b2;">p.${m.page}</strong> \u2014 ${String(m.snippet || '').slice(0, 90)}`;
+            row.innerHTML = `<strong style="color:var(--fb-text-secondary,#9aa3b2);">p.${m.page}</strong> \u2014 ${String(m.snippet || '').slice(0, 90)}`;
             row.addEventListener('click', () => { this._activeDocViewer?.viewer.setPage(m.page); });
             matchPanel.appendChild(row);
           });

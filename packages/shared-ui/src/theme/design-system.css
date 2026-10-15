@@ -3683,20 +3683,25 @@ html {
   height: 100%;
   padding: 0;
   border: 0;
-  background: rgba(0, 0, 0, 0.45);
+  /* FULLY TRANSPARENT: the page must NOT be dimmed or blurred while the
+     menu is open (user request) - the scrim only exists as an invisible
+     click target so clicking outside closes the menu, exactly like a
+     native browser menu. */
+  background: transparent;
   cursor: default;
-  animation: fb-fade-in 0.15s ease;
 }
 
 .fb-side-drawer-menu {
   position: absolute;
   top: 0;
-  right: 0;
+  left: 0;
   bottom: 0;
   width: 320px;
-  background: #090d16;
-  border-left: 1px solid rgba(255, 255, 255, 0.1);
-  box-shadow: -10px 0 36px rgba(0, 0, 0, 0.5);
+  /* Theme-aware: solid dark in dark mode, white in light mode (the
+     light overrides below). */
+  background: var(--fb-drawer-bg, #090d16);
+  border-right: 1px solid var(--fb-drawer-border, rgba(255, 255, 255, 0.1));
+  box-shadow: 10px 0 36px rgba(0, 0, 0, 0.5);
   display: flex;
   flex-direction: column;
   z-index: 600001;
@@ -3707,7 +3712,7 @@ html {
 }
 
 @keyframes fb-drawer-slide {
-  from { transform: translateX(100%); }
+  from { transform: translateX(-100%); }
   to { transform: translateX(0); }
 }
 
@@ -3747,8 +3752,42 @@ html {
 }
 
 .fb-drawer-item:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--fb-drawer-hover, rgba(255, 255, 255, 0.08));
   color: var(--fb-text-primary);
+}
+
+/* LIGHT MODE: the drawer, its flyouts and the mini window used to stay
+   near-black with light hardcoded text - unreadable islands on a light
+   page. They follow the theme now. */
+[data-theme="light"] {
+  --fb-drawer-bg: #ffffff;
+  --fb-drawer-border: rgba(15, 23, 42, 0.1);
+  --fb-drawer-submenu-bg: #ffffff;
+  --fb-drawer-hover: rgba(15, 23, 42, 0.06);
+}
+[data-theme="light"] .fb-side-drawer-menu {
+  box-shadow: 8px 0 28px rgba(15, 23, 42, 0.14);
+}
+[data-theme="light"] .fb-side-drawer-header {
+  border-bottom: 1px solid rgba(15, 23, 42, 0.08);
+}
+[data-theme="light"] .fb-drawer-item.active {
+  background: rgba(8, 145, 178, 0.12);
+}
+[data-theme="light"] .fb-drawer-separator {
+  border-bottom: 1px solid rgba(15, 23, 42, 0.08);
+}
+[data-theme="light"] .fb-floating-popup-window {
+  background: rgba(245, 248, 252, 0.96);
+  border: 1px solid rgba(15, 23, 42, 0.12);
+  box-shadow: 0 24px 64px rgba(15, 23, 42, 0.22), 0 0 32px rgba(8, 145, 178, 0.12);
+}
+[data-theme="light"] .fb-floating-popup-header {
+  background: rgba(15, 23, 42, 0.04);
+  border-bottom: 1px solid rgba(15, 23, 42, 0.08);
+}
+[data-theme="light"] .fb-floating-popup-btn:hover {
+  background: rgba(15, 23, 42, 0.08);
 }
 
 .fb-drawer-item.active {
@@ -3885,10 +3924,12 @@ html {
   display: none;
   position: absolute;
   top: -4px;
-  right: calc(100% - 1px);
+  /* The drawer lives on the LEFT edge, so flyouts open to its RIGHT -
+    both stay on the left half of the screen, like the reference. */
+  left: calc(100% - 1px);
   width: 270px;
-  background: #131722;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: var(--fb-drawer-submenu-bg, #131722);
+  border: 1px solid var(--fb-border-glass, rgba(255, 255, 255, 0.12));
   border-radius: 12px;
   padding: 8px 6px;
   box-shadow: -8px 8px 28px rgba(0, 0, 0, 0.6);
