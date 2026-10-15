@@ -100,7 +100,11 @@ class YayraOverlayPlugin : Plugin() {
     fun tabWebSetVisible(call: PluginCall) {
         val id = call.getString("id")
         if (id.isNullOrBlank()) { call.reject("id-required"); return }
-        tabWeb()?.setVisible(id, call.getBoolean("visible", true))
+        // PluginCall.getBoolean(String, Boolean) is @Nullable in Capacitor 8
+        // (Type mismatch: inferred type is Boolean? but Boolean was expected
+        // - killed the whole v1.0.39 Android release build). Elvis back to
+        // true: unspecified means show, matching the JS call sites.
+        tabWeb()?.setVisible(id, call.getBoolean("visible", true) ?: true)
         call.resolve(JSObject().put("ok", true))
     }
 

@@ -353,3 +353,20 @@ test('KOTLIN PIN (bubble): the Settings quick action launches the real app - nev
   assert.ok(block.includes('getLaunchIntentForPackage'), 'the app own launch intent is used');
   assert.ok(!block.includes('yayra://settings'), 'the unresolvable in-app scheme is gone');
 });
+
+test('KOTLIN PIN (compile guard): Capacitor PluginCall getters are @Nullable - every call site must survive null (the v1.0.39 Android release build died on this)', () => {
+  const plugin = readFileSync(new URL('../packages/floating-android/src/kotlin/com/yayra/floating/android/YayraOverlayPlugin.kt', import.meta.url), 'utf8');
+  // getDouble sites must elvis; getBoolean sites must elvis when the callee
+  // wants a non-null Boolean; getString may stay nullable ONLY where the
+  // callee accepts String?.
+  for (const line of plugin.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('//')) continue;
+    if (/call\.getDouble\(/.test(trimmed)) {
+      assert.ok(/\?\:/.test(trimmed), `getDouble site must elvis a default: ${trimmed}`);
+    }
+    if (/call\.getBoolean\(/.test(trimmed)) {
+      assert.ok(/\?\:/.test(trimmed), `getBoolean site must elvis a default (Boolean? -> Boolean killed the v1.0.39 APK build): ${trimmed}`);
+    }
+  }
+});

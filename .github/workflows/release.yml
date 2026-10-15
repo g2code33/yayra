@@ -390,6 +390,7 @@ jobs:
             echo "::error::${line}"
             [ "$i" -ge 12 ] && break
           done < /tmp/android-errors.txt
+          exit 0
       - name: Verify Android release is actually signed
         if: steps.signing.outputs.signed == 'true'
         shell: bash

@@ -173,6 +173,7 @@ jobs:
             echo "::error::${line}"
             [ "$i" -ge 12 ] && break
           done < /tmp/android-errors.txt
+          exit 0
 
   ios:
     name: iOS archive build-only
