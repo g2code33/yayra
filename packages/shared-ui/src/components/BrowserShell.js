@@ -6484,6 +6484,102 @@ export class BrowserShell {
     });
   }
 
+  /** Chrome-style confirmation for installing the active website as an app. */
+  _installPageAsAppDialog({ title = '', url = '', iconHtml = '' } = {}) {
+    return new Promise((resolve) => {
+      if (typeof document === 'undefined' || !document.body) { resolve(null); return; }
+      document.getElementById('yayra-install-app-overlay')?.remove();
+
+      let domain = '';
+      try { domain = new URL(url).hostname; } catch { domain = String(url || ''); }
+
+      const overlay = document.createElement('div');
+      overlay.id = 'yayra-install-app-overlay';
+      overlay.className = 'fb-install-app-overlay';
+      overlay.setAttribute('role', 'presentation');
+
+      const dialog = document.createElement('section');
+      dialog.className = 'fb-install-app-dialog';
+      dialog.setAttribute('role', 'dialog');
+      dialog.setAttribute('aria-modal', 'true');
+      dialog.setAttribute('aria-labelledby', 'yayra-install-app-title');
+      dialog.addEventListener('click', (event) => event.stopPropagation());
+
+      const heading = document.createElement('h2');
+      heading.id = 'yayra-install-app-title';
+      heading.className = 'fb-install-app-title';
+      heading.textContent = 'Install this page as an app';
+      dialog.appendChild(heading);
+
+      const hint = document.createElement('p');
+      hint.className = 'fb-install-app-hint';
+      hint.textContent = 'Apps open in a window';
+      dialog.appendChild(hint);
+
+      const identity = document.createElement('div');
+      identity.className = 'fb-install-app-identity';
+      const icon = document.createElement('div');
+      icon.className = 'fb-install-app-icon';
+      // getTabFavicon returns only Yayra-owned SVG markup and a sanitized
+      // site favicon URL, so it is safe to reuse in this small preview.
+      icon.innerHTML = iconHtml || Icons.globe;
+      identity.appendChild(icon);
+
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'fb-input fb-install-app-name';
+      input.setAttribute('aria-label', 'App name');
+      input.value = String(title || domain || 'Website').slice(0, 60);
+      input.maxLength = 60;
+      identity.appendChild(input);
+      dialog.appendChild(identity);
+
+      const site = document.createElement('div');
+      site.className = 'fb-install-app-domain';
+      site.textContent = domain;
+      dialog.appendChild(site);
+
+      const actions = document.createElement('div');
+      actions.className = 'fb-install-app-actions';
+      const cancel = document.createElement('button');
+      cancel.type = 'button';
+      cancel.className = 'fb-btn fb-btn-secondary';
+      cancel.textContent = 'Cancel';
+      const install = document.createElement('button');
+      install.type = 'button';
+      install.className = 'fb-btn fb-btn-primary';
+      install.textContent = 'Install';
+      actions.appendChild(cancel);
+      actions.appendChild(install);
+      dialog.appendChild(actions);
+
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        try { overlay.remove(); } catch { /* already gone */ }
+        resolve(value);
+      };
+      cancel.addEventListener('click', () => finish(null));
+      install.addEventListener('click', () => finish(input.value.trim() || null));
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') { event.preventDefault?.(); finish(input.value.trim() || null); }
+      });
+      overlay.addEventListener('pointerdown', (event) => {
+        if (event.target === overlay) finish(null);
+      });
+      overlay.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') { event.preventDefault?.(); finish(null); }
+      });
+
+      overlay.appendChild(dialog);
+      document.body.appendChild(overlay);
+      input.focus();
+      input.select();
+      this.bindTabLogoFallbacks(icon);
+    });
+  }
+
   /**
    * Real QR code modal for the current page (vendored generator - no
    * network, works offline). Used by "Create QR Code" and the honest
@@ -6712,11 +6808,10 @@ export class BrowserShell {
     if (overlay && typeof overlay.installSiteAsApp === 'function') {
       let shortcutName = title;
       try {
-        const editedName = await this._textPromptDialog({
-          title: 'Add to home screen',
-          description: 'Choose a name for the shortcut. The site\u2019s own icon is used when it can be fetched.',
-          initialValue: title,
-          placeholder: 'Shortcut name'
+        const editedName = await this._installPageAsAppDialog({
+          title,
+          url: tab.url,
+          iconHtml: this.getTabFavicon(tab)
         });
         if (editedName === null) { this.showTransientNotice('Install cancelled.'); return; }
         shortcutName = editedName;
@@ -6738,26 +6833,21 @@ export class BrowserShell {
       try {
         let installName = String(tab.title || tab.url).slice(0, 60);
         let startUrl = tab.url;
-        let isPwaInstall = false;
         if (typeof this.systemBridge.installPageAsAppPreview === 'function') {
           try {
             const preview = await this.systemBridge.installPageAsAppPreview({ url: tab.url, title: tab.title || tab.url });
             if (preview && preview.ok) {
               if (preview.name) installName = String(preview.name).slice(0, 60);
               if (preview.startUrl) startUrl = preview.startUrl;
-              isPwaInstall = Boolean(preview.pwa);
             }
           } catch { /* preview is best-effort - plain install still works */ }
         }
         let finalName = installName;
         try {
-          const editedName = await this._textPromptDialog({
-            title: 'Install as app',
-            description: isPwaInstall
-              ? 'This site is a web app - it installs with its own name, its own icon and its own window on your desktop.'
-              : 'This installs the site on your desktop with its own icon and window. You can edit the name.',
-            initialValue: installName,
-            placeholder: 'App name'
+          const editedName = await this._installPageAsAppDialog({
+            title: installName,
+            url: tab.url,
+            iconHtml: this.getTabFavicon(tab)
           });
           if (editedName === null) { this.showTransientNotice('Install cancelled.'); return; }
           finalName = editedName;

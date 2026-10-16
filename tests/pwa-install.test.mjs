@@ -241,23 +241,58 @@ test('INSTALL FLOW (desktop): the name is EDITABLE - previewed from the site own
   shell.state.tabs[0].url = 'https://example.com/app';
   shell.state.tabs[0].title = 'Some page title';
   try {
-    let seenInitial = null;
-    shell._textPromptDialog = async (opts) => { seenInitial = opts.initialValue; return 'My Example'; };
+    let seenInstallDialog = null;
+    shell._installPageAsAppDialog = async (opts) => { seenInstallDialog = opts; return 'My Example'; };
     await shell.installPageAsApp();
-    assert.equal(seenInitial, 'Example App', 'the dialog is pre-filled with the SITE OWN name');
+    assert.equal(seenInstallDialog.title, 'Example App', 'the confirmation is pre-filled with the SITE OWN name');
+    assert.equal(seenInstallDialog.url, 'https://example.com/app', 'the active site is previewed in the confirmation');
     assert.equal(lastInstall.url, 'https://example.com/?src=pwa', 'the manifest start url is installed');
     assert.equal(lastInstall.title, 'My Example', 'the EDITED name is used');
     assert.equal(lastInstall.nameOverride, 'My Example', 'the edit is passed as an explicit override');
     assert.ok(notices.some((n) => /its own icon/.test(n)), 'announced as the site own app');
 
     lastInstall = null;
-    shell._textPromptDialog = async () => null;
+    shell._installPageAsAppDialog = async () => null;
     await shell.installPageAsApp();
     assert.equal(lastInstall, null, 'cancel writes nothing');
     assert.ok(notices.some((n) => /cancelled/i.test(n)), 'cancellation is confirmed to the user');
   } finally {
     shell.destroy();
     delete globalThis.window.yayra;
+  }
+});
+
+test('INSTALL CONFIRMATION: Chrome-style name, site identity, Install and Cancel controls', async () => {
+  const { setupDomShim } = await import('./dom-shim.mjs');
+  setupDomShim();
+  const { BrowserShell } = await import('../packages/shared-ui/src/components/BrowserShell.js');
+  const shell = new BrowserShell({ container: document.createElement('div'), platform: 'linux', isMobile: false });
+  await shell.initialize();
+  try {
+    const accepted = shell._installPageAsAppDialog({
+      title: 'Redis',
+      url: 'https://redis.io/docs/latest/',
+      iconHtml: '<svg aria-hidden="true"></svg>'
+    });
+    const overlay = document.getElementById('yayra-install-app-overlay');
+    assert.ok(overlay, 'confirmation dialog is visible');
+    const dialog = overlay.querySelector('[role="dialog"]');
+    assert.ok(dialog, 'dialog has an accessible role');
+    assert.equal(dialog.getAttribute('aria-modal'), 'true');
+    assert.equal(dialog.querySelector('h2').textContent, 'Install this page as an app');
+    assert.equal(dialog.querySelector('input').value, 'Redis', 'name is editable and site-provided');
+    assert.equal(dialog.querySelector('.fb-install-app-domain').textContent, 'redis.io');
+    assert.equal(dialog.querySelector('.fb-install-app-hint').textContent, 'Apps open in a window');
+    dialog.querySelector('input').value = 'Redis Docs';
+    dialog.querySelector('.fb-btn-primary').click();
+    assert.equal(await accepted, 'Redis Docs', 'Install returns the edited app name');
+    assert.equal(document.getElementById('yayra-install-app-overlay'), null, 'dialog closes on Install');
+
+    const cancelled = shell._installPageAsAppDialog({ title: 'Redis', url: 'https://redis.io/' });
+    document.getElementById('yayra-install-app-overlay').querySelector('.fb-btn-secondary').click();
+    assert.equal(await cancelled, null, 'Cancel does not install');
+  } finally {
+    shell.destroy();
   }
 });
 

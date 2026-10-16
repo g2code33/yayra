@@ -94,7 +94,7 @@ test('INSTALL AS APP (Android): a REAL native home-screen shortcut is requested 
     shell.render(container);
     // The editable-name dialog (pre-filled with the site title) is part of
     // the flow - simulate the user accepting the suggested name.
-    shell._textPromptDialog = async (opts) => opts?.initialValue || 'Example News';
+    shell._installPageAsAppDialog = async (opts) => opts?.title || 'Example News';
     await shell.installPageAsApp();
     assert.equal(installCalls.length, 1, 'the native install method was called');
     assert.equal(installCalls[0].url, 'https://news.example.com/');
@@ -102,6 +102,51 @@ test('INSTALL AS APP (Android): a REAL native home-screen shortcut is requested 
   } finally {
     shell.destroy();
     delete window.Capacitor;
+  }
+});
+
+test('CAST, SAVE, AND SHARE → INSTALL PAGE AS APP: the submenu click installs the active site with its edited name', async () => {
+  const previousBridge = window.yayra;
+  const installCalls = [];
+  window.yayra = {
+    system: {
+      installPageAsAppPreview: async () => ({ ok: true, name: 'Redis', startUrl: 'https://redis.io/?source=app', pwa: true }),
+      installPageAsApp: async (opts) => {
+        installCalls.push(opts);
+        return { ok: true, name: opts.title, inLauncher: true, pwa: true };
+      }
+    }
+  };
+  const { shell, container } = await makeShell();
+  try {
+    shell.state.tabs[0].url = 'https://redis.io/docs/latest/';
+    shell.state.tabs[0].title = 'Redis documentation';
+    let confirmation = null;
+    shell._installPageAsAppDialog = async (opts) => { confirmation = opts; return 'Redis Docs'; };
+    shell.showTransientNotice = () => {};
+    shell.state.isSideDrawerOpen = true;
+    shell.render(container);
+
+    const castMenu = container.querySelector('.fb-dr-cast-parent');
+    castMenu.click();
+    assert.equal(castMenu.getAttribute('aria-expanded'), 'true', 'Cast, save, and share opens its lateral submenu');
+    const installItem = container.querySelector('.fb-dr-install-app');
+    assert.ok(installItem, 'Install page as app is present in the opened submenu');
+    assert.equal(installItem.getAttribute('role'), 'menuitem');
+    installItem.click();
+    await flush();
+
+    assert.equal(confirmation.url, 'https://redis.io/docs/latest/', 'confirmation describes the active site');
+    assert.equal(confirmation.title, 'Redis', 'site manifest name is suggested');
+    assert.ok(confirmation.iconHtml.includes('redis.io'), 'the site favicon is previewed');
+    assert.equal(installCalls.length, 1, 'the submenu click reaches the native installer');
+    assert.equal(installCalls[0].url, 'https://redis.io/?source=app', 'the site app start URL is installed');
+    assert.equal(installCalls[0].title, 'Redis Docs', 'the edited site name reaches the installer');
+    assert.equal(installCalls[0].nameOverride, 'Redis Docs');
+  } finally {
+    shell.destroy();
+    if (previousBridge === undefined) delete window.yayra;
+    else window.yayra = previousBridge;
   }
 });
 
