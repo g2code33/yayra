@@ -220,6 +220,15 @@ export function createShortcutsRepo(storage) {
 
 const LAST_SESSION_KEY = 'last-session-tabs';
 
+function sanitizeSessionGroup(group) {
+  if (!group || typeof group !== 'object') return null;
+  const name = String(group.name || '').replace(/\s+/g, ' ').trim().slice(0, 48);
+  if (!name) return null;
+  const rawColor = String(group.color || '').trim();
+  const color = /^#[0-9a-f]{6}$/i.test(rawColor) ? rawColor : null;
+  return color ? { name, color } : { name };
+}
+
 /**
  * "Continue with these tabs": a rolling snapshot of the tabs currently
  * open (non-private, real websites only). Closing a tab by hand removes
@@ -230,7 +239,14 @@ const LAST_SESSION_KEY = 'last-session-tabs';
 export function createSessionRepo(storage) {
   const sanitize = (tabs) => (Array.isArray(tabs) ? tabs : [])
     .filter((t) => t && typeof t.url === 'string' && /^https?:\/\//i.test(t.url))
-    .map(({ url, title }) => ({ url, title: String(title || url).slice(0, 120) }))
+    .map(({ url, title, group }) => {
+      const safeGroup = sanitizeSessionGroup(group);
+      return {
+        url,
+        title: String(title || url).slice(0, 120),
+        ...(safeGroup ? { group: safeGroup } : {})
+      };
+    })
     .slice(0, 20);
   return {
     async getLastSession() {

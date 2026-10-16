@@ -146,12 +146,12 @@ test('session repo: snapshot keeps only real non-private websites - what the use
   const repo = createSessionRepo(memoryStorage());
   assert.deepEqual((await repo.getLastSession()).tabs, [], 'fresh profile has no previous session');
   await repo.saveSession([
-    { url: 'https://docs.rs/x', title: 'docs' },
+    { url: 'https://docs.rs/x', title: 'docs', group: { name: 'Research', color: '#3b82f6' } },
     { url: 'yayra://newtab', title: 'New Tab' },
     { url: 'not a url', title: 'junk' }
   ]);
   const { tabs, savedAt } = await repo.getLastSession();
-  assert.deepEqual(tabs, [{ url: 'https://docs.rs/x', title: 'docs' }]);
+  assert.deepEqual(tabs, [{ url: 'https://docs.rs/x', title: 'docs', group: { name: 'Research', color: '#3b82f6' } }], 'restored sessions retain safe tab-group metadata');
   assert.ok(savedAt > 0);
 });
 

@@ -44,6 +44,7 @@ export interface IconMap {
   moreHorizontal: string;
   share: string;
   tabs: string;
+  tabGroup: string;
   incognito: string;
   gemini: string;
   sparkles: string;

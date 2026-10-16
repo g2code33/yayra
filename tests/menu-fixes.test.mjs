@@ -311,6 +311,35 @@ test('TAB GROUPS: real create / group / ungroup with colour dots in the tab stri
     assert.equal(third.group.name, 'Research');
     assert.equal(third.group.color, grouped[0].group.color, 'joining by name reuses the group colour');
 
+    // The group-picker icon sits beside the site-security control and one
+    // tap on a group row switches directly to a member tab.
+    shell.createNewTab();
+    const ungrouped = shell.getActiveTab();
+    shell.render(container);
+    assert.ok(container.querySelector('.fb-security-lock-btn'), 'site security control remains in the omnibox');
+    const groupIcon = container.querySelector('.fb-omnibox-group-btn');
+    assert.ok(groupIcon, 'tab-group icon is present beside the site connection control');
+    groupIcon.click();
+    assert.equal(shell.state.activeModal, 'tab-groups', 'group icon opens the group picker');
+    const groupChoice = container.querySelector('.fb-tab-group-picker-item');
+    assert.ok(groupChoice, 'the picker lists open groups');
+    groupChoice.click();
+    assert.ok(shell.getActiveTab().group, 'one tap opens a member tab from that group');
+    assert.notEqual(shell.getActiveTab().id, ungrouped.id, 'the ungrouped tab was switched away from');
+
+    // Ctrl+Shift+G opens the same picker from the keyboard.
+    shell.handleGlobalKeyDown({ ctrlKey: true, metaKey: false, shiftKey: true, altKey: false, key: 'G', preventDefault() {} });
+    assert.equal(shell.state.activeModal, 'tab-groups', 'Ctrl+Shift+G opens tab groups');
+    shell.closeModal();
+
+    // The Settings sidebar has a dedicated tab-group manager.
+    shell.navigateActiveTab('yayra://settings');
+    const settingsGroupsTab = container.querySelector('[data-cat="tab-groups"]');
+    assert.ok(settingsGroupsTab, 'Settings includes a Tab Groups category');
+    settingsGroupsTab.click();
+    assert.equal(shell.state.settingsActiveCategory, 'tab-groups');
+    assert.ok(container.querySelector('#fb-in-tab-groups-list')?.querySelector('.fb-tab-group-settings-card'), 'the Settings category lists grouped tabs');
+
     // Ungroup removes every group.
     shell.ungroupAllTabs();
     assert.ok(shell.state.tabs.every((t) => !t.group), 'all tabs ungrouped');

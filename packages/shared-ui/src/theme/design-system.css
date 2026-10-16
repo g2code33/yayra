@@ -695,6 +695,130 @@ html {
   box-shadow: 0 0 4px rgba(0, 0, 0, 0.4);
 }
 
+.fb-tab-group-settings-toolbar,
+.fb-tab-groups-modal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.fb-tab-groups-settings-list,
+.fb-tab-groups-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+
+.fb-tab-groups-picker-list {
+  max-height: min(48vh, 420px);
+  overflow-y: auto;
+}
+
+.fb-tab-group-settings-card,
+.fb-tab-group-picker-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 12px;
+  border: 1px solid var(--fb-border-glass);
+  border-radius: 12px;
+  background: var(--fb-bg-surface-elevated);
+  color: var(--fb-text-primary);
+  text-align: left;
+}
+
+.fb-tab-group-picker-item {
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+}
+
+.fb-tab-group-picker-item:hover,
+.fb-tab-group-picker-item:focus-visible {
+  border-color: var(--fb-accent-primary);
+  background: var(--fb-bg-glass-input);
+  transform: translateY(-1px);
+  outline: none;
+}
+
+.fb-tab-group-settings-header,
+.fb-tab-group-picker-copy {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.fb-tab-group-settings-copy,
+.fb-tab-group-picker-copy {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.fb-tab-group-settings-copy small,
+.fb-tab-group-picker-copy small {
+  overflow: hidden;
+  color: var(--fb-text-muted);
+  font-size: 0.75rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fb-tab-group-swatch {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 12px;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  border-radius: 50%;
+}
+
+.fb-tab-group-picker-open {
+  flex: none;
+  color: var(--fb-accent-primary);
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.fb-tab-group-settings-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.fb-tab-groups-empty,
+.fb-tab-groups-modal-description {
+  margin: 0;
+  color: var(--fb-text-secondary);
+  font-size: 0.85rem;
+}
+
+.fb-tab-groups-modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.fb-tab-groups-modal-actions .fb-btn {
+  min-height: 36px;
+}
+
+@media (max-width: 600px) {
+  .fb-tab-group-settings-card {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .fb-tab-group-settings-actions {
+    justify-content: flex-start;
+  }
+}
+
 /* Real site logo in the tab: the globe fallback sits UNDER the logo
    image and is hidden the moment the logo loads (onload), or kept if
    the logo fails (onerror removes the img). */
@@ -880,6 +1004,34 @@ html {
   align-items: center;
   cursor: pointer;
   color: #34d399;
+}
+
+.fb-omnibox-group-btn,
+.fb-mobile-group-btn {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--fb-text-muted);
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+
+.fb-omnibox-group-btn:hover,
+.fb-omnibox-group-btn:focus-visible,
+.fb-mobile-group-btn:hover,
+.fb-mobile-group-btn:focus-visible,
+.fb-omnibox-group-btn.is-grouped,
+.fb-mobile-group-btn.is-grouped {
+  color: var(--fb-accent-primary);
+  background: var(--fb-accent-glow);
+  outline: none;
 }
 
 .fb-omnibox-input {

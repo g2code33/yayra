@@ -1838,6 +1838,19 @@ export class BrowserShell {
     });
     omnibox.appendChild(securityBadge);
 
+    const tabGroupsBtn = document.createElement('button');
+    tabGroupsBtn.type = 'button';
+    tabGroupsBtn.className = `fb-omnibox-group-btn${activeTab.group ? ' is-grouped' : ''}`;
+    tabGroupsBtn.setAttribute('title', activeTab.group?.name ? `Tab group: ${activeTab.group.name}` : 'Tab groups');
+    tabGroupsBtn.setAttribute('aria-label', activeTab.group?.name ? `Open tab groups; current group ${activeTab.group.name}` : 'Open tab groups');
+    tabGroupsBtn.setAttribute('aria-haspopup', 'dialog');
+    tabGroupsBtn.innerHTML = Icons.tabGroup;
+    tabGroupsBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.openModal('tab-groups');
+    });
+    omnibox.appendChild(tabGroupsBtn);
+
     // Omnibox Input
     const omniboxInput = document.createElement('input');
     omniboxInput.type = 'text';
@@ -2140,6 +2153,20 @@ export class BrowserShell {
     secIcon.className = 'fb-mobile-sec-icon';
     secIcon.innerHTML = activeTab.isSecure ? Icons.lock : Icons.alertTriangle;
     addressPill.appendChild(secIcon);
+
+    const mobileTabGroupsBtn = document.createElement('button');
+    mobileTabGroupsBtn.type = 'button';
+    mobileTabGroupsBtn.className = `fb-mobile-group-btn${activeTab.group ? ' is-grouped' : ''}`;
+    mobileTabGroupsBtn.setAttribute('title', 'Tab groups');
+    mobileTabGroupsBtn.setAttribute('aria-label', 'Open tab groups');
+    mobileTabGroupsBtn.setAttribute('aria-haspopup', 'dialog');
+    mobileTabGroupsBtn.innerHTML = Icons.tabGroup;
+    mobileTabGroupsBtn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      this.openModal('tab-groups');
+    });
+    mobileTabGroupsBtn.addEventListener('keydown', (event) => event.stopPropagation());
+    addressPill.appendChild(mobileTabGroupsBtn);
 
     const titleWrap = document.createElement('div');
     titleWrap.className = 'fb-mobile-pill-text';
@@ -4256,6 +4283,9 @@ export class BrowserShell {
         <button class="fb-settings-nav-item ${activeCat === 'tabs' ? 'active' : ''}" data-cat="tabs" data-category="tabs">
           ${Icons.tabs} <span>Tabs & Startup</span>
         </button>
+        <button class="fb-settings-nav-item ${activeCat === 'tab-groups' ? 'active' : ''}" data-cat="tab-groups" data-category="tab-groups">
+          ${Icons.tabGroup} <span>Tab Groups</span>
+        </button>
         <button class="fb-settings-nav-item ${activeCat === 'shortcuts' ? 'active' : ''}" data-cat="shortcuts" data-category="shortcuts">
           ${Icons.lightning || Icons.settings} <span>Shortcuts</span>
         </button>
@@ -4555,6 +4585,18 @@ export class BrowserShell {
             </div>
           </section>
 
+          <!-- Tab Groups: view, open, rename, or ungroup existing groups. -->
+          <section class="fb-settings-group-card" id="sec-tab-groups" style="${activeCat === 'tab-groups' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
+            <h3 class="fb-settings-group-title">${Icons.tabGroup} Tab Groups</h3>
+            <p>Open a group with one click, rename it, or ungroup its tabs without closing them.</p>
+            <div class="fb-tab-group-settings-toolbar">
+              <button type="button" class="fb-btn fb-btn-primary fb-in-create-tab-group">${Icons.plus} New tab group</button>
+              <button type="button" class="fb-btn fb-btn-secondary fb-in-group-current-tab">${Icons.tabs} Group current tab</button>
+              <button type="button" class="fb-btn fb-btn-secondary fb-in-open-tab-groups">${Icons.tabGroup} Open group picker</button>
+            </div>
+            <div class="fb-tab-groups-settings-list" id="fb-in-tab-groups-list"></div>
+          </section>
+
           <!-- Shortcuts: every keyboard shortcut, system-wide hotkey and
                bubble gesture in one reference. -->
           <section class="fb-settings-group-card" id="sec-shortcuts" style="${activeCat === 'shortcuts' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
@@ -4575,6 +4617,7 @@ export class BrowserShell {
               <div class="fb-shortcut-row"><span>History</span><kbd>Ctrl+H</kbd></div>
               <div class="fb-shortcut-row"><span>Downloads</span><kbd>Ctrl+J</kbd></div>
               <div class="fb-shortcut-row"><span>Find in page</span><kbd>Ctrl+F</kbd></div>
+              <div class="fb-shortcut-row"><span>Open tab groups</span><kbd>Ctrl+Shift+G</kbd></div>
               <div class="fb-shortcut-row"><span>Stop loading / close menus &amp; overlays</span><kbd>Esc</kbd></div>
             </div>
             <h4 class="fb-shortcuts-subhead">System-wide (work anywhere on your PC)</h4>
@@ -4630,6 +4673,11 @@ export class BrowserShell {
         </div>
       </main>
     `;
+
+    this.renderTabGroupSettingsList(page.querySelector('#fb-in-tab-groups-list'));
+    page.querySelector('.fb-in-create-tab-group')?.addEventListener('click', () => this.createTabGroup());
+    page.querySelector('.fb-in-group-current-tab')?.addEventListener('click', () => this.groupCurrentTab());
+    page.querySelector('.fb-in-open-tab-groups')?.addEventListener('click', () => this.openModal('tab-groups'));
 
     // Sidebar navigation clicks
     page.querySelectorAll('.fb-settings-nav-item').forEach((btn) => {
@@ -7279,6 +7327,217 @@ export class BrowserShell {
 
   static TAB_GROUP_COLORS = ['#8b5cf6', '#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#ec4899'];
 
+  sanitizeTabGroup(group) {
+    if (!group || typeof group !== 'object') return null;
+    const name = String(group.name || '').replace(/\s+/g, ' ').trim().slice(0, 48);
+    if (!name) return null;
+    const candidateColor = String(group.color || '').trim().toLowerCase();
+    const color = BrowserShell.TAB_GROUP_COLORS.find((entry) => entry.toLowerCase() === candidateColor)
+      || BrowserShell.TAB_GROUP_COLORS[0];
+    return { name, color };
+  }
+
+  getTabGroups() {
+    const groups = new Map();
+    for (const tab of this.state.tabs || []) {
+      const group = this.sanitizeTabGroup(tab?.group);
+      if (!group) continue;
+      const id = `${group.name.toLocaleLowerCase()}::${group.color.toLowerCase()}`;
+      if (!groups.has(id)) groups.set(id, { id, name: group.name, color: group.color, tabs: [] });
+      groups.get(id).tabs.push(tab);
+    }
+    return Array.from(groups.values());
+  }
+
+  openTabGroup(groupId) {
+    const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
+    if (!group || !group.tabs.length) return false;
+    const target = group.tabs.find((tab) => tab.id === this.state.activeTabId) || group.tabs[0];
+    this.selectTab(target.id);
+    return true;
+  }
+
+  async renameTabGroup(groupId) {
+    const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
+    if (!group) return false;
+    const prompted = await this._textPromptDialog({
+      title: 'Rename tab group',
+      description: 'Choose a name for this group of tabs.',
+      placeholder: 'e.g. Research, Shopping, Work',
+      initialValue: group.name
+    });
+    if (prompted === null || prompted === undefined) return false;
+    const name = String(prompted).replace(/\s+/g, ' ').trim().slice(0, 48);
+    if (!name) {
+      this.showTransientNotice('Group name was empty - the group was not renamed.');
+      return false;
+    }
+    for (const tab of this.state.tabs) {
+      const current = this.sanitizeTabGroup(tab.group);
+      if (current && `${current.name.toLocaleLowerCase()}::${current.color.toLowerCase()}` === groupId) {
+        tab.group = { name, color: group.color };
+      }
+    }
+    this.render();
+    this.showTransientNotice(`Tab group renamed to “${name}”.`);
+    return true;
+  }
+
+  ungroupTabGroup(groupId) {
+    const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
+    if (!group) return 0;
+    const memberIds = new Set(group.tabs.map((tab) => tab.id));
+    for (const tab of this.state.tabs) {
+      if (memberIds.has(tab.id)) tab.group = null;
+    }
+    this.render();
+    this.showTransientNotice(`“${group.name}” ungrouped - its tabs stay open.`);
+    return memberIds.size;
+  }
+
+  ungroupCurrentTab() {
+    const tab = this.getActiveTab();
+    if (!tab?.group) return false;
+    const name = this.sanitizeTabGroup(tab.group)?.name || 'Tab group';
+    tab.group = null;
+    this.render();
+    this.showTransientNotice(`This tab was removed from “${name}”.`);
+    return true;
+  }
+
+  openTabGroupsSettings() {
+    this.state.settingsActiveCategory = 'tab-groups';
+    this.state.activeSettingsCategory = 'tab-groups';
+    this.openInternalPage('yayra://settings');
+  }
+
+  renderTabGroupPickerList(container) {
+    if (!container) return;
+    container.innerHTML = '';
+    const groups = this.getTabGroups();
+    if (!groups.length) {
+      const empty = document.createElement('p');
+      empty.className = 'fb-tab-groups-empty';
+      empty.textContent = 'No tab groups yet. Create one or group the current tab to get started.';
+      container.appendChild(empty);
+      return;
+    }
+    for (const group of groups) {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'fb-tab-group-picker-item';
+      item.setAttribute('aria-label', `Open ${group.name} group (${group.tabs.length} tabs)`);
+      const swatch = document.createElement('span');
+      swatch.className = 'fb-tab-group-swatch';
+      swatch.style.background = group.color;
+      const copy = document.createElement('span');
+      copy.className = 'fb-tab-group-picker-copy';
+      const title = document.createElement('strong');
+      title.textContent = group.name;
+      const details = document.createElement('small');
+      details.textContent = `${group.tabs.length} tab${group.tabs.length === 1 ? '' : 's'} · ${group.tabs.map((tab) => this.getTabTitle(tab)).join(', ')}`;
+      const open = document.createElement('span');
+      open.className = 'fb-tab-group-picker-open';
+      open.textContent = 'Open';
+      copy.appendChild(title);
+      copy.appendChild(details);
+      item.appendChild(swatch);
+      item.appendChild(copy);
+      item.appendChild(open);
+      item.addEventListener('click', () => {
+        this.closeModal();
+        this.openTabGroup(group.id);
+      });
+      container.appendChild(item);
+    }
+  }
+
+  renderTabGroupSettingsList(container) {
+    if (!container) return;
+    container.innerHTML = '';
+    const groups = this.getTabGroups();
+    if (!groups.length) {
+      const empty = document.createElement('p');
+      empty.className = 'fb-tab-groups-empty';
+      empty.textContent = 'No tab groups yet. Create a group or add the current tab to one.';
+      container.appendChild(empty);
+      return;
+    }
+    for (const group of groups) {
+      const card = document.createElement('article');
+      card.className = 'fb-tab-group-settings-card';
+      const header = document.createElement('div');
+      header.className = 'fb-tab-group-settings-header';
+      const swatch = document.createElement('span');
+      swatch.className = 'fb-tab-group-swatch';
+      swatch.style.background = group.color;
+      const copy = document.createElement('span');
+      copy.className = 'fb-tab-group-settings-copy';
+      const title = document.createElement('strong');
+      title.textContent = group.name;
+      const details = document.createElement('small');
+      details.textContent = `${group.tabs.length} tab${group.tabs.length === 1 ? '' : 's'}: ${group.tabs.map((tab) => this.getTabTitle(tab)).join(', ')}`;
+      copy.appendChild(title);
+      copy.appendChild(details);
+      header.appendChild(swatch);
+      header.appendChild(copy);
+      const actions = document.createElement('div');
+      actions.className = 'fb-tab-group-settings-actions';
+      const makeAction = (className, label, action) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = `fb-btn fb-btn-secondary ${className}`;
+        button.textContent = label;
+        button.addEventListener('click', action);
+        actions.appendChild(button);
+      };
+      makeAction('fb-tab-group-open-btn', 'Open group', () => this.openTabGroup(group.id));
+      makeAction('fb-tab-group-rename-btn', 'Rename', () => this.renameTabGroup(group.id));
+      makeAction('fb-tab-group-ungroup-btn', 'Ungroup', () => this.ungroupTabGroup(group.id));
+      card.appendChild(header);
+      card.appendChild(actions);
+      container.appendChild(card);
+    }
+  }
+
+  renderTabGroupsModal(modal) {
+    modal.className = 'fb-modal-card fb-tab-groups-modal';
+    modal.innerHTML = `
+      <div class="fb-modal-header">
+        <h2 class="fb-modal-title">${Icons.tabGroup} Tab groups</h2>
+        <button class="fb-modal-close-btn" aria-label="Close tab groups">${Icons.close}</button>
+      </div>
+      <div class="fb-modal-body fb-tab-groups-modal-body">
+        <p class="fb-tab-groups-modal-description">Choose a group to switch straight to one of its tabs.</p>
+        <div class="fb-tab-groups-picker-list"></div>
+        <div class="fb-tab-groups-modal-actions">
+          <button class="fb-btn fb-btn-primary fb-tab-groups-create-btn">${Icons.plus} New group</button>
+          <button class="fb-btn fb-btn-secondary fb-tab-groups-current-btn">${Icons.tabs} Group current tab</button>
+          <button class="fb-btn fb-btn-secondary fb-tab-groups-manage-btn">Manage in Settings</button>
+          ${this.getActiveTab()?.group ? '<button class="fb-btn fb-btn-secondary fb-tab-groups-ungroup-current-btn">Remove current tab from group</button>' : ''}
+        </div>
+      </div>
+    `;
+    this.renderTabGroupPickerList(modal.querySelector('.fb-tab-groups-picker-list'));
+    modal.querySelector('.fb-modal-close-btn')?.addEventListener('click', () => this.closeModal());
+    modal.querySelector('.fb-tab-groups-create-btn')?.addEventListener('click', () => {
+      this.closeModal();
+      this.createTabGroup();
+    });
+    modal.querySelector('.fb-tab-groups-current-btn')?.addEventListener('click', () => {
+      this.closeModal();
+      this.groupCurrentTab();
+    });
+    modal.querySelector('.fb-tab-groups-manage-btn')?.addEventListener('click', () => {
+      this.closeModal();
+      this.openTabGroupsSettings();
+    });
+    modal.querySelector('.fb-tab-groups-ungroup-current-btn')?.addEventListener('click', () => {
+      this.closeModal();
+      this.ungroupCurrentTab();
+    });
+  }
+
   _nextTabGroupColor() {
     const used = new Set(this.state.tabs.map((t) => t.group && t.group.color).filter(Boolean));
     const free = BrowserShell.TAB_GROUP_COLORS.find((c) => !used.has(c));
@@ -7297,7 +7556,7 @@ export class BrowserShell {
       initialValue: ''
     });
     if (name === null) return;
-    const groupName = String(name || '').trim() || 'Group';
+    const groupName = String(name || '').replace(/\s+/g, ' ').trim().slice(0, 48) || 'Group';
     const color = this._nextTabGroupColor();
     tab.group = { name: groupName, color };
     this.render();
@@ -7319,14 +7578,14 @@ export class BrowserShell {
       initialValue: tab.group ? tab.group.name : ''
     });
     if (name === null) return;
-    const groupName = String(name || '').trim();
+    const groupName = String(name || '').replace(/\s+/g, ' ').trim().slice(0, 48);
     if (!groupName) {
       this.showTransientNotice('Group name was empty - tab left ungrouped.');
       return;
     }
-    const existing = this.state.tabs.find((t) => t.group && t.group.name === groupName);
+    const existing = this.getTabGroups().find((candidate) => candidate.name.toLocaleLowerCase() === groupName.toLocaleLowerCase());
     tab.group = existing
-      ? { name: existing.group.name, color: existing.group.color }
+      ? { name: existing.name, color: existing.color }
       : { name: groupName, color: this._nextTabGroupColor() };
     this.render();
     this.showTransientNotice(`\u201C${tab.title || 'Tab'}\u201D added to group \u201C${groupName}\u201D.`);
@@ -7575,7 +7834,10 @@ export class BrowserShell {
     if (this.options?.isMiniShell) return;
     const tabs = (this.state.tabs || [])
       .filter((t) => t && !t.isPrivate && /^https?:\/\//i.test(String(t.url || '')))
-      .map((t) => ({ url: t.url, title: t.title || t.url }));
+      .map((t) => {
+        const group = this.sanitizeTabGroup(t.group);
+        return { url: t.url, title: t.title || t.url, ...(group ? { group } : {}) };
+      });
     // Launch-wipe protection: a fresh run opens on a lone newtab, and
     // 600ms later used to OVERWRITE the previous session's snapshot
     // with [] - if the user quit again without browsing (or the app
@@ -7938,6 +8200,7 @@ export class BrowserShell {
             <span class="fb-toolbar-brand-text">${Icons.officialWordmark}<span class="fb-brand-text-fallback">yayra</span></span>
           </div>
           <button class="fb-omnibox-security fb-mini-security-btn" title="Site security" aria-label="Site security">${activeTab.isSecure ? Icons.lock : Icons.alertTriangle}</button>
+          <button class="fb-omnibox-group-btn fb-mini-group-btn${activeTab.group ? ' is-grouped' : ''}" title="Tab groups" aria-label="Open tab groups" aria-haspopup="dialog">${Icons.tabGroup}</button>
           <input type="text" class="fb-omnibox-input fb-mini-omnibox" value="${this.getDisplayUrl(activeTab.url)}" placeholder="Search with ${(this.state.settings.searchEngine || 'Google').replace(/^./, (letter) => letter.toUpperCase())} or enter address" aria-label="Mini address and search bar" />
           <button class="fb-omnibox-star fb-mini-star-btn" title="Bookmark" aria-label="Bookmark">${this.state.isBookmarked ? Icons.starFilled : Icons.star}</button>
         </div>
@@ -8001,6 +8264,11 @@ export class BrowserShell {
 
     win.querySelector('.fb-mini-extensions-btn')?.addEventListener('click', () => {
       this.openInternalPage('yayra://extensions');
+    });
+
+    win.querySelector('.fb-mini-group-btn')?.addEventListener('click', (event) => {
+      event.stopPropagation();
+      this.openModal('tab-groups');
     });
 
     win.querySelector('.fb-mini-security-btn')?.addEventListener('click', () => {
@@ -8434,7 +8702,10 @@ export class BrowserShell {
       ? []
       : this.state.tabs
         .filter((t) => !t.isPrivate && /^https?:\/\//i.test(t.url || ''))
-        .map((t) => ({ url: t.url, title: t.title || '' }));
+        .map((t) => {
+          const group = this.sanitizeTabGroup(t.group);
+          return { url: t.url, title: t.title || '', ...(group ? { group } : {}) };
+        });
     if (typeof localStorage !== 'undefined') {
       try {
         localStorage.setItem('yayra:close-session', JSON.stringify({ mode, tabs, savedAt: new Date().toISOString() }));
@@ -8463,17 +8734,21 @@ export class BrowserShell {
     if (saved.mode === 'restore' && this.options?.initialUrl) saved.mode = 'recent';
     if (saved.mode === 'restore') {
       // Reopen every tab automatically, exactly as they were.
-      this.state.tabs = tabs.map((t, i) => ({
-        id: `tab-${Date.now()}-${i}`,
-        title: t.title || 'New Tab',
-        url: t.url,
-        isSecure: String(t.url).startsWith('https://'),
-        canGoBack: false,
-        canGoForward: false,
-        isLoading: false,
-        isPrivate: false,
-        favicon: null
-      }));
+      this.state.tabs = tabs.map((t, i) => {
+        const group = this.sanitizeTabGroup(t.group);
+        return {
+          id: `tab-${Date.now()}-${i}`,
+          title: t.title || 'New Tab',
+          url: t.url,
+          isSecure: String(t.url).startsWith('https://'),
+          canGoBack: false,
+          canGoForward: false,
+          isLoading: false,
+          isPrivate: false,
+          favicon: null,
+          ...(group ? { group } : {})
+        };
+      });
       this.state.activeTabId = this.state.tabs[0].id;
       this.state.urlInputValue = this.getDisplayUrl(this.state.tabs[0].url);
     } else if (saved.mode === 'recent') {
@@ -8486,17 +8761,21 @@ export class BrowserShell {
     const tabs = this.state.recentTabsOffer || [];
     this.state.recentTabsOffer = null;
     if (!tabs.length) { this.render(); return; }
-    const restored = tabs.map((t, i) => ({
-      id: `tab-${Date.now()}-${i}`,
-      title: t.title || 'New Tab',
-      url: t.url,
-      isSecure: String(t.url).startsWith('https://'),
-      canGoBack: false,
-      canGoForward: false,
-      isLoading: false,
-      isPrivate: false,
-      favicon: null
-    }));
+    const restored = tabs.map((t, i) => {
+      const group = this.sanitizeTabGroup(t.group);
+      return {
+        id: `tab-${Date.now()}-${i}`,
+        title: t.title || 'New Tab',
+        url: t.url,
+        isSecure: String(t.url).startsWith('https://'),
+        canGoBack: false,
+        canGoForward: false,
+        isLoading: false,
+        isPrivate: false,
+        favicon: null,
+        ...(group ? { group } : {})
+      };
+    });
     // Replace a lone pristine new-tab; otherwise append after current tabs.
     const onlyPristine = this.state.tabs.length === 1 && this.state.tabs[0].url === 'yayra://newtab';
     this.state.tabs = onlyPristine ? restored : [...this.state.tabs, ...restored];
@@ -9512,6 +9791,7 @@ export class BrowserShell {
             <button class="fb-drawer-item fb-dr-tg-new">${Icons.plus} <span>New tab group</span></button>
             <button class="fb-drawer-item fb-dr-tg-add">${Icons.tabs} <span>Group current tab</span></button>
             <button class="fb-drawer-item fb-dr-tg-ungroup">${Icons.close} <span>Ungroup tabs</span></button>
+            <button class="fb-drawer-item fb-dr-tg-manage">${Icons.settings} <span>Manage tab groups</span></button>
           </div>
         </div>
 
@@ -9818,6 +10098,11 @@ export class BrowserShell {
     drawer.querySelector('.fb-dr-tg-ungroup')?.addEventListener('click', () => {
       this.state.isSideDrawerOpen = false;
       this.ungroupAllTabs();
+    });
+
+    drawer.querySelector('.fb-dr-tg-manage')?.addEventListener('click', () => {
+      this.state.isSideDrawerOpen = false;
+      this.openTabGroupsSettings();
     });
 
     drawer.querySelector('.fb-dr-downloads')?.addEventListener('click', () => {
@@ -10140,6 +10425,9 @@ export class BrowserShell {
         break;
       case 'tab-switcher':
         this.renderTabSwitcherModal(modal);
+        break;
+      case 'tab-groups':
+        this.renderTabGroupsModal(modal);
         break;
       case 'search-overlay':
         this.renderMobileSearchOverlay(modal);
@@ -11762,9 +12050,14 @@ export class BrowserShell {
         this.createNewTab();
         this.navigateActiveTab(entry.url);
       }
+      const restoredTab = this.getActiveTab();
+      if (restoredTab) restoredTab.group = this.sanitizeTabGroup(entry.group);
       opened += 1;
     }
-    if (opened > 0) this.showTransientNotice(`Restored ${opened} tab${opened === 1 ? '' : 's'}.`);
+    if (opened > 0) {
+      this.render();
+      this.showTransientNotice(`Restored ${opened} tab${opened === 1 ? '' : 's'}.`);
+    }
   }
 
   /** "No thanks" on the prompt: remember the snapshot so it never re-asks. */
@@ -11804,7 +12097,7 @@ export class BrowserShell {
       <button class="fb-restore-toast-close fb-restore-bar-close" aria-label="Dismiss" title="Dismiss">${Icons.close}</button>
     `;
     bar.querySelector('.fb-restore-bar-btn')?.addEventListener('click', () => {
-      this.restoreContinueTabs(tabs.map((t) => ({ url: t.url, title: t.title || t.url })));
+      this.restoreContinueTabs(tabs.map((t) => ({ url: t.url, title: t.title || t.url, group: t.group })));
     });
     bar.querySelector('.fb-restore-bar-close')?.addEventListener('click', () => {
       this._restoreToastClosed = true;
@@ -11829,7 +12122,7 @@ export class BrowserShell {
     for (const t of (this.state.continueTabs || [])) {
       if (seenContinue.has(t.url)) continue;
       seenContinue.add(t.url);
-      continueEntries.push({ url: t.url, title: t.title || t.url, reason: 'From last session' });
+      continueEntries.push({ url: t.url, title: t.title || t.url, reason: 'From last session', group: t.group });
       if (continueEntries.length >= 5) break;
     }
     for (const site of frequentSites) {
@@ -11863,7 +12156,15 @@ export class BrowserShell {
       </div>
     `;
     continueCard.querySelectorAll('.fb-continue-item').forEach((item) => {
-      item.addEventListener('click', () => this.navigateActiveTab(item.dataset.url));
+      item.addEventListener('click', () => {
+        const entry = continueEntries.find((candidate) => candidate.url === item.dataset.url);
+        this.navigateActiveTab(item.dataset.url);
+        const active = this.getActiveTab();
+        if (active && entry?.group) {
+          active.group = this.sanitizeTabGroup(entry.group);
+          this.render();
+        }
+      });
     });
     continueCard.querySelector('.fb-continue-restore-btn')?.addEventListener('click', () => {
       this.restoreContinueTabs(continueEntries);
@@ -13471,6 +13772,11 @@ export class BrowserShell {
     else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'n') {
       e.preventDefault();
       this.openFloatingMini();
+    }
+    // Ctrl+Shift+G: open the tab-group picker for one-tap group switching.
+    else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'g') {
+      e.preventDefault();
+      this.openModal('tab-groups');
     }
     // Ctrl+Shift+A: Tab search (the tab switcher)
     else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'a') {
