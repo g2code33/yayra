@@ -2904,33 +2904,41 @@ export class BrowserShell {
         this.nativeWebview.setVisible(tabId, true).catch(() => {});
         continue;
       }
-      // Hiding the ACTIVE tab because chrome needs to overlay it. Order
-      // matters to avoid a blank flash: FIRST snapshot the still-visible
-      // page and paint the still image into the slot, THEN hide the
-      // native surface - with a fail-safe so the hide can never hang on a
-      // slow/failed capture. (Hidden background tabs need no snapshot.)
+      // Hiding the ACTIVE tab because chrome needs to overlay it. Start a
+      // snapshot capture, but never make the UI wait for it: native views
+      // paint above every HTML overlay, so wait-for-snapshot made menus
+      // appear behind the page (sometimes for hundreds of milliseconds).
+      // The placeholder already contains the last available still; a fresh
+      // one is painted asynchronously when capturePage resolves.
       const wantsCapture = captureActive && tabId === activeTabId;
       if (wantsCapture && typeof this.nativeWebview.capture === 'function') {
-        let hidden = false;
-        const hideNow = () => {
-          if (hidden) return;
-          hidden = true;
-          const r = this.nativeWebview.setVisible(tabId, false);
-          if (r && typeof r.catch === 'function') r.catch(() => {});
-        };
-        const failSafe = setTimeout(hideNow, 350);
-        this.nativeWebview.capture(tabId).then((res) => {
-          if (res && res.snapshot) {
-            this._pageSnapshots.set(tabId, res.snapshot);
-            this.applyPageSnapshot(tabId, () => { clearTimeout(failSafe); hideNow(); });
-            // The tab switcher may already be on screen showing a stale
-            // or placeholder preview for this tab - paint the fresh one.
-            this.refreshTabSwitcherPreviews();
-          } else {
-            clearTimeout(failSafe);
-            hideNow();
+        if (!this._nativeSnapshotCaptures) this._nativeSnapshotCaptures = new Set();
+        const capturePending = this._nativeSnapshotCaptures;
+        let capturePromise = null;
+        if (!capturePending.has(tabId)) {
+          capturePending.add(tabId);
+          try {
+            capturePromise = Promise.resolve(this.nativeWebview.capture(tabId));
+          } catch {
+            capturePending.delete(tabId);
           }
-        }).catch(() => { clearTimeout(failSafe); hideNow(); });
+        }
+
+        // Hide immediately, independently of the snapshot's completion.
+        const hiddenResult = this.nativeWebview.setVisible(tabId, false);
+        if (hiddenResult && typeof hiddenResult.catch === 'function') hiddenResult.catch(() => {});
+
+        if (capturePromise) {
+          capturePromise.then((res) => {
+            if (res && res.snapshot) {
+              this._pageSnapshots.set(tabId, res.snapshot);
+              this.applyPageSnapshot(tabId);
+              // The tab switcher may already be on screen showing a stale
+              // or placeholder preview for this tab - paint the fresh one.
+              this.refreshTabSwitcherPreviews();
+            }
+          }).catch(() => {}).finally(() => capturePending.delete(tabId));
+        }
         continue;
       }
       // Legacy combined path (older preloads without capture()): the main

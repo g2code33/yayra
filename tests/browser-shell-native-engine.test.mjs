@@ -19,12 +19,13 @@ import { BrowserShell } from '../packages/shared-ui/src/components/BrowserShell.
  */
 
 function installFakeNativeWebview() {
-  const calls = { ensure: [], setBounds: [], setVisible: [], destroy: [], goBack: [], goForward: [], reload: [], stop: [] };
+  const calls = { ensure: [], setBounds: [], setVisible: [], capture: [], destroy: [], goBack: [], goForward: [], reload: [], stop: [] };
   let eventListener = null;
   const fake = {
     ensure: (tabId, url, isPrivate) => { calls.ensure.push({ tabId, url, isPrivate }); return Promise.resolve({ handedOffToSystemBrowser: false }); },
     setBounds: (tabId, bounds) => { calls.setBounds.push({ tabId, bounds }); return Promise.resolve(); },
     setVisible: (tabId, visible) => { calls.setVisible.push({ tabId, visible }); return Promise.resolve(); },
+    capture: (tabId) => { calls.capture.push(tabId); return Promise.resolve({ snapshot: `data:image/png;base64,${tabId}` }); },
     goBack: (tabId) => { calls.goBack.push(tabId); return Promise.resolve(); },
     goForward: (tabId) => { calls.goForward.push(tabId); return Promise.resolve(); },
     reload: (tabId) => { calls.reload.push(tabId); return Promise.resolve(); },
@@ -162,6 +163,43 @@ test('Native engine: visiting an internal yayra:// page hides the active tab\'s 
     shell.navigateActiveTab('yayra://settings');
     shell.render(container);
     assert.ok(calls.setVisible.some((c) => c.tabId === tabId && c.visible === false), 'native surface must be hidden behind internal pages');
+  } finally {
+    uninstall();
+  }
+});
+
+test('Native overlays hide the active page immediately while fresh snapshots paint asynchronously', async () => {
+  const { fake, calls, uninstall } = installFakeNativeWebview();
+  let resolveCapture;
+  fake.capture = (tabId) => {
+    calls.capture.push(tabId);
+    return new Promise((resolve) => { resolveCapture = resolve; });
+  };
+  try {
+    const container = document.createElement('div');
+    const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+    await shell.initialize();
+    const tabId = shell.getActiveTab().id;
+    shell.navigateActiveTab('https://example.com/');
+    shell.render(container);
+
+    calls.setVisible.length = 0;
+    shell.state.isSideDrawerOpen = true;
+    shell.render(container);
+
+    assert.ok(calls.capture.includes(tabId), 'the existing asynchronous screenshot capture is retained');
+    assert.ok(calls.setVisible.some((call) => call.tabId === tabId && call.visible === false), 'the native page is hidden before the screenshot promise resolves');
+    const still = container.querySelector('.fb-page-snapshot-img');
+    assert.ok(still, 'the page slot keeps a snapshot placeholder beneath the drawer');
+    assert.equal(still.src || '', '', 'the new snapshot has not been awaited or painted yet');
+
+    resolveCapture({ snapshot: 'data:image/png;base64,captured-page' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(still.src, 'data:image/png;base64,captured-page', 'the fresh snapshot paints after capture resolves');
+
+    shell.state.isSideDrawerOpen = false;
+    shell.render(container);
+    shell.destroy();
   } finally {
     uninstall();
   }
