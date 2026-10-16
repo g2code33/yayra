@@ -9,6 +9,7 @@ const { pathToFileURL } = require('node:url');
 const { registerDesktopUpdateHandlers } = require('./desktopUpdater.cjs');
 const { createWebviewBridge, buildContextMenuTemplate, buildBrowserUserAgent } = require('./webviewBridge.cjs');
 const { parseAppModeUrl, buildInstallPlan, appWindowClass } = require('./appMode.cjs');
+const { parsePdfFileArg } = require('./pdfLaunch.cjs');
 const { extractManifestLink, extractIconLink, parseManifest, pickInstallIdentity, isPngBuffer, isIcoBuffer, pngToIco } = require('./pwaManifest.cjs');
 const { startGlobalHotkeys } = require('./globalHotkeys.cjs');
 const { createAuthBridge } = require('./authBridge.cjs');
@@ -336,27 +337,6 @@ function createAppModeWindow(url) {
   return win;
 }
 
-/**
- * PDF "Open With" handling: the OS launched Yayra on a .pdf file (or a
- * file was dragged onto the app icon). Only real, existing .pdf files are
- * accepted (extension checked, flags ignored) - the bytes are read in the
- * MAIN process and handed to the renderer, exactly like the in-app
- * document picker: the renderer never receives a filesystem path it did
- * not choose itself, and nothing outside that one file is readable.
- */
-function parsePdfFileArg(argv) {
-  for (const arg of argv || []) {
-    if (typeof arg !== 'string' || arg === '' || arg.startsWith('--')) continue;
-    const raw = arg.replace(/^["']|["']$/g, '');
-    if (!/\.pdf$/i.test(raw)) continue;
-    try {
-      const abs = path.resolve(raw);
-      if (fs.existsSync(abs) && fs.statSync(abs).isFile()) return abs;
-    } catch { /* not a real path - keep scanning */ }
-  }
-  return null;
-}
-
 const pendingPdfFiles = []; // queued until the shell renderer is listening
 
 function deliverPdfFile(filePath) {
@@ -365,9 +345,14 @@ function deliverPdfFile(filePath) {
     if (!stat.isFile() || stat.size > 150 * 1024 * 1024) return false;
     const data = fs.readFileSync(filePath);
     const payload = { name: path.basename(filePath), size: stat.size, data };
-    if (mainWindow && !mainWindow.isDestroyed()) {
+    const rendererReady = mainWindow && !mainWindow.isDestroyed()
+      && (typeof mainWindow.webContents.isLoadingMainFrame !== 'function' || !mainWindow.webContents.isLoadingMainFrame());
+    if (rendererReady) {
       mainWindow.webContents.send('yayra:open-pdf-file', payload);
     } else {
+      // A second-instance launch can create a window from the background
+      // bubble/autostart state. Queue until did-finish-load, just like a cold
+      // launch, so the preload listener cannot miss the file event.
       pendingPdfFiles.push(payload);
     }
     return true;
@@ -378,6 +363,8 @@ function deliverPdfFile(filePath) {
 }
 
 function flushPendingPdfFiles() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (typeof mainWindow.webContents.isLoadingMainFrame === 'function' && mainWindow.webContents.isLoadingMainFrame()) return;
   while (pendingPdfFiles.length > 0 && mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('yayra:open-pdf-file', pendingPdfFiles.shift());
   }
@@ -515,10 +502,9 @@ app.whenReady().then(async () => {
   const isSmokeStartup = process.env.YAYRA_SMOKE === '1' || process.env.IBROWSE_SMOKE === '1';
   // Launched from an installed site-app shortcut: only the site's own
   // app window opens - no browser window, like chrome --app=<url>.
-  // Launched via the desktop's "Open with > yayra" on a PDF (the .desktop
-  // entries and the Windows file association pass the file path as argv):
-  // queue it - createWindow()'s did-finish-load flush delivers it to the
-  // document viewer.
+  // Launched via the desktop's "Open with > yayra" on a PDF (the Linux
+  // desktop entry may pass a file:// URI while Windows passes a path): queue
+  // it - createWindow()'s did-finish-load flush delivers it to the viewer.
   const coldPdfFile = parsePdfFileArg(process.argv);
   if (coldPdfFile && !isSmokeStartup) deliverPdfFile(coldPdfFile);
 

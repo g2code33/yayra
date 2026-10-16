@@ -277,6 +277,19 @@ async function bootShell() {
   return { shell, container };
 }
 
+test('PDF OFFLINE: local document bytes and the vendored PDF.js engine do not require a network fetch', async () => {
+  const { existsSync } = await import('node:fs');
+  for (const asset of ['pdf.mjs', 'pdf.worker.mjs']) {
+    assert.ok(existsSync(new URL(`../packages/shared-ui/src/vendor/pdfjs/${asset}`, import.meta.url)), `${asset} is bundled locally`);
+  }
+  const workspace = readFileSync(new URL('../packages/shared-ui/src/services/documentWorkspace.js', import.meta.url), 'utf8');
+  const shell = readFileSync(new URL('../packages/shared-ui/src/components/BrowserShell.js', import.meta.url), 'utf8');
+  assert.match(workspace, /pdfjs\.getDocument\(\{ data \}\)/, 'PDF.js receives the selected file bytes directly');
+  assert.match(shell, /await import\('\.\.\/vendor\/pdfjs\/pdf\.mjs'\)/, 'the PDF engine is imported from the local package');
+  assert.match(shell, /new URL\('\.\.\/vendor\/pdfjs\/pdf\.worker\.mjs'/, 'the worker is also a local bundled asset');
+  assert.doesNotMatch(shell, /https?:\/\/(?:cdn\.)?mozilla\.github\.io\/pdf\.js/, 'the viewer never depends on a PDF.js CDN');
+});
+
 test('PDF FONTS: standard-14 font data and CJK cmaps are vendored and wired into every getDocument call', async () => {
   const { existsSync, readdirSync } = await import('node:fs');
   const fontsDir = new URL('../packages/shared-ui/src/vendor/pdfjs/standard_fonts/', import.meta.url);

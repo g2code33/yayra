@@ -1,11 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
+import { createRequire } from 'node:module';
 import { setupDomShim } from './dom-shim.mjs';
 
 setupDomShim();
 
 import { BrowserShell } from '../packages/shared-ui/src/components/BrowserShell.js';
+
+const require = createRequire(import.meta.url);
+const { parsePdfFileArg } = require('../electron/pdfLaunch.cjs');
 
 /**
  * "PDF EVERYWHERE" (user request):
@@ -44,6 +51,7 @@ function fakeDesktop({ openPdfResult } = {}) {
       }
     },
     downloads: {
+      list: async () => ({ items: [], downloadRoot: null }),
       openPdf: async (id) => {
         calls.openPdf.push(id);
         return openPdfResult || { ok: true, name: 'downloaded-report.pdf', data: PDF_BYTES };
@@ -109,12 +117,30 @@ test('DRAG & DROP: non-PDF files get the honest roadmap notice, never a dead tab
   }
 });
 
-test('OPEN WITH: a pdf pushed by the OS launch ("Open with > yayra") opens in the viewer', async () => {
+test('OPEN WITH ARGUMENTS: local PDF paths and Linux file:// URIs resolve to the same existing file', () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'yayra-pdf-open-'));
+  const pdfPath = join(tempDir, 'annual report 2026.pdf');
+  writeFileSync(pdfPath, '%PDF-1.7');
+  const fileUri = pathToFileURL(pdfPath).href;
+  try {
+    assert.equal(parsePdfFileArg(['--some-electron-flag', pdfPath]), pdfPath, 'ordinary OS path works');
+    assert.equal(parsePdfFileArg(['--some-electron-flag', fileUri]), pdfPath, 'URI-encoded spaces from Linux %U become a filesystem path');
+    assert.equal(parsePdfFileArg([`"${fileUri}"`]), pdfPath, 'quoted desktop URI is also accepted');
+    assert.equal(parsePdfFileArg(['https://example.com/remote.pdf']), null, 'remote URLs are never read as local files');
+    assert.equal(parsePdfFileArg(['--pdf', join(tempDir, 'missing.pdf')]), null, 'a nonexistent PDF is ignored');
+  } finally {
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('OPEN WITH: a pdf pushed by the OS launch ("Open with > yayra") opens in the viewer as a new tab', async () => {
   const calls = fakeDesktop();
   const { shell } = await makeShell();
   try {
     assert.ok(fakeDesktop.push, 'the shell subscribed to open-pdf-file pushes');
+    const tabsBefore = shell.state.tabs.length;
     fakeDesktop.push({ name: 'from-desktop.pdf', data: PDF_BYTES.slice(0) });
+    assert.equal(shell.state.tabs.length, tabsBefore + 1, 'the desktop-opened PDF gets its own new tab');
     const tab = shell.getActiveTab();
     assert.ok(tab.isDocument, 'the OS-provided pdf opened in the viewer');
     assert.equal(tab.title, 'from-desktop.pdf');
@@ -165,6 +191,7 @@ test('DOWNLOADS RIGHT-CLICK: a downloaded pdf offers "Open in Yayra" and it open
     shell.showDownloadsContextMenu({ clientX: 120, clientY: 80, preventDefault: () => {} }, pdfItem);
     const menu = document.getElementById('yayra-dl-context-menu');
     assert.ok(menu, 'the context menu opened');
+    assert.match(menu.style.cssText, /z-index:2147483647/, 'the downloaded-file context menu stacks above the downloads panel');
     const entries = Array.from(menu.querySelectorAll('button')).map((b) => b.textContent);
     assert.ok(entries.includes('Open in Yayra'), '"Open in Yayra" is offered for pdf downloads');
 
@@ -210,10 +237,13 @@ test('DOWNLOADS RIGHT-CLICK: without the desktop bridge the honest notice shows 
 test('SOURCE PIN (main.cjs): OS "Open With" launches, desktop-app escape hatch, downloads->viewer bytes IPC', () => {
   const src = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
   // Open With: a real .pdf file argument is parsed, capped, and delivered.
-  assert.match(src, /function parsePdfFileArg\(argv\)/, 'argv pdf parser exists');
-  assert.ok(src.includes('/\\.pdf$/i.test(raw)'), 'only .pdf files are accepted');
+  const parser = readFileSync(new URL('../electron/pdfLaunch.cjs', import.meta.url), 'utf8');
+  assert.match(src, /require\('\.\/pdfLaunch\.cjs'\)/, 'main process uses the desktop-argument parser');
+  assert.match(parser, /fileURLToPath\(fileUrl\)/, 'Linux file:// launches are decoded to local paths');
+  assert.match(parser, /\\.pdf\$\/i\.test\(candidate\)/, 'only .pdf files are accepted');
   assert.match(src, /mainWindow\.webContents\.send\('yayra:open-pdf-file'/, 'bytes are pushed to the renderer');
   assert.match(src, /did-finish-load', \(\) => flushPendingPdfFiles\(\)\)/, 'cold-start launches flush once the shell is up');
+  assert.match(src, /webContents\.isLoadingMainFrame\(\)/, 'a second-instance launch waits for a newly-created renderer');
   assert.match(src, /const pdfFile = parsePdfFileArg\(argv \|\| \[\]\);/, 'second-instance pdf launches are handled');
   // Desktop app escape hatch: temp file + OS open, sanitized name.
   const ext = src.indexOf("ipcMain.handle('yayra:doc-open-externally'");
