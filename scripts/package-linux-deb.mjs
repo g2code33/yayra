@@ -34,14 +34,32 @@ if (!existsSync(distIndexPath)) {
 
 console.log(`[Linux DEB Packager] Building the self-contained Electron Debian application for Yayra v${pkg.version}...`);
 
-const result = spawnSync(electronBuilder.command, [...electronBuilder.args, '--linux', 'deb', '--publish', 'never'], {
-  cwd: root,
-  stdio: 'inherit',
-  env: process.env
-});
-if (result.error) {
-  console.error(`[Linux DEB Packager] Could not start electron-builder: ${result.error.message}`);
-  process.exit(1);
+// electron-builder must DOWNLOAD the Electron runtime zip from the CDN on
+// every fresh CI runner - the only network-dependent piece of `npm test`.
+// That download has intermittently failed on GitHub runners (transient
+// CDN/TLS errors, release run 38840844245), taking the whole pipeline down
+// even though the build config was byte-identical to the previous green
+// run. Retry with a short backoff before giving up; deterministic failures
+// (e.g. an invalid build config) still fail, just after the extra attempts.
+const maxAttempts = 3;
+let result = null;
+for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  if (attempt > 1) {
+    const backoffMs = 10000 * (attempt - 1);
+    console.warn(`[Linux DEB Packager] retrying electron-builder in ${backoffMs / 1000}s (attempt ${attempt}/${maxAttempts})...`);
+    await new Promise((resolve) => setTimeout(resolve, backoffMs));
+  }
+  result = spawnSync(electronBuilder.command, [...electronBuilder.args, '--linux', 'deb', '--publish', 'never'], {
+    cwd: root,
+    stdio: 'inherit',
+    env: process.env
+  });
+  if (result.error) {
+    console.error(`[Linux DEB Packager] Could not start electron-builder: ${result.error.message}`);
+    process.exit(1);
+  }
+  if (result.status === 0) break;
+  console.error(`[Linux DEB Packager] electron-builder failed with status ${result.status} (attempt ${attempt}/${maxAttempts}).`);
 }
 if (result.status !== 0) process.exit(result.status ?? 1);
 

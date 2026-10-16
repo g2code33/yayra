@@ -12,7 +12,8 @@
  *
  * This suite EXECUTES electron/main.cjs (and therefore its full ready
  * sequence: createWindow, overlay bubble, tray) under a mocked 'electron'
- * module and asserts:
+ * module (and a mocked uiohook-napi - the startup suite must never touch
+ * the native keyboard-hook binary) and asserts:
  *   1. the startup sequence completes without throwing;
  *   2. `win` stays declared-before-use in createWindow;
  *   3. a throw in the startup sequence is ROUTED to startup-error.log and
@@ -198,6 +199,58 @@ function createElectronMock({ userDataDir, mutateMock } = {}) {
 }
 
 /**
+ * Wait for the (fully mocked, but async) startup sequence to settle.
+ *
+ * A fixed `sleep(400)` is a coin flip on a loaded CI runner - `npm test`
+ * executes ~100 test files in parallel, so a chain that takes 50ms on an
+ * idle machine can take seconds under contention (and the v1.0.41 release
+ * run failed exactly this way). Instead: poll the observable startup
+ * effects until (a) SOMETHING happened (a window, an error box, or a
+ * startup-error.log entry) and (b) nothing changed for `quietMs`. Falls
+ * through after `timeoutMs` so a broken boot fails on the assertions
+ * instead of hanging the suite.
+ */
+async function settleStartup({ probe, started, timeoutMs = 20000, quietMs = 300, intervalMs = 25 }) {
+  const deadline = Date.now() + timeoutMs;
+  let last = probe();
+  let lastChange = Date.now();
+  let seenStart = started();
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    const now = probe();
+    seenStart = seenStart || started();
+    if (now !== last) {
+      last = now;
+      lastChange = Date.now();
+      continue;
+    }
+    if (seenStart && Date.now() - lastChange >= quietMs) return;
+  }
+}
+
+/**
+ * Hermetic stand-in for the uiohook-napi NATIVE module. On CI runners the
+ * real binding loads (X11 libs are installed) and start() tries to open an
+ * X display; headless machines hit libuiohook's fast-fail path whose
+ * condition-signal can race the waiting parent thread into a lost-wakeup
+ * deadlock (uv_cond_wait) - freezing the whole test process. The chords
+ * state machine is dependency-injected and unit-tested on its own; the
+ * startup suite only needs the documented wiring, so native code stays out.
+ */
+function createUiohookFake() {
+  const listeners = {};
+  return {
+    uIOhook: {
+      on: (event, fn) => { (listeners[event] = listeners[event] || []).push(fn); },
+      start: () => {},
+      stop: () => {}
+    },
+    UiohookKey: { CapsLock: 0x003a, Escape: 0x0001, F1: 0x003b, R: 0x0013, Y: 0x0015 },
+    listeners
+  };
+}
+
+/**
  * Load and boot electron/main.cjs under the mock. Returns the observable
  * startup effects. Throws (fails the test) if the ready sequence throws
  * uncaught; caught startup failures are observable via errorBoxes and the
@@ -205,7 +258,9 @@ function createElectronMock({ userDataDir, mutateMock } = {}) {
  */
 async function bootMain({ mutateMock, env = {} } = {}) {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'yayra-startup-'));
+  const startupErrorLogPath = path.join(userDataDir, 'startup-error.log');
   const { electronMock, windows, loadLog, appendSwitches, errorBoxes } = createElectronMock({ userDataDir, mutateMock });
+  const uiohookFake = createUiohookFake();
 
   const envApplied = [];
   for (const [k, v] of Object.entries(env)) {
@@ -222,6 +277,7 @@ async function bootMain({ mutateMock, env = {} } = {}) {
   const origLoad = Module._load;
   Module._load = function (request, parent, isMain) {
     if (request === 'electron') return electronMock;
+    if (request === 'uiohook-napi') return uiohookFake;
     return origLoad.call(this, request, parent, isMain);
   };
   let loadError = null;
@@ -231,8 +287,18 @@ async function bootMain({ mutateMock, env = {} } = {}) {
       if (key.startsWith(path.join(repoRoot, 'electron'))) delete require.cache[key];
     }
     require(path.join(repoRoot, 'electron', 'main.cjs'));
-    // Let the whenReady microtask chain (the whole startup sequence) run.
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    // Let the whenReady chain (the whole startup sequence) run to
+    // completion - condition-based, never a fixed sleep (see settleStartup).
+    await settleStartup({
+      probe: () => JSON.stringify([
+        windows.length,
+        loadLog.length,
+        appendSwitches.length,
+        errorBoxes.length,
+        fs.existsSync(startupErrorLogPath) ? fs.statSync(startupErrorLogPath).size : -1
+      ]),
+      started: () => windows.length > 0 || errorBoxes.length > 0 || fs.existsSync(startupErrorLogPath)
+    });
   } catch (err) {
     loadError = err;
   } finally {
