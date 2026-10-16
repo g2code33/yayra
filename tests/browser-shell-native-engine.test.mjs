@@ -205,6 +205,35 @@ test('Native overlays hide the active page immediately while fresh snapshots pai
   }
 });
 
+test('Install-as-app confirmation hides the native page and restores it after the user confirms', async () => {
+  const { calls, uninstall } = installFakeNativeWebview();
+  try {
+    const container = document.createElement('div');
+    const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+    await shell.initialize();
+    const tabId = shell.getActiveTab().id;
+    shell.navigateActiveTab('https://example.com/app');
+    shell.render(container);
+    calls.setVisible.length = 0;
+
+    const choice = shell._installPageAsAppDialog({ title: 'Example App', url: 'https://example.com/app' });
+    const overlay = document.getElementById('yayra-install-app-overlay');
+    assert.ok(overlay, 'the app-install dialog is mounted');
+    assert.equal(shell.state.isPageObscured, true, 'the dialog participates in the native-surface visibility state');
+    assert.ok(calls.setVisible.some((call) => call.tabId === tabId && call.visible === false), 'native page hides immediately so the dialog can be clicked');
+
+    overlay.querySelector('.fb-install-app-name').value = 'Example';
+    overlay.querySelector('.fb-btn-primary').click();
+    assert.equal(await choice, 'Example', 'the chosen app name resolves from the Install button');
+    assert.equal(document.getElementById('yayra-install-app-overlay'), null, 'confirmation is removed after the choice');
+    assert.equal(shell.state.isPageObscured, false, 'closing the dialog restores the page state');
+    assert.ok(calls.setVisible.some((call) => call.tabId === tabId && call.visible === true), 'native page becomes visible again');
+    shell.destroy();
+  } finally {
+    uninstall();
+  }
+});
+
 test('Native engine: a "navigated" event from the main process updates tab URL, security state, and back/forward state', async () => {
   const { fake, uninstall } = installFakeNativeWebview();
   try {

@@ -615,6 +615,9 @@ export class BrowserShell {
       // page surface painted right over it, so the close button looked
       // dead on desktop - "sometimes the close button misbehaves".
       s.closePrompt ||
+      // A body-mounted install confirmation is outside render(), but it must
+      // still keep the desktop native page surface out of the way.
+      Boolean(typeof document !== 'undefined' && document.getElementById('yayra-install-app-overlay')) ||
       // The update prompt cards ("Update available - now or later?" and
       // "Update downloaded - install when?") were missing for the SAME
       // reason: with a real site open the native page surface painted
@@ -3103,6 +3106,7 @@ export class BrowserShell {
         if (up(document.getElementById('yayra-reader-overlay'))) return false;
         if (up(document.getElementById('yayra-taskmgr-overlay'))) return false;
         if (up(document.getElementById('yayra-url-qr-overlay'))) return false;
+        if (up(document.getElementById('yayra-install-app-overlay'))) return false;
         const lists = document.querySelectorAll('.fb-search-suggestions');
         for (const list of (lists || [])) {
           if (up(list)) return false; // omnibox / new-tab suggestion dropdown
@@ -6667,8 +6671,10 @@ export class BrowserShell {
         if (settled) return;
         settled = true;
         try { overlay.remove(); } catch { /* already gone */ }
+        if (this.nativeWebview) this.setPageObscured(false);
         resolve(value);
       };
+      overlay._yayraFinish = finish;
       cancel.addEventListener('click', () => finish(null));
       install.addEventListener('click', () => finish(input.value.trim() || null));
       input.addEventListener('keydown', (event) => {
@@ -6683,6 +6689,10 @@ export class BrowserShell {
 
       overlay.appendChild(dialog);
       document.body.appendChild(overlay);
+      // Electron's native WebContentsView is a separate OS surface above
+      // the HTML tree. Mark this body-mounted dialog as an obscuring layer
+      // so the page is hidden immediately and the buttons receive clicks.
+      if (this.nativeWebview) this.setPageObscured(true);
       input.focus();
       input.select();
       this.bindTabLogoFallbacks(icon);
@@ -13292,6 +13302,12 @@ export class BrowserShell {
       detach(document.getElementById('yayra-reader-overlay'), 'reader');
       detach(document.getElementById('yayra-taskmgr-overlay'), 'task manager');
       detach(document.getElementById('yayra-url-qr-overlay'), 'QR dialog');
+      const installDialog = document.getElementById('yayra-install-app-overlay');
+      if (installDialog) {
+        if (typeof installDialog._yayraFinish === 'function') installDialog._yayraFinish(null);
+        else detach(installDialog, 'install app dialog');
+        dismissed = true;
+      }
       detach(document.body.querySelector('.fb-passkey-dialog-overlay'), 'passkey dialog');
       detach(document.querySelector('.fb-update-splash'), 'update splash');
     }
