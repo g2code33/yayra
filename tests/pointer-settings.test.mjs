@@ -62,6 +62,7 @@ test('SETTINGS UI: the Pointer section exists with style + size options and a li
     assert.deepEqual(sizeOptions, ['normal', 'large', 'xlarge'], 'three sizes');
     assert.ok(section.querySelector('.fb-pointer-preview'), 'live preview area');
     assert.match(section.textContent, /native operating-system pointer and its configured size/, 'the System option still explains OS cursor sizing');
+    assert.match(section.textContent, /web\/PWA mode,[\s\S]*cross-origin frames/, 'web/PWA users are told about the browser security limit');
   } finally {
     shell.destroy();
     delete globalThis.localStorage;

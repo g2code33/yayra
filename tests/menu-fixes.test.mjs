@@ -150,6 +150,59 @@ test('CAST, SAVE, AND SHARE → INSTALL PAGE AS APP: the submenu click installs 
   }
 });
 
+test('EXIT from Yayra menu quits the whole desktop app after the tab-session choice', async () => {
+  const previousBridge = window.yayra;
+  const calls = [];
+  const storage = makeStorage();
+  globalThis.localStorage = storage;
+  window.yayra = {
+    windowControls: {
+      close: () => { calls.push('close-window'); },
+      quit: () => { calls.push('quit-app'); }
+    }
+  };
+  const { shell, container } = await makeShell();
+  try {
+    shell.state.tabs[0].url = 'https://example.com/';
+    shell.state.tabs[0].title = 'Example';
+    shell.state.isSideDrawerOpen = true;
+    shell.render(container);
+
+    container.querySelector('.fb-dr-exit').click();
+    assert.equal(shell.state.closePrompt, true, 'open tabs get the session choice before exit');
+    assert.equal(shell.state.closePromptExitsApp, true, 'the choice is marked as an app-wide exit');
+    assert.deepEqual(calls, [], 'the app waits for the user\'s session choice');
+
+    container.querySelector('.fb-close-prompt-modal').querySelector('.fb-close-just-close').click();
+    assert.deepEqual(calls, ['quit-app'], 'Exit quits the entire app rather than closing only the main window');
+    assert.equal(JSON.parse(storage.getItem('yayra:close-session')).mode, 'recent', 'the chosen session mode is preserved');
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+    if (previousBridge === undefined) delete window.yayra;
+    else window.yayra = previousBridge;
+  }
+});
+
+test('EXIT on web/PWA tells the user to close the browser tab instead of silently doing nothing', async () => {
+  const previousBridge = window.yayra;
+  const notices = [];
+  delete window.yayra;
+  const { shell, container } = await makeShell();
+  try {
+    shell.showTransientNotice = (message) => notices.push(String(message));
+    shell.state.isSideDrawerOpen = true;
+    shell.render(container);
+    container.querySelector('.fb-dr-exit').click();
+    assert.equal(shell.state.isSideDrawerOpen, false, 'the menu closes');
+    assert.match(notices.at(-1), /close this browser tab/i, 'browser security is explained clearly');
+  } finally {
+    shell.destroy();
+    if (previousBridge === undefined) delete window.yayra;
+    else window.yayra = previousBridge;
+  }
+});
+
 test('INSTALL AS APP (web): triggers the browser\'s real PWA install flow when available; internal pages are refused honestly', async () => {
   const { shell, container } = await makeShell();
   try {

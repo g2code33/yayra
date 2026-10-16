@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { setupDomShim } from './dom-shim.mjs';
 
 setupDomShim();
@@ -55,6 +56,14 @@ test('web/PWA (no bridge): no window-control buttons - the browser owns the wind
 
   assert.equal(shell.windowControls, null);
   assert.equal(el.querySelector('.fb-window-controls'), null);
+});
+
+test('Exit bridge quits the whole Electron app separately from closing only the current window', () => {
+  const preload = readFileSync(new URL('../electron/preload.cjs', import.meta.url), 'utf8');
+  const main = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
+  assert.match(preload, /quit:\s*\(\)\s*=>\s*ipcRenderer\.invoke\('yayra:app-quit'\)/, 'preload exposes an explicit app-wide quit action');
+  assert.match(main, /ipcMain\.handle\('yayra:app-quit',[\s\S]{0,220}app\.quit\(\)/, 'the menu can terminate tray/bubble windows too');
+  assert.match(main, /ipcMain\.handle\('yayra:window-close',[\s\S]{0,140}senderWindow\(event\)\?\.close\(\)/, 'the regular close button still closes only its window');
 });
 
 test('Electron (bridge present): real minimize/maximize/close buttons render and drive the IPC bridge', async () => {

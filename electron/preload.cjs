@@ -14,7 +14,10 @@ const api = {
     minimize: () => ipcRenderer.invoke('yayra:window-minimize'),
     toggleMaximize: () => ipcRenderer.invoke('yayra:window-maximize-toggle'),
     isMaximized: () => ipcRenderer.invoke('yayra:window-is-maximized'),
-    close: () => ipcRenderer.invoke('yayra:window-close')
+    close: () => ipcRenderer.invoke('yayra:window-close'),
+    // Explicit menu > Exit: unlike close(), this quits the whole app and
+    // its floating bubble/tray process, not only this BrowserWindow.
+    quit: () => ipcRenderer.invoke('yayra:app-quit')
   },
   updates: {
     check: () => ipcRenderer.invoke('yayra:updates-check'),

@@ -362,6 +362,9 @@ export class BrowserShell {
       updateInstallPrompt: null,
       // "Close Yayra?" prompt (close all / just close / keep all tabs)
       closePrompt: false,
+      // Menu > Exit quits the whole desktop app after the session choice;
+      // the tab-strip close button still closes only the current window.
+      closePromptExitsApp: false,
       // "Reopen recent tabs?" offer after a plain close: [{url,title}]
       recentTabsOffer: null,
       // Real "Sign in with Google" app-level identity (Electron desktop only
@@ -4374,7 +4377,8 @@ export class BrowserShell {
             </div>
             <p style="font-size:0.75rem; color:var(--fb-text-muted); margin:10px 0 0; line-height:1.5;">
               Custom styles apply to Yayra's interface and websites opened in Yayra's built-in web views. The
-              System style keeps the native operating-system pointer and its configured size.
+              System style keeps the native operating-system pointer and its configured size. In web/PWA mode,
+              browser security prevents restyling external sites inside cross-origin frames.
             </p>
           </section>
           <section class="fb-settings-group-card" id="sec-privacy" style="${activeCat === 'privacy' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
@@ -6391,9 +6395,10 @@ export class BrowserShell {
   /** window.yayra.system (Electron): app metrics + desktop shortcuts. */
   /**
    * Apply the saved pointer to Yayra's chrome and every native site view.
-   * The native engine injects the same visible arrow/hand styles into each
-   * loaded page (including child frames); 'system' removes those styles and
-   * leaves the OS cursor untouched.
+   * Desktop uses a CSP-resilient user stylesheet on each native website view
+   * and a nonce-aware best-effort fallback for child frames; Android applies
+   * the same theme in its native WebView. A plain browser/PWA cannot reach
+   * into cross-origin iframes.
    */
   applyPointerTheme() {
     const requestedTheme = this.state.settings.pointerTheme || 'system';
@@ -8227,22 +8232,58 @@ export class BrowserShell {
    * The choice is stored in localStorage ('yayra:close-session') and
    * consumed exactly once by the next launch (restoreCloseSession()).
    * ----------------------------------------------------------- */
-  requestAppClose() {
+  /** Exit the whole app from the Yayra menu (not just close this window). */
+  exitYayra() {
+    const controls = this.windowControls;
+    if (controls && typeof controls.quit === 'function') {
+      // Desktop asks how to handle open tabs, then quits every window,
+      // including the always-on floating bubble and tray process.
+      this.requestAppClose({ exitWholeApp: true });
+      return;
+    }
+
+    // Native Android: Capacitor's App plugin is the supported process exit.
+    try {
+      const app = typeof window !== 'undefined' ? window.Capacitor?.Plugins?.App : null;
+      if (app && typeof app.exitApp === 'function') {
+        Promise.resolve(app.exitApp()).catch(() => {});
+        return;
+      }
+    } catch { /* fall through to the browser-safe explanation */ }
+
+    // A website cannot close a tab it did not open. Try the user-initiated
+    // close for standalone/browser launches, then be explicit if blocked.
+    this.state.isSideDrawerOpen = false;
+    this.render();
+    try { if (typeof window !== 'undefined') window.close?.(); } catch { /* browser may block it */ }
+    this.showTransientNotice('To exit Yayra, close this browser tab or app window.');
+  }
+
+  requestAppClose({ exitWholeApp = false } = {}) {
     // Only REAL web pages warrant the session prompt. Internal pages
     // (Settings, History, ...) used to count as "real tabs", so closing
     // an app that showed only Settings interrogated the user about
     // nothing - and could even save yayra:// URLs as the session.
     const realTabs = this.state.tabs.filter((t) => !t.isPrivate && /^https?:\/\//i.test(t.url || ''));
+    const controls = this.windowControls;
+    const canQuitWholeApp = exitWholeApp && controls && typeof controls.quit === 'function';
     if (!realTabs.length || typeof document === 'undefined') {
-      try { this.windowControls?.close(); } catch { /* already closing */ }
+      try {
+        if (canQuitWholeApp) controls.quit();
+        else controls?.close();
+      } catch { /* already closing */ }
+      this.state.closePromptExitsApp = false;
       return;
     }
+    this.state.closePromptExitsApp = Boolean(canQuitWholeApp);
     this.state.closePrompt = true;
     this.render();
   }
 
   closeWithSessionMode(mode) {
+    const exitWholeApp = Boolean(this.state.closePromptExitsApp);
     this.state.closePrompt = false;
+    this.state.closePromptExitsApp = false;
     const tabs = mode === 'fresh'
       ? []
       : this.state.tabs
@@ -8253,7 +8294,10 @@ export class BrowserShell {
         localStorage.setItem('yayra:close-session', JSON.stringify({ mode, tabs, savedAt: new Date().toISOString() }));
       } catch { /* storage unavailable - closing still works */ }
     }
-    try { this.windowControls?.close(); } catch { /* already closing */ }
+    try {
+      if (exitWholeApp && typeof this.windowControls?.quit === 'function') this.windowControls.quit();
+      else this.windowControls?.close();
+    } catch { /* already closing */ }
     // Web/PWA builds have no native window to close - at least dismiss
     // the prompt so the choice is still honoured on the next visit.
     this.render();
@@ -8325,6 +8369,7 @@ export class BrowserShell {
     scrim.className = 'fb-close-prompt-scrim';
     scrim.addEventListener('click', () => {
       this.state.closePrompt = false;
+      this.state.closePromptExitsApp = false;
       this.render();
     });
     root.appendChild(scrim);
@@ -8349,6 +8394,7 @@ export class BrowserShell {
     modal.querySelector('.fb-close-all-tabs')?.addEventListener('click', () => this.closeWithSessionMode('fresh'));
     modal.querySelector('.fb-close-cancel')?.addEventListener('click', () => {
       this.state.closePrompt = false;
+      this.state.closePromptExitsApp = false;
       this.render();
     });
     root.appendChild(modal);
@@ -9878,10 +9924,12 @@ export class BrowserShell {
       this.openDevToolsForActiveTab();
     });
 
-    // "Exit" must actually exit (it used to just minimize to the bubble).
+    // Exit means quit the whole app (including the desktop bubble/tray),
+    // not just close this window. Web builds explain that only the browser
+    // can close its own tab.
     drawer.querySelector('.fb-dr-exit')?.addEventListener('click', () => {
       this.state.isSideDrawerOpen = false;
-      this.requestAppClose();
+      this.exitYayra();
     });
 
     root.appendChild(scrim);

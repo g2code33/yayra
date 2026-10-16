@@ -698,6 +698,13 @@ function registerIpcBridges() {
   ipcMain.handle('yayra:window-close', (event) => {
     senderWindow(event)?.close();
   });
+  // Menu > Exit is app-wide. The window close button intentionally closes
+  // only its BrowserWindow so the optional floating bubble can stay alive.
+  ipcMain.handle('yayra:app-quit', (event) => {
+    if (!senderWindow(event)) return false;
+    app.quit();
+    return true;
+  });
 
   // Menu > More tools > Performance / Task manager: REAL process metrics
   // (no invented numbers). Summarized here so the renderer gets plain data.

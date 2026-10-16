@@ -6109,21 +6109,24 @@ html {
 /* =============================================================
    POINTER SETTINGS (Settings > Pointer)
    ============================================================= */
-/* Users can customize the pointer inside Yayra. "System" (default)
-   requests ONLY native system cursors, so the pointer always matches
-   the OS pointer size (Windows Settings > Accessibility > Mouse
-   pointer; see tests/native-cursor-size.test.mjs). The custom themes
-   below replace the arrow + hand with SVG cursors in three sizes.
+/* Users can customize the pointer inside Yayra and across pages rendered
+   by its native website views. "System" (default) requests ONLY native
+   system cursors, so the pointer always matches the OS pointer size
+   (Windows Settings > Accessibility > Mouse pointer; see the native cursor
+   tests). The custom themes below replace arrow + hand with SVG cursors.
 
-   Scope, honestly: custom themes style YAYRA'S OWN interface. Content
-   inside web pages (iframes/native engine) keeps the site's own
-   pointer behavior - a browser must not repaint the web.
+   Electron installs a user-origin stylesheet into each native site view and
+   uses nonce-aware best-effort injection for child frames. Android applies
+   the same theme to its native WebViews. A strict child-frame CSP without a
+   usable nonce, or a policy that blocks data-backed cursor images, can still
+   prevent the graphic. A plain web/PWA build is limited: browser same-origin
+   isolation prevents the shell from restyling an arbitrary cross-origin site
+   inside an iframe.
 
-   The application rules need !important because most of the app's
-   cursor styling is inline (style="...cursor:pointer...") and inline
-   styles otherwise beat any stylesheet rule. Text fields keep the
-   NATIVE text cursor: it follows the OS pointer size, and an SVG
-   I-beam renders worse than the real one. */
+   The application rules need !important because most Yayra cursor styling
+   is inline and page styles may also use !important. Text fields keep the
+   NATIVE text cursor: it follows the OS pointer size, and an SVG I-beam
+   renders worse than the real one. */
 
 /* Theme shapes (24px base; one SVG per shape, scaled by width/height) */
 [data-fb-pointer='yayra'] {

@@ -113,9 +113,9 @@ function buildPointerThemeCss(theme, size = 'normal') {
 }
 
 /**
- * Make a page-owned style resilient to navigation, route changes and a
- * site's own DOM replacing its <head>. It stays inside the page renderer;
- * no site requests, cookies or page content are touched.
+ * Best-effort page-owned fallback for frame APIs that do not support
+ * user-origin CSS insertion. It is nonce-aware and resilient to navigation,
+ * route changes and a site's own DOM replacing its <head>.
  */
 function buildPointerThemeScript(theme, size = 'normal') {
   const normalizedTheme = theme === 'yayra' || theme === 'high-visibility' ? theme : 'system';
@@ -133,6 +133,9 @@ function buildPointerThemeScript(theme, size = 'normal') {
         if (!root) return;
         var style = document.getElementById(id);
         if (!style) { style = document.createElement('style'); style.id = id; }
+        var nonceNode = document.querySelector('style[nonce],script[nonce]');
+        var nonce = nonceNode && (nonceNode.nonce || nonceNode.getAttribute('nonce'));
+        if (nonce) style.setAttribute('nonce', nonce);
         if (style.textContent !== css) style.textContent = css;
         var parent = document.head || root;
         if (style.parentNode !== parent) parent.appendChild(style);
@@ -496,35 +499,119 @@ function createWebviewBridge({
     };
   }
 
+  function removePointerCss(target, key, wc) {
+    const owner = target && typeof target.removeInsertedCSS === 'function' ? target : wc;
+    if (!owner || typeof owner.removeInsertedCSS !== 'function' || !key) return;
+    try {
+      const result = owner.removeInsertedCSS(key);
+      if (result && typeof result.catch === 'function') result.catch(() => {});
+    } catch { /* a navigated frame may have already discarded its style */ }
+  }
+
+  function executePointerThemeFallback(frames, theme, size) {
+    const script = buildPointerThemeScript(theme, size);
+    for (const frame of frames) {
+      if (!frame || typeof frame.executeJavaScript !== 'function') continue;
+      try {
+        const result = frame.executeJavaScript(script, true);
+        if (result && typeof result.catch === 'function') result.catch(() => {});
+      } catch { /* best-effort fallback for older Electron surfaces */ }
+    }
+  }
+
   function applyPointerThemeToPage(entry) {
     const wc = entry && entry.view && entry.view.webContents;
-    if (!wc || typeof wc.executeJavaScript !== 'function') return;
-    const script = buildPointerThemeScript(entry.pointerTheme, entry.pointerSize);
+    if (!wc) return;
+
     const frames = [];
     const seen = new Set();
     try {
       const mainFrame = wc.mainFrame;
-      if (mainFrame && typeof mainFrame.executeJavaScript === 'function') {
+      if (mainFrame) {
         frames.push(mainFrame);
         seen.add(mainFrame);
       }
       const subtree = mainFrame && mainFrame.framesInSubtree;
       if (subtree && typeof subtree[Symbol.iterator] === 'function') {
         for (const frame of subtree) {
-          if (frame && typeof frame.executeJavaScript === 'function' && !seen.has(frame)) {
+          if (frame && !seen.has(frame)) {
             frames.push(frame);
             seen.add(frame);
           }
         }
       }
     } catch { /* an about:blank or tearing-down frame may not be traversable */ }
-
     if (!frames.length) frames.push(wc);
-    for (const frame of frames) {
-      try {
-        const result = frame.executeJavaScript(script, true);
-        if (result && typeof result.catch === 'function') result.catch(() => {});
-      } catch { /* a navigated or CSP-locked frame keeps its native cursor */ }
+
+    const theme = entry.pointerTheme === 'yayra' || entry.pointerTheme === 'high-visibility'
+      ? entry.pointerTheme
+      : 'system';
+    const size = entry.pointerSize === 'large' || entry.pointerSize === 'xlarge'
+      ? entry.pointerSize
+      : 'normal';
+    const revision = (entry.pointerCssRevision || 0) + 1;
+    entry.pointerCssRevision = revision;
+    const installed = entry.pointerCssEntries || new Map();
+    entry.pointerCssEntries = installed;
+
+    // User-origin CSS is installed by Chromium rather than as a page-owned
+    // <style> tag, so the site's style-src CSP cannot block the stylesheet;
+    // user-important rules also outrank site cursor declarations. Prefer
+    // per-frame insertion where Electron exposes it. The WebContents API
+    // styles the main page; nonce-aware page injection supplements child
+    // frames and did-frame-finish-load reapplies after navigation. A child
+    // frame without a usable nonce, or a site that blocks data-backed cursor
+    // images, can still prevent the custom graphic from rendering.
+    const frameTargets = frames.filter((frame) => typeof frame.insertCSS === 'function');
+    let targets = [];
+    if (frames.length > 0 && frameTargets.length === frames.length) targets = frameTargets;
+    else if (typeof wc.insertCSS === 'function') targets = [wc];
+    else if (frameTargets.length > 0) targets = frameTargets;
+
+    if (theme === 'system') {
+      const previous = Array.from(installed.entries());
+      installed.clear();
+      for (const [target, key] of previous) removePointerCss(target, key, wc);
+      // Remove a page-owned stylesheet left by older/limited Electron APIs.
+      executePointerThemeFallback(frames, 'system', size);
+      return;
+    }
+
+    if (!targets.length) {
+      executePointerThemeFallback(frames, theme, size);
+      return;
+    }
+
+    const css = buildPointerThemeCss(theme, size);
+    for (const [target, oldKey] of Array.from(installed.entries())) {
+      if (!targets.includes(target)) {
+        installed.delete(target);
+        removePointerCss(target, oldKey, wc);
+      }
+    }
+
+    for (const target of targets) {
+      let insertion;
+      try { insertion = target.insertCSS(css, { cssOrigin: 'user' }); }
+      catch {
+        executePointerThemeFallback(frames, theme, size);
+        continue;
+      }
+      Promise.resolve(insertion).then((key) => {
+        if (!key) return;
+        // A quick theme change/navigation may finish a prior insertion late.
+        // Remove stale CSS instead of allowing it to override the new choice.
+        if (entry.pointerCssRevision !== revision || entry.pointerTheme !== theme || entry.pointerSize !== size) {
+          removePointerCss(target, key, wc);
+          return;
+        }
+        const previousKey = installed.get(target);
+        installed.set(target, key);
+        if (previousKey && previousKey !== key) removePointerCss(target, previousKey, wc);
+      }).catch(() => executePointerThemeFallback(frames, theme, size));
+    }
+    if (targets.includes(wc) && wc.mainFrame) {
+      executePointerThemeFallback(frames.filter((frame) => frame !== wc.mainFrame), theme, size);
     }
   }
 

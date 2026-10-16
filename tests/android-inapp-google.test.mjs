@@ -306,6 +306,7 @@ test('KOTLIN PIN: the native tab engine exists, is safe, and reports through tab
   assert.ok(manager.includes('fun setVisible('), 'visibility control');
   assert.ok(manager.includes('fun setPointerTheme('), 'website pointer preference reaches live Android tabs');
   assert.ok(manager.includes('applyPointerThemeToPage'), 'the custom cursor is injected into the page renderer');
+  assert.ok(manager.includes("style[nonce],script[nonce]"), 'site CSP nonces are reused where available so custom cursors remain visible');
   assert.ok(manager.includes('Bitmap.createBitmap'), 'hiding captures the page frame (no blank flash under chrome)');
   assert.ok(manager.includes('fun navigate('), 'omnibox navigation');
   assert.ok(manager.includes('fun goBack('), 'back history');

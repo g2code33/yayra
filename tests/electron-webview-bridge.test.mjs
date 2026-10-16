@@ -174,34 +174,53 @@ test('webview bridge: creating a tab adds a WebContentsView as a child view and 
   assert.equal(fakeWin.contentView.children.length, 1, 'view attached to the window content view (not an <iframe>)');
 });
 
-test('webview bridge: persisted pointer settings apply to every loaded frame and survive later frame loads', async () => {
+test('webview bridge: user-origin pointer styles bypass site CSP, style child frames best-effort, and update live', async () => {
   const { handlers, views } = makeHarness();
   const ensure = handlers.get('yayra:webview-ensure');
   await ensure(null, { tabId: 'tab-pointer', url: 'https://example.com/', pointerTheme: 'yayra', pointerSize: 'large' });
   const wc = views[0].webContents;
   const frameScripts = [];
+  const inserted = new Map();
+  const insertionCalls = [];
+  let nextKey = 0;
   const makeFrame = () => ({ executeJavaScript: async (script) => { frameScripts.push(script); return true; } });
   const mainFrame = makeFrame();
   const childFrame = makeFrame();
   mainFrame.framesInSubtree = [mainFrame, childFrame];
   wc.mainFrame = mainFrame;
   wc.executeJavaScript = async (script) => { frameScripts.push(script); return true; };
+  wc.insertCSS = async (css, options) => {
+    const key = `pointer-${++nextKey}`;
+    inserted.set(key, { css, options });
+    insertionCalls.push({ key, css, options });
+    return key;
+  };
+  wc.removeInsertedCSS = async (key) => { inserted.delete(key); };
 
+  const flushStyles = () => new Promise((resolve) => setImmediate(resolve));
   wc.emit('dom-ready');
-  await Promise.resolve();
-  assert.equal(frameScripts.filter((script) => script.includes('yayra-custom-pointer-theme')).length, 2, 'main document and child frame both receive the custom pointer');
-  assert.ok(frameScripts.some((script) => script.includes('data:image/svg+xml')), 'cursor art is embedded locally');
+  await flushStyles();
+  assert.equal(inserted.size, 1, 'the main website document receives a user-origin stylesheet');
+  assert.equal(insertionCalls.length, 1);
+  assert.equal(insertionCalls[0].options.cssOrigin, 'user', 'page CSP and author !important rules cannot block the native stylesheet');
+  assert.ok(insertionCalls[0].css.includes('data:image/svg+xml'), 'cursor artwork is embedded, not fetched from a site');
+  assert.ok(frameScripts.some((script) => script.includes("style[nonce],script[nonce]")), 'nonce-aware fallback also styles child frames');
 
   const setTheme = handlers.get('yayra:webview-set-pointer-theme');
   assert.deepEqual(setTheme(null, { tabId: 'tab-pointer', theme: 'high-visibility', size: 'xlarge' }), { ok: true });
-  assert.ok(frameScripts.some((script) => script.includes('%23ffd400') && script.includes('width%3D%2248%22')), 'live setting changes update all loaded pages at the chosen size');
+  await flushStyles();
+  assert.equal(inserted.size, 1, 'live change replaces, rather than stacks, the old style');
+  assert.ok([...inserted.values()].every(({ css }) => css.includes('%23ffd400') && css.includes('width%3D%2248%22')), 'live settings reach the website at the selected size');
 
   wc.emit('did-frame-finish-load', {}, false, 1, 2);
-  await Promise.resolve();
-  assert.ok(frameScripts.filter((script) => script.includes('yayra-custom-pointer-theme')).length >= 6, 'a later child-frame load is re-styled too');
+  await flushStyles();
+  assert.equal(inserted.size, 1, 'a later frame load reapplies without leaving duplicate styles');
+  assert.equal(insertionCalls.length, 3, 'the user stylesheet refreshes on later frame loads');
 
   setTheme(null, { tabId: 'tab-pointer', theme: 'system', size: 'normal' });
-  assert.ok(frameScripts.some((script) => script.includes('delete window.__yayraPointerThemeObserver')), 'switching back to System removes the injected override');
+  await flushStyles();
+  assert.equal(inserted.size, 0, 'System removes the installed user style');
+  assert.ok(frameScripts.some((script) => script.includes('delete window.__yayraPointerThemeObserver')), 'page-owned child-frame styles are removed too');
 });
 
 test('webview bridge: re-ensuring the same tab with the same URL does not reload', async () => {
