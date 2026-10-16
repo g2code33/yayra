@@ -570,6 +570,18 @@ test('Requirement 5 & 7: New Tab Developer Ad Badges Showcase above Logo without
   assert.ok(sponsored, 'Developer ad badges showcase must render above logo');
   assert.ok(container.querySelectorAll('.fb-dev-ad-card').length >= 4, 'Developer ad badges should be present');
   assert.ok(container.querySelectorAll('.fb-dev-ad-label').length >= 4, 'Developer ad links should show as a horizontal labelled row');
+
+  const designSystem = readFileSync(new URL('../packages/shared-ui/src/theme/design-system.css', import.meta.url), 'utf8');
+  const lightCardStart = designSystem.indexOf('[data-theme="light"] .fb-dev-ad-card.fb-sponsored-card {');
+  const lightCardRule = lightCardStart >= 0 ? designSystem.slice(lightCardStart, designSystem.indexOf('}', lightCardStart)) : '';
+  assert.ok(lightCardRule, 'light-theme sponsor cards have a targeted rule');
+  assert.ok(lightCardRule.includes('background: #ffffff;'));
+  assert.ok(lightCardRule.includes('color: var(--fb-text-primary);'));
+  assert.ok(lightCardRule.includes('border-color: rgba(15, 23, 42, 0.12);'), 'sponsor border stays subtle at roughly 12% opacity');
+  const lightHoverStart = designSystem.indexOf('[data-theme="light"] .fb-dev-ad-card.fb-sponsored-card:hover,');
+  const lightHoverRule = lightHoverStart >= 0 ? designSystem.slice(lightHoverStart, designSystem.indexOf('}', lightHoverStart)) : '';
+  assert.ok(lightHoverRule.includes('background: #f8fafc;'));
+  assert.ok(lightHoverRule.includes('box-shadow: 0 6px 18px rgba(8, 145, 178, 0.12);'), 'light-theme hover is a restrained accent');
 });
 
 test('Requirement 11: Downloads page includes Visit File Location button and List vs Card View Toggle', async () => {

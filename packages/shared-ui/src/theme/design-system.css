@@ -4600,6 +4600,34 @@ html {
   object-fit: contain;
 }
 
+/* Targeted light-theme treatment: make sponsor cards read as clean, legible
+   surfaces instead of translucent white-on-white glass. Dark-theme cards
+   continue to use the original glass styling above. */
+[data-theme="light"] .fb-dev-ad-card.fb-sponsored-card {
+  background: #ffffff;
+  color: var(--fb-text-primary);
+  border-color: rgba(15, 23, 42, 0.12);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.04);
+}
+
+[data-theme="light"] .fb-sponsored-card .fb-dev-ad-label {
+  color: var(--fb-text-primary);
+}
+
+[data-theme="light"] .fb-sponsored-card .fb-dev-ad-domain {
+  color: var(--fb-text-secondary);
+}
+
+[data-theme="light"] .fb-dev-ad-card.fb-sponsored-card:hover,
+[data-theme="light"] .fb-dev-ad-card.fb-sponsored-card:focus-visible {
+  background: #f8fafc;
+  border-color: rgba(8, 145, 178, 0.34);
+  box-shadow: 0 6px 18px rgba(8, 145, 178, 0.12);
+  outline: none;
+}
+
 /* =============================================================
    7. CUTE COMPACT TAB STRIP & TOOLBAR BUTTON REFINEMENTS
    ============================================================= */
