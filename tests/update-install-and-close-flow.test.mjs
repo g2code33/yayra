@@ -94,8 +94,12 @@ test('staged update: "Later - manually" dismisses but Settings -> Yayra Updates 
     shell.state.updateInstallPrompt = { path: '/tmp/yayra-new.deb', version: '2.0.0' };
     shell.render(container);
 
-    container.querySelector('.fb-update-install-later').click();
+    // The install card is a window-level overlay on document.body now.
+    const installCard = document.getElementById('yayra-update-install-card');
+    assert.ok(installCard, 'install choice card rendered');
+    installCard.querySelector('.fb-update-install-later').click();
     assert.equal(shell.state.updateInstallPrompt, null);
+    assert.equal(document.getElementById('yayra-update-install-card'), null, 'dismissed card is gone from the DOM');
     assert.equal(installs.length, 0);
 
     // Manual home: the "Yayra Updates" settings section still has BOTH options.
@@ -113,6 +117,10 @@ test('staged update: "Later - manually" dismisses but Settings -> Yayra Updates 
     await new Promise((r) => setTimeout(r, 10));
     assert.deepEqual(installs, [{ path: '/tmp/yayra-new.deb', version: '2.0.0' }], 'manual install carries the staged path and version');
   } finally {
+    // Window-level prompt cards live on document.body - clear them so a
+    // failed assertion cannot leak a card into later tests.
+    document.getElementById('yayra-update-install-card')?.remove();
+    document.getElementById('yayra-update-prompt-card')?.remove();
     bridge.uninstall();
     cleanup();
   }

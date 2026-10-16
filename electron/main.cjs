@@ -23,6 +23,7 @@ const { createOverlayBridge } = require('./overlayWindow.cjs');
 const { createOverlayStore } = require('./overlayStore.cjs');
 const { createScreenRecorder } = require('./screenRecorder.cjs');
 const { createTrayController } = require('./tray.cjs');
+const { applyVaapiPolicy } = require('./vaapiProbe.cjs');
 
 const CUSTOM_SCHEME = 'yayra';
 const DIST_DIR = path.join(__dirname, '..', 'dist');
@@ -102,7 +103,7 @@ if (process.platform === 'linux') {
     app.whenReady().then(() => {
       app.relaunch(relaunchOpts);
       app.exit(0);
-    });
+    }).catch((err) => reportStartupFailure('x11-relaunch', err));
   } else if (display === '') {
     console.warn('[yayra] no $DISPLAY - staying on the native backend; bubble drag/topmost may be limited on native Wayland');
   }
@@ -112,8 +113,15 @@ if (process.platform === 'linux') {
 // looks like "the app is not opening at all"). Surface it in a native
 // error box when possible and always append it to a log file next to
 // the user data, so there is something actionable to report.
-process.on('uncaughtException', (err) => {
-  const detail = `[${new Date().toISOString()}] uncaughtException\n${err && err.stack ? err.stack : String(err)}\n`;
+//
+// BOTH failure shapes are routed here: uncaughtException, and promise
+// rejections - the app.whenReady() startup sequence is async, so a throw
+// inside it (e.g. createWindow) surfaces as an unhandled rejection. That
+// shape used to escape this logger entirely: the only trace was a
+// UnhandledPromiseRejectionWarning on stderr and a silently running
+// zombie with no window ("the app is crashing / not opening").
+function reportStartupFailure(kind, err) {
+  const detail = `[${new Date().toISOString()}] ${kind}\n${err && err.stack ? err.stack : String(err)}\n`;
   try {
     const dir = app.getPath('userData');
     fs.mkdirSync(dir, { recursive: true });
@@ -121,10 +129,15 @@ process.on('uncaughtException', (err) => {
   } catch { /* disk unavailable - still try to show the box */ }
   try { console.error(detail); } catch { /* stderr gone */ }
   try {
+    console.error(`[yayra] startup failed (${kind}) - details appended to ${path.join(app.getPath('userData'), 'startup-error.log')}`);
+  } catch { /* stderr gone */ }
+  try {
     const { dialog } = require('electron');
     if (app.isReady()) dialog.showErrorBox('Yayra hit an unexpected error', String(err && err.stack ? err.stack : err));
   } catch { /* headless / too early */ }
-});
+}
+process.on('uncaughtException', (err) => reportStartupFailure('uncaughtException', err));
+process.on('unhandledRejection', (err) => reportStartupFailure('unhandledRejection', err));
 
 // GPU self-heal: on some Linux driver/XWayland combos Chromium's GPU
 // process segfault-loops ("GPU process exited unexpectedly:
@@ -143,6 +156,16 @@ if (softwareRenderActive) {
   app.disableHardwareAcceleration();
   console.warn(`[yayra] software rendering active (the GPU process crashed on this machine before). Delete ${softwareRenderFlagPath()} to retry hardware acceleration.`);
 }
+
+// VA-API video decode: on Linux boxes with no VA driver installed (common
+// on fresh Ubuntu), Chromium's GPU process probes VA-API at startup and
+// logs "vaInitialize failed: unknown libva error" on every launch -
+// harmless (software video decode) but reads like a crash. Skip the probe
+// when there is no driver to use; see electron/vaapiProbe.cjs.
+try {
+  applyVaapiPolicy({ app, platform: process.platform, fsImpl: fs, logger: console });
+} catch { /* probe is best-effort - never block startup over it */ }
+
 let gpuCrashCount = 0;
 app.on('child-process-gone', (_event, details) => {
   if (!details || details.type !== 'GPU') return;
@@ -628,7 +651,7 @@ app.whenReady().then(async () => {
       console.warn(`[yayra] could not register Ctrl+Alt+Y global shortcut: ${err?.message || err}`);
     }
   }
-});
+}).catch((err) => reportStartupFailure('startup-sequence', err));
 
 app.on('will-quit', () => {
   try { globalHotkeys?.detach(); } catch { /* exiting */ }
@@ -1131,6 +1154,8 @@ function createWindow() {
     }
   });
 
+  const win = mainWindow;
+
   // PDFs queued before the window existed (OS "Open With" at cold start)
   // are delivered the moment the shell renderer finished loading - the
   // preload's listener is attached before any page script runs.
@@ -1142,7 +1167,6 @@ function createWindow() {
   // own context menu wired in electron/webviewBridge.cjs), so without this
   // right-clicking the address bar or any text field in Yayra's own UI
   // would show no menu at all.
-  const win = mainWindow;
   win.webContents.on('context-menu', (_event, params) => {
     if (win.isDestroyed()) return;
     const template = buildContextMenuTemplate({

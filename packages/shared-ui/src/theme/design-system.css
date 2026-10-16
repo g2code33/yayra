@@ -3203,19 +3203,28 @@ html {
 
 /* -------------------------------------------------------------
    "UPDATE AVAILABLE - NOW OR LATER?" CARD (background auto-checks)
-   ------------------------------------------------------------- */
+   -------------------------------------------------------------
+   THE update prompt is a WINDOW-LEVEL overlay: it is pinned to the TOP
+   RIGHT CORNER and stacked ABOVE EVERYTHING - the maximum CSS z-index
+   beats the post-update splash (2147483000), close-prompt modals,
+   toasts, menus and dropdowns, so nothing can ever cover it. It mounts
+   on document.body with position:fixed (see BrowserShell
+   renderUpdatePromptCard) so no ancestor stacking context can trap it
+   under other chrome either. The install-choice card
+   (.fb-update-install-card) shares this box.
+   ----------------------------------------------------------- */
 .fb-update-prompt-card {
-  position: absolute;
-  top: 88px;
-  right: 16px;
+  position: fixed;
+  top: 12px;
+  right: 12px;
   width: 330px;
-  max-width: calc(100vw - 32px);
+  max-width: calc(100vw - 24px);
   background: #0f172a;
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 14px;
   box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
   padding: 16px;
-  z-index: 500003;
+  z-index: 2147483647;
   display: flex;
   flex-direction: column;
   gap: 12px;

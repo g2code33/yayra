@@ -52,8 +52,20 @@ function installDialogSpies() {
   return { confirms, reloads, uninstall: () => { delete window.confirm; delete window.alert; } };
 }
 
+// The prompt is a WINDOW-LEVEL overlay: it mounts on document.body at the
+// top right corner (see BrowserShell.renderUpdatePromptCard), never
+// inside the shell container. `container` is kept in the call signature
+// for readability at the call sites.
 function findUpdateCard(container) {
-  return container.querySelector('.fb-update-prompt-card');
+  return document.getElementById('yayra-update-prompt-card')
+    || document.querySelector('.fb-update-prompt-card');
+}
+
+// Cards are body-level, so they outlive their test's container unless
+// cleared (re-renders of a dead shell can no longer clean them up).
+function clearUpdateCards() {
+  document.getElementById('yayra-update-prompt-card')?.remove();
+  document.getElementById('yayra-update-install-card')?.remove();
 }
 
 test('checkForUpdates: already up to date NEVER shows the update card, even though no real update exists', async () => {
@@ -119,6 +131,7 @@ test('checkForUpdates: a genuinely available update shows ONE correctly-versione
     await shell.checkForUpdates(false);
     assert.equal(shell.state.updatePrompt, null, 'never a second card in the same session');
   } finally {
+    clearUpdateCards();
     uninstall();
   }
 });
@@ -139,6 +152,7 @@ test('checkForUpdates: "Later" dismisses the card without applying and does not 
     assert.equal(reloads.length, 0, 'Later must not reload the page');
     assert.equal(shell.state.updateState.status, 'ready', 'update stays ready for the toolbar chip/menu');
   } finally {
+    clearUpdateCards();
     uninstall();
   }
 });
@@ -202,6 +216,7 @@ test('checkForUpdates: a blocked/throwing alert() during applyUpdate must not be
     assert.equal(shell.state.updateState.availableVersion, '0.2.0');
     assert.equal(reloads.length, 1, 'reload must still happen even if the informational alert() throws/is blocked');
   } finally {
+    clearUpdateCards();
     delete window.alert;
   }
 });

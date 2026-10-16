@@ -601,6 +601,14 @@ export class BrowserShell {
       // page surface painted right over it, so the close button looked
       // dead on desktop - "sometimes the close button misbehaves".
       s.closePrompt ||
+      // The update prompt cards ("Update available - now or later?" and
+      // "Update downloaded - install when?") were missing for the SAME
+      // reason: with a real site open the native page surface painted
+      // right over the prompt, so on desktop it never really appeared.
+      // While either is up the page is held back - THE update prompt must
+      // overlay anything.
+      s.updatePrompt ||
+      s.updateInstallPrompt ||
       s.isPageObscured
     );
   }
@@ -1321,14 +1329,13 @@ export class BrowserShell {
     }
 
     // "Update available - now or later?" card (auto background checks)
-    if (this.state.updatePrompt) {
-      this.renderUpdatePromptCard(shell);
-    }
-
-    // "Update downloaded - install now / next launch / later" card
-    if (this.state.updateInstallPrompt) {
-      this.renderUpdateInstallPromptCard(shell);
-    }
+    // and "Update downloaded - install now / next launch / later" card.
+    // BOTH are window-level overlays pinned to the top right corner and
+    // mounted on document.body (see renderUpdatePromptCard) - they are
+    // re-created/cleaned up on EVERY render whether or not prompt state
+    // is live, so a dismissed prompt never lingers on screen.
+    this.renderUpdatePromptCard(shell);
+    this.renderUpdateInstallPromptCard(shell);
 
     // "Close Yayra?" prompt (close all tabs / just close / keep all tabs)
     if (this.state.closePrompt) {
@@ -8663,10 +8670,29 @@ export class BrowserShell {
     this.showTransientNotice('Okay - update anytime from the "Update" chip or menu.');
   }
 
+  /**
+   * THE update prompt, pinned to the TOP RIGHT CORNER above EVERYTHING.
+   *
+   * It mounts on document.body (never inside the shell tree) as a
+   * position:fixed card with the maximum z-index (design-system.css
+   * .fb-update-prompt-card) - so no menu, dropdown, modal, toast, splash
+   * or ancestor stacking context can ever cover it. On Electron the
+   * native page surface is also held back while it is open (see
+   * hasBlockingOverlay()). Self-cleaning: with no live prompt state every
+   * render removes a lingering card, so "Later" can never leave it up.
+   */
   renderUpdatePromptCard(root) {
     const prompt = this.state.updatePrompt;
-    if (!prompt) return;
+    const host = (typeof document !== 'undefined' && document.body) ? document.body : root;
+    const previous = (typeof document !== 'undefined' && document.getElementById)
+      ? document.getElementById('yayra-update-prompt-card')
+      : null;
+    if (!prompt) {
+      previous?.remove();
+      return;
+    }
     const card = document.createElement('div');
+    card.id = 'yayra-update-prompt-card';
     card.className = 'fb-update-prompt-card';
     card.setAttribute('role', 'dialog');
     card.setAttribute('aria-label', 'Update available');
@@ -8689,7 +8715,8 @@ export class BrowserShell {
       `;
       card.querySelector('.fb-update-prompt-now')?.addEventListener('click', () => this.relaunchToUpdate());
       card.querySelector('.fb-update-prompt-later')?.addEventListener('click', () => this.deferUpdatePrompt());
-      root.appendChild(card);
+      previous?.remove();
+      host.appendChild(card);
       return;
     }
     card.innerHTML = `
@@ -8709,7 +8736,8 @@ export class BrowserShell {
     `;
     card.querySelector('.fb-update-prompt-now')?.addEventListener('click', () => this.acceptUpdatePrompt());
     card.querySelector('.fb-update-prompt-later')?.addEventListener('click', () => this.deferUpdatePrompt());
-    root.appendChild(card);
+    previous?.remove();
+    host.appendChild(card);
   }
 
   /** Read (without consuming) a scheduled "install on next launch". */
@@ -8952,10 +8980,24 @@ export class BrowserShell {
     }
   }
 
+  /**
+   * "Update downloaded - install when?" - the second update prompt card.
+   * Same overlay contract as renderUpdatePromptCard: window-level,
+   * document.body-mounted, pinned to the top right corner above
+   * everything, self-cleaning on every render.
+   */
   renderUpdateInstallPromptCard(root) {
     const prompt = this.state.updateInstallPrompt;
-    if (!prompt) return;
+    const host = (typeof document !== 'undefined' && document.body) ? document.body : root;
+    const previous = (typeof document !== 'undefined' && document.getElementById)
+      ? document.getElementById('yayra-update-install-card')
+      : null;
+    if (!prompt) {
+      previous?.remove();
+      return;
+    }
     const card = document.createElement('div');
+    card.id = 'yayra-update-install-card';
     card.className = 'fb-update-prompt-card fb-update-install-card';
     card.setAttribute('role', 'dialog');
     card.setAttribute('aria-label', 'Update downloaded');
@@ -8976,7 +9018,8 @@ export class BrowserShell {
     card.querySelector('.fb-update-install-now')?.addEventListener('click', () => this.installDesktopUpdateNow());
     card.querySelector('.fb-update-install-next-launch')?.addEventListener('click', () => this.deferInstallToNextLaunch());
     card.querySelector('.fb-update-install-later')?.addEventListener('click', () => this.dismissInstallPrompt());
-    root.appendChild(card);
+    previous?.remove();
+    host.appendChild(card);
   }
 
   /**
