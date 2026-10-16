@@ -21,10 +21,9 @@ import { BrowserShell } from '../packages/shared-ui/src/components/BrowserShell.
  *     inside navigateActiveTab (still in the activation window), for
  *     frame-hostile sites AND search URLs, and the render shows the
  *     honest already-opened card without double-opening.
- *  3. THE DRAWER: it dimmed the page behind a dark scrim and lived on the
- *     RIGHT with flyouts squeezed to its left. It is now on the LEFT with
- *     flyouts to its right, and the scrim is fully transparent - the page
- *     is never dimmed or blurred.
+ *  3. THE DRAWER: it lives on the RIGHT, with submenus opening sideways to
+ *     the LEFT rather than expanding inside the menu. Its scrim stays fully
+ *     transparent, so the page is never dimmed or blurred.
  */
 
 function makeStorage() {
@@ -192,17 +191,20 @@ test('LIGHT MODE (behavior): the document viewer renders with tokenized surfaces
 
 /* ---------------- 3. THE DRAWER ---------------- */
 
-test('DRAWER: opens on the LEFT with flyouts to its right, and never dims or blurs the page', () => {
+test('DRAWER: opens on the RIGHT with sideways flyouts to its left, without dimming or blurring the page', () => {
   const css = readFileSync(new URL('../packages/shared-ui/src/theme/design-system.css', import.meta.url), 'utf8');
   const menuAt = css.indexOf('.fb-side-drawer-menu {');
   assert.ok(menuAt > -1);
   const menu = css.slice(menuAt, css.indexOf('}', menuAt));
-  assert.match(menu, /left: 0;/, 'the drawer is anchored to the left edge');
-  assert.ok(!/right: 0;/.test(menu), 'not to the right anymore');
-  assert.match(css, /@keyframes fb-drawer-slide \{\s*from \{ transform: translateX\(-100%\); \}/, 'it slides in from the left');
+  assert.match(menu, /right: 0;/, 'the drawer is anchored to the right edge');
+  assert.ok(!/left: 0;/.test(menu), 'it is not anchored to the left');
+  assert.match(css, /@keyframes fb-drawer-slide \{\s*from \{ transform: translateX\(100%\); \}/, 'it slides in from the right');
   const subAt = css.indexOf('.fb-drawer-submenu {');
   const submenu = css.slice(subAt, css.indexOf('}', subAt));
-  assert.match(submenu, /left: calc\(100% - 1px\);/, 'flyouts open to the RIGHT of the left-side drawer');
+  assert.match(submenu, /position: absolute;/, 'submenus are positioned as flyouts, not inline accordions');
+  assert.match(submenu, /right: calc\(100% - 1px\);/, 'flyouts open to the LEFT of the right-side drawer');
+  assert.match(css, /\.fb-drawer-submenu\.is-open \{\s*display: flex;/, 'only active lateral flyouts are displayed');
+  assert.ok(!/\.fb-drawer-item-has-submenu\.open > \.fb-drawer-submenu \{\s*position: static;/.test(css), 'open submenus never become inline');
   // The scrim is fully transparent: the page is never dimmed or blurred.
   const scrimAt = css.indexOf('.fb-side-drawer-scrim {');
   const scrim = css.slice(scrimAt, css.indexOf('}', scrimAt));
@@ -211,7 +213,7 @@ test('DRAWER: opens on the LEFT with flyouts to its right, and never dims or blu
   assert.match(menu, /backdrop-filter: none !important;/, 'the drawer itself never blurs the page');
 });
 
-test('DRAWER (behavior): opening the menu keeps the page visible - no scrim styling, click-outside closes', async () => {
+test('DRAWER (behavior): submenus leave the scroll list and open beside the menu; click-outside closes', async () => {
   const { shell, container } = await makeShell();
   try {
     shell.state.tabs[0].url = 'https://example.com/';
@@ -219,6 +221,22 @@ test('DRAWER (behavior): opening the menu keeps the page visible - no scrim styl
     shell.render(container);
     const menu = container.querySelector('.fb-side-drawer-menu');
     assert.ok(menu, 'the menu renders');
+
+    const parentButton = menu.querySelector('.fb-dr-tabgroups-parent');
+    const parent = parentButton.parentElement;
+    const flyout = parent.querySelector('.fb-drawer-submenu');
+    menu.getBoundingClientRect = () => ({ left: 680, top: 0, right: 1000, bottom: 768, width: 320, height: 768 });
+    parentButton.getBoundingClientRect = () => ({ left: 704, top: 400, right: 980, bottom: 440, width: 276, height: 40 });
+    flyout.getBoundingClientRect = () => ({ left: 0, top: 0, right: 270, bottom: 220, width: 270, height: 220 });
+    parentButton.click();
+    assert.equal(parent.classList.contains('open'), true, 'the parent opens on tap/click');
+    assert.equal(flyout.parentElement, menu, 'the submenu is detached from the scrolling list');
+    assert.equal(flyout.classList.contains('is-open'), true, 'the detached submenu is visible as a lateral flyout');
+    assert.equal(flyout.style.left, '-269px', 'the submenu is positioned outside the drawer on its left side');
+    parentButton.click();
+    assert.equal(flyout.parentElement, parent, 'closing the submenu restores it to its source item');
+    assert.equal(parent.classList.contains('open'), false, 'a second click closes the flyout');
+
     const scrim = container.querySelector('.fb-side-drawer-scrim');
     assert.ok(scrim, 'the invisible close target renders');
     scrim.click();

@@ -9342,15 +9342,118 @@ export class BrowserShell {
       this.installDesktopUpdateNow();
     });
 
-    // Submenu click toggling for mobile / touch
-    drawer.querySelectorAll('.fb-drawer-item-has-submenu').forEach((parent) => {
-      const button = parent.querySelector('.fb-drawer-item');
-      button?.addEventListener('click', (event) => {
+    // Submenus are lateral flyouts, never inline accordions. Move the active
+    // panel out of the scrollable menu list so its absolute positioning can
+    // escape the list's overflow boundary while remaining part of the drawer.
+    const submenuEntries = Array.from(drawer.querySelectorAll('.fb-drawer-item-has-submenu'))
+      .map((parent) => {
+        const button = parent.querySelector('.fb-drawer-item');
+        const submenu = parent.querySelector('.fb-drawer-submenu');
+        if (!button || !submenu) return null;
+        button.setAttribute('aria-haspopup', 'true');
+        button.setAttribute('aria-expanded', 'false');
+        submenu.setAttribute('role', 'menu');
+        submenu.querySelectorAll('.fb-drawer-item').forEach((item) => item.setAttribute('role', 'menuitem'));
+        return { parent, button, submenu };
+      })
+      .filter(Boolean);
+    const pinnedSubmenus = new Set();
+
+    const positionFlyout = ({ button, submenu }) => {
+      const drawerRect = drawer.getBoundingClientRect();
+      const rootRect = root.getBoundingClientRect();
+      const buttonRect = button.getBoundingClientRect();
+      const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || rootRect.right || 1024;
+      const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || rootRect.bottom || 768;
+      const hasRootBounds = rootRect.width > 0 && rootRect.height > 0;
+      const leftEdge = hasRootBounds ? Math.max(8, rootRect.left + 8) : 8;
+      const rightEdge = hasRootBounds ? Math.min(viewportWidth - 8, rootRect.right - 8) : viewportWidth - 8;
+      const topEdge = hasRootBounds ? Math.max(8, rootRect.top + 8) : 8;
+      const bottomEdge = hasRootBounds ? Math.min(viewportHeight - 8, rootRect.bottom - 8) : viewportHeight - 8;
+      const availableWidth = Math.max(1, rightEdge - leftEdge);
+      const availableHeight = Math.max(1, bottomEdge - topEdge);
+
+      // Bound the flyout to its host as well as the viewport. That matters for
+      // the resizable mini window, whose rounded frame clips anything outside.
+      submenu.style.width = `${Math.min(270, availableWidth)}px`;
+      submenu.style.maxHeight = `${availableHeight}px`;
+      const submenuRect = submenu.getBoundingClientRect();
+      const submenuWidth = submenuRect.width || Math.min(270, availableWidth);
+      const submenuHeight = submenuRect.height || Math.min(submenu.scrollHeight || 240, availableHeight);
+      const maxLeft = Math.max(leftEdge, rightEdge - submenuWidth);
+      const left = Math.max(leftEdge, Math.min(drawerRect.left - submenuWidth + 1, maxLeft));
+      const maxTop = Math.max(topEdge, bottomEdge - submenuHeight);
+      const top = Math.max(topEdge, Math.min(buttonRect.top - 4, maxTop));
+
+      // The submenu is positioned relative to the drawer; clamp both axes so
+      // flyouts stay usable on narrow screens and near the bottom of the menu.
+      submenu.style.left = `${Math.round(left - drawerRect.left)}px`;
+      submenu.style.right = 'auto';
+      submenu.style.top = `${Math.round(top - drawerRect.top)}px`;
+    };
+
+    const closeFlyout = (entry) => {
+      pinnedSubmenus.delete(entry.parent);
+      entry.parent.classList.remove('open');
+      entry.button.setAttribute('aria-expanded', 'false');
+      entry.submenu.classList.remove('is-open');
+      if (entry.submenu.parentElement === drawer) entry.parent.appendChild(entry.submenu);
+      entry.submenu.style.left = '';
+      entry.submenu.style.right = '';
+      entry.submenu.style.top = '';
+      entry.submenu.style.width = '';
+      entry.submenu.style.maxHeight = '';
+    };
+
+    const closeOtherFlyouts = (activeEntry) => {
+      submenuEntries.forEach((entry) => {
+        if (entry !== activeEntry) closeFlyout(entry);
+      });
+    };
+
+    const openFlyout = (entry) => {
+      closeOtherFlyouts(entry);
+      if (entry.submenu.parentElement !== drawer) drawer.appendChild(entry.submenu);
+      entry.parent.classList.add('open');
+      entry.button.setAttribute('aria-expanded', 'true');
+      entry.submenu.classList.add('is-open');
+      positionFlyout(entry);
+    };
+
+    submenuEntries.forEach((entry) => {
+      entry.parent.addEventListener('pointerenter', (event) => {
+        if (event.pointerType === 'touch') return;
+        openFlyout(entry);
+      });
+
+      entry.parent.addEventListener('pointerleave', (event) => {
+        const nextTarget = event.relatedTarget;
+        if (nextTarget && (entry.submenu.contains?.(nextTarget) || entry.parent.contains?.(nextTarget))) return;
+        if (!pinnedSubmenus.has(entry.parent)) closeFlyout(entry);
+      });
+
+      entry.submenu.addEventListener('pointerleave', (event) => {
+        const nextTarget = event.relatedTarget;
+        if (nextTarget && (entry.parent.contains?.(nextTarget) || entry.submenu.contains?.(nextTarget))) return;
+        if (!pinnedSubmenus.has(entry.parent)) closeFlyout(entry);
+      });
+
+      entry.button.addEventListener('click', (event) => {
         event.preventDefault();
         event.stopPropagation();
-        parent.classList.toggle('open');
+        if (pinnedSubmenus.has(entry.parent)) {
+          closeFlyout(entry);
+          return;
+        }
+        closeOtherFlyouts(entry);
+        pinnedSubmenus.add(entry.parent);
+        openFlyout(entry);
       });
     });
+
+    drawer.querySelector('.fb-side-drawer-content')?.addEventListener('scroll', () => {
+      submenuEntries.forEach(closeFlyout);
+    }, { passive: true });
 
     drawer.querySelector('.fb-dr-newtab')?.addEventListener('click', () => {
       this.state.isSideDrawerOpen = false;

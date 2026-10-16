@@ -284,6 +284,14 @@ test('SUBMENUS: every submenu parent opens on click, lists its items, and closes
     shell.render(container);
     const parents = Array.from(container.querySelectorAll('.fb-drawer-item-has-submenu'));
     assert.ok(parents.length >= 7, `all submenu groups present (${parents.length} found)`);
+    const drawer = container.querySelector('.fb-side-drawer-menu');
+    const hoverParent = parents[0];
+    const hoverFlyout = hoverParent.querySelector('.fb-drawer-submenu');
+    hoverParent.dispatchEvent({ type: 'pointerenter', pointerType: 'mouse', relatedTarget: null });
+    assert.equal(hoverParent.classList.contains('open'), true, 'desktop hover opens the lateral flyout');
+    assert.equal(hoverFlyout.parentElement, drawer, 'the hover flyout is outside the scrolling list');
+    hoverParent.dispatchEvent({ type: 'pointerleave', relatedTarget: null });
+    assert.equal(hoverParent.classList.contains('open'), false, 'the hover flyout closes when the pointer leaves');
     for (const parent of parents) {
       const button = parent.querySelector('.fb-drawer-item');
       const items = parent.querySelectorAll('.fb-drawer-item');

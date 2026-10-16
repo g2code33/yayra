@@ -3682,7 +3682,7 @@ html {
 }
 
 /* =============================================================
-   5. FULL RIGHT-SIDE DRAWER MENU (NO BLUR)
+   5. RIGHT-SIDE DRAWER MENU (NO BLUR)
    ============================================================= */
 .fb-side-drawer-scrim {
   position: fixed;
@@ -3692,10 +3692,7 @@ html {
   height: 100%;
   padding: 0;
   border: 0;
-  /* FULLY TRANSPARENT: the page must NOT be dimmed or blurred while the
-     menu is open (user request) - the scrim only exists as an invisible
-     click target so clicking outside closes the menu, exactly like a
-     native browser menu. */
+  /* Fully transparent: this is only an outside-click target, not a dimmer. */
   background: transparent;
   cursor: default;
 }
@@ -3703,14 +3700,13 @@ html {
 .fb-side-drawer-menu {
   position: absolute;
   top: 0;
-  left: 0;
+  right: 0;
   bottom: 0;
-  width: 320px;
-  /* Theme-aware: solid dark in dark mode, white in light mode (the
-     light overrides below). */
+  width: min(320px, 100%);
+  max-width: 100%;
   background: var(--fb-drawer-bg, #090d16);
-  border-right: 1px solid var(--fb-drawer-border, rgba(255, 255, 255, 0.1));
-  box-shadow: 10px 0 36px rgba(0, 0, 0, 0.5);
+  border-left: 1px solid var(--fb-drawer-border, rgba(255, 255, 255, 0.1));
+  box-shadow: -10px 0 36px rgba(0, 0, 0, 0.5);
   display: flex;
   flex-direction: column;
   z-index: 600001;
@@ -3721,7 +3717,7 @@ html {
 }
 
 @keyframes fb-drawer-slide {
-  from { transform: translateX(-100%); }
+  from { transform: translateX(100%); }
   to { transform: translateX(0); }
 }
 
@@ -3736,6 +3732,7 @@ html {
 
 .fb-side-drawer-content {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 12px 8px;
   display: flex;
@@ -3775,7 +3772,7 @@ html {
   --fb-drawer-hover: rgba(15, 23, 42, 0.06);
 }
 [data-theme="light"] .fb-side-drawer-menu {
-  box-shadow: 8px 0 28px rgba(15, 23, 42, 0.14);
+  box-shadow: -8px 0 28px rgba(15, 23, 42, 0.14);
 }
 [data-theme="light"] .fb-side-drawer-header {
   border-bottom: 1px solid rgba(15, 23, 42, 0.08);
@@ -3907,7 +3904,9 @@ html {
   color: var(--fb-text-muted);
 }
 
-/* Submenu Flyout / Accordion for 3-Dot Menu */
+/* Lateral flyouts for the 3-dot menu. BrowserShell moves the active submenu
+   out of the scrolling list before opening it, so it can sit beside the
+   right-hand drawer without being clipped or taking space inside the list. */
 .fb-drawer-item-has-submenu {
   position: relative;
   width: 100%;
@@ -3932,43 +3931,34 @@ html {
 .fb-drawer-submenu {
   display: none;
   position: absolute;
-  top: -4px;
-  /* The drawer lives on the LEFT edge, so flyouts open to its RIGHT -
-    both stay on the left half of the screen, like the reference. */
-  left: calc(100% - 1px);
-  width: 270px;
+  top: 0;
+  left: auto;
+  right: calc(100% - 1px);
+  width: min(270px, calc(100vw - 16px));
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
   background: var(--fb-drawer-submenu-bg, #131722);
   border: 1px solid var(--fb-border-glass, rgba(255, 255, 255, 0.12));
   border-radius: 12px;
   padding: 8px 6px;
-  box-shadow: -8px 8px 28px rgba(0, 0, 0, 0.6);
-  z-index: 2100;
+  box-shadow: 8px 8px 28px rgba(0, 0, 0, 0.6);
+  z-index: 2;
   flex-direction: column;
   gap: 2px;
 }
 
-.fb-drawer-item-has-submenu:hover > .fb-drawer-submenu,
-.fb-drawer-item-has-submenu.open > .fb-drawer-submenu {
+.fb-drawer-submenu.is-open {
   display: flex;
   animation: fb-submenu-fade 0.15s ease;
 }
 
-/* Click/tap activation uses an inline accordion. This keeps More tools and
-   other flyouts inside the scrollable drawer instead of clipping them at the
-   drawer-content overflow boundary. Hover-only desktop flyouts remain above. */
-.fb-drawer-item-has-submenu.open > .fb-drawer-submenu {
-  position: static;
-  width: auto;
-  max-height: none;
-  margin: 2px 8px 6px 24px;
-  padding: 4px;
-  background: rgba(255, 255, 255, 0.035);
-  border-color: rgba(255, 255, 255, 0.08);
-  box-shadow: none;
-  transform: none;
+.fb-drawer-item-has-submenu.open > .fb-drawer-item {
+  background: var(--fb-drawer-hover, rgba(255, 255, 255, 0.08));
+  color: var(--fb-text-primary);
 }
 
-.fb-drawer-item-has-submenu.open > .fb-drawer-submenu .fb-drawer-item {
+.fb-drawer-submenu .fb-drawer-item {
   font-size: 0.82rem;
   padding: 8px 10px;
 }
