@@ -51,15 +51,34 @@ test('capacitorBrowser getter: absent when Capacitor is present but running in a
   }
 });
 
-test('isSystemBrowserAuthHost: matches the same identity-provider hosts as the Electron bridge', async () => {
+test('isSystemBrowserAuthHost: matches provider sign-in URL paths, not ordinary Google account browsing', async () => {
   const container = document.createElement('div');
   const shell = new BrowserShell({ container, platform: 'android', isMobile: true });
   await shell.initialize();
 
   assert.equal(shell.isSystemBrowserAuthHost('https://accounts.google.com/signin'), true);
+  assert.equal(shell.isSystemBrowserAuthHost('https://accounts.google.com/o/oauth2/v2/auth?client_id=x'), true);
   assert.equal(shell.isSystemBrowserAuthHost('https://appleid.apple.com/auth'), true);
   assert.equal(shell.isSystemBrowserAuthHost('https://sub.login.microsoftonline.com/'), true);
   assert.equal(shell.isSystemBrowserAuthHost('https://www.google.com/search?q=ghana'), false);
+  assert.equal(shell.isSystemBrowserAuthHost('https://accounts.google.com/ManageAccount'), false);
+  assert.equal(shell.isSystemBrowserAuthHost('https://myaccount.google.com/security'), false);
+  assert.equal(shell.isSystemBrowserAuthHost('http://accounts.google.com/signin'), true);
+});
+
+test('Capacitor: HTTP Google sign-in is upgraded to HTTPS before it opens externally', async () => {
+  const { opened, uninstall } = installFakeCapacitorBrowser();
+  try {
+    const container = document.createElement('div');
+    const shell = new BrowserShell({ container, platform: 'android', isMobile: true });
+    await shell.initialize();
+    shell.navigateActiveTab('http://accounts.google.com/signin');
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.deepEqual(opened, ['https://accounts.google.com/signin']);
+  } finally {
+    uninstall();
+  }
 });
 
 test('Capacitor (Android/iOS): navigating to a sign-in host opens the native in-app browser instead of an embedded iframe', async () => {
@@ -77,6 +96,11 @@ test('Capacitor (Android/iOS): navigating to a sign-in host opens the native in-
     await Promise.resolve();
     await Promise.resolve();
     assert.deepEqual(opened, ['https://accounts.google.com/signin/v2/identifier']);
+
+    shell.render();
+    shell.render();
+    await Promise.resolve();
+    assert.deepEqual(opened, ['https://accounts.google.com/signin/v2/identifier'], 'chrome re-renders do not reopen the same provider login');
   } finally {
     uninstall();
   }

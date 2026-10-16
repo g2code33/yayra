@@ -138,6 +138,40 @@ test('ANDROID: frame-friendly sites keep the iframe engine (the native layer is 
   }
 });
 
+test('ANDROID: a native-page OAuth redirect is canceled, opened with Browser, and leaves the source tab/history intact', async () => {
+  const android = fakeAndroid();
+  const { shell } = await makeShell();
+  try {
+    shell.navigateActiveTab('https://www.google.com/search?q=ghana');
+    const tab = shell.getActiveTab();
+    const activeTabId = shell.state.activeTabId;
+    const history = [...tab.navigationState.historyStack];
+
+    android.deliverEvent({
+      id: tab.id,
+      type: 'auth-navigation-blocked',
+      url: 'https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client'
+    });
+    await flush();
+
+    assert.deepEqual(android.calls.browserOpen, ['https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client']);
+
+    android.deliverEvent({ id: tab.id, type: 'auth-navigation-blocked', url: 'http://accounts.google.com/signin' });
+    await flush();
+    assert.deepEqual(android.calls.browserOpen, [
+      'https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client',
+      'https://accounts.google.com/signin'
+    ], 'an insecure provider URL is upgraded before it reaches the system browser');
+    assert.equal(shell.state.activeTabId, activeTabId);
+    assert.equal(tab.url, 'https://www.google.com/search?q=ghana');
+    assert.deepEqual(tab.navigationState.historyStack, history);
+  } finally {
+    shell.destroy();
+    delete window.Capacitor;
+    delete globalThis.localStorage;
+  }
+});
+
 test('ANDROID: Google SIGN-IN hosts still hand off honestly (Google blocks sign-in inside embedded WebViews)', async () => {
   const android = fakeAndroid();
   const { shell } = await makeShell();
@@ -317,6 +351,13 @@ test('KOTLIN PIN: the native tab engine exists, is safe, and reports through tab
   assert.ok(manager.includes('settings.javaScriptEnabled = true'), 'JS on (a real browser surface)');
   assert.ok(manager.includes('settings.allowFileAccess = false'), 'file access OFF');
   assert.ok(manager.includes('settings.allowContentAccess = false'), 'content access OFF');
+  assert.ok(manager.includes('isSystemBrowserAuthUrl(uri)'), 'Google auth is path-classified rather than all of google.com');
+  assert.ok(manager.includes('request.isForMainFrame && isSystemBrowserAuthUrl(targetUri)'), 'top-level provider redirects are stopped before loading');
+  assert.ok(manager.includes('auth-navigation-blocked'), 'the shell receives a safe handoff request');
+  assert.ok(manager.includes('secureSystemBrowserAuthUrl(targetUri)'), 'HTTP provider endpoints are upgraded before handoff');
+  assert.ok(manager.includes('uri.buildUpon().scheme("https")'), 'the native helper never opens auth over plaintext HTTP');
+  assert.ok(manager.includes('onCreateWindow'), 'OAuth popups are routed instead of silently failing in the native view');
+  assert.ok(manager.includes('setSupportMultipleWindows(true)'), 'user-initiated popups reach the routing callback');
 
   const plugin = readFileSync(new URL('../packages/floating-android/src/kotlin/com/yayra/floating/android/YayraOverlayPlugin.kt', import.meta.url), 'utf8');
   for (const method of ['tabWebAttach', 'tabWebUpdate', 'tabWebSetVisible', 'tabWebSetPointerTheme', 'tabWebNavigate', 'tabWebGoBack', 'tabWebGoForward', 'tabWebReload', 'tabWebStop', 'tabWebRemove']) {

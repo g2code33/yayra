@@ -53,14 +53,18 @@
  * checks, which remain in effect and are handled by the handoff below.
  */
 
-// Apex hostnames (and all subdomains) that must be completed in the user's
-// default system browser instead of the embedded WebContentsView.
+// Identity-provider endpoints that must be completed in the user's default
+// system browser instead of the embedded WebContentsView. Google is
+// deliberately path-scoped: accounts.google.com also serves ordinary account
+// pages, while OAuth/sign-in endpoints must never be embedded. Keep the
+// matching path policy in sync with BrowserShell.isSystemBrowserAuthHost().
 const SYSTEM_BROWSER_AUTH_HOSTS = Object.freeze([
   'accounts.google.com',
   'appleid.apple.com',
   'login.live.com',
   'login.microsoftonline.com'
 ]);
+const GOOGLE_SIGN_IN_PATH = /^\/(?:o\/oauth2(?:\/|$)|oauth2(?:\/|$)|signin(?:\/|$)|servicelogin(?:\/|$)|accountchooser(?:\/|$)|v\d+\/signin(?:\/|$)|gsi\/select(?:\/|$))/i;
 
 const WEBVIEW_EVENT_CHANNEL = 'yayra:webview-event';
 
@@ -284,18 +288,31 @@ function reloadActionForInput(input = {}) {
   return null;
 }
 
-function hostnameOf(rawUrl) {
-  try {
-    return new URL(rawUrl).hostname.toLowerCase();
-  } catch {
-    return '';
-  }
+function requiresSystemBrowserAuth(rawUrl, hosts = SYSTEM_BROWSER_AUTH_HOSTS) {
+  let parsed;
+  try { parsed = new URL(rawUrl); } catch { return false; }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+
+  const hostname = parsed.hostname.toLowerCase();
+  return hosts.some((host) => {
+    const normalizedHost = String(host).toLowerCase();
+    if (normalizedHost === 'accounts.google.com') {
+      return hostname === normalizedHost && GOOGLE_SIGN_IN_PATH.test(parsed.pathname);
+    }
+    return hostname === normalizedHost || hostname.endsWith(`.${normalizedHost}`);
+  });
 }
 
-function requiresSystemBrowserAuth(rawUrl, hosts = SYSTEM_BROWSER_AUTH_HOSTS) {
-  const hostname = hostnameOf(rawUrl);
-  if (!hostname) return false;
-  return hosts.some((host) => hostname === host || hostname.endsWith(`.${host}`));
+function secureSystemBrowserAuthUrl(rawUrl, hosts = SYSTEM_BROWSER_AUTH_HOSTS) {
+  if (!requiresSystemBrowserAuth(rawUrl, hosts)) return rawUrl;
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== 'http:') return rawUrl;
+    parsed.protocol = 'https:';
+    return parsed.toString();
+  } catch {
+    return rawUrl;
+  }
 }
 
 /**
@@ -650,6 +667,29 @@ function createWebviewBridge({
     });
     wc.on('did-start-loading', () => sendTo(entry, 'loading-start'));
     wc.on('did-stop-loading', () => sendTo(entry, 'loading-stop'));
+    const handoffAuthNavigation = (...args) => {
+      const event = args[0];
+      // Electron 44 exposes navigation details on the event (or as a details
+      // object); keep accepting the legacy positional signature used by older
+      // Electron releases and test fakes.
+      const details = args.find((value) => value && typeof value === 'object' && typeof value.url === 'string');
+      const url = details?.url || args.find((value, index) => index > 0 && typeof value === 'string') || '';
+      const isMainFrame = typeof details?.isMainFrame === 'boolean'
+        ? details.isMainFrame
+        : (typeof args[3] === 'boolean' ? args[3] : true);
+      if (!isMainFrame || !requiresSystemBrowserAuth(url, authHosts)) return;
+
+      event?.preventDefault?.();
+      const externalUrl = secureSystemBrowserAuthUrl(url, authHosts);
+      Promise.resolve(shell.openExternal(externalUrl)).catch((err) => logger.error('[yayra:webview] failed to open external auth url', err));
+      // Prevent the canceled navigation from leaving a stale loading spinner
+      // in the original tab. No URL/history event is emitted: the in-app page
+      // stays where it was before the provider redirect.
+      sendTo(entry, 'loading-stop');
+      sendTo(entry, 'system-browser-handoff', { url: externalUrl, sourceUrl: entry.lastUrl || null, reason: 'navigation' });
+    };
+    wc.on('will-navigate', handoffAuthNavigation);
+    wc.on('will-redirect', handoffAuthNavigation);
     wc.on('did-navigate', (_event, url) => {
       entry.lastUrl = url;
       sendTo(entry, 'navigated', { url, ...navState(wc) });
@@ -696,8 +736,9 @@ function createWebviewBridge({
         return { action: 'deny' };
       }
       if (requiresSystemBrowserAuth(url, authHosts)) {
-        shell.openExternal(url).catch((err) => logger.error('[yayra:webview] failed to open external auth url', err));
-        sendTo(entry, 'system-browser-handoff', { url });
+        const externalUrl = secureSystemBrowserAuthUrl(url, authHosts);
+        shell.openExternal(externalUrl).catch((err) => logger.error('[yayra:webview] failed to open external auth url', err));
+        sendTo(entry, 'system-browser-handoff', { url: externalUrl });
         return { action: 'deny' };
       }
       // Let the renderer decide (usually: open as a new Yayra tab).
@@ -765,8 +806,9 @@ function createWebviewBridge({
     if (!win || win.isDestroyed() || !tabId || !url) return { handedOffToSystemBrowser: false };
 
     if (requiresSystemBrowserAuth(url, authHosts)) {
-      shell.openExternal(url).catch((err) => logger.error('[yayra:webview] failed to open external auth url', err));
-      sendTo({ tabId, hostWc }, 'system-browser-handoff', { url });
+      const externalUrl = secureSystemBrowserAuthUrl(url, authHosts);
+      shell.openExternal(externalUrl).catch((err) => logger.error('[yayra:webview] failed to open external auth url', err));
+      sendTo({ tabId, hostWc }, 'system-browser-handoff', { url: externalUrl });
       return { handedOffToSystemBrowser: true };
     }
 
@@ -1192,6 +1234,7 @@ module.exports = {
   SYSTEM_BROWSER_AUTH_HOSTS,
   OPEN_EXTERNAL_SCHEME,
   requiresSystemBrowserAuth,
+  secureSystemBrowserAuthUrl,
   decodeOpenExternalRequest,
   buildWebAuthnWatchdogScript,
   buildPointerThemeCss,

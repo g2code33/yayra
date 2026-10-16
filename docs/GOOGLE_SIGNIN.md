@@ -9,11 +9,15 @@ service logged-in *inside* Yayra's embedded browsing view — Google actively
 detects and blocks sign-in inside any embedded browser surface (WebView,
 WebContentsView, iframe, etc.) as an anti-phishing measure. See
 [Google's own policy](https://developers.google.com/identity/protocols/oauth2/policies#embedded-webviews).
-Yayra does not attempt to bypass that; `electron/webviewBridge.cjs` already
-hands those navigations off to the user's real system browser.
+Yayra does not attempt to bypass that. `electron/webviewBridge.cjs` sends
+Google sign-in/OAuth endpoints to the user's real system browser, while
+ordinary Google pages and Search remain in the native in-app view where the
+platform allows it. System-browser cookies are not copied into Yayra.
 
-This document covers **Phase 1: Electron desktop only**. Web/PWA and
-Android/iOS are separate follow-up work (see "Status by platform" below).
+The setup and architecture are documented here for Electron desktop, Web/PWA,
+and Android/iOS. The original implementation started with desktop; all three
+transports are now implemented, with remaining live-provider/device checks
+listed in "Status by platform" below.
 
 ## How it works
 
@@ -208,6 +212,12 @@ npx wrangler secret put GOOGLE_WEB_CLIENT_ID  --config wrangler.worker.toml
 npx wrangler secret put GOOGLE_WEB_CLIENT_SECRET --config wrangler.worker.toml
 ```
 
+`wrangler.worker.toml` also pins the exchange endpoint to the exact web
+callback origins `https://yayra.pages.dev` and `http://localhost:4173`.
+If you deploy Yayra on another origin, add that exact origin to the
+non-secret `GOOGLE_WEB_ALLOWED_ORIGINS` variable and register its matching
+`/auth/callback` URI with the same Google Web OAuth client.
+
 Web build (public values only — injected into `<meta>` tags by
 `scripts/build-web.mjs`): either export before `npm run build:web`
 ```bash
@@ -236,7 +246,9 @@ Native Apps"), mobile transport:
 2. Google redirects to the app's **custom URL scheme**
    `com.yayra.app:/oauth2redirect` (RFC 8252 §7.1). The OS reopens the
    app; the first-party `@capacitor/app` plugin surfaces the URL as an
-   `appUrlOpen` event.
+   `appUrlOpen` event. Yayra accepts only this exact scheme/path (not a
+   prefix or lookalike URL), rejects duplicate OAuth parameters, and checks
+   the returned state before either handling an error or exchanging a code.
 3. The one-shot code + PKCE verifier go to the **same Worker exchange
    endpoint as the web flow** with `platform: 'android' | 'ios'`. These
    Google client types have **no secret at all** (verified by package

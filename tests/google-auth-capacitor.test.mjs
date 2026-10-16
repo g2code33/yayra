@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   DEFAULT_MOBILE_REDIRECT_URI,
+  isExpectedMobileCallbackUrl,
   createCapacitorAuthBridge,
   signInWithGoogleCapacitor
 } from '../src/services/googleAuthCapacitor.js';
@@ -55,6 +56,20 @@ async function waitFor(predicate, timeoutMs = 2000) {
     await new Promise((resolve) => setTimeout(resolve, 2));
   }
 }
+
+test('mobile callback URL validation requires the exact app scheme and callback path', () => {
+  assert.equal(isExpectedMobileCallbackUrl(`${DEFAULT_MOBILE_REDIRECT_URI}?code=c&state=s`), true);
+  for (const candidate of [
+    'com.yayra.app:/oauth2redirect-evil?code=c&state=s',
+    'com.yayra.app:/oauth2redirect/extra?code=c&state=s',
+    'com.yayra.app://oauth2redirect?code=c&state=s',
+    'com.yayra.app.evil:/oauth2redirect?code=c&state=s',
+    `${DEFAULT_MOBILE_REDIRECT_URI}?code=c&state=s#fragment`,
+    'https://attacker.example/oauth2redirect?code=c&state=s'
+  ]) {
+    assert.equal(isExpectedMobileCallbackUrl(candidate), false, candidate);
+  }
+});
 
 function profileResponse() {
   return new Response(JSON.stringify({
@@ -121,12 +136,43 @@ test('capacitor sign-in ignores unrelated deep links and still completes on the 
   const state = new URL(cap.opened[0]).searchParams.get('state');
 
   cap.deliverUrl('com.yayra.app:/share?url=https://example.com'); // unrelated deep link
+  cap.deliverUrl(`com.yayra.app:/oauth2redirect.evil?code=forged&state=${state}`); // prefix lookalike
+  cap.deliverUrl(`com.yayra.app://oauth2redirect?code=forged&state=${state}`); // authority/path lookalike
   cap.deliverUrl(`${DEFAULT_MOBILE_REDIRECT_URI}?code=c1&state=${state}`);
   const { profile } = await pending;
   assert.equal(profile.email, 'ama@example.com');
 });
 
 // --- failure paths -----------------------------------------------------------
+
+test('capacitor sign-in refuses an unregistered redirect URI before opening a browser', async () => {
+  const cap = fakeCapacitor();
+  await assert.rejects(
+    () => signInWithGoogleCapacitor({
+      clientId: CLIENT_ID, platform: 'android', exchangeUrl: EXCHANGE_URL,
+      redirectUri: 'com.yayra.app:/oauth2redirect.evil',
+      openBrowser: cap.openBrowser, onUrlOpen: cap.onUrlOpen
+    }),
+    /invalid_redirect_uri/
+  );
+  assert.equal(cap.opened.length, 0);
+});
+
+test('capacitor sign-in ignores a URI-prefix lookalike instead of exchanging it', async () => {
+  const cap = fakeCapacitor();
+  let exchanges = 0;
+  const pending = signInWithGoogleCapacitor({
+    clientId: CLIENT_ID, platform: 'android', exchangeUrl: EXCHANGE_URL,
+    openBrowser: cap.openBrowser, onUrlOpen: cap.onUrlOpen,
+    fetchImpl: async () => { exchanges += 1; return profileResponse(); },
+    timeoutMs: 15
+  });
+  await waitFor(() => cap.opened.length === 1);
+  const state = new URL(cap.opened[0]).searchParams.get('state');
+  cap.deliverUrl(`com.yayra.app:/oauth2redirect.evil?code=forged&state=${state}`);
+  await assert.rejects(() => pending, /sign_in_timeout/);
+  assert.equal(exchanges, 0, 'an untrusted callback never reaches the worker');
+});
 
 test('capacitor sign-in rejects a state mismatch without calling the worker', async () => {
   const cap = fakeCapacitor();
@@ -140,6 +186,18 @@ test('capacitor sign-in rejects a state mismatch without calling the worker', as
   await assert.rejects(() => pending, /state_mismatch/);
 });
 
+test('capacitor sign-in validates state on OAuth error callbacks before surfacing the provider error', async () => {
+  const cap = fakeCapacitor();
+  const pending = signInWithGoogleCapacitor({
+    clientId: CLIENT_ID, platform: 'android', exchangeUrl: EXCHANGE_URL,
+    openBrowser: cap.openBrowser, onUrlOpen: cap.onUrlOpen,
+    fetchImpl: async () => { throw new Error('must not fetch'); }
+  });
+  await waitFor(() => cap.opened.length === 1);
+  cap.deliverUrl(`${DEFAULT_MOBILE_REDIRECT_URI}?error=access_denied&state=FORGED`);
+  await assert.rejects(() => pending, /state_mismatch/);
+});
+
 test('capacitor sign-in surfaces consent-screen cancellation (error param) and user dismissal (browserFinished)', async () => {
   const cancelled = fakeCapacitor();
   const viaErrorParam = signInWithGoogleCapacitor({
@@ -148,7 +206,8 @@ test('capacitor sign-in surfaces consent-screen cancellation (error param) and u
     fetchImpl: async () => { throw new Error('must not fetch'); }
   });
   await waitFor(() => cancelled.opened.length === 1);
-  cancelled.deliverUrl(`${DEFAULT_MOBILE_REDIRECT_URI}?error=access_denied`);
+  const cancelState = new URL(cancelled.opened[0]).searchParams.get('state');
+  cancelled.deliverUrl(`${DEFAULT_MOBILE_REDIRECT_URI}?error=access_denied&state=${cancelState}`);
   await assert.rejects(() => viaErrorParam, /access_denied/);
 
   const dismissed = fakeCapacitor();
@@ -253,7 +312,8 @@ test('capacitor auth bridge reports sign-in errors through the event channel wit
   bridge.onEvent((evt) => events.push(evt));
   const pending = bridge.signIn();
   await waitFor(() => cap.opened.length === 1);
-  cap.deliverUrl(`${DEFAULT_MOBILE_REDIRECT_URI}?error=access_denied`);
+  const cancelState = new URL(cap.opened[0]).searchParams.get('state');
+  cap.deliverUrl(`${DEFAULT_MOBILE_REDIRECT_URI}?error=access_denied&state=${cancelState}`);
   const result = await pending;
   assert.deepEqual(result, { ok: false, error: 'access_denied' });
   assert.deepEqual(events.map((e) => e.type), ['signing-in', 'error']);

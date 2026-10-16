@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   requiresSystemBrowserAuth,
+  secureSystemBrowserAuthUrl,
   sanitizeBounds,
   buildBrowserUserAgent,
   buildContextMenuTemplate,
@@ -13,18 +14,32 @@ import {
 
 // --- Pure helper logic -------------------------------------------------
 
-test('requiresSystemBrowserAuth: recognizes Google/Apple/Microsoft sign-in hosts and their subdomains', () => {
+test('requiresSystemBrowserAuth: recognizes Google OAuth/sign-in paths and preserves other providers', () => {
   assert.equal(requiresSystemBrowserAuth('https://accounts.google.com/signin/v2/identifier'), true);
+  assert.equal(requiresSystemBrowserAuth('https://accounts.google.com/o/oauth2/v2/auth?client_id=x'), true);
+  assert.equal(requiresSystemBrowserAuth('https://accounts.google.com/gsi/select?client_id=x'), true);
   assert.equal(requiresSystemBrowserAuth('https://appleid.apple.com/auth/authorize'), true);
   assert.equal(requiresSystemBrowserAuth('https://login.live.com/'), true);
   assert.equal(requiresSystemBrowserAuth('https://sub.login.microsoftonline.com/'), true);
 });
 
-test('requiresSystemBrowserAuth: does not flag ordinary browsing (including other Google subdomains)', () => {
+test('requiresSystemBrowserAuth: ordinary Google browsing/account pages stay in Yayra', () => {
   assert.equal(requiresSystemBrowserAuth('https://www.google.com/search?q=ghana'), false);
   assert.equal(requiresSystemBrowserAuth('https://mail.google.com/mail/u/0/'), false);
+  assert.equal(requiresSystemBrowserAuth('https://accounts.google.com/'), false);
+  assert.equal(requiresSystemBrowserAuth('https://accounts.google.com/ManageAccount'), false);
+  assert.equal(requiresSystemBrowserAuth('https://myaccount.google.com/security'), false);
+  assert.equal(requiresSystemBrowserAuth('https://accounts.google.com.evil.example/signin'), false);
   assert.equal(requiresSystemBrowserAuth('https://www.youtube.com/'), false);
   assert.equal(requiresSystemBrowserAuth('not a url'), false);
+});
+
+test('secureSystemBrowserAuthUrl: upgrades recognized HTTP auth endpoints without broadening Google routing', () => {
+  assert.equal(requiresSystemBrowserAuth('http://accounts.google.com/signin'), true);
+  assert.equal(secureSystemBrowserAuthUrl('http://accounts.google.com/signin'), 'https://accounts.google.com/signin');
+  assert.equal(secureSystemBrowserAuthUrl('http://login.live.com/'), 'https://login.live.com/');
+  assert.equal(secureSystemBrowserAuthUrl('https://accounts.google.com/signin'), 'https://accounts.google.com/signin');
+  assert.equal(secureSystemBrowserAuthUrl('http://www.google.com/search?q=ghana'), 'http://www.google.com/search?q=ghana');
 });
 
 test('buildBrowserUserAgent: never includes the Electron identity token, on any platform', () => {
@@ -174,6 +189,13 @@ test('webview bridge: creating a tab adds a WebContentsView as a child view and 
   assert.equal(fakeWin.contentView.children.length, 1, 'view attached to the window content view (not an <iframe>)');
 });
 
+test('webview bridge: an ordinary Google account page stays in the native in-app view', async () => {
+  const { handlers, views, externalCalls } = makeHarness();
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-google-account', url: 'https://accounts.google.com/ManageAccount' });
+  assert.equal(views.length, 1);
+  assert.deepEqual(externalCalls, []);
+});
+
 test('webview bridge: user-origin pointer styles bypass site CSP, style child frames best-effort, and update live', async () => {
   const { handlers, views } = makeHarness();
   const ensure = handlers.get('yayra:webview-ensure');
@@ -256,6 +278,14 @@ test('webview bridge: Google sign-in is also handed off to the system browser (n
   assert.equal(views.length, 0, 'no native view is ever created for Google sign-in');
 });
 
+test('webview bridge: direct HTTP Google sign-in is upgraded before opening externally', async () => {
+  const { handlers, externalCalls, views } = makeHarness();
+  const result = await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-insecure-auth', url: 'http://accounts.google.com/signin' });
+  assert.equal(result.handedOffToSystemBrowser, true);
+  assert.deepEqual(externalCalls, ['https://accounts.google.com/signin']);
+  assert.equal(views.length, 0);
+});
+
 test('webview bridge: popups to an identity-provider sign-in host from an already-open tab are also handed off externally, not opened as a child view', async () => {
   const { handlers, views, externalCalls } = makeHarness();
   await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-1', url: 'https://mail.google.com/' });
@@ -274,6 +304,54 @@ test('webview bridge: popups to accounts.google.com are also handed off external
   const response = guestWebContents._simulateWindowOpen({ url: 'https://accounts.google.com/signin/oauth' });
   assert.deepEqual(response, { action: 'deny' });
   assert.deepEqual(externalCalls, ['https://accounts.google.com/signin/oauth']);
+});
+
+test('webview bridge: top-level OAuth redirects are canceled and handed off without changing the in-app page', async () => {
+  const { handlers, views, sentEvents, externalCalls } = makeHarness();
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-site', url: 'https://mail.google.com/' });
+  const wc = views[0].webContents;
+  const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client';
+  const event = { prevented: false, preventDefault() { this.prevented = true; } };
+
+  // Electron 44 details-object signature.
+  wc.emit('will-redirect', event, { url: authUrl, isMainFrame: true });
+  assert.equal(event.prevented, true);
+  assert.deepEqual(externalCalls, [authUrl]);
+  assert.equal(sentEvents.some((e) => e.payload.type === 'navigated'), false, 'a canceled auth redirect does not rewrite the source tab URL/history');
+  assert.ok(sentEvents.some((e) => e.payload.type === 'system-browser-handoff' && e.payload.url === authUrl));
+  assert.ok(sentEvents.some((e) => e.payload.type === 'loading-stop'), 'canceled navigation clears the loading state');
+
+  // Electron may place navigation details directly on the event object.
+  const eventDetails = {
+    url: 'https://accounts.google.com/signin/v2/identifier',
+    isMainFrame: true,
+    prevented: false,
+    preventDefault() { this.prevented = true; }
+  };
+  wc.emit('will-navigate', eventDetails);
+  assert.equal(eventDetails.prevented, true);
+  assert.deepEqual(externalCalls, [authUrl, eventDetails.url]);
+
+  // Legacy positional signature still guards against subframe redirects.
+  const subframe = { prevented: false, preventDefault() { this.prevented = true; } };
+  wc.emit('will-navigate', subframe, 'https://accounts.google.com/signin/v2/identifier', false, false);
+  assert.equal(subframe.prevented, false);
+  assert.deepEqual(externalCalls, [authUrl, eventDetails.url]);
+
+  const ordinaryGoogle = { prevented: false, preventDefault() { this.prevented = true; } };
+  wc.emit('will-redirect', ordinaryGoogle, { url: 'https://www.google.com/search?q=ghana', isMainFrame: true });
+  assert.equal(ordinaryGoogle.prevented, false, 'ordinary Google search is not sent to the system browser by auth routing');
+  assert.deepEqual(externalCalls, [authUrl, eventDetails.url]);
+});
+
+test('webview bridge: HTTP auth redirects are canceled and upgraded before handoff', async () => {
+  const { handlers, views, sentEvents, externalCalls } = makeHarness();
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-source', url: 'https://example.com/' });
+  const event = { prevented: false, preventDefault() { this.prevented = true; } };
+  views[0].webContents.emit('will-redirect', event, { url: 'http://accounts.google.com/signin', isMainFrame: true });
+  assert.equal(event.prevented, true);
+  assert.deepEqual(externalCalls, ['https://accounts.google.com/signin']);
+  assert.ok(sentEvents.some((e) => e.payload.type === 'system-browser-handoff' && e.payload.url === 'https://accounts.google.com/signin'));
 });
 
 test('webview bridge: every new tab gets a browser-like user agent without the Electron token', async () => {

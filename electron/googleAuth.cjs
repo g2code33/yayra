@@ -94,11 +94,23 @@ function buildAuthorizationUrl({ clientId, redirectUri, state, codeChallenge, sc
  * function, no I/O, fully unit-testable.
  */
 function parseCallbackUrl(requestUrl) {
-  const url = new URL(requestUrl, 'http://127.0.0.1');
-  if (url.pathname !== CALLBACK_PATH) return { ignored: true };
-  const error = url.searchParams.get('error');
-  const code = url.searchParams.get('code');
-  const state = url.searchParams.get('state');
+  // Node's loopback HTTP server should receive an origin-form path only.
+  // Reject absolute-form URLs, authority-relative targets and path lookalikes
+  // before URL normalization can turn them into the trusted callback path.
+  if (typeof requestUrl !== 'string'
+    || (requestUrl !== CALLBACK_PATH && !requestUrl.startsWith(`${CALLBACK_PATH}?`))) {
+    return { ignored: true };
+  }
+  let url;
+  try { url = new URL(requestUrl, 'http://127.0.0.1'); } catch { return { ignored: true }; }
+  if (url.origin !== 'http://127.0.0.1' || url.pathname !== CALLBACK_PATH || url.hash) return { ignored: true };
+  const errors = url.searchParams.getAll('error');
+  const codes = url.searchParams.getAll('code');
+  const states = url.searchParams.getAll('state');
+  if (errors.length > 1 || codes.length > 1 || states.length > 1) return { error: 'invalid_callback_parameters' };
+  const error = errors[0];
+  const code = codes[0];
+  const state = states[0];
   if (error) return { error, state };
   if (!code) return { error: 'missing_code', state };
   return { code, state };

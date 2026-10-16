@@ -5,7 +5,9 @@ import android.app.Activity
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.net.Uri
 import android.util.Base64
+import android.os.Message
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
@@ -59,6 +61,21 @@ class YayraTabWebviewManager(
     private val tabs = HashMap<String, TabEntry>()
     private val density: Float get() = activity.resources.displayMetrics.density
 
+    private companion object {
+        // Keep in sync with BrowserShell.isSystemBrowserAuthHost() and
+        // electron/webviewBridge.cjs. Google account browsing is allowed in
+        // the native view; only Google sign-in/OAuth URL paths are routed out.
+        val SYSTEM_BROWSER_AUTH_HOSTS = setOf(
+            "appleid.apple.com",
+            "login.live.com",
+            "login.microsoftonline.com"
+        )
+        val GOOGLE_SIGN_IN_PATH = Regex(
+            "^/(?:o/oauth2(?:/|$)|oauth2(?:/|$)|signin(?:/|$)|servicelogin(?:/|$)|accountchooser(?:/|$)|v\\d+/signin(?:/|$)|gsi/select(?:/|$))",
+            RegexOption.IGNORE_CASE
+        )
+    }
+
     private class TabEntry(val id: String) {
         lateinit var webView: WebView
         lateinit var snapshot: ImageView
@@ -66,6 +83,21 @@ class YayraTabWebviewManager(
         var lastReportedUrl: String? = null
         var pointerTheme: String = "system"
         var pointerSize: String = "normal"
+    }
+
+    private fun isSystemBrowserAuthUrl(uri: Uri): Boolean {
+        if (!uri.scheme.equals("https", ignoreCase = true) && !uri.scheme.equals("http", ignoreCase = true)) return false
+        val host = uri.host?.lowercase() ?: return false
+        if (host == "accounts.google.com") return GOOGLE_SIGN_IN_PATH.containsMatchIn(uri.encodedPath ?: "/")
+        return SYSTEM_BROWSER_AUTH_HOSTS.any { host == it || host.endsWith(".$it") }
+    }
+
+    private fun secureSystemBrowserAuthUrl(uri: Uri): String {
+        return if (uri.scheme.equals("http", ignoreCase = true)) {
+            uri.buildUpon().scheme("https").build().toString()
+        } else {
+            uri.toString()
+        }
     }
 
     private fun emitEvent(id: String, type: String, extra: (JSObject) -> Unit = {}) {
@@ -132,9 +164,18 @@ class YayraTabWebviewManager(
                         settings.allowFileAccess = false
                         settings.allowContentAccess = false
                         settings.cacheMode = WebSettings.LOAD_DEFAULT
+                        settings.setSupportMultipleWindows(true)
                         webViewClient = object : WebViewClient() {
                             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                                val target = request?.url?.toString() ?: return false
+                                val targetUri = request?.url ?: return false
+                                if (request.isForMainFrame && isSystemBrowserAuthUrl(targetUri)) {
+                                    // Cancel before the provider page is loaded.
+                                    // JS opens it with Capacitor Browser, leaving
+                                    // this native tab and its history untouched.
+                                    emitEvent(id, "auth-navigation-blocked") { d -> d.put("url", secureSystemBrowserAuthUrl(targetUri)) }
+                                    return true
+                                }
+                                val target = targetUri.toString()
                                 // Only web pages render in this engine; other
                                 // schemes (mailto:, market:, intent:) stay off
                                 // the app webview rather than half-working.
@@ -176,7 +217,64 @@ class YayraTabWebviewManager(
                                 }
                             }
                         }
-                        webChromeClient = WebChromeClient()
+                        webChromeClient = object : WebChromeClient() {
+                            override fun onCreateWindow(parent: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?): Boolean {
+                                // Mirror Electron: user-initiated ordinary popups
+                                // become Yayra tabs; identity-provider sign-in
+                                // popups are handed to the secure browser.
+                                if (!isUserGesture || resultMsg == null) return false
+                                var routed = false
+                                lateinit var popup: WebView
+                                fun routePopup(target: String) {
+                                    if (target.equals("about:blank", ignoreCase = true) || routed) return
+                                    routed = true
+                                    val uri = try { Uri.parse(target) } catch (_: Exception) { null }
+                                    if (uri != null && isSystemBrowserAuthUrl(uri)) {
+                                        emitEvent(id, "auth-navigation-blocked") { d -> d.put("url", secureSystemBrowserAuthUrl(uri)) }
+                                    } else if (target.startsWith("http://", true) || target.startsWith("https://", true)) {
+                                        emitEvent(id, "new-window-request") { d -> d.put("url", target) }
+                                    }
+                                    try { popup.stopLoading(); popup.destroy() } catch (_: Exception) { /* best effort */ }
+                                }
+
+                                popup = WebView(activity).apply {
+                                    settings.javaScriptEnabled = true
+                                    settings.domStorageEnabled = true
+                                    settings.allowFileAccess = false
+                                    settings.allowContentAccess = false
+                                    webViewClient = object : WebViewClient() {
+                                        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                                            if (request?.isForMainFrame != true) return true
+                                            val target = request.url.toString()
+                                            if (target.equals("about:blank", ignoreCase = true)) return false
+                                            routePopup(target)
+                                            return true
+                                        }
+
+                                        override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                                            if (!url.isNullOrBlank()) routePopup(url)
+                                        }
+                                    }
+                                }
+                                val transport = resultMsg.obj as? WebView.WebViewTransport ?: run {
+                                    popup.destroy()
+                                    return false
+                                }
+                                transport.webView = popup
+                                resultMsg.sendToTarget()
+                                main.postDelayed({
+                                    if (!routed) {
+                                        routed = true
+                                        try { popup.stopLoading(); popup.destroy() } catch (_: Exception) { /* best effort */ }
+                                    }
+                                }, 30_000)
+                                return true
+                            }
+
+                            override fun onCloseWindow(window: WebView?) {
+                                try { window?.stopLoading(); window?.destroy() } catch (_: Exception) { /* best effort */ }
+                            }
+                        }
                     }
                     parent.addView(entry.snapshot)
                     parent.addView(entry.webView)

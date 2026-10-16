@@ -372,20 +372,29 @@ function resolveGoogleClient(env, platform) {
   return null;
 }
 
-function isAcceptableRedirectUri(redirectUri, platform) {
+const DEFAULT_GOOGLE_WEB_ALLOWED_ORIGINS = ['https://yayra.pages.dev', 'http://localhost:4173'];
+
+function isAcceptableRedirectUri(redirectUri, platform, env = {}) {
   let redirect;
   try {
     redirect = new URL(redirectUri);
   } catch {
     return false;
   }
+  if (redirect.username || redirect.password || redirect.search || redirect.hash) return false;
   if (platform === 'android' || platform === 'ios') {
-    // RFC 8252 custom scheme (com.yayra.app:/oauth2redirect) or an HTTPS
-    // app link. Google is the real enforcement point either way.
-    return redirect.protocol !== 'http:';
+    // Mobile builds register exactly this RFC 8252 reverse-DNS callback.
+    // Do not accept arbitrary non-HTTP schemes or lookalike callback paths.
+    return redirectUri === 'com.yayra.app:/oauth2redirect'
+      && redirect.protocol === 'com.yayra.app:'
+      && redirect.host === ''
+      && redirect.pathname === '/oauth2redirect';
   }
-  const isLocalhost = redirect.hostname === 'localhost' || redirect.hostname === '127.0.0.1';
-  return redirect.protocol === 'https:' || (redirect.protocol === 'http:' && isLocalhost);
+  if (redirect.pathname !== '/auth/callback') return false;
+  const configuredOrigins = typeof env.GOOGLE_WEB_ALLOWED_ORIGINS === 'string'
+    ? env.GOOGLE_WEB_ALLOWED_ORIGINS.split(',').map((origin) => origin.trim()).filter(Boolean)
+    : DEFAULT_GOOGLE_WEB_ALLOWED_ORIGINS;
+  return configuredOrigins.includes(redirect.origin);
 }
 
 async function exchangeGoogleAuthCode(request, headers, env) {
@@ -411,7 +420,13 @@ async function exchangeGoogleAuthCode(request, headers, env) {
   if (!code || !codeVerifier || !redirectUri) {
     return new Response(JSON.stringify({ error: 'missing_fields' }), { status: 400, headers });
   }
-  if (!isAcceptableRedirectUri(redirectUri, platform)) {
+  // RFC 7636 code_verifier: 43-128 unreserved characters. The clients
+  // generate a 43-character base64url verifier; reject malformed requests
+  // before forwarding anything to Google.
+  if (!/^[A-Za-z0-9._~-]{43,128}$/.test(codeVerifier)) {
+    return new Response(JSON.stringify({ error: 'invalid_code_verifier' }), { status: 400, headers });
+  }
+  if (!isAcceptableRedirectUri(redirectUri, platform, env)) {
     return new Response(JSON.stringify({ error: 'invalid_redirect_uri' }), { status: 400, headers });
   }
 

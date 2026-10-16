@@ -103,6 +103,7 @@ test('update worker serves a cached response on a repeat request instead of re-h
 
 const EXCHANGE_URL = 'https://yayra-updates-api.g2code335.workers.dev/auth/google/exchange';
 const AUTH_ENV = { GOOGLE_WEB_CLIENT_ID: 'web-id.apps.googleusercontent.com', GOOGLE_WEB_CLIENT_SECRET: 'server-side-secret' };
+const VALID_CODE_VERIFIER = 'A'.repeat(43);
 
 function exchangeRequest(body, method = 'POST') {
   return new Request(EXCHANGE_URL, {
@@ -113,7 +114,7 @@ function exchangeRequest(body, method = 'POST') {
 }
 
 test('auth exchange returns 501 not_configured when the Google client bindings are missing', async () => {
-  const response = await worker.fetch(exchangeRequest({ code: 'c', codeVerifier: 'v', redirectUri: 'https://yayra.pages.dev/auth/callback' }), {});
+  const response = await worker.fetch(exchangeRequest({ code: 'c', codeVerifier: VALID_CODE_VERIFIER, redirectUri: 'https://yayra.pages.dev/auth/callback' }), {});
   assert.equal(response.status, 501);
   assert.equal((await response.json()).error, 'not_configured');
 });
@@ -133,9 +134,21 @@ test('auth exchange only accepts POST and rejects malformed bodies before touchi
     assert.equal(missing.status, 400);
     assert.equal((await missing.json()).error, 'missing_fields');
 
-    const badUri = await worker.fetch(exchangeRequest({ code: 'c', codeVerifier: 'v', redirectUri: 'http://evil.example/cb' }), AUTH_ENV);
+    const badUri = await worker.fetch(exchangeRequest({ code: 'c', codeVerifier: VALID_CODE_VERIFIER, redirectUri: 'http://evil.example/cb' }), AUTH_ENV);
     assert.equal(badUri.status, 400);
     assert.equal((await badUri.json()).error, 'invalid_redirect_uri');
+
+    const badCallbackPath = await worker.fetch(exchangeRequest({ code: 'c', codeVerifier: VALID_CODE_VERIFIER, redirectUri: 'https://yayra.pages.dev/not-callback' }), AUTH_ENV);
+    assert.equal(badCallbackPath.status, 400);
+    assert.equal((await badCallbackPath.json()).error, 'invalid_redirect_uri');
+
+    const untrustedOrigin = await worker.fetch(exchangeRequest({ code: 'c', codeVerifier: VALID_CODE_VERIFIER, redirectUri: 'https://attacker.example/auth/callback' }), AUTH_ENV);
+    assert.equal(untrustedOrigin.status, 400);
+    assert.equal((await untrustedOrigin.json()).error, 'invalid_redirect_uri');
+
+    const badVerifier = await worker.fetch(exchangeRequest({ code: 'c', codeVerifier: 'short', redirectUri: 'https://yayra.pages.dev/auth/callback' }), AUTH_ENV);
+    assert.equal(badVerifier.status, 400);
+    assert.equal((await badVerifier.json()).error, 'invalid_code_verifier');
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -152,7 +165,7 @@ test('auth exchange attaches the client secret server-side, forwards PKCE verifi
     return new Response(JSON.stringify({ sub: '42', name: 'Ama Mensah', email: 'ama@example.com', picture: 'https://lh3.googleusercontent.com/a/p', email_verified: true }), { status: 200 });
   };
   try {
-    const response = await worker.fetch(exchangeRequest({ code: 'one-shot-code', codeVerifier: 'pkce-verifier', redirectUri: 'https://yayra.pages.dev/auth/callback' }), AUTH_ENV);
+    const response = await worker.fetch(exchangeRequest({ code: 'one-shot-code', codeVerifier: VALID_CODE_VERIFIER, redirectUri: 'https://yayra.pages.dev/auth/callback' }), AUTH_ENV);
     assert.equal(response.status, 200);
     assert.equal(response.headers.get('access-control-allow-origin'), '*');
     assert.equal(response.headers.get('cache-control'), 'no-store');
@@ -160,7 +173,7 @@ test('auth exchange attaches the client secret server-side, forwards PKCE verifi
     const tokenCall = upstream.find((u) => u.target.includes('/token'));
     const params = new URLSearchParams(tokenCall.options.body);
     assert.equal(params.get('code'), 'one-shot-code');
-    assert.equal(params.get('code_verifier'), 'pkce-verifier');
+    assert.equal(params.get('code_verifier'), VALID_CODE_VERIFIER);
     assert.equal(params.get('client_secret'), 'server-side-secret');
     assert.equal(params.get('grant_type'), 'authorization_code');
 
@@ -178,7 +191,7 @@ test('auth exchange attaches the client secret server-side, forwards PKCE verifi
   }
 });
 
-test('auth exchange serves Android/iOS clients WITHOUT a secret (public native clients) and accepts custom-scheme redirects', async () => {
+test('auth exchange serves Android/iOS clients WITHOUT a secret and accepts only the registered app redirect', async () => {
   const originalFetch = globalThis.fetch;
   const upstream = [];
   globalThis.fetch = async (target, options) => {
@@ -188,7 +201,7 @@ test('auth exchange serves Android/iOS clients WITHOUT a secret (public native c
   };
   const env = { GOOGLE_ANDROID_CLIENT_ID: 'android-id.apps.googleusercontent.com' };
   try {
-    const response = await worker.fetch(exchangeRequest({ code: 'c', codeVerifier: 'v', redirectUri: 'com.yayra.app:/oauth2redirect', platform: 'android' }), env);
+    const response = await worker.fetch(exchangeRequest({ code: 'c', codeVerifier: VALID_CODE_VERIFIER, redirectUri: 'com.yayra.app:/oauth2redirect', platform: 'android' }), env);
     assert.equal(response.status, 200);
     const params = new URLSearchParams(upstream[0].options.body);
     assert.equal(params.get('client_id'), 'android-id.apps.googleusercontent.com');
@@ -197,14 +210,20 @@ test('auth exchange serves Android/iOS clients WITHOUT a secret (public native c
     assert.deepEqual(await response.json(), { profile: { sub: '9', name: 'Kofi', email: 'kofi@example.com', picture: 'p' } });
 
     // The same request without the matching platform binding is honestly unconfigured.
-    const unconfigured = await worker.fetch(exchangeRequest({ code: 'c', codeVerifier: 'v', redirectUri: 'com.yayra.app:/oauth2redirect', platform: 'ios' }), env);
+    const unconfigured = await worker.fetch(exchangeRequest({ code: 'c', codeVerifier: VALID_CODE_VERIFIER, redirectUri: 'com.yayra.app:/oauth2redirect', platform: 'ios' }), env);
     assert.equal(unconfigured.status, 501);
 
+    for (const redirectUri of ['com.yayra.app:/oauth2redirect.evil', 'javascript:alert(1)', 'com.attacker.app:/oauth2redirect']) {
+      const untrusted = await worker.fetch(exchangeRequest({ code: 'c', codeVerifier: VALID_CODE_VERIFIER, redirectUri, platform: 'android' }), env);
+      assert.equal(untrusted.status, 400, redirectUri);
+      assert.equal((await untrusted.json()).error, 'invalid_redirect_uri', redirectUri);
+    }
+
     // And a web-platform request must NOT accept a custom-scheme redirect.
-    const badScheme = await worker.fetch(exchangeRequest({ code: 'c', codeVerifier: 'v', redirectUri: 'com.yayra.app:/oauth2redirect', platform: 'web' }), AUTH_ENV);
+    const badScheme = await worker.fetch(exchangeRequest({ code: 'c', codeVerifier: VALID_CODE_VERIFIER, redirectUri: 'com.yayra.app:/oauth2redirect', platform: 'web' }), AUTH_ENV);
     assert.equal(badScheme.status, 400);
 
-    const badPlatform = await worker.fetch(exchangeRequest({ code: 'c', codeVerifier: 'v', redirectUri: 'com.yayra.app:/x', platform: 'desktop' }), env);
+    const badPlatform = await worker.fetch(exchangeRequest({ code: 'c', codeVerifier: VALID_CODE_VERIFIER, redirectUri: 'com.yayra.app:/x', platform: 'desktop' }), env);
     assert.equal(badPlatform.status, 400);
     assert.equal((await badPlatform.json()).error, 'invalid_platform');
   } finally {
@@ -216,7 +235,7 @@ test('auth exchange passes Google OAuth error codes through without echoing requ
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({ error: 'invalid_grant', error_description: 'Code was already redeemed.' }), { status: 400 });
   try {
-    const response = await worker.fetch(exchangeRequest({ code: 'reused-code', codeVerifier: 'v', redirectUri: 'http://localhost:4173/auth/callback' }), AUTH_ENV);
+    const response = await worker.fetch(exchangeRequest({ code: 'reused-code', codeVerifier: VALID_CODE_VERIFIER, redirectUri: 'http://localhost:4173/auth/callback' }), AUTH_ENV);
     assert.equal(response.status, 502);
     const body = await response.json();
     assert.equal(body.error, 'invalid_grant');

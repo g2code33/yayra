@@ -87,6 +87,30 @@ export function generateState(cryptoImpl = globalThis.crypto) {
   return base64urlFromBytes(cryptoImpl.getRandomValues(new Uint8Array(16)));
 }
 
+function validatedWebOrigin(rawOrigin) {
+  try {
+    const parsed = new URL(rawOrigin);
+    const localHttp = parsed.protocol === 'http:'
+      && ['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname);
+    if (parsed.origin !== rawOrigin || parsed.username || parsed.password
+      || (parsed.protocol !== 'https:' && !localHttp)) throw new Error('invalid_redirect_uri');
+    return parsed.origin;
+  } catch {
+    throw new Error('invalid_redirect_uri');
+  }
+}
+
+function safeReturnToPath(value, origin) {
+  if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//') || value.includes('\\')) return '/';
+  try {
+    const parsed = new URL(value, origin);
+    if (parsed.origin !== origin || parsed.username || parsed.password) return '/';
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return '/';
+  }
+}
+
 /**
  * Same parameter set as the Electron flow (including `prompt=consent
  * select_account` so "Switch account" shows Google's account chooser), with
@@ -121,10 +145,16 @@ export async function beginSignIn({
   navigate
 }) {
   if (!clientId) throw new Error('not_configured');
+  const safeOrigin = validatedWebOrigin(origin);
   const { codeVerifier, codeChallenge } = await generatePkcePair(cryptoImpl);
   const state = generateState(cryptoImpl);
-  const redirectUri = `${origin}${CALLBACK_PATH}`;
-  sessionStorage.setItem(PENDING_KEY, JSON.stringify({ codeVerifier, state, returnTo, startedAt: new Date().toISOString() }));
+  const redirectUri = `${safeOrigin}${CALLBACK_PATH}`;
+  sessionStorage.setItem(PENDING_KEY, JSON.stringify({
+    codeVerifier,
+    state,
+    returnTo: safeReturnToPath(returnTo, safeOrigin),
+    startedAt: new Date().toISOString()
+  }));
   const url = buildAuthorizationUrl({ clientId, redirectUri, state, codeChallenge });
   navigate(url);
   return url;
@@ -132,12 +162,15 @@ export async function beginSignIn({
 
 /** Parses and validates Google's callback query parameters. */
 export function parseCallbackParams(search) {
-  const params = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search);
-  const error = params.get('error');
-  if (error) return { ok: false, error };
-  const code = params.get('code');
-  const state = params.get('state');
-  if (!code || !state) return { ok: false, error: 'missing_code_or_state' };
+  const params = new URLSearchParams(String(search || '').startsWith('?') ? String(search).slice(1) : String(search || ''));
+  const errors = params.getAll('error');
+  const codes = params.getAll('code');
+  const states = params.getAll('state');
+  if (errors.length > 1 || codes.length > 1 || states.length > 1) return { ok: false, error: 'invalid_callback' };
+  const state = states[0];
+  if (errors[0]) return { ok: false, error: errors[0], ...(state ? { state } : {}) };
+  const code = codes[0];
+  if (!code || !state) return { ok: false, error: 'missing_code_or_state', ...(state ? { state } : {}) };
   return { ok: true, code, state };
 }
 
@@ -151,10 +184,13 @@ export function parseCallbackParams(search) {
 export async function completeSignIn({
   search,
   origin,
+  pathname = CALLBACK_PATH,
   exchangeUrl,
   sessionStorage,
   fetchImpl = globalThis.fetch
 }) {
+  if (pathname !== CALLBACK_PATH) throw new Error('invalid_callback');
+  const safeOrigin = validatedWebOrigin(origin);
   const pendingRaw = sessionStorage.getItem(PENDING_KEY);
   // Single-use: consume the pending attempt before anything can throw, so a
   // replayed/bookmarked callback URL can never complete a second time.
@@ -166,10 +202,17 @@ export async function completeSignIn({
   } catch {
     throw new Error('corrupt_pending_sign_in');
   }
+  if (!pending || typeof pending.state !== 'string' || !pending.state
+    || typeof pending.codeVerifier !== 'string'
+    || !/^[A-Za-z0-9._~-]{43,128}$/.test(pending.codeVerifier)) {
+    throw new Error('corrupt_pending_sign_in');
+  }
 
   const parsed = parseCallbackParams(search);
+  if (parsed.error === 'invalid_callback') throw new Error(parsed.error);
+  if (!parsed.state) throw new Error('missing_code_or_state');
+  if (parsed.state !== pending.state) throw new Error('state_mismatch');
   if (!parsed.ok) throw new Error(parsed.error);
-  if (!pending.state || parsed.state !== pending.state) throw new Error('state_mismatch');
 
   const response = await fetchImpl(exchangeUrl, {
     method: 'POST',
@@ -177,7 +220,7 @@ export async function completeSignIn({
     body: JSON.stringify({
       code: parsed.code,
       codeVerifier: pending.codeVerifier,
-      redirectUri: `${origin}${CALLBACK_PATH}`
+      redirectUri: `${safeOrigin}${CALLBACK_PATH}`
     })
   });
   if (!response.ok) {
@@ -191,7 +234,10 @@ export async function completeSignIn({
   // never let them past this seam. Profile only - same contract as the
   // Electron bridge (electron/authBridge.cjs).
   const { sub, name, email, picture } = body.profile;
-  return { profile: { sub, name, email, picture }, returnTo: typeof pending.returnTo === 'string' ? pending.returnTo : '/' };
+  return {
+    profile: { sub, name, email, picture },
+    returnTo: safeReturnToPath(pending.returnTo, safeOrigin)
+  };
 }
 
 /** Profile-only persistence (see the security trade-off note at the top). */

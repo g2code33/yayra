@@ -188,22 +188,38 @@ test('Native engine: a "navigated" event from the main process updates tab URL, 
   }
 });
 
-test('Native engine: a sign-in host handoff result resets the tab to the new-tab page instead of leaving a blank native slot', async () => {
+test('Native engine: Google sign-in handoff preserves tab id, URL, active selection, history and a visible fallback', async () => {
   const { fake, calls, uninstall } = installFakeNativeWebview();
   try {
-    fake.ensure = (tabId) => { calls.ensure.push(tabId); return Promise.resolve({ handedOffToSystemBrowser: true }); };
+    fake.ensure = (tabId, url) => {
+      calls.ensure.push({ tabId, url });
+      return Promise.resolve({ handedOffToSystemBrowser: url.includes('accounts.google.com') });
+    };
     const container = document.createElement('div');
     const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
     await shell.initialize();
     const tab = shell.getActiveTab();
+    const tabId = tab.id;
 
-    shell.navigateActiveTab('https://accounts.google.com/signin');
+    shell.navigateActiveTab('https://example.com/before-sign-in');
+    shell.navigateActiveTab('https://accounts.google.com/signin/v2/identifier');
+    const originalHistory = [...tab.navigationState.historyStack];
+    const originalIndex = tab.navigationState.currentIndex;
+    shell.render(container);
     shell.render(container);
     // Allow the ensure() promise microtask to resolve.
     await Promise.resolve();
     await Promise.resolve();
 
-    assert.equal(tab.url, 'yayra://newtab');
+    assert.equal(tab.id, tabId);
+    assert.equal(tab.url, 'https://accounts.google.com/signin/v2/identifier');
+    assert.equal(shell.state.activeTabId, tabId);
+    assert.deepEqual(tab.navigationState.historyStack, originalHistory);
+    assert.equal(tab.navigationState.currentIndex, originalIndex);
+    assert.equal(tab.canGoBack, true);
+    assert.ok(shell.rootElement.querySelector('.fb-auth-handoff-fallback'), 'the tab explains why sign-in is external');
+    assert.equal(calls.ensure.filter((call) => call.url === tab.url).length, 1, 're-rendering does not reopen the same auth URL');
+    assert.ok(calls.setVisible.some((call) => call.tabId === tabId && call.visible === false), 'any previous native page surface is hidden, not painted over the fallback');
   } finally {
     uninstall();
   }

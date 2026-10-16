@@ -33,6 +33,7 @@ function fakeStorage(seed = {}) {
 const CLIENT_ID = 'web-client-id.apps.googleusercontent.com';
 const ORIGIN = 'https://yayra.pages.dev';
 const EXCHANGE_URL = 'https://yayra-updates-api.g2code335.workers.dev/auth/google/exchange';
+const VALID_WEB_VERIFIER = 'A'.repeat(43);
 
 // --- PKCE / state generation --------------------------------------------
 
@@ -106,19 +107,32 @@ test('beginSignIn refuses to start without a client id', async () => {
   );
 });
 
+test('beginSignIn rejects an untrusted redirect origin and stores only a same-origin return path', async () => {
+  await assert.rejects(
+    () => beginSignIn({ clientId: CLIENT_ID, origin: 'javascript:alert(1)', sessionStorage: fakeStorage(), navigate: () => {} }),
+    /invalid_redirect_uri/
+  );
+  const session = fakeStorage();
+  await beginSignIn({ clientId: CLIENT_ID, origin: ORIGIN, returnTo: '//attacker.example', sessionStorage: session, navigate: () => {} });
+  assert.equal(JSON.parse(session.getItem(PENDING_KEY)).returnTo, '/');
+});
+
 // --- parseCallbackParams ---------------------------------------------------
 
-test('parseCallbackParams surfaces Google error codes and rejects incomplete callbacks', () => {
+test('parseCallbackParams surfaces Google errors, rejects incomplete or ambiguous callbacks', () => {
   assert.deepEqual(parseCallbackParams('?error=access_denied'), { ok: false, error: 'access_denied' });
+  assert.deepEqual(parseCallbackParams('?error=access_denied&state=xyz'), { ok: false, error: 'access_denied', state: 'xyz' });
   assert.deepEqual(parseCallbackParams('?code=abc'), { ok: false, error: 'missing_code_or_state' });
   assert.deepEqual(parseCallbackParams('?code=abc&state=xyz'), { ok: true, code: 'abc', state: 'xyz' });
+  assert.deepEqual(parseCallbackParams('?code=one&code=two&state=xyz'), { ok: false, error: 'invalid_callback' });
+  assert.deepEqual(parseCallbackParams('?code=abc&state=one&state=two'), { ok: false, error: 'invalid_callback' });
 });
 
 // --- completeSignIn (step 2: validate + server-side exchange) -------------
 
 function pendingSession(overrides = {}) {
   return fakeStorage({
-    [PENDING_KEY]: JSON.stringify({ codeVerifier: 'verifier-abc', state: 'state-xyz', returnTo: '/settings', ...overrides })
+    [PENDING_KEY]: JSON.stringify({ codeVerifier: VALID_WEB_VERIFIER, state: 'state-xyz', returnTo: '/settings', ...overrides })
   });
 }
 
@@ -146,7 +160,7 @@ test('completeSignIn posts code+verifier+redirectUri to the worker and returns p
   assert.equal(requests[0].url, EXCHANGE_URL);
   assert.equal(requests[0].options.method, 'POST');
   const body = JSON.parse(requests[0].options.body);
-  assert.deepEqual(body, { code: 'auth-code-1', codeVerifier: 'verifier-abc', redirectUri: 'https://yayra.pages.dev/auth/callback' });
+  assert.deepEqual(body, { code: 'auth-code-1', codeVerifier: VALID_WEB_VERIFIER, redirectUri: 'https://yayra.pages.dev/auth/callback' });
   // No token-ish material may leave completeSignIn.
   assert.deepEqual(result, {
     profile: { sub: '108', name: 'Ama Mensah', email: 'ama@example.com', picture: 'https://lh3.googleusercontent.com/a/photo' },
@@ -166,6 +180,40 @@ test('completeSignIn rejects a CSRF state mismatch and still consumes the pendin
   assert.equal(session.getItem(PENDING_KEY), null);
 });
 
+test('completeSignIn validates state on OAuth error callbacks before surfacing the provider error', async () => {
+  await assert.rejects(
+    () => completeSignIn({ search: '?error=access_denied&state=wrong', origin: ORIGIN, exchangeUrl: EXCHANGE_URL, sessionStorage: pendingSession(), fetchImpl: async () => { throw new Error('must not fetch'); } }),
+    /state_mismatch/
+  );
+  await assert.rejects(
+    () => completeSignIn({ search: '?error=access_denied&state=state-xyz', origin: ORIGIN, exchangeUrl: EXCHANGE_URL, sessionStorage: pendingSession(), fetchImpl: async () => { throw new Error('must not fetch'); } }),
+    /access_denied/
+  );
+});
+
+test('completeSignIn rejects a callback on an unexpected route or untrusted origin before exchanging', async () => {
+  const session = pendingSession();
+  await assert.rejects(
+    () => completeSignIn({ search: '?code=c&state=state-xyz', origin: ORIGIN, pathname: '/not-auth-callback', exchangeUrl: EXCHANGE_URL, sessionStorage: session, fetchImpl: async () => { throw new Error('must not fetch'); } }),
+    /invalid_callback/
+  );
+  assert.ok(session.getItem(PENDING_KEY), 'an unrelated route cannot consume the pending sign-in');
+
+  await assert.rejects(
+    () => completeSignIn({ search: '?code=c&state=state-xyz', origin: 'http://evil.example', exchangeUrl: EXCHANGE_URL, sessionStorage: session, fetchImpl: async () => { throw new Error('must not fetch'); } }),
+    /invalid_redirect_uri/
+  );
+});
+
+test('completeSignIn rejects a malformed pending PKCE verifier before worker exchange', async () => {
+  const session = pendingSession({ codeVerifier: 'short' });
+  await assert.rejects(
+    () => completeSignIn({ search: '?code=c&state=state-xyz', origin: ORIGIN, exchangeUrl: EXCHANGE_URL, sessionStorage: session, fetchImpl: async () => { throw new Error('must not fetch'); } }),
+    /corrupt_pending_sign_in/
+  );
+  assert.equal(session.getItem(PENDING_KEY), null, 'the malformed attempt is consumed and cannot be replayed');
+});
+
 test('completeSignIn rejects a callback with no pending sign-in (replayed/bookmarked URL)', async () => {
   await assert.rejects(
     () => completeSignIn({ search: '?code=c&state=s', origin: ORIGIN, exchangeUrl: EXCHANGE_URL, sessionStorage: fakeStorage(), fetchImpl: async () => { throw new Error('must not fetch'); } }),
@@ -175,7 +223,7 @@ test('completeSignIn rejects a callback with no pending sign-in (replayed/bookma
 
 test('completeSignIn surfaces Google consent-screen cancellation as its error code', async () => {
   await assert.rejects(
-    () => completeSignIn({ search: '?error=access_denied', origin: ORIGIN, exchangeUrl: EXCHANGE_URL, sessionStorage: pendingSession(), fetchImpl: async () => { throw new Error('must not fetch'); } }),
+    () => completeSignIn({ search: '?error=access_denied&state=state-xyz', origin: ORIGIN, exchangeUrl: EXCHANGE_URL, sessionStorage: pendingSession(), fetchImpl: async () => { throw new Error('must not fetch'); } }),
     /access_denied/
   );
 });

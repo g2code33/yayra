@@ -87,9 +87,18 @@ test('parseCallbackUrl: treats a missing code with no error as a malformed callb
   assert.equal(result.error, 'missing_code');
 });
 
-test('parseCallbackUrl: ignores requests to any path other than the OAuth callback', () => {
+test('parseCallbackUrl: ignores non-origin-form, untrusted-origin, and lookalike callback URLs', () => {
   assert.deepEqual(parseCallbackUrl('/favicon.ico'), { ignored: true });
   assert.deepEqual(parseCallbackUrl('/'), { ignored: true });
+  assert.deepEqual(parseCallbackUrl('/callback/../callback?code=c&state=s'), { ignored: true });
+  assert.deepEqual(parseCallbackUrl('/callback-evil?code=c&state=s'), { ignored: true });
+  assert.deepEqual(parseCallbackUrl('http://evil.example/callback?code=c&state=s'), { ignored: true });
+  assert.deepEqual(parseCallbackUrl('//evil.example/callback?code=c&state=s'), { ignored: true });
+});
+
+test('parseCallbackUrl: rejects duplicate OAuth security parameters', () => {
+  assert.deepEqual(parseCallbackUrl('/callback?code=one&code=two&state=s'), { error: 'invalid_callback_parameters' });
+  assert.deepEqual(parseCallbackUrl('/callback?code=c&state=one&state=two'), { error: 'invalid_callback_parameters' });
 });
 
 // --- Token exchange / userinfo (fetch injected, no real network) ---------

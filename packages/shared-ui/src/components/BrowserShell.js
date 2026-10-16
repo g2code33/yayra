@@ -117,6 +117,11 @@ const FRAME_EMBEDDING_BLOCKED_HOSTS = [
   'bing.com'
 ];
 
+// Keep in sync with GOOGLE_SIGN_IN_PATH in electron/webviewBridge.cjs.
+// accounts.google.com has account pages as well as OAuth/sign-in endpoints,
+// so host matching alone would send ordinary account browsing outside Yayra.
+const GOOGLE_SIGN_IN_PATH = /^\/(?:o\/oauth2(?:\/|$)|oauth2(?:\/|$)|signin(?:\/|$)|servicelogin(?:\/|$)|accountchooser(?:\/|$)|v\d+\/signin(?:\/|$)|gsi\/select(?:\/|$))/i;
+
 export class BrowserShell {
   static FRAME_EMBEDDING_BLOCKED_HOSTS = FRAME_EMBEDDING_BLOCKED_HOSTS;
 
@@ -428,6 +433,10 @@ export class BrowserShell {
     // because the underlying native views persist across this class's
     // frequent full-DOM re-renders.
     this._nativeWebviewTabIds = new Set();
+    // A handoff belongs to a tab and its auth URL, not to the whole shell.
+    // Keeping it here prevents chrome re-renders from reopening the system
+    // browser while the original tab URL/history remain intact.
+    this._systemBrowserHandoffs = new Map();
     this._nativeWebviewResizeObservers = new Map();
     this._lastAppliedNativePointerConfig = null;
     this._lastAppliedAndroidPointerConfig = null;
@@ -841,10 +850,9 @@ export class BrowserShell {
     }
   }
 
-  // Keep in sync with SYSTEM_BROWSER_AUTH_HOSTS in electron/webviewBridge.cjs
-  // (the Electron main process equivalent). Duplicated rather than imported
-  // because electron/webviewBridge.cjs is a CommonJS, Electron-only module
-  // and this file ships in the plain web/PWA/Capacitor bundle too.
+  // Keep in sync with SYSTEM_BROWSER_AUTH_HOSTS and GOOGLE_SIGN_IN_PATH in
+  // electron/webviewBridge.cjs. Duplicated rather than imported because that
+  // module is CommonJS/Electron-only and this file ships in web/PWA/Capacitor.
   static SYSTEM_BROWSER_AUTH_HOSTS = ['accounts.google.com', 'appleid.apple.com', 'login.live.com', 'login.microsoftonline.com'];
 
   // Chrome-style keep-alive: loaded pages are never reloaded in the
@@ -855,8 +863,15 @@ export class BrowserShell {
 
   isSystemBrowserAuthHost(url) {
     try {
-      const hostname = new URL(url).hostname.toLowerCase();
-      return BrowserShell.SYSTEM_BROWSER_AUTH_HOSTS.some((host) => hostname === host || hostname.endsWith(`.${host}`));
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+      const hostname = parsed.hostname.toLowerCase();
+      return BrowserShell.SYSTEM_BROWSER_AUTH_HOSTS.some((host) => {
+        if (host === 'accounts.google.com') {
+          return hostname === host && GOOGLE_SIGN_IN_PATH.test(parsed.pathname);
+        }
+        return hostname === host || hostname.endsWith(`.${host}`);
+      });
     } catch (_err) {
       return false;
     }
@@ -868,17 +883,27 @@ export class BrowserShell {
   // handoff (shell.openExternal, see electron/webviewBridge.cjs) and never
   // reaches this method for auth hosts.
   async openExternally(url) {
+    let externalUrl = url;
+    if (this.isSystemBrowserAuthHost(url)) {
+      try {
+        const parsed = new URL(url);
+        if (parsed.protocol === 'http:') {
+          parsed.protocol = 'https:';
+          externalUrl = parsed.toString();
+        }
+      } catch { /* the classifier already rejects malformed URLs */ }
+    }
     const capacitorBrowser = this.capacitorBrowser;
     if (capacitorBrowser && typeof capacitorBrowser.open === 'function') {
       try {
-        await capacitorBrowser.open({ url });
+        await capacitorBrowser.open({ url: externalUrl });
         return;
       } catch (err) {
         console.warn('[yayra] Capacitor Browser.open() failed, falling back to window.open', err);
       }
     }
     if (typeof window !== 'undefined' && typeof window.open === 'function') {
-      window.open(url, '_blank', 'noopener,noreferrer');
+      window.open(externalUrl, '_blank', 'noopener,noreferrer');
     }
   }
 
@@ -2233,12 +2258,14 @@ export class BrowserShell {
     // mini window) needs to appear above the page - capturing a snapshot
     // first so the page still appears present underneath the chrome.
     const overlayOpen = this.hasBlockingOverlay();
-    this.syncNativeWebviewVisibility(activeTab.id, !isInternalPage && !overlayOpen, {
-      captureActive: overlayOpen && !isInternalPage
+    const authHandoffOnly = this.isSystemBrowserAuthHost(url);
+    this.syncNativeWebviewVisibility(activeTab.id, !isInternalPage && !overlayOpen && !authHandoffOnly, {
+      captureActive: overlayOpen && !isInternalPage && !authHandoffOnly
     });
     // Same rule for the Android native tab engine (its hide path captures
     // the page frame natively, so the chrome keeps a page underneath it).
-    this.syncAndroidTabWebVisibility(activeTab.id, !isInternalPage && !overlayOpen);
+    // Provider sign-in URLs are rendered as an in-tab handoff card instead.
+    this.syncAndroidTabWebVisibility(activeTab.id, !isInternalPage && !overlayOpen && !authHandoffOnly);
 
     // LOCAL DOCUMENT TABS (yayra://doc/<id>): the integrated document
     // viewer - never the web frame path, never the native engine. This is
@@ -2466,15 +2493,22 @@ export class BrowserShell {
     return false;
   }
 
-  buildSystemBrowserHandoffFallback(url) {
+  buildSystemBrowserHandoffFallback(url, { tabId = null, native = false } = {}) {
     const fallback = document.createElement('div');
     fallback.className = 'fb-frame-blocked-fallback fb-auth-handoff-fallback';
     fallback.style.cssText = 'position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; background:var(--fb-bg-elevated,#15171c); color:var(--fb-text-primary,#d7dbe3); text-align:center; padding:24px; z-index:1;';
     fallback.innerHTML = `
-      <div style="font-size:0.9rem; max-width:360px; line-height:1.5;">For your security, sign-in opens in your browser and never inside an embedded view.</div>
-      <button type="button" class="fb-btn fb-auth-handoff-open-btn" style="padding:8px 16px; border-radius:8px; border:none; background:#3b82f6; color:#fff; cursor:pointer; font-size:0.875rem;">Continue sign-in</button>
+      <div style="font-size:0.9rem; max-width:380px; line-height:1.5;">Identity-provider sign-in opens in a separate secure browser. This Yayra tab and its URL stay intact. Browser cookies are not copied into Yayra, so a third-party site may not reflect the sign-in here unless it completes its own supported callback.</div>
+      <button type="button" class="fb-btn fb-auth-handoff-open-btn" style="padding:8px 16px; border-radius:8px; border:none; background:#3b82f6; color:#fff; cursor:pointer; font-size:0.875rem;">Open sign-in in browser</button>
     `;
     fallback.querySelector('.fb-auth-handoff-open-btn')?.addEventListener('click', () => {
+      if (native && tabId) {
+        // Re-enter the normal native ensure path to ask the main process to
+        // retry shell.openExternal(), without changing this tab or history.
+        this._systemBrowserHandoffs.delete(tabId);
+        if (this.state.activeTabId === tabId) this.render();
+        return;
+      }
       this.openExternally(url);
     });
     return fallback;
@@ -2511,8 +2545,18 @@ export class BrowserShell {
     // to embed the sign-in page. See the matching Electron-side handoff in
     // electron/webviewBridge.cjs for the desktop equivalent of this check.
     if (this.isSystemBrowserAuthHost(url)) {
-      wrapper.appendChild(this.buildSystemBrowserHandoffFallback(url));
-      this.openExternally(url);
+      let handoff = this._systemBrowserHandoffs.get(tabId);
+      if (!handoff || handoff.url !== url) {
+        handoff = { url, status: 'opening' };
+        this._systemBrowserHandoffs.set(tabId, handoff);
+        Promise.resolve(this.openExternally(url)).then(() => {
+          if (this._systemBrowserHandoffs.get(tabId) === handoff) handoff.status = 'opened';
+        }).catch((err) => {
+          if (this._systemBrowserHandoffs.get(tabId) === handoff) handoff.status = 'failed';
+          console.warn('[yayra] system-browser auth handoff failed:', err);
+        });
+      }
+      wrapper.appendChild(this.buildSystemBrowserHandoffFallback(url, { tabId }));
       if (typeof onLoaded === 'function') onLoaded();
       return { wrapper, iframe: null };
     }
@@ -2614,6 +2658,47 @@ export class BrowserShell {
    * ----------------------------------------------------------- */
   attachNativeWebviewSlot(wrapper, tabId, url, isPrivate) {
     wrapper.className += ' fb-native-webview-slot';
+
+    // OAuth/sign-in is handled outside the embedded WebContentsView. Keep
+    // the original tab, URL and navigationState authoritative; only the
+    // provider URL is sent to Electron for shell.openExternal(). The record
+    // is installed BEFORE the async IPC call so a fast re-render cannot open
+    // another system-browser window for the same tab+URL.
+    if (this.isSystemBrowserAuthHost(url)) {
+      let handoff = this._systemBrowserHandoffs.get(tabId);
+      if (!handoff || handoff.url !== url) {
+        handoff = { url, status: 'opening' };
+        this._systemBrowserHandoffs.set(tabId, handoff);
+        wrapper.appendChild(this.buildSystemBrowserHandoffFallback(url, { tabId, native: true }));
+
+        const activeProfileId = this.profileService ? this.profileService.current().id : 'default';
+        Promise.resolve(this.nativeWebview.ensure(tabId, url, isPrivate, activeProfileId, {
+          theme: this.state.settings.pointerTheme || 'system',
+          size: this.state.settings.pointerSize || 'normal'
+        })).then((result) => {
+          if (this._systemBrowserHandoffs.get(tabId) !== handoff) return;
+          const tab = this.state.tabs.find((item) => item.id === tabId);
+          if (result && result.handedOffToSystemBrowser) {
+            handoff.status = 'opened';
+            if (tab && tab.url === url) this.updateTabLoading(tabId, false);
+          } else {
+            handoff.status = 'failed';
+            if (tab && tab.url === url) this.updateTabLoading(tabId, false);
+            this.showTransientNotice('Could not open the sign-in browser. This tab was kept unchanged.');
+          }
+        }).catch((err) => {
+          if (this._systemBrowserHandoffs.get(tabId) === handoff) handoff.status = 'failed';
+          const tab = this.state.tabs.find((item) => item.id === tabId);
+          if (tab && tab.url === url) this.updateTabLoading(tabId, false);
+          console.warn('[yayra] native auth handoff failed:', err);
+        });
+      } else {
+        wrapper.appendChild(this.buildSystemBrowserHandoffFallback(url, { tabId, native: true }));
+      }
+      return;
+    }
+
+    this._systemBrowserHandoffs.delete(tabId);
     this._nativeWebviewTabIds.add(tabId);
 
     // While chrome is overlaying the page the native surface stays hidden;
@@ -2636,16 +2721,6 @@ export class BrowserShell {
     this.nativeWebview.ensure(tabId, url, isPrivate, activeProfileId, {
       theme: this.state.settings.pointerTheme || 'system',
       size: this.state.settings.pointerSize || 'normal'
-    }).then((result) => {
-      if (result && result.handedOffToSystemBrowser) {
-        const tab = this.state.tabs.find((t) => t.id === tabId);
-        if (tab) {
-          tab.url = 'yayra://newtab';
-          tab.isLoading = false;
-          this.showTransientNotice('Opened in your default browser for secure sign-in.');
-          if (tabId === this.state.activeTabId) this.render();
-        }
-      }
     }).catch((err) => console.warn('[yayra] native webview ensure() failed:', err));
 
     const reportBounds = () => {
@@ -3079,6 +3154,8 @@ export class BrowserShell {
         break;
       case 'navigated': {
         const previousUrl = tab.url;
+        const pendingHandoff = this._systemBrowserHandoffs.get(tabId);
+        if (pendingHandoff && evt.url && pendingHandoff.url !== evt.url) this._systemBrowserHandoffs.delete(tabId);
         tab.url = evt.url || tab.url;
         tab.isSecure = (tab.url || '').startsWith('https://');
         tab.canGoBack = Boolean(evt.canGoBack);
@@ -3126,9 +3203,28 @@ export class BrowserShell {
         this.updateTabLoading(tabId, false);
         console.warn(`[yayra] native webview failed to load ${evt.url}: ${evt.errorDescription} (${evt.errorCode})`);
         break;
-      case 'system-browser-handoff':
-        this.showTransientNotice('Opened in your default browser for secure sign-in.');
+      case 'system-browser-handoff': {
+        // Direct auth URLs have an in-tab fallback card; popups and blocked
+        // redirects leave the relying site visible and get this non-blocking
+        // notice instead. Never claim browser cookies/session state are shared.
+        const sameTabAuthUrl = evt.url && evt.url === tab.url
+          && this._systemBrowserHandoffs.get(tabId)?.url === evt.url;
+        if (!sameTabAuthUrl) {
+          this.showTransientNotice('Sign-in opened in a separate browser; this tab may not receive the site’s login state.');
+        }
         break;
+      }
+      case 'auth-navigation-blocked': {
+        // Android's native TabWebView cancels top-level provider sign-in
+        // navigations before loading them, then asks the Capacitor Browser
+        // plugin for its secure system-browser surface. The current tab and
+        // its history are deliberately left untouched.
+        if (evt.url && this.isSystemBrowserAuthHost(evt.url)) {
+          this.showTransientNotice('Sign-in opened in a separate browser; this tab may not receive the site’s login state.');
+          Promise.resolve(this.openExternally(evt.url)).catch(() => {});
+        }
+        break;
+      }
       case 'hard-reloaded': {
         // Ctrl+Shift+R / Ctrl+F5 pressed INSIDE the page (the native view
         // owns those keystrokes) - cache already cleared main-side.
@@ -11115,6 +11211,7 @@ export class BrowserShell {
     if (tabIndex === -1) return;
 
     this.destroyNativeWebview(tabId);
+    this._systemBrowserHandoffs.delete(tabId);
     this._pageSnapshots.delete(tabId); // closed tab, dead preview
 
     const [closedTab] = this.state.tabs.splice(tabIndex, 1);
@@ -11312,6 +11409,10 @@ export class BrowserShell {
     if (!query) return;
 
     const targetUrl = this.interpretUrl(query);
+    // An explicit navigation (including re-entering the same auth URL) is a
+    // fresh attempt, unlike a render. It may therefore launch the browser once
+    // again; passive chrome updates may not.
+    this._systemBrowserHandoffs.delete(activeTab.id);
     const navigationState = this.ensureNavigationState(activeTab);
     const currentUrl = navigationState.historyStack[navigationState.currentIndex];
     if (currentUrl !== targetUrl) {
@@ -11436,6 +11537,7 @@ export class BrowserShell {
   goBack() {
     const activeTab = this.getActiveTab();
     if (!activeTab) return false;
+    this._systemBrowserHandoffs.delete(activeTab.id);
     // Move the active tab's local history first. A native controller may
     // update its own model synchronously, so delegating before this step can
     // overwrite the shell state or jump straight back to the new-tab page.
@@ -11460,6 +11562,7 @@ export class BrowserShell {
   goForward() {
     const activeTab = this.getActiveTab();
     if (!activeTab) return false;
+    this._systemBrowserHandoffs.delete(activeTab.id);
     const navigationState = this.ensureNavigationState(activeTab);
     if (navigationState.currentIndex >= navigationState.historyStack.length - 1) return false;
     navigationState.currentIndex += 1;
@@ -11481,10 +11584,12 @@ export class BrowserShell {
   reload() {
     const activeTab = this.getActiveTab();
     if (!activeTab) return;
+    this._systemBrowserHandoffs.delete(activeTab.id);
     // FREEZE FIX: refresh must ALWAYS hand back the live page surface -
     // in the field a stuck obscured flag made refresh look dead.
     try { this.healStuckPageSurface(); } catch { /* best-effort heal */ }
-    if (this.nativeWebview && this._nativeWebviewTabIds.has(activeTab.id)) {
+    if (this.nativeWebview && this._nativeWebviewTabIds.has(activeTab.id)
+      && !this.isSystemBrowserAuthHost(activeTab.url)) {
       // The X (stop) must appear the INSTANT the reload is requested -
       // not a roundtrip later when loading-start comes back from the
       // native engine. loading-stop flips it back to the refresh sign.
@@ -11492,6 +11597,11 @@ export class BrowserShell {
       this.nativeWebview.reload(activeTab.id).catch(() => {
         this.updateTabLoading(activeTab.id, false);
       });
+      return;
+    }
+    if (this.isSystemBrowserAuthHost(activeTab.url)) {
+      activeTab.isLoading = false;
+      this.render(); // explicit reload is a fresh, deduplicated browser handoff
       return;
     }
     activeTab.isLoading = true;
@@ -11513,6 +11623,11 @@ export class BrowserShell {
   async hardReload() {
     const activeTab = this.getActiveTab();
     if (!activeTab) return;
+    this._systemBrowserHandoffs.delete(activeTab.id);
+    if (this.isSystemBrowserAuthHost(activeTab.url)) {
+      this.render(); // auth tabs retry the secure browser, never reload a hidden previous page
+      return;
+    }
     // FREEZE FIX: same invariant as reload() - the live surface comes back.
     try { this.healStuckPageSurface(); } catch { /* best-effort heal */ }
     if (this.nativeWebview && typeof this.nativeWebview.hardReload === 'function' && this._nativeWebviewTabIds.has(activeTab.id)) {
@@ -11735,7 +11850,8 @@ export class BrowserShell {
     // contentWindow.stop() (only reachable for same-origin documents).
     // Either way the UI flips back to the refresh icon IMMEDIATELY - a
     // stop must never leave the button stuck as an X.
-    if (this.nativeWebview && this._nativeWebviewTabIds.has(activeTab.id)) {
+    if (this.nativeWebview && this._nativeWebviewTabIds.has(activeTab.id)
+      && !this.isSystemBrowserAuthHost(activeTab.url)) {
       this.nativeWebview.stop(activeTab.id).catch(() => {});
     } else {
       const frame = this.webFrames?.get(activeTab.id);

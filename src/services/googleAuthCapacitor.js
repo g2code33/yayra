@@ -65,6 +65,24 @@ import {
 export const DEFAULT_MOBILE_REDIRECT_URI = 'com.yayra.app:/oauth2redirect';
 export const DEFAULT_SIGN_IN_TIMEOUT_MS = 5 * 60 * 1000; // match the Electron flow
 
+/** Accept only the exact registered app callback URI, with OAuth query data. */
+export function isExpectedMobileCallbackUrl(candidate, redirectUri = DEFAULT_MOBILE_REDIRECT_URI) {
+  if (typeof candidate !== 'string' || typeof redirectUri !== 'string') return false;
+  if (candidate !== redirectUri && !candidate.startsWith(`${redirectUri}?`)) return false;
+  try {
+    const actual = new URL(candidate);
+    const expected = new URL(redirectUri);
+    return !expected.search && !expected.hash
+      && actual.protocol === expected.protocol
+      && actual.host === expected.host
+      && actual.pathname === expected.pathname
+      && !actual.username && !actual.password
+      && !actual.hash;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Runs one complete sign-in attempt. Resolves with the profile or rejects
  * with an Error whose message is a stable snake_case code (plus detail).
@@ -73,7 +91,7 @@ export const DEFAULT_SIGN_IN_TIMEOUT_MS = 5 * 60 * 1000; // match the Electron f
  * @param {string} deps.clientId          "Android" or "iOS" type Google OAuth client ID
  * @param {string} deps.platform          'android' | 'ios' (forwarded to the worker)
  * @param {string} deps.exchangeUrl       worker /auth/google/exchange endpoint
- * @param {string} [deps.redirectUri]     custom-scheme redirect (default com.yayra.app:/oauth2redirect)
+ * @param {string} [deps.redirectUri]     registered app redirect (must match com.yayra.app:/oauth2redirect)
  * @param {Function} deps.openBrowser     async ({url}) => void  (Browser.open)
  * @param {Function} [deps.closeBrowser]  async () => void       (Browser.close - iOS only; Android Custom Tabs dismiss themselves)
  * @param {Function} deps.onUrlOpen       (handler) => unsubscribe - App 'appUrlOpen' subscription
@@ -100,6 +118,9 @@ export async function signInWithGoogleCapacitor({
 }) {
   if (!clientId) throw new Error('not_configured');
   if (!exchangeUrl) throw new Error('not_configured');
+  // The Worker and generated Android/iOS manifests are bound to this one
+  // registered app callback. Never let a caller substitute an arbitrary URI.
+  if (redirectUri !== DEFAULT_MOBILE_REDIRECT_URI) throw new Error('invalid_redirect_uri');
 
   const { codeVerifier, codeChallenge } = await generatePkcePair(cryptoImpl);
   const state = generateState(cryptoImpl);
@@ -123,8 +144,9 @@ export async function signInWithGoogleCapacitor({
 
     cleanups.push(onUrlOpen((event) => {
       const url = typeof event === 'string' ? event : event?.url;
-      if (typeof url === 'string' && url.startsWith(redirectUri)) finish(resolve, url);
-      // Unrelated deep links (share targets etc.) are ignored, not errors.
+      if (isExpectedMobileCallbackUrl(url, redirectUri)) finish(resolve, url);
+      // Unrelated or prefix-confusable deep links are ignored, not trusted as
+      // callbacks. A valid app callback must still pass the state check below.
     }));
     if (typeof onBrowserFinished === 'function') {
       // The user swiped the Custom Tab / Safari sheet away without
@@ -145,12 +167,17 @@ export async function signInWithGoogleCapacitor({
     try { await closeBrowser(); } catch { /* Android Custom Tabs have no close(); ignore */ }
   }
 
-  const params = new URL(callbackUrl.replace(`${redirectUri}`, 'https://callback.invalid/')).searchParams;
-  if (params.get('error')) throw new Error(params.get('error'));
-  const code = params.get('code');
-  const returnedState = params.get('state');
-  if (!code || !returnedState) throw new Error('missing_code_or_state');
+  const params = new URL(callbackUrl).searchParams;
+  const codes = params.getAll('code');
+  const states = params.getAll('state');
+  const errors = params.getAll('error');
+  if (codes.length > 1 || states.length > 1 || errors.length > 1) throw new Error('invalid_callback');
+  const returnedState = states[0];
+  if (!returnedState) throw new Error('missing_code_or_state');
   if (returnedState !== state) throw new Error('state_mismatch');
+  if (errors[0]) throw new Error(errors[0]);
+  const code = codes[0];
+  if (!code) throw new Error('missing_code_or_state');
 
   // Server-side exchange: tokens never enter this process (see header).
   const response = await fetchImpl(exchangeUrl, {

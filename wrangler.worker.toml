@@ -12,3 +12,6 @@ workers_dev = true
 # no code changes needed. API keys are NEVER here: secrets only
 # (NVIDIA_API_KEYS / NVIDIA_API_KEY_n via `wrangler secret put`).
 NVIDIA_MODEL = "moonshotai/kimi-k3"
+# Exact web OAuth callback origins. Add any custom Yayra web origin here and
+# register its matching /auth/callback URI with the Google Web OAuth client.
+GOOGLE_WEB_ALLOWED_ORIGINS = "https://yayra.pages.dev,http://localhost:4173"

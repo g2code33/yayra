@@ -31,6 +31,7 @@ async function run() {
     const { profile, returnTo } = await completeSignIn({
       search: window.location.search,
       origin: window.location.origin,
+      pathname: window.location.pathname,
       exchangeUrl,
       sessionStorage: window.sessionStorage,
       fetchImpl: window.fetch.bind(window)
