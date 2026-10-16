@@ -6,13 +6,18 @@
  * moment the main window was created, so every normal launch died during
  * the app.whenReady() startup sequence. The desktop smoke harness could
  * not catch it: when the Electron runtime is absent it falls back to
- * string-matching the built DOM, and even with the runtime present the
- * uncaught exception is swallowed by the startup-error logger.
+ * string-matching the built DOM, and the async whenReady chain turned the
+ * throw into a bare UnhandledPromiseRejectionWarning that bypassed the
+ * startup-error logger and error box entirely.
  *
  * This suite EXECUTES electron/main.cjs (and therefore its full ready
  * sequence: createWindow, overlay bubble, tray) under a mocked 'electron'
- * module and asserts it completes without throwing - exactly the code
- * path every desktop launch takes.
+ * module and asserts:
+ *   1. the startup sequence completes without throwing;
+ *   2. `win` stays declared-before-use in createWindow;
+ *   3. a throw in the startup sequence is ROUTED to startup-error.log and
+ *      the native error box (the old silent-zombie regression);
+ *   4. the no-VA-driver policy reaches the Chromium command line.
  */
 
 import test from 'node:test';
@@ -21,7 +26,7 @@ import Module from 'node:module';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
@@ -59,10 +64,12 @@ function makeWebContents() {
   });
 }
 
-function createElectronMock({ userDataDir }) {
+function createElectronMock({ userDataDir, mutateMock } = {}) {
   const windows = [];
   const readyCbs = [];
   const loadLog = [];
+  const appendSwitches = [];
+  const errorBoxes = [];
 
   class FakeBrowserWindow {
     constructor(opts = {}) {
@@ -95,6 +102,14 @@ function createElectronMock({ userDataDir }) {
     static fromId() { return null; }
   }
 
+  class FakeTray {
+    constructor(...args) {
+      this.iconArgs = args;
+    }
+    setToolTip() {} setContextMenu() {} setImage() {} on() {} destroy() {}
+    isDestroyed() { return false; } setTitle() {}
+  }
+
   const sessionStub = {
     clearCache: async () => {}, clearStorageData: async () => {}, getCacheSize: async () => 0,
     clearCodeCaches: async () => {}, clearAuthCache: async () => {},
@@ -108,7 +123,7 @@ function createElectronMock({ userDataDir }) {
 
   const app = {
     commandLine: {
-      appendSwitch: () => {},
+      appendSwitch: (key, value) => { appendSwitches.push([key, value]); },
       hasSwitch: (s) => process.argv.some((x) => x === `--${s}` || x.startsWith(`--${s}=`)),
       appendArgument: () => {}
     },
@@ -151,7 +166,12 @@ function createElectronMock({ userDataDir }) {
     Menu: { setApplicationMenu: () => {}, buildFromTemplate: () => ({ popup: () => {} }) },
     clipboard: { readText: () => '', writeText: () => {}, readImage: () => ({ toPNG: () => Buffer.alloc(0) }), writeImage: () => {}, availableFormats: () => [] },
     session: { defaultSession: sessionStub, fromPartition: () => sessionStub },
-    dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }), showSaveDialog: async () => ({ canceled: true }), showMessageBox: async () => ({ response: 0 }), showErrorBox: () => {} },
+    dialog: {
+      showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
+      showSaveDialog: async () => ({ canceled: true }),
+      showMessageBox: async () => ({ response: 0 }),
+      showErrorBox: (title, message) => { errorBoxes.push({ title, message }); }
+    },
     screen: {
       getPrimaryDisplay: () => ({ id: 1, bounds: { x: 0, y: 0, width: 1920, height: 1080 }, workArea: { x: 0, y: 0, width: 1920, height: 1040 }, scaleFactor: 1 }),
       getAllDisplays: () => [electronMock.screen.getPrimaryDisplay()],
@@ -160,10 +180,7 @@ function createElectronMock({ userDataDir }) {
       getCursorScreenPoint: () => ({ x: 10, y: 10 }),
       on: () => {}
     },
-    Tray: class {
-      setToolTip() {} setContextMenu() {} setImage() {} on() {} destroy() {}
-      isDestroyed() { return false; } setTitle() {}
-    },
+    Tray: FakeTray,
     nativeImage: {
       createFromPath: (p) => ({ isEmpty: () => false, toPNG: () => Buffer.alloc(0), resize: () => electronMock.nativeImage.createFromPath(p), getSize: () => ({ width: 32, height: 32 }) }),
       createFromBuffer: (b) => ({ isEmpty: () => b.length === 0, toPNG: () => b, resize: () => electronMock.nativeImage.createFromBuffer(b), getSize: () => ({ width: 32, height: 32 }) }),
@@ -175,22 +192,39 @@ function createElectronMock({ userDataDir }) {
     globalShortcut: { register: () => true, unregisterAll: () => {}, unregister: () => {} }
   };
 
-  return { electronMock, app, windows, loadLog };
+  if (typeof mutateMock === 'function') mutateMock({ electronMock, windows, loadLog, appendSwitches, errorBoxes });
+
+  return { electronMock, app, windows, loadLog, appendSwitches, errorBoxes };
 }
 
 /**
  * Load and boot electron/main.cjs under the mock. Returns the observable
- * startup effects. Throws (fails the test) if the ready sequence throws.
+ * startup effects. Throws (fails the test) if the ready sequence throws
+ * uncaught; caught startup failures are observable via errorBoxes and the
+ * userDataDir/startup-error.log file.
  */
-async function bootMain() {
+async function bootMain({ mutateMock, env = {} } = {}) {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'yayra-startup-'));
-  const { electronMock, windows, loadLog } = createElectronMock({ userDataDir });
+  const { electronMock, windows, loadLog, appendSwitches, errorBoxes } = createElectronMock({ userDataDir, mutateMock });
+
+  const envApplied = [];
+  for (const [k, v] of Object.entries(env)) {
+    envApplied.push([k, process.env[k]]);
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+
+  // main.cjs registers process-level error handlers; snapshot so each boot
+  // can remove exactly the listeners it added (keep the test runner's own).
+  const beforeUncaught = new Set(process.listeners('uncaughtException'));
+  const beforeRejection = new Set(process.listeners('unhandledRejection'));
 
   const origLoad = Module._load;
   Module._load = function (request, parent, isMain) {
     if (request === 'electron') return electronMock;
     return origLoad.call(this, request, parent, isMain);
   };
+  let loadError = null;
   try {
     // Clear any previously loaded app modules so each boot re-executes them.
     for (const key of Object.keys(require.cache)) {
@@ -199,11 +233,33 @@ async function bootMain() {
     require(path.join(repoRoot, 'electron', 'main.cjs'));
     // Let the whenReady microtask chain (the whole startup sequence) run.
     await new Promise((resolve) => setTimeout(resolve, 400));
+  } catch (err) {
+    loadError = err;
   } finally {
     Module._load = origLoad;
-    fs.rmSync(userDataDir, { recursive: true, force: true });
+    for (const l of process.listeners('uncaughtException')) {
+      if (!beforeUncaught.has(l)) process.removeListener('uncaughtException', l);
+    }
+    for (const l of process.listeners('unhandledRejection')) {
+      if (!beforeRejection.has(l)) process.removeListener('unhandledRejection', l);
+    }
+    for (const [k, v] of envApplied) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
   }
-  return { windows, loadLog };
+  if (loadError) throw loadError;
+  return {
+    windows,
+    loadLog,
+    appendSwitches,
+    errorBoxes,
+    startupErrorLogPath: path.join(userDataDir, 'startup-error.log'),
+    readStartupErrorLog() {
+      try { return fs.readFileSync(path.join(userDataDir, 'startup-error.log'), 'utf8'); } catch { return ''; }
+    },
+    cleanup() { fs.rmSync(userDataDir, { recursive: true, force: true }); }
+  };
 }
 
 test('CONFIRMED: the full desktop startup sequence (createWindow + bubble + tray) runs without throwing', async () => {
@@ -211,15 +267,20 @@ test('CONFIRMED: the full desktop startup sequence (createWindow + bubble + tray
   //   ReferenceError: Cannot access 'win' before initialization
   //   at createWindow (electron/main.cjs) - via the app.whenReady chain,
   // killing the app before any window appeared on every Ubuntu launch.
-  const { windows, loadLog } = await bootMain();
-
-  // The main browser window was created and pointed at the app shell.
-  assert.ok(
-    loadLog.some((u) => u.startsWith('yayra://app/index.html')),
-    `main window must load the app shell (load log: ${JSON.stringify(loadLog)})`
-  );
-  // ...and the floating bubble window came up alongside it.
-  assert.ok(windows.length >= 2, `expected main window + floating bubble, got ${windows.length} window(s)`);
+  const boot = await bootMain();
+  try {
+    // The main browser window was created and pointed at the app shell.
+    assert.ok(
+      boot.loadLog.some((u) => u.startsWith('yayra://app/index.html')),
+      `main window must load the app shell (load log: ${JSON.stringify(boot.loadLog)})`
+    );
+    // ...and the floating bubble window came up alongside it.
+    assert.ok(boot.windows.length >= 2, `expected main window + floating bubble, got ${boot.windows.length} window(s)`);
+    // A clean startup must never write the crash log.
+    assert.equal(boot.readStartupErrorLog(), '', 'no startup-error.log on a clean boot');
+  } finally {
+    boot.cleanup();
+  }
 });
 
 test('CONFIRMED: createWindow keeps its `win` binding above every use (no TDZ use-before-declaration)', () => {
@@ -232,4 +293,54 @@ test('CONFIRMED: createWindow keeps its `win` binding above every use (no TDZ us
   const firstUseAt = body.search(/\bwin\./);
   assert.ok(firstUseAt !== -1, 'createWindow uses win');
   assert.ok(firstUseAt > declAt, 'every `win.` use must come after `const win = mainWindow` (temporal dead zone crash otherwise)');
+});
+
+test('CONFIRMED: a throw in the startup sequence lands in startup-error.log AND the error box (no silent zombie)', async () => {
+  // The v1.0.39/40 crash surfaced only as UnhandledPromiseRejectionWarning
+  // on stderr: startup-error.log was never written and no error box
+  // appeared, so the app looked like it silently crashed. Inject an
+  // unguarded startup failure (Menu.setApplicationMenu throws - it is
+  // called bare in the ready sequence) and assert the failure is reported
+  // through BOTH documented channels.
+  const boot = await bootMain({
+    mutateMock: ({ electronMock }) => {
+      electronMock.Menu.setApplicationMenu = () => { throw new Error('menu exploded'); };
+    }
+  });
+  try {
+    const log = boot.readStartupErrorLog();
+    assert.match(log, /startup-sequence/, 'startup-error.log must record the failing startup sequence');
+    assert.match(log, /menu exploded/, 'startup-error.log must carry the original error');
+    assert.equal(boot.errorBoxes.length, 1, 'the native error box must be shown');
+    assert.match(boot.errorBoxes[0].message, /menu exploded/);
+  } finally {
+    boot.cleanup();
+  }
+});
+
+test('CONFIRMED: no VA-API driver -> VA-API video paths disabled on the Chromium command line before ready', async () => {
+  const boot = await bootMain({ env: { YAYRA_DISABLE_VAAPI: '1' } });
+  try {
+    const disableFeatures = boot.appendSwitches.find(([key]) => key === 'disable-features');
+    assert.ok(disableFeatures, 'disable-features switch must be appended');
+    assert.match(disableFeatures[1], /VaapiVideoDecodeLinuxGL/);
+    assert.ok(
+      boot.appendSwitches.some(([key]) => key === 'disable-accelerated-video-decode'),
+      'accelerated video decode must be disabled when no VA-API driver exists'
+    );
+  } finally {
+    boot.cleanup();
+  }
+});
+
+test('CONFIRMED: YAYRA_KEEP_VAAPI=1 opts out - no VA-API switches are appended', async () => {
+  const boot = await bootMain({ env: { YAYRA_KEEP_VAAPI: '1', YAYRA_DISABLE_VAAPI: undefined } });
+  try {
+    assert.ok(
+      !boot.appendSwitches.some(([key]) => key === 'disable-accelerated-video-decode'),
+      'opt-out must leave VA-API/video decode switches alone'
+    );
+  } finally {
+    boot.cleanup();
+  }
 });
