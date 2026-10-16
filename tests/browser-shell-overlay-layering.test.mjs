@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { setupDomShim } from './dom-shim.mjs';
+
+const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 setupDomShim();
 
@@ -41,6 +46,12 @@ function installFakeNativeWebview() {
   };
   globalThis.window.yayra = { webview: fake };
   return { fake, calls, uninstall: () => { delete globalThis.window.yayra; } };
+}
+
+// Update prompt cards mount on document.body (window-level overlays).
+function clearUpdateCards() {
+  document.getElementById('yayra-update-prompt-card')?.remove();
+  document.getElementById('yayra-update-install-card')?.remove();
 }
 
 async function makeDesktopShellOnExternalPage() {
@@ -174,7 +185,7 @@ test('desktop update pipeline: confirming an available update downloads via the 
     await shell.checkForUpdates(true);
     // The in-app update card offers "Download & install now" / "Later" -
     // accept it, which kicks off the async desktop download; let it settle.
-    const card = container.querySelector('.fb-update-prompt-card');
+    const card = document.getElementById('yayra-update-prompt-card');
     assert.ok(card, 'update card rendered for the available update');
     assert.match(String(card.querySelector('.fb-update-prompt-now').textContent), /Download/i, 'desktop pipeline wording');
     card.querySelector('.fb-update-prompt-now').click();
@@ -184,7 +195,7 @@ test('desktop update pipeline: confirming an available update downloads via the 
     // opened again, or later - choose "Install & restart now".
     assert.equal(downloadCalls.length, 1, 'download already ran');
     assert.equal(installCalls.length, 0, 'install must NOT run behind the user\u2019s back');
-    const installCard = container.querySelector('.fb-update-install-card');
+    const installCard = document.getElementById('yayra-update-install-card');
     assert.ok(installCard, 'install choice card rendered after staging');
     assert.ok(installCard.querySelector('.fb-update-install-next-launch'), 'offers install-on-next-launch');
     assert.ok(installCard.querySelector('.fb-update-install-later'), 'offers later/manual');
@@ -201,6 +212,7 @@ test('desktop update pipeline: confirming an available update downloads via the 
     // "installing" (it only falls back to "staged" if the install fails).
     assert.equal(shell.state.updateState.status, 'installing');
   } finally {
+    clearUpdateCards();
     delete window.alert;
     uninstall();
   }
@@ -229,13 +241,14 @@ test('desktop update pipeline: a failed/tampered download surfaces as an error s
     await shell.initialize();
     shell.render(container);
     await shell.checkForUpdates(true);
-    const card = container.querySelector('.fb-update-prompt-card');
+    const card = document.getElementById('yayra-update-prompt-card');
     assert.ok(card, 'update card rendered');
     card.querySelector('.fb-update-prompt-now').click();
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(shell.state.updateState.status, 'error');
     assert.match(shell.state.updateState.notes, /sha256-mismatch/);
   } finally {
+    clearUpdateCards();
     delete window.alert;
     uninstall();
   }
@@ -371,4 +384,60 @@ test('no blank flash: a failing capture still hides the view via the fail-safe (
   } finally {
     uninstall();
   }
+});
+
+test('THE update prompt overlays ANYTHING: while it is up the native page surface is held back', async () => {
+  const { uninstall } = installFakeNativeWebview();
+  try {
+    const { shell } = await makeDesktopShellOnExternalPage();
+    assert.equal(shell.hasBlockingOverlay(), false);
+    shell.state.updatePrompt = { version: '9.9.9', notes: '', relaunch: false, desktopPipeline: false };
+    assert.equal(shell.hasBlockingOverlay(), true,
+      '"Update available" card must hide the native page surface (it paints ABOVE all HTML - without this the prompt is invisible)');
+    shell.state.updatePrompt = null;
+    shell.state.updateInstallPrompt = { path: '/tmp/yayra.deb', version: '9.9.9' };
+    assert.equal(shell.hasBlockingOverlay(), true,
+      '"Update downloaded" install-choice card must do the same');
+    shell.state.updateInstallPrompt = null;
+    assert.equal(shell.hasBlockingOverlay(), false, 'the live page returns once the prompt is gone');
+  } finally {
+    clearUpdateCards();
+    uninstall();
+  }
+});
+
+test('THE update prompt is a window-level card on document.body at the TOP RIGHT CORNER - and "Later" removes it', async () => {
+  const { uninstall } = installFakeNativeWebview();
+  try {
+    const { shell, container } = await makeDesktopShellOnExternalPage();
+    shell.state.updatePrompt = { version: '9.9.9', notes: '', relaunch: false, desktopPipeline: false };
+    shell.render(container);
+    const card = document.getElementById('yayra-update-prompt-card');
+    assert.ok(card, 'prompt card rendered');
+    assert.equal(card.parentElement, document.body,
+      'mounted on document.body - no shell stacking context can ever cover it');
+    assert.ok(card.className.includes('fb-update-prompt-card'), 'keeps the styled class');
+    assert.equal(container.querySelector('.fb-update-prompt-card'), null,
+      'NOT buried inside the shell tree');
+
+    card.querySelector('.fb-update-prompt-later').click();
+    assert.equal(document.getElementById('yayra-update-prompt-card'), null,
+      '"Later" removes the card - a dismissed prompt never lingers');
+    assert.equal(shell.hasBlockingOverlay(), false);
+  } finally {
+    clearUpdateCards();
+    uninstall();
+  }
+});
+
+test('the update prompt CSS pins it to the top right corner at the MAXIMUM z-index (nothing can overlay it)', () => {
+  const css = fs.readFileSync(path.join(repoRoot, 'packages/shared-ui/src/theme/design-system.css'), 'utf8');
+  const match = css.match(/\.fb-update-prompt-card\s*\{[^}]*\}/);
+  assert.ok(match, '.fb-update-prompt-card rule exists');
+  const block = match[0];
+  assert.match(block, /position:\s*fixed/, 'window-level overlay');
+  assert.match(block, /top:\s*12px/, 'at the top right corner (top)');
+  assert.match(block, /right:\s*12px/, 'at the top right corner (right)');
+  assert.match(block, /z-index:\s*2147483647/,
+    'maximum CSS z-index - above every other layer including the update splash (2147483000) and close-prompt modals (600001)');
 });
