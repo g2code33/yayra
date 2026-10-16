@@ -3837,6 +3837,18 @@ html {
   overflow-y: auto;
 }
 
+.fb-dl-more-btn {
+  width: 100%;
+  min-height: 34px;
+  color: var(--fb-accent-primary);
+  font-weight: 700;
+}
+
+.fb-dl-more-btn:hover {
+  border-color: var(--fb-accent-primary);
+  background: var(--fb-accent-glow);
+}
+
 .fb-dl-empty {
   margin: 0;
   padding: 14px 8px;

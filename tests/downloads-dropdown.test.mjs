@@ -4,8 +4,8 @@
  *  - The toolbar download button wears a revolving ring tracking the
  *    live aggregate percentage while anything downloads.
  *  - Clicking it opens a DROPDOWN (latest 5 downloads + state-aware
- *    actions) - it must NOT yank the user to the yayra://downloads page;
- *    the full page is one explicit button away inside the dropdown.
+ *    actions). More expands the complete list inline without navigating;
+ *    the full downloads page remains an explicit, separate button.
  *  - Actions are state-aware: in progress -> pause/cancel/copy address
  *    (never open/show-in-folder); completed -> open/show in folder/copy
  *    file path/copy address/open address in tab/remove; failed or
@@ -87,15 +87,26 @@ test('download button opens the dropdown - NEVER the downloads page', async () =
   }
 });
 
-test('dropdown shows only the LATEST 5 downloads', async () => {
+test('More expands all downloads inline without navigating away from the current tab', async () => {
   const uninstall = installDownloadsBridgeStub();
   try {
     const { shell, container } = await makeShell();
     shell.state.downloadsItems = sampleItems(); // 6 items
     shell.state.isDownloadsDropdownOpen = true;
     shell.render(container);
-    const rows = container.querySelectorAll('.fb-dl-item');
-    assert.equal(rows.length, 5, 'capped at 5');
+    const beforeUrl = shell.getActiveTab().url;
+    assert.equal(container.querySelectorAll('.fb-dl-item').length, 5, 'the dropdown starts with the latest 5');
+    const more = container.querySelector('.fb-dl-more-btn');
+    assert.ok(more, 'More appears when older downloads are hidden');
+    assert.match(more.textContent, /^More/);
+    more.click();
+    assert.equal(shell.state.isDownloadsDropdownExpanded, true);
+    assert.equal(container.querySelectorAll('.fb-dl-item').length, 6, 'all downloads are shown inline');
+    assert.equal(shell.getActiveTab().url, beforeUrl, 'More does not navigate to the downloads page');
+    assert.equal(container.querySelector('.fb-dl-more-btn').textContent, 'Show less');
+
+    container.querySelector('.fb-dl-more-btn').click();
+    assert.equal(container.querySelectorAll('.fb-dl-item').length, 5, 'Show less restores the compact list');
   } finally {
     uninstall();
   }

@@ -390,8 +390,10 @@ export class BrowserShell {
       isAccountMenuOpen: false,
       // Chrome-style downloads dropdown under the toolbar download button
       // (see renderDownloadsDropdown()) - tracks downloads without ever
-      // yanking the user to the yayra://downloads page.
+      // yanking the user to the yayra://downloads page. The More toggle
+      // expands all items inline without changing tabs.
       isDownloadsDropdownOpen: false,
+      isDownloadsDropdownExpanded: false,
       // True while a transient popup that is NOT part of render() (omnibox
       // search-suggestion dropdown) is covering the page area. On Electron
       // the native page surface must be hidden for the popup to be seen at
@@ -1936,6 +1938,7 @@ export class BrowserShell {
     dlBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       this.state.isDownloadsDropdownOpen = !this.state.isDownloadsDropdownOpen;
+      if (!this.state.isDownloadsDropdownOpen) this.state.isDownloadsDropdownExpanded = false;
       this.render();
     });
     toolbarActions.appendChild(dlBtn);
@@ -12636,14 +12639,17 @@ export class BrowserShell {
   renderDownloadsDropdown(root) {
     this.appendDropdownScrim(root, () => {
       this.state.isDownloadsDropdownOpen = false;
+      this.state.isDownloadsDropdownExpanded = false;
       this.render();
     });
 
     const dropdown = document.createElement('div');
     dropdown.className = 'fb-downloads-dropdown';
-    const latest = (this.state.downloadsItems || []).slice(0, 5);
+    const allDownloads = this.state.downloadsItems || [];
+    const expanded = Boolean(this.state.isDownloadsDropdownExpanded);
+    const visibleDownloads = expanded ? allDownloads : allDownloads.slice(0, 5);
 
-    const rows = latest.map((item) => `
+    const rows = visibleDownloads.map((item) => `
       <div class="fb-dl-item st-${String(item.state || '').toLowerCase()}" data-dl-id="${item.id}">
         ${this.downloadStateIconHtml(item)}
         <span class="fb-dl-item-main">
@@ -12662,15 +12668,22 @@ export class BrowserShell {
         ${this.activeDownloads().length ? `<small>${this.describeDownloadActivity()}</small>` : ''}
       </div>
       <div class="fb-downloads-dropdown-list">
-        ${latest.length ? rows : `<p class="fb-dl-empty">${this.downloadsBridge
+        ${visibleDownloads.length ? rows : `<p class="fb-dl-empty">${this.downloadsBridge
           ? 'No downloads yet - files you download will appear here.'
           : 'Downloads appear here on the Yayra desktop app. This browser handles file saving natively.'}</p>`}
       </div>
+      ${allDownloads.length > 5 ? `<button type="button" class="fb-btn fb-btn-secondary fb-dl-more-btn">${expanded ? 'Show less' : `More (${allDownloads.length - 5})`}</button>` : ''}
       <button class="fb-btn fb-btn-secondary fb-dl-open-page" style="width:100%;">${Icons.download} Open Yayra Downloads</button>
     `;
 
+    dropdown.querySelector('.fb-dl-more-btn')?.addEventListener('click', () => {
+      this.state.isDownloadsDropdownExpanded = !this.state.isDownloadsDropdownExpanded;
+      this.render();
+    });
+
     dropdown.querySelector('.fb-dl-open-page')?.addEventListener('click', () => {
       this.state.isDownloadsDropdownOpen = false;
+      this.state.isDownloadsDropdownExpanded = false;
       this.openInternalPage('yayra://downloads');
     });
 
@@ -12730,6 +12743,7 @@ export class BrowserShell {
           break;
         }
         this.state.isDownloadsDropdownOpen = false;
+        this.state.isDownloadsDropdownExpanded = false;
         const res = await bridge.openPdf(id);
         if (res && res.ok) {
           this.addDocumentTab({ name: res.name, bytes: res.data });
@@ -12741,6 +12755,7 @@ export class BrowserShell {
       case 'open-url':
         if (item.url) {
           this.state.isDownloadsDropdownOpen = false;
+          this.state.isDownloadsDropdownExpanded = false;
           this.createNewTab();
           this.navigateActiveTab(item.url);
         }
@@ -13648,7 +13663,11 @@ export class BrowserShell {
     if (s.activeModal) { this.closeModal(); dismissed = true; }
     if (s.isSecurityDropdownOpen) { s.isSecurityDropdownOpen = false; dismissed = true; }
     if (s.isAccountMenuOpen) { s.isAccountMenuOpen = false; dismissed = true; }
-    if (s.isDownloadsDropdownOpen) { s.isDownloadsDropdownOpen = false; dismissed = true; }
+    if (s.isDownloadsDropdownOpen) {
+      s.isDownloadsDropdownOpen = false;
+      s.isDownloadsDropdownExpanded = false;
+      dismissed = true;
+    }
     if (s.isRadialLauncherOpen) { try { this.closeRadialLauncher(); } catch { /* shim */ } dismissed = true; }
     if (s.findInPage && s.findInPage.isOpen) { s.findInPage.isOpen = false; dismissed = true; }
     if (s.isFloatingMiniOpen) { try { this.closeFloatingMini(); } catch { /* shim */ } dismissed = true; }
