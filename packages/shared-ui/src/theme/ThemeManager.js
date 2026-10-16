@@ -2,7 +2,7 @@
  * FloatBrowse Design System - Theme Manager (JS runtime)
  */
 
-import { DarkThemeTokens, LightThemeTokens, AccentThemeTokens } from './colors.js';
+import { DarkThemeTokens, LightThemeTokens, AccentThemeTokens, LightAccentThemeTokens } from './colors.js';
 import { Radii, Blur } from './spacing.js';
 import { Typography } from './typography.js';
 
@@ -78,7 +78,8 @@ export class ThemeManager {
     for (const [key, value] of Object.entries(tokens)) {
       props[`--fb-${this.kebabCase(key)}`] = value;
     }
-    for (const [key, value] of Object.entries(AccentThemeTokens[this.currentColorTheme])) {
+    const accentTokens = isDark ? AccentThemeTokens[this.currentColorTheme] : LightAccentThemeTokens[this.currentColorTheme];
+    for (const [key, value] of Object.entries(accentTokens)) {
       props[`--fb-${this.kebabCase(key)}`] = value;
     }
 
@@ -104,7 +105,8 @@ export class ThemeManager {
       const cssVar = `--fb-${this.kebabCase(key)}`;
       root.style.setProperty(cssVar, value);
     }
-    for (const [key, value] of Object.entries(AccentThemeTokens[this.currentColorTheme])) {
+    const accentTokens = isDark ? AccentThemeTokens[this.currentColorTheme] : LightAccentThemeTokens[this.currentColorTheme];
+    for (const [key, value] of Object.entries(accentTokens)) {
       root.style.setProperty(`--fb-${this.kebabCase(key)}`, value);
     }
   }

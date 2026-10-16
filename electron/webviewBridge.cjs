@@ -86,6 +86,67 @@ function decodeOpenExternalRequest(url) {
   }
 }
 
+const POINTER_STYLE_ID = 'yayra-custom-pointer-theme';
+
+/** Builds the same custom cursor rules for a native website view as the UI uses. */
+function buildPointerThemeCss(theme, size = 'normal') {
+  if (theme !== 'yayra' && theme !== 'high-visibility') return '';
+  const normalizedSize = size === 'large' || size === 'xlarge' ? size : 'normal';
+  const dimension = normalizedSize === 'xlarge' ? 48 : normalizedSize === 'large' ? 36 : 24;
+  const scale = dimension / 24;
+  const color = theme === 'yayra' ? '#6d5df2' : '#111a2e';
+  const outline = theme === 'yayra' ? '#ffffff' : '#ffd400';
+  const arrowStroke = (theme === 'yayra' ? 1.6 : 2.4) / scale;
+  const handStroke = (theme === 'yayra' ? 1.6 : 2.4) / scale;
+  const arrowSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="${dimension}" height="${dimension}" viewBox="0 0 24 24"><path d="M5 2l14 10-6 1 3.5 7-2.6 1.2L10.5 14 5 18z" fill="${color}" stroke="${outline}" stroke-width="${arrowStroke}" stroke-linejoin="round"/></svg>`;
+  const handSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="${dimension}" height="${dimension}" viewBox="0 0 24 24"><path d="M9 11V4.5a1.5 1.5 0 0 1 3 0V10l4.6.9c1.1.2 1.9 1.2 1.9 2.3v3.3c0 2.5-2 4.5-4.5 4.5h-3.4c-1.3 0-2.6-.6-3.4-1.7L4 15.5c-.6-.9-.4-2 .5-2.6.8-.5 1.9-.3 2.5.5l2 2.6z" fill="${color}" stroke="${outline}" stroke-width="${handStroke}" stroke-linejoin="round"/></svg>`;
+  const arrowHotspot = `${Math.round(4 * scale)} ${Math.round(2 * scale)}`;
+  const handHotspot = `${Math.round(9 * scale)} ${Math.round(2 * scale)}`;
+  const arrowCursor = `url("data:image/svg+xml,${encodeURIComponent(arrowSvg)}") ${arrowHotspot}, auto`;
+  const handCursor = `url("data:image/svg+xml,${encodeURIComponent(handSvg)}") ${handHotspot}, pointer`;
+
+  return [
+    `html, body, body * { cursor: ${arrowCursor} !important; }`,
+    `button, a, [role="button"], [role="tab"], [role="menuitem"], select, summary, input[type="button"], input[type="submit"], input[type="reset"] { cursor: ${handCursor} !important; }`,
+    `input:not([type]), input[type="text"], input[type="search"], input[type="url"], input[type="email"], input[type="password"], input[type="number"], textarea, [contenteditable="true"], [role="textbox"] { cursor: text !important; }`
+  ].join('\n');
+}
+
+/**
+ * Make a page-owned style resilient to navigation, route changes and a
+ * site's own DOM replacing its <head>. It stays inside the page renderer;
+ * no site requests, cookies or page content are touched.
+ */
+function buildPointerThemeScript(theme, size = 'normal') {
+  const normalizedTheme = theme === 'yayra' || theme === 'high-visibility' ? theme : 'system';
+  if (normalizedTheme === 'system') {
+    return `(function () { try { window.__yayraPointerThemeObserver?.disconnect(); delete window.__yayraPointerThemeObserver; document.getElementById(${JSON.stringify(POINTER_STYLE_ID)})?.remove(); } catch (_err) {} })();`;
+  }
+  const css = buildPointerThemeCss(normalizedTheme, size);
+  return `(function () {
+    try {
+      var id = ${JSON.stringify(POINTER_STYLE_ID)};
+      var css = ${JSON.stringify(css)};
+      try { window.__yayraPointerThemeObserver?.disconnect(); } catch (_err) {}
+      var install = function () {
+        var root = document.documentElement;
+        if (!root) return;
+        var style = document.getElementById(id);
+        if (!style) { style = document.createElement('style'); style.id = id; }
+        if (style.textContent !== css) style.textContent = css;
+        var parent = document.head || root;
+        if (style.parentNode !== parent) parent.appendChild(style);
+      };
+      install();
+      if (typeof MutationObserver === 'function' && document.documentElement) {
+        var observer = new MutationObserver(install);
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+        window.__yayraPointerThemeObserver = observer;
+      }
+    } catch (_err) { /* some pages lock down DOM mutation; keep the site usable */ }
+  })();`;
+}
+
 /**
  * Main-world script injected into every page-rendering WebContentsView on
  * dom-ready (executeJavaScript - a preload CANNOT do this job, because
@@ -435,6 +496,38 @@ function createWebviewBridge({
     };
   }
 
+  function applyPointerThemeToPage(entry) {
+    const wc = entry && entry.view && entry.view.webContents;
+    if (!wc || typeof wc.executeJavaScript !== 'function') return;
+    const script = buildPointerThemeScript(entry.pointerTheme, entry.pointerSize);
+    const frames = [];
+    const seen = new Set();
+    try {
+      const mainFrame = wc.mainFrame;
+      if (mainFrame && typeof mainFrame.executeJavaScript === 'function') {
+        frames.push(mainFrame);
+        seen.add(mainFrame);
+      }
+      const subtree = mainFrame && mainFrame.framesInSubtree;
+      if (subtree && typeof subtree[Symbol.iterator] === 'function') {
+        for (const frame of subtree) {
+          if (frame && typeof frame.executeJavaScript === 'function' && !seen.has(frame)) {
+            frames.push(frame);
+            seen.add(frame);
+          }
+        }
+      }
+    } catch { /* an about:blank or tearing-down frame may not be traversable */ }
+
+    if (!frames.length) frames.push(wc);
+    for (const frame of frames) {
+      try {
+        const result = frame.executeJavaScript(script, true);
+        if (result && typeof result.catch === 'function') result.catch(() => {});
+      } catch { /* a navigated or CSP-locked frame keeps its native cursor */ }
+    }
+  }
+
   function attachListeners(key, entry) {
     const wc = entry.view.webContents;
     // Passkey/WebAuthn stuck-request watchdog - injected into the page's
@@ -442,9 +535,15 @@ function createWebviewBridge({
     // the full rationale). Guarded: test fakes may not implement
     // executeJavaScript.
     wc.on('dom-ready', () => {
+      if (entry.pointerTheme !== 'system') applyPointerThemeToPage(entry);
       if (typeof wc.executeJavaScript === 'function') {
         wc.executeJavaScript(buildWebAuthnWatchdogScript(), true).catch(() => {});
       }
+    });
+    // Apply the selected pointer to cross-origin child frames as each one
+    // finishes loading; a main-frame style cannot cross an iframe boundary.
+    wc.on('did-frame-finish-load', () => {
+      if (entry.pointerTheme !== 'system') applyPointerThemeToPage(entry);
     });
     // Reload shortcuts pressed while the PAGE has focus (which is most
     // of the time): the guest WebContents swallows keystrokes, so
@@ -551,13 +650,30 @@ function createWebviewBridge({
     if (typeof view.setBackgroundColor === 'function') {
       try { view.setBackgroundColor('#101218'); } catch { /* older electron */ }
     }
-    const entry = { view, lastUrl: null, tabId, hostWc, hostWin, isPrivate: Boolean(isPrivate), profileId: String(profileId || 'default') };
+    const entry = {
+      view,
+      lastUrl: null,
+      tabId,
+      hostWc,
+      hostWin,
+      isPrivate: Boolean(isPrivate),
+      profileId: String(profileId || 'default'),
+      pointerTheme: 'system',
+      pointerSize: 'normal'
+    };
     views.set(key, entry);
     attachListeners(key, entry);
     return entry;
   }
 
-  function ensureView(key, tabId, url, { isPrivate = false, hostWc = null, hostWin = null, profileId = 'default' } = {}) {
+  function ensureView(key, tabId, url, {
+    isPrivate = false,
+    hostWc = null,
+    hostWin = null,
+    profileId = 'default',
+    pointerTheme = 'system',
+    pointerSize = 'normal'
+  } = {}) {
     const win = (hostWin && !hostWin.isDestroyed?.()) ? hostWin : getMainWindow();
     if (!win || win.isDestroyed() || !tabId || !url) return { handedOffToSystemBrowser: false };
 
@@ -579,6 +695,13 @@ function createWebviewBridge({
       win.contentView.addChildView(entry.view);
     }
 
+    const nextPointerTheme = pointerTheme === 'yayra' || pointerTheme === 'high-visibility' ? pointerTheme : 'system';
+    const nextPointerSize = pointerSize === 'large' || pointerSize === 'xlarge' ? pointerSize : 'normal';
+    const pointerChanged = entry.pointerTheme !== nextPointerTheme || entry.pointerSize !== nextPointerSize;
+    entry.pointerTheme = nextPointerTheme;
+    entry.pointerSize = nextPointerSize;
+    if (pointerChanged && entry.lastUrl) applyPointerThemeToPage(entry);
+
     if (entry.lastUrl !== url) {
       entry.lastUrl = url;
       entry.view.webContents.loadURL(url).catch((err) => {
@@ -587,6 +710,18 @@ function createWebviewBridge({
       });
     }
     return { handedOffToSystemBrowser: false };
+  }
+
+  function setPointerTheme(key, theme, size) {
+    const entry = views.get(key);
+    if (!entry) return { ok: false, reason: 'no-view' };
+    const nextTheme = theme === 'yayra' || theme === 'high-visibility' ? theme : 'system';
+    const nextSize = size === 'large' || size === 'xlarge' ? size : 'normal';
+    if (entry.pointerTheme === nextTheme && entry.pointerSize === nextSize) return { ok: true };
+    entry.pointerTheme = nextTheme;
+    entry.pointerSize = nextSize;
+    if (entry.lastUrl) applyPointerThemeToPage(entry);
+    return { ok: true };
   }
 
   function withView(key, fn) {
@@ -766,10 +901,11 @@ function createWebviewBridge({
     }
   }
 
-  ipcMain.handle('yayra:webview-ensure', (event, { tabId, url, isPrivate, profileId } = {}) => {
+  ipcMain.handle('yayra:webview-ensure', (event, { tabId, url, isPrivate, profileId, pointerTheme, pointerSize } = {}) => {
     const { hostWc, hostWin } = resolveHost(event);
-    return ensureView(viewKey(event, tabId), tabId, url, { isPrivate, hostWc, hostWin, profileId });
+    return ensureView(viewKey(event, tabId), tabId, url, { isPrivate, hostWc, hostWin, profileId, pointerTheme, pointerSize });
   });
+  ipcMain.handle('yayra:webview-set-pointer-theme', (event, { tabId, theme, size } = {}) => setPointerTheme(viewKey(event, tabId), theme, size));
   ipcMain.handle('yayra:webview-set-bounds', (event, { tabId, bounds } = {}) => setBounds(viewKey(event, tabId), bounds));
   ipcMain.handle('yayra:webview-set-visible', (event, { tabId, visible, capture } = {}) => setVisible(viewKey(event, tabId), visible, { capture }));
   ipcMain.handle('yayra:webview-capture', (event, { tabId } = {}) => capture(viewKey(event, tabId)));
@@ -971,6 +1107,8 @@ module.exports = {
   requiresSystemBrowserAuth,
   decodeOpenExternalRequest,
   buildWebAuthnWatchdogScript,
+  buildPointerThemeCss,
+  buildPointerThemeScript,
   sanitizeBounds,
   buildBrowserUserAgent,
   buildContextMenuTemplate,

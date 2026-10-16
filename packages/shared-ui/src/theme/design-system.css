@@ -45,10 +45,15 @@
   --fb-border-glass-highlight: rgba(14, 116, 144, 0.45);
   --fb-text-primary: #0f172a;
   --fb-text-secondary: #475569;
-  --fb-text-muted: #94a3b8;
-  --fb-accent-primary: #0891b2;
-  --fb-accent-secondary: #2563eb;
-  --fb-accent-glow: rgba(8, 145, 178, 0.25);
+  --fb-text-muted: #64748b;
+  --fb-accent-primary: #0e7490;
+  --fb-gradient-accent: linear-gradient(135deg, #0e7490 0%, #1d4ed8 52%, #4338ca 100%);
+  --fb-settings-row-bg: #f8fafc;
+  --fb-settings-hover: rgba(15, 23, 42, 0.06);
+  --fb-settings-border: rgba(15, 23, 42, 0.12);
+  --fb-settings-preview-base: 255, 255, 255;
+  --fb-accent-secondary: #1d4ed8;
+  --fb-accent-glow: rgba(14, 116, 144, 0.22);
   --fb-shadow-surface: 0 20px 40px -15px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0, 0, 0, 0.06);
 }
 
@@ -1902,7 +1907,7 @@ html {
   padding: 16px;
   border-radius: 12px;
   border: 1px solid rgba(255, 255, 255, 0.16);
-  background: rgba(13, 23, 54, 0.85);
+  background: rgba(var(--fb-settings-preview-base, 13, 23, 54), var(--fb-frame-preview-opacity, 0.85));
   backdrop-filter: blur(24px);
   -webkit-backdrop-filter: blur(24px);
 }
@@ -2095,6 +2100,73 @@ html {
   align-items: center;
   gap: 10px;
   color: var(--fb-text-primary);
+}
+
+/* Shared form rows used by every Settings category. */
+.fb-setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: var(--fb-text-primary);
+}
+
+.fb-setting-row > label {
+  min-width: 140px;
+  color: var(--fb-text-secondary);
+  font-size: 0.84rem;
+  font-weight: 600;
+}
+
+.fb-setting-row > .fb-select,
+.fb-setting-row > .fb-input {
+  min-width: min(220px, 100%);
+}
+
+.fb-setting-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--fb-border-glass);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--fb-text-primary);
+}
+
+.fb-setting-toggle-row > div {
+  min-width: 0;
+}
+
+.fb-setting-toggle-row strong,
+.fb-setting-row strong {
+  color: var(--fb-text-primary);
+  font-size: 0.86rem;
+}
+
+.fb-setting-toggle-row p,
+.fb-setting-row p {
+  margin: 4px 0 0;
+  color: var(--fb-text-secondary);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.fb-settings-search-input {
+  color: var(--fb-text-primary);
+}
+
+.fb-pointer-preview {
+  border: 1px dashed var(--fb-border-glass-highlight);
+  border-radius: 10px;
+  background: var(--fb-bg-glass-input);
+}
+
+.fb-pointer-preview input[type='text'] {
+  color: var(--fb-text-primary);
+  border-color: var(--fb-border-glass);
 }
 
 /* History Page In-Tab Styles */
@@ -5997,4 +6069,267 @@ html {
 [data-fb-pointer] textarea,
 [data-fb-pointer] [contenteditable='true'] {
   cursor: text !important;
+}
+
+/* =============================================================
+   LIGHT THEME CONTRAST: Settings and app-level surfaces
+   =============================================================
+   These rules cover UI mounted both inside the shell and directly under
+   document.body (dialogs, dropdowns and notices). The document root and
+   body receive data-theme from BrowserShell so variables inherit outside
+   the shell's own stacking tree as well.
+*/
+[data-theme="light"] {
+  color-scheme: light;
+  --fb-text-muted: #64748b;
+  --fb-settings-row-bg: #f8fafc;
+  --fb-settings-hover: rgba(15, 23, 42, 0.06);
+  --fb-settings-border: rgba(15, 23, 42, 0.12);
+  --fb-settings-preview-base: 255, 255, 255;
+}
+
+[data-theme="light"] .fb-settings-app {
+  background: var(--fb-bg-app);
+  color: var(--fb-text-primary);
+}
+
+[data-theme="light"] .fb-settings-sidebar {
+  background: #f8fafc;
+  border-right-color: var(--fb-settings-border);
+}
+
+[data-theme="light"] .fb-settings-nav-item {
+  color: #475569;
+}
+
+[data-theme="light"] .fb-settings-nav-item:hover {
+  background: var(--fb-settings-hover);
+  color: #0f172a;
+}
+
+[data-theme="light"] .fb-settings-nav-item.active {
+  background: rgba(8, 145, 178, 0.12);
+  color: #0e7490;
+}
+
+[data-theme="light"] .fb-settings-group-card {
+  background: #ffffff;
+  border-color: var(--fb-settings-border);
+  color: #0f172a;
+}
+
+[data-theme="light"] .fb-setting-toggle-row {
+  background: var(--fb-settings-row-bg);
+  border-color: var(--fb-settings-border);
+}
+
+[data-theme="light"] .fb-setting-row > label,
+[data-theme="light"] .fb-setting-toggle-row p,
+[data-theme="light"] .fb-setting-row p,
+[data-theme="light"] .fb-settings-group-card p {
+  color: var(--fb-text-secondary);
+}
+
+[data-theme="light"] .fb-settings-group-title,
+[data-theme="light"] .fb-setting-toggle-row strong,
+[data-theme="light"] .fb-setting-row strong {
+  color: var(--fb-text-primary);
+}
+
+[data-theme="light"] .fb-settings-error-note {
+  color: #b91c1c !important;
+}
+
+[data-theme="light"] .fb-avatar-fallback {
+  background: linear-gradient(135deg, #0e7490, #1d4ed8) !important;
+}
+
+[data-theme="light"] .fb-settings-app .fb-select,
+[data-theme="light"] .fb-settings-app .fb-input,
+[data-theme="light"] .fb-settings-app .fb-internal-search input {
+  color: var(--fb-text-primary);
+  border-color: var(--fb-settings-border);
+}
+
+[data-theme="light"] .fb-settings-app .fb-select,
+[data-theme="light"] .fb-settings-app .fb-internal-search input {
+  background: #ffffff;
+}
+
+[data-theme="light"] .fb-settings-app .fb-select option {
+  color: #0f172a;
+  background: #ffffff;
+}
+
+[data-theme="light"] .fb-pointer-preview {
+  border-color: rgba(14, 116, 144, 0.4);
+  background: #f8fafc;
+}
+
+[data-theme="light"] .fb-pointer-preview input[type='text'] {
+  background: #ffffff;
+  color: #0f172a;
+  border-color: var(--fb-settings-border);
+}
+
+[data-theme="light"] .fb-transparency-preview-card {
+  border-color: var(--fb-settings-border);
+  color: var(--fb-text-primary);
+}
+
+[data-theme="light"] .fb-shortcut-row {
+  border-bottom-color: rgba(15, 23, 42, 0.08);
+  color: var(--fb-text-primary);
+}
+
+[data-theme="light"] .fb-shortcut-row kbd {
+  background: rgba(15, 23, 42, 0.05);
+  border-color: rgba(15, 23, 42, 0.14);
+  color: #0f172a;
+}
+
+[data-theme="light"] .fb-updates-scheduled-row {
+  color: #1e3a8a;
+  background: rgba(59, 130, 246, 0.08);
+  border-color: rgba(37, 99, 235, 0.22);
+}
+
+[data-theme="light"] .fb-settings-app .fb-btn-secondary {
+  background: rgba(15, 23, 42, 0.035);
+  color: var(--fb-text-primary);
+  border-color: var(--fb-settings-border);
+}
+
+[data-theme="light"] .fb-btn-secondary:hover:not(:disabled) {
+  background: rgba(15, 23, 42, 0.07);
+}
+
+[data-theme="light"] .fb-btn-danger {
+  background: #fee2e2;
+  border-color: #fecaca;
+  color: #991b1b;
+}
+
+[data-theme="light"] .fb-btn-danger:hover:not(:disabled) {
+  background: #fecaca;
+}
+
+/* Shared app-level overlays use dark fills in dark mode; switch the entire
+   surface and its inherited text together so no white-on-white or
+   dark-on-dark islands remain in light mode. */
+[data-theme="light"] .fb-security-dropdown,
+[data-theme="light"] .fb-tab-context-menu,
+[data-theme="light"] .fb-account-dropdown,
+[data-theme="light"] .fb-profile-suggestion-card,
+[data-theme="light"] .fb-update-prompt-card,
+[data-theme="light"] .fb-close-prompt-modal,
+[data-theme="light"] .fb-recent-tabs-offer,
+[data-theme="light"] .fb-downloads-dropdown {
+  background: #ffffff;
+  border-color: rgba(15, 23, 42, 0.14);
+  box-shadow: 0 16px 40px rgba(15, 23, 42, 0.18);
+  color: #0f172a;
+}
+
+[data-theme="light"] .fb-security-header,
+[data-theme="light"] .fb-account-dropdown-header,
+[data-theme="light"] .fb-downloads-dropdown-header,
+[data-theme="light"] .fb-chrome-menu-header,
+[data-theme="light"] .fb-modal-header {
+  border-color: rgba(15, 23, 42, 0.1);
+}
+
+[data-theme="light"] .fb-security-header {
+  color: #047857;
+}
+
+[data-theme="light"] .fb-search-engine-option:hover,
+[data-theme="light"] .fb-tab-context-menu-item:hover:not(:disabled),
+[data-theme="light"] .fb-profile-row:hover,
+[data-theme="light"] .fb-dl-item:hover {
+  background: rgba(15, 23, 42, 0.06);
+}
+
+[data-theme="light"] .fb-tab-context-menu-sep,
+[data-theme="light"] .fb-account-profiles,
+[data-theme="light"] .fb-downloads-dropdown-header {
+  border-color: rgba(15, 23, 42, 0.1);
+}
+
+[data-theme="light"] .fb-profile-row {
+  color: var(--fb-text-primary);
+}
+
+[data-theme="light"] .fb-profile-row-text small,
+[data-theme="light"] .fb-account-profiles-label {
+  color: var(--fb-text-secondary);
+}
+
+[data-theme="light"] .fb-profile-suggestion-avatars .fb-profile-avatar + .fb-profile-avatar {
+  box-shadow: 0 0 0 2px #ffffff;
+}
+
+[data-theme="light"] .fb-downloads-dropdown-header small {
+  color: #1d4ed8;
+}
+
+[data-theme="light"] .fb-dl-meta,
+[data-theme="light"] .fb-passwords-controls,
+[data-theme="light"] .fb-password-row {
+  background: #f8fafc;
+  border-color: rgba(15, 23, 42, 0.1);
+}
+
+[data-theme="light"] .fb-password-preview {
+  background: #f1f5f9;
+  border-color: rgba(15, 23, 42, 0.16);
+  color: #0f172a;
+}
+
+[data-theme="light"] .fb-modal-card {
+  border-color: rgba(15, 23, 42, 0.14);
+  box-shadow: 0 24px 48px rgba(15, 23, 42, 0.18);
+}
+
+[data-theme="light"] .fb-find-in-page-bar {
+  border-color: rgba(15, 23, 42, 0.14);
+}
+
+[data-theme="light"] .fb-history-item-row {
+  border-color: rgba(15, 23, 42, 0.08);
+}
+
+/* Keep selectable accent colors readable when used as light-mode text or
+   white-label button gradients (their brighter dark-mode colors are not
+   strong enough against white surfaces). */
+[data-theme="light"][data-color-theme="purple"] {
+  --fb-accent-primary: #6d28d9;
+  --fb-accent-secondary: #5b21b6;
+  --fb-accent-glow: rgba(109, 40, 217, 0.18);
+  --fb-gradient-accent: linear-gradient(135deg, #6d28d9 0%, #5b21b6 52%, #4c1d95 100%);
+  --fb-border-glass-highlight: rgba(109, 40, 217, 0.38);
+}
+
+[data-theme="light"][data-color-theme="green"] {
+  --fb-accent-primary: #047857;
+  --fb-accent-secondary: #065f46;
+  --fb-accent-glow: rgba(4, 120, 87, 0.18);
+  --fb-gradient-accent: linear-gradient(135deg, #047857 0%, #065f46 52%, #064e3b 100%);
+  --fb-border-glass-highlight: rgba(4, 120, 87, 0.36);
+}
+
+[data-theme="light"][data-color-theme="rose"] {
+  --fb-accent-primary: #be123c;
+  --fb-accent-secondary: #9f1239;
+  --fb-accent-glow: rgba(190, 18, 60, 0.16);
+  --fb-gradient-accent: linear-gradient(135deg, #be123c 0%, #9f1239 52%, #881337 100%);
+  --fb-border-glass-highlight: rgba(190, 18, 60, 0.34);
+}
+
+[data-theme="light"][data-color-theme="amber"] {
+  --fb-accent-primary: #92400e;
+  --fb-accent-secondary: #78350f;
+  --fb-accent-glow: rgba(146, 64, 14, 0.16);
+  --fb-gradient-accent: linear-gradient(135deg, #92400e 0%, #78350f 52%, #713f12 100%);
+  --fb-border-glass-highlight: rgba(146, 64, 14, 0.36);
 }

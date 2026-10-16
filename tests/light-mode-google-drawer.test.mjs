@@ -6,6 +6,7 @@ import { setupDomShim } from './dom-shim.mjs';
 setupDomShim();
 
 import { BrowserShell } from '../packages/shared-ui/src/components/BrowserShell.js';
+import { ThemeManager } from '../packages/shared-ui/src/theme/ThemeManager.js';
 
 /**
  * Three user reports from the light-mode/web audit:
@@ -156,6 +157,47 @@ test('LIGHT MODE: the drawer, submenus and mini window follow the theme (no blac
   assert.ok(css.includes('--fb-drawer-submenu-bg: #ffffff'), 'submenu flyouts flip too');
   assert.ok(css.includes('--fb-drawer-hover: rgba(15, 23, 42, 0.06)'), 'hover state flips');
   assert.ok(css.includes('[data-theme="light"] .fb-floating-popup-window') && css.includes('background: rgba(245, 248, 252, 0.96)'), 'the mini window flips');
+});
+
+test('LIGHT MODE SETTINGS: document-level theme reaches every Settings category and its shared readable surfaces', async () => {
+  const { shell, container } = await makeShell();
+  const categories = ['account', 'floating', 'ai', 'appearance', 'pointer', 'privacy', 'passwords', 'tabs', 'shortcuts', 'downloads', 'extensions', 'updates', 'about'];
+  try {
+    shell.state.settings.theme = 'light';
+    shell.state.tabs[0].url = 'yayra://settings';
+    for (const category of categories) {
+      shell.state.settingsActiveCategory = category;
+      shell.render(container);
+      assert.equal(document.documentElement.getAttribute('data-theme'), 'light', 'the document root carries light mode');
+      assert.equal(document.body.getAttribute('data-theme'), 'light', 'body-mounted Settings dialogs and overlays inherit light mode');
+      assert.ok(container.querySelector(`#sec-${category}`), `the ${category} Settings panel renders`);
+    }
+    assert.ok(container.querySelector('#sec-overlay'), 'the nested System-Wide Overlay card is present under Floating');
+
+    const css = readFileSync(new URL('../packages/shared-ui/src/theme/design-system.css', import.meta.url), 'utf8');
+    assert.match(css, /\[data-theme="light"\] \.fb-settings-group-card\s*\{[^}]*color:\s*#0f172a/s, 'every category card has a light surface and dark text');
+    assert.match(css, /\[data-theme="light"\] \.fb-setting-toggle-row\s*\{[^}]*background:\s*var\(--fb-settings-row-bg\)/s, 'toggle rows flip with the theme');
+    assert.match(css, /\[data-theme="light"\] \.fb-settings-app \.fb-select,[\s\S]{0,220}color:\s*var\(--fb-text-primary\)/, 'form controls use readable light-mode text');
+    assert.match(css, /\[data-theme="light"\] \.fb-shortcut-row kbd\s*\{[^}]*color:\s*#0f172a/s, 'shortcut keys remain legible');
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('LIGHT MODE ACCENTS: all selectable accents use readable text colors and white-text-safe buttons', () => {
+  const manager = new ThemeManager('light');
+  const root = document.createElement('div');
+  const expected = {
+    blue: '#0e7490', purple: '#6d28d9', green: '#047857', rose: '#be123c', amber: '#92400e'
+  };
+  for (const [colorTheme, accent] of Object.entries(expected)) {
+    manager.setColorTheme(colorTheme, root);
+    const tokens = manager.getCssCustomProperties();
+    assert.equal(tokens['--fb-accent-primary'], accent, `${colorTheme} link/label color is dark enough for light surfaces`);
+    assert.match(tokens['--fb-gradient-accent'], /linear-gradient\(135deg, #/, `${colorTheme} primary buttons use the light-mode gradient`);
+    assert.equal(root.getAttribute('data-theme'), 'light');
+  }
 });
 
 test('LIGHT MODE: inline-styled surfaces use theme tokens (dark values only as fallbacks)', () => {

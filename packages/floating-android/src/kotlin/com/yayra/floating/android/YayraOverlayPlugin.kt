@@ -77,7 +77,9 @@ class YayraOverlayPlugin : Plugin() {
             call.getDouble("x") ?: 0.0,
             call.getDouble("y") ?: 0.0,
             call.getDouble("width") ?: 0.0,
-            call.getDouble("height") ?: 0.0
+            call.getDouble("height") ?: 0.0,
+            call.getString("pointerTheme") ?: "system",
+            call.getString("pointerSize") ?: "normal"
         )
         call.resolve(JSObject().put("ok", true))
     }
@@ -105,6 +107,18 @@ class YayraOverlayPlugin : Plugin() {
         // - killed the whole v1.0.39 Android release build). Elvis back to
         // true: unspecified means show, matching the JS call sites.
         tabWeb()?.setVisible(id, call.getBoolean("visible", true) ?: true)
+        call.resolve(JSObject().put("ok", true))
+    }
+
+    @PluginMethod
+    fun tabWebSetPointerTheme(call: PluginCall) {
+        val id = call.getString("id")
+        if (id.isNullOrBlank()) { call.reject("id-required"); return }
+        tabWeb()?.setPointerTheme(
+            id,
+            call.getString("theme") ?: "system",
+            call.getString("size") ?: "normal"
+        )
         call.resolve(JSObject().put("ok", true))
     }
 

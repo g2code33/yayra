@@ -426,6 +426,8 @@ export class BrowserShell {
     // frequent full-DOM re-renders.
     this._nativeWebviewTabIds = new Set();
     this._nativeWebviewResizeObservers = new Map();
+    this._lastAppliedNativePointerConfig = null;
+    this._lastAppliedAndroidPointerConfig = null;
     this._unsubscribeNativeWebview = null;
     // Last captured still image of each tab's native view, shown underneath
     // Yayra's own chrome (menu drawer, modals, mini window, dropdowns)
@@ -1218,8 +1220,10 @@ export class BrowserShell {
   }
 
   render(container = null) {
-    // Pointer theme: applied on every render (idempotent, one attribute
-    // set) so any settings change shows up immediately everywhere.
+    // Global theme tokens must reach body-mounted dialogs too, not just
+    // the shell node that render() rebuilds. Pointer preference follows the
+    // same lifecycle and is also forwarded to the native website surfaces.
+    try { this.applyDocumentTheme(); } catch { /* headless */ }
     try { this.applyPointerTheme(); } catch { /* headless */ }
     const target = container || this.container || (this.rootElement && this.rootElement.parentElement);
     if (!target) return null;
@@ -2626,7 +2630,10 @@ export class BrowserShell {
     // Pass the active browsing profile so Electron places this view in
     // that profile's own session partition (real cookie/login separation).
     const activeProfileId = this.profileService ? this.profileService.current().id : 'default';
-    this.nativeWebview.ensure(tabId, url, isPrivate, activeProfileId).then((result) => {
+    this.nativeWebview.ensure(tabId, url, isPrivate, activeProfileId, {
+      theme: this.state.settings.pointerTheme || 'system',
+      size: this.state.settings.pointerSize || 'normal'
+    }).then((result) => {
       if (result && result.handedOffToSystemBrowser) {
         const tab = this.state.tabs.find((t) => t.id === tabId);
         if (tab) {
@@ -2696,7 +2703,16 @@ export class BrowserShell {
 
     // Attach at a 1px placeholder; the ResizeObserver below reports the
     // real DOM bounds the moment the wrapper is mounted.
-    plugin.tabWebAttach({ id: tabId, url, x: 0, y: 0, width: 1, height: 1 }).then((res) => {
+    plugin.tabWebAttach({
+      id: tabId,
+      url,
+      x: 0,
+      y: 0,
+      width: 1,
+      height: 1,
+      pointerTheme: this.state.settings.pointerTheme || 'system',
+      pointerSize: this.state.settings.pointerSize || 'normal'
+    }).then((res) => {
       if (res && res.ok === false) {
         this._androidTabWebEngineUnavailable(wrapper, tabId, url);
         return;
@@ -4041,7 +4057,7 @@ export class BrowserShell {
     }
 
     const errorNote = account.status === 'error'
-      ? `<p style="color:#f66;">Couldn't sign in: ${account.error === 'not_configured' ? 'Google sign-in isn\u2019t configured for this build yet.' : (account.error || 'please try again.')}</p>`
+      ? `<p class="fb-settings-error-note" style="color:#f66;">Couldn't sign in: ${account.error === 'not_configured' ? 'Google sign-in isn\u2019t configured for this build yet.' : (account.error || 'please try again.')}</p>`
       : '';
 
     return `
@@ -4348,17 +4364,17 @@ export class BrowserShell {
                 <option value="xlarge" ${this.state.settings.pointerSize === 'xlarge' ? 'selected' : ''}>Extra large</option>
               </select>
             </div>
-            <div class="fb-pointer-preview" id="fb-pointer-preview" style="margin-top:10px; padding:14px; border:1px dashed rgba(255,255,255,0.18); border-radius:10px; background:rgba(255,255,255,0.03);">
+            <div class="fb-pointer-preview" id="fb-pointer-preview" style="margin-top:10px; padding:14px;">
               <div style="font-size:0.78rem; color:var(--fb-text-muted); margin-bottom:8px;">Live preview - move your pointer over this area:</div>
               <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap;">
                 <button type="button" class="fb-btn fb-btn-secondary" style="padding:6px 12px;">A button</button>
                 <a href="#" onclick="return false;" style="color:var(--fb-accent-primary);">A link</a>
-                <input type="text" placeholder="A text field" style="padding:6px 10px; border-radius:8px; border:1px solid rgba(255,255,255,0.14); background:var(--fb-bg-glass-input,#101218); color:inherit;" />
+                <input type="text" placeholder="A text field" style="padding:6px 10px; border-radius:8px; border:1px solid var(--fb-border-glass,rgba(255,255,255,0.14)); background:var(--fb-bg-glass-input,#101218); color:var(--fb-text-primary,#f3f4f6);" />
               </div>
             </div>
             <p style="font-size:0.75rem; color:var(--fb-text-muted); margin:10px 0 0; line-height:1.5;">
-              Custom styles apply to Yayra's own interface. Web pages keep their own pointer behavior, and the
-              System style always follows your operating system's pointer size (including Windows' large pointer setting).
+              Custom styles apply to Yayra's interface and websites opened in Yayra's built-in web views. The
+              System style keeps the native operating-system pointer and its configured size.
             </p>
           </section>
           <section class="fb-settings-group-card" id="sec-privacy" style="${activeCat === 'privacy' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
@@ -4532,7 +4548,7 @@ export class BrowserShell {
       if (page.querySelector('#fb-in-val-blur')) page.querySelector('#fb-in-val-blur').textContent = `${blurVal}px`;
 
       if (previewBox) {
-        previewBox.style.background = `rgba(13, 23, 54, ${fOp})`;
+        previewBox.style.setProperty('--fb-frame-preview-opacity', String(fOp));
         previewBox.style.backdropFilter = `blur(${blurVal}px)`;
       }
       this.ensurePersistentAssistiveBubble();
@@ -6374,26 +6390,46 @@ export class BrowserShell {
 
   /** window.yayra.system (Electron): app metrics + desktop shortcuts. */
   /**
-   * POINTER SETTINGS application. Sets data-fb-pointer / -size on
-   * <body> (everything Yayra renders lives under it: the shell, the
-   * mini window, dropdowns, modals). 'system' removes the attribute
-   * entirely - native cursors only, so the OS pointer size always
-   * rules (see design-system.css "POINTER SETTINGS" + the
-   * native-cursor-size test). Page content inside iframes/native
-   * engines keeps its own pointer behavior - Yayra never repaints
-   * the web.
+   * Apply the saved pointer to Yayra's chrome and every native site view.
+   * The native engine injects the same visible arrow/hand styles into each
+   * loaded page (including child frames); 'system' removes those styles and
+   * leaves the OS cursor untouched.
    */
   applyPointerTheme() {
-    if (typeof document === 'undefined' || !document.body) return;
-    const theme = this.state.settings.pointerTheme || 'system';
-    if (theme === 'system' || theme === 'yayra' || theme === 'high-visibility') {
+    const requestedTheme = this.state.settings.pointerTheme || 'system';
+    const theme = ['yayra', 'high-visibility'].includes(requestedTheme) ? requestedTheme : 'system';
+    const requestedSize = this.state.settings.pointerSize || 'normal';
+    const size = ['large', 'xlarge'].includes(requestedSize) ? requestedSize : 'normal';
+
+    if (typeof document !== 'undefined' && document.body) {
       if (theme === 'system') {
         document.body.removeAttribute?.('data-fb-pointer');
         document.body.removeAttribute?.('data-fb-pointer-size');
       } else {
         document.body.setAttribute?.('data-fb-pointer', theme);
-        document.body.setAttribute?.('data-fb-pointer-size', this.state.settings.pointerSize || 'normal');
+        document.body.setAttribute?.('data-fb-pointer-size', size);
       }
+    }
+
+    const configKey = `${theme}:${size}`;
+    const native = this.nativeWebview;
+    if (native && typeof native.setPointerTheme === 'function' && this._lastAppliedNativePointerConfig !== configKey) {
+      for (const tabId of this._nativeWebviewTabIds || []) {
+        try {
+          Promise.resolve(native.setPointerTheme(tabId, theme, size)).catch(() => {});
+        } catch { /* a closing native page is best-effort */ }
+      }
+      this._lastAppliedNativePointerConfig = configKey;
+    }
+
+    const android = this.capacitorTabWeb;
+    if (android && typeof android.tabWebSetPointerTheme === 'function' && this._lastAppliedAndroidPointerConfig !== configKey) {
+      for (const tabId of this._androidTabWebIds || []) {
+        try {
+          Promise.resolve(android.tabWebSetPointerTheme({ id: tabId, theme, size })).catch(() => {});
+        } catch { /* a closing Android page is best-effort */ }
+      }
+      this._lastAppliedAndroidPointerConfig = configKey;
     }
   }
 
@@ -11934,7 +11970,7 @@ export class BrowserShell {
     const menu = document.createElement('div');
     menu.id = 'yayra-dl-context-menu';
     menu.className = 'fb-dl-context-menu';
-    menu.style.cssText = `position:fixed; z-index:100000; min-width:200px; background:var(--fb-bg-elevated,#171a22); border:1px solid var(--fb-border-glass,rgba(255,255,255,0.12)); border-radius:10px; padding:6px; box-shadow:0 16px 48px rgba(0,0,0,0.55); left:${Math.max(8, (evt.clientX || 60) - 24)}px; top:${Math.max(8, evt.clientY || 60)}px; font-size:0.82rem; color:var(--fb-text-primary,#f3f4f6);`;
+    menu.style.cssText = `position:fixed; z-index:2147483647; min-width:200px; background:var(--fb-bg-surface-elevated,#171a22); border:1px solid var(--fb-border-glass,rgba(255,255,255,0.12)); border-radius:10px; padding:6px; box-shadow:0 16px 48px rgba(0,0,0,0.55); left:${Math.max(8, (evt.clientX || 60) - 24)}px; top:${Math.max(8, evt.clientY || 60)}px; font-size:0.82rem; color:var(--fb-text-primary,#f3f4f6);`;
     const dismiss = () => { try { menu.remove(); } catch { /* gone */ } };
     const entry = (label, fn) => {
       const b = document.createElement('button');
@@ -12209,7 +12245,8 @@ export class BrowserShell {
    */
   resolveEffectiveTheme() {
     const pref = this.state.settings.theme || 'dark';
-    if (pref !== 'system') return pref;
+    if (pref === 'light') return 'light';
+    if (pref !== 'system') return 'dark';
     try {
       if (typeof matchMedia === 'function') {
         return matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
@@ -12218,6 +12255,20 @@ export class BrowserShell {
       // Fall through to the dark default below.
     }
     return 'dark';
+  }
+
+  /** Apply the resolved theme at document scope as well as to the shell. */
+  applyDocumentTheme() {
+    if (typeof document === 'undefined') return this.resolveEffectiveTheme();
+    const theme = this.resolveEffectiveTheme();
+    const colorTheme = this.state.settings.colorTheme || 'blue';
+    const roots = [document.documentElement, document.body].filter(Boolean);
+    for (const root of roots) {
+      root.setAttribute?.('data-theme', theme);
+      root.setAttribute?.('data-color-theme', colorTheme);
+      root.style?.setProperty?.('color-scheme', theme);
+    }
+    return theme;
   }
 
   /**

@@ -41,7 +41,12 @@ const api = {
   // running inside Electron and should use the native WebContentsView engine
   // instead of an <iframe> for rendering visited websites.
   webview: {
-    ensure: (tabId, url, isPrivate = false, profileId = 'default') => ipcRenderer.invoke('yayra:webview-ensure', { tabId, url, isPrivate, profileId }),
+    ensure: (tabId, url, isPrivate = false, profileId = 'default', pointer = {}) => ipcRenderer.invoke('yayra:webview-ensure', {
+      tabId, url, isPrivate, profileId,
+      pointerTheme: pointer && pointer.theme,
+      pointerSize: pointer && pointer.size
+    }),
+    setPointerTheme: (tabId, theme, size) => ipcRenderer.invoke('yayra:webview-set-pointer-theme', { tabId, theme, size }),
     setBounds: (tabId, bounds) => ipcRenderer.invoke('yayra:webview-set-bounds', { tabId, bounds }),
     setVisible: (tabId, visible, options = {}) => ipcRenderer.invoke('yayra:webview-set-visible', { tabId, visible, capture: Boolean(options && options.capture) }),
     // Snapshot the live page WITHOUT hiding it - lets the renderer paint

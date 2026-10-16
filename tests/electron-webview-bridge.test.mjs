@@ -5,6 +5,8 @@ import {
   sanitizeBounds,
   buildBrowserUserAgent,
   buildContextMenuTemplate,
+  buildPointerThemeCss,
+  buildPointerThemeScript,
   createWebviewBridge,
   WEBVIEW_EVENT_CHANNEL
 } from '../electron/webviewBridge.cjs';
@@ -32,6 +34,16 @@ test('buildBrowserUserAgent: never includes the Electron identity token, on any 
     assert.match(ua, /Chrome\/130\.0\.6723\.70/);
     assert.match(ua, /AppleWebKit\/537\.36/);
   }
+});
+
+test('custom pointer CSS is self-contained, sized, and leaves text fields usable', () => {
+  const css = buildPointerThemeCss('yayra', 'large');
+  assert.match(css, /data:image\/svg\+xml,%3Csvg/, 'cursor art is inline (no network fetch)');
+  assert.match(css, /width%3D%2236%22/, 'large cursor image uses the selected size');
+  assert.match(css, /button, a, \[role=/, 'interactive targets use the hand cursor');
+  assert.match(css, /input\[type="text"\][\s\S]*cursor: text !important/, 'text entry keeps its I-beam');
+  assert.match(buildPointerThemeCss('high-visibility', 'xlarge'), /%23ffd400/, 'high-visibility keeps its yellow outline');
+  assert.match(buildPointerThemeScript('system'), /yayra-custom-pointer-theme/, 'System removes any injected cursor stylesheet');
 });
 
 test('sanitizeBounds: clamps negative/missing values and rounds floats', () => {
@@ -160,6 +172,36 @@ test('webview bridge: creating a tab adds a WebContentsView as a child view and 
 
   assert.equal(views.length, 1, 'exactly one native view created');
   assert.equal(fakeWin.contentView.children.length, 1, 'view attached to the window content view (not an <iframe>)');
+});
+
+test('webview bridge: persisted pointer settings apply to every loaded frame and survive later frame loads', async () => {
+  const { handlers, views } = makeHarness();
+  const ensure = handlers.get('yayra:webview-ensure');
+  await ensure(null, { tabId: 'tab-pointer', url: 'https://example.com/', pointerTheme: 'yayra', pointerSize: 'large' });
+  const wc = views[0].webContents;
+  const frameScripts = [];
+  const makeFrame = () => ({ executeJavaScript: async (script) => { frameScripts.push(script); return true; } });
+  const mainFrame = makeFrame();
+  const childFrame = makeFrame();
+  mainFrame.framesInSubtree = [mainFrame, childFrame];
+  wc.mainFrame = mainFrame;
+  wc.executeJavaScript = async (script) => { frameScripts.push(script); return true; };
+
+  wc.emit('dom-ready');
+  await Promise.resolve();
+  assert.equal(frameScripts.filter((script) => script.includes('yayra-custom-pointer-theme')).length, 2, 'main document and child frame both receive the custom pointer');
+  assert.ok(frameScripts.some((script) => script.includes('data:image/svg+xml')), 'cursor art is embedded locally');
+
+  const setTheme = handlers.get('yayra:webview-set-pointer-theme');
+  assert.deepEqual(setTheme(null, { tabId: 'tab-pointer', theme: 'high-visibility', size: 'xlarge' }), { ok: true });
+  assert.ok(frameScripts.some((script) => script.includes('%23ffd400') && script.includes('width%3D%2248%22')), 'live setting changes update all loaded pages at the chosen size');
+
+  wc.emit('did-frame-finish-load', {}, false, 1, 2);
+  await Promise.resolve();
+  assert.ok(frameScripts.filter((script) => script.includes('yayra-custom-pointer-theme')).length >= 6, 'a later child-frame load is re-styled too');
+
+  setTheme(null, { tabId: 'tab-pointer', theme: 'system', size: 'normal' });
+  assert.ok(frameScripts.some((script) => script.includes('delete window.__yayraPointerThemeObserver')), 'switching back to System removes the injected override');
 });
 
 test('webview bridge: re-ensuring the same tab with the same URL does not reload', async () => {

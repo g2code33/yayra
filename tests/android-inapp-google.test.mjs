@@ -44,7 +44,7 @@ function makeStorage() {
  * Back-button handler.
  */
 function fakeAndroid({ attachResult } = {}) {
-  const calls = { attach: [], update: [], visible: [], navigate: [], goBack: [], remove: [], browserOpen: [], exitApp: 0 };
+  const calls = { attach: [], update: [], visible: [], pointerTheme: [], navigate: [], goBack: [], remove: [], browserOpen: [], exitApp: 0 };
   let eventHandler = null;
   let backHandler = null;
   window.Capacitor = {
@@ -64,6 +64,7 @@ function fakeAndroid({ attachResult } = {}) {
         tabWebAttach: async (opts) => { calls.attach.push(opts); return attachResult || { ok: true }; },
         tabWebUpdate: async (opts) => { calls.update.push(opts); return { ok: true }; },
         tabWebSetVisible: async (opts) => { calls.visible.push(opts); return { ok: true }; },
+        tabWebSetPointerTheme: async (opts) => { calls.pointerTheme.push(opts); return { ok: true }; },
         tabWebNavigate: async (opts) => { calls.navigate.push(opts); return { ok: true }; },
         tabWebGoBack: async (opts) => { calls.goBack.push(opts); return { ok: true }; },
         tabWebRemove: async (opts) => { calls.remove.push(opts); return { ok: true }; }
@@ -146,6 +147,33 @@ test('ANDROID: Google SIGN-IN hosts still hand off honestly (Google blocks sign-
     assert.equal(iframe, null);
     assert.equal(android.calls.attach.length, 0, 'sign-in pages never enter the in-app engine');
     assert.deepEqual(android.calls.browserOpen, ['https://accounts.google.com/signin'], 'they open in the secure system browser instead');
+  } finally {
+    shell.destroy();
+    delete window.Capacitor;
+    delete globalThis.localStorage;
+  }
+});
+
+test('ANDROID: custom pointer settings reach existing and newly opened native website views', async () => {
+  const android = fakeAndroid();
+  const { shell } = await makeShell();
+  try {
+    shell.createWebContentFrame('https://www.google.com/', { tabId: 'tab-1', allowNative: false });
+    await flush();
+    assert.equal(android.calls.attach[0].pointerTheme, 'system', 'the saved/default theme is sent when a site view is created');
+
+    shell.state.settings.pointerTheme = 'high-visibility';
+    shell.state.settings.pointerSize = 'xlarge';
+    shell.applyPointerTheme();
+    await flush();
+    assert.ok(android.calls.pointerTheme.some((item) => item.id === 'tab-1' && item.theme === 'high-visibility' && item.size === 'xlarge'), 'an open website gets the live change');
+    assert.equal(document.body.getAttribute('data-fb-pointer'), 'high-visibility', 'Yayra chrome uses the same setting');
+
+    shell.createWebContentFrame('https://www.google.com/search?q=pointer', { tabId: 'tab-pointer-new' });
+    await flush();
+    const next = android.calls.attach.at(-1);
+    assert.equal(next.pointerTheme, 'high-visibility', 'future website tabs inherit the saved theme');
+    assert.equal(next.pointerSize, 'xlarge');
   } finally {
     shell.destroy();
     delete window.Capacitor;
@@ -276,6 +304,8 @@ test('KOTLIN PIN: the native tab engine exists, is safe, and reports through tab
   assert.ok(manager.includes('fun attach('), 'attach (create/reuse per tab)');
   assert.ok(manager.includes('fun update('), 'update (follows the DOM slot)');
   assert.ok(manager.includes('fun setVisible('), 'visibility control');
+  assert.ok(manager.includes('fun setPointerTheme('), 'website pointer preference reaches live Android tabs');
+  assert.ok(manager.includes('applyPointerThemeToPage'), 'the custom cursor is injected into the page renderer');
   assert.ok(manager.includes('Bitmap.createBitmap'), 'hiding captures the page frame (no blank flash under chrome)');
   assert.ok(manager.includes('fun navigate('), 'omnibox navigation');
   assert.ok(manager.includes('fun goBack('), 'back history');
@@ -288,7 +318,7 @@ test('KOTLIN PIN: the native tab engine exists, is safe, and reports through tab
   assert.ok(manager.includes('settings.allowContentAccess = false'), 'content access OFF');
 
   const plugin = readFileSync(new URL('../packages/floating-android/src/kotlin/com/yayra/floating/android/YayraOverlayPlugin.kt', import.meta.url), 'utf8');
-  for (const method of ['tabWebAttach', 'tabWebUpdate', 'tabWebSetVisible', 'tabWebNavigate', 'tabWebGoBack', 'tabWebGoForward', 'tabWebReload', 'tabWebStop', 'tabWebRemove']) {
+  for (const method of ['tabWebAttach', 'tabWebUpdate', 'tabWebSetVisible', 'tabWebSetPointerTheme', 'tabWebNavigate', 'tabWebGoBack', 'tabWebGoForward', 'tabWebReload', 'tabWebStop', 'tabWebRemove']) {
     assert.ok(plugin.includes(`fun ${method}(call: PluginCall)`), `plugin exposes ${method}`);
   }
   assert.ok(plugin.includes('notifyListeners("tabWebEvent", data)'), 'the plugin forwards engine events');

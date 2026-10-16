@@ -61,7 +61,7 @@ test('SETTINGS UI: the Pointer section exists with style + size options and a li
     const sizeOptions = Array.from(sizeSelect.querySelectorAll('option')).map((o) => o.getAttribute('value'));
     assert.deepEqual(sizeOptions, ['normal', 'large', 'xlarge'], 'three sizes');
     assert.ok(section.querySelector('.fb-pointer-preview'), 'live preview area');
-    assert.match(section.textContent, /operating system's pointer size/, 'honest scope note');
+    assert.match(section.textContent, /native operating-system pointer and its configured size/, 'the System option still explains OS cursor sizing');
   } finally {
     shell.destroy();
     delete globalThis.localStorage;
@@ -96,6 +96,55 @@ test('APPLICATION: choosing a custom style applies it live (body attribute) and 
     assert.ok(!document.body.getAttribute('data-fb-pointer'), 'System removes the custom cursors entirely');
   } finally {
     shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('PERSISTENCE: a saved custom pointer and size are restored before the first render', async () => {
+  const storage = makeStorage();
+  storage.setItem('yayra:settings', JSON.stringify({ pointerTheme: 'high-visibility', pointerSize: 'large' }));
+  globalThis.localStorage = storage;
+  const container = document.createElement('div');
+  const shell = new BrowserShell({ container, isMobile: false });
+  try {
+    await shell.initialize();
+    shell.render(container);
+    assert.equal(shell.state.settings.pointerTheme, 'high-visibility');
+    assert.equal(shell.state.settings.pointerSize, 'large');
+    assert.equal(document.body.getAttribute('data-fb-pointer'), 'high-visibility');
+    assert.equal(document.body.getAttribute('data-fb-pointer-size'), 'large');
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('NATIVE WEBSITE VIEWS: pointer style and size are sent live and System restores the native cursor', async () => {
+  const previousYayra = window.yayra;
+  const pointerCalls = [];
+  window.yayra = {
+    webview: {
+      onEvent: () => () => {},
+      setPointerTheme: (tabId, theme, size) => { pointerCalls.push({ tabId, theme, size }); return Promise.resolve({ ok: true }); },
+      destroy: async () => ({ ok: true })
+    }
+  };
+  const { shell } = await makeShell();
+  try {
+    shell._nativeWebviewTabIds.add('tab-site');
+    shell.state.settings.pointerTheme = 'yayra';
+    shell.state.settings.pointerSize = 'xlarge';
+    shell.applyPointerTheme();
+    assert.deepEqual(pointerCalls.at(-1), { tabId: 'tab-site', theme: 'yayra', size: 'xlarge' }, 'the selected cursor is applied to an already-open native website tab');
+    assert.equal(document.body.getAttribute('data-fb-pointer'), 'yayra');
+
+    shell.state.settings.pointerTheme = 'system';
+    shell.applyPointerTheme();
+    assert.deepEqual(pointerCalls.at(-1), { tabId: 'tab-site', theme: 'system', size: 'xlarge' }, 'System is forwarded so the site returns to the OS cursor');
+    assert.equal(document.body.getAttribute('data-fb-pointer'), null);
+  } finally {
+    shell.destroy();
+    if (previousYayra === undefined) delete window.yayra; else window.yayra = previousYayra;
     delete globalThis.localStorage;
   }
 });

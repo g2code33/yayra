@@ -5,6 +5,7 @@ import android.app.Activity
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.util.Base64
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
@@ -18,6 +19,7 @@ import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.ImageView
 import com.getcapacitor.JSObject
+import org.json.JSONObject
 
 /**
  * IN-APP NATIVE TAB WEBVIEW ENGINE - the Android equivalent of the desktop
@@ -62,6 +64,8 @@ class YayraTabWebviewManager(
         lateinit var snapshot: ImageView
         var currentUrl: String? = null
         var lastReportedUrl: String? = null
+        var pointerTheme: String = "system"
+        var pointerSize: String = "normal"
     }
 
     private fun emitEvent(id: String, type: String, extra: (JSObject) -> Unit = {}) {
@@ -100,7 +104,16 @@ class YayraTabWebviewManager(
 
     /** Create (or reuse) the native webview for a tab and place it. */
     @SuppressLint("SetJavaScriptEnabled")
-    fun attach(id: String, url: String?, x: Double, y: Double, width: Double, height: Double) {
+    fun attach(
+        id: String,
+        url: String?,
+        x: Double,
+        y: Double,
+        width: Double,
+        height: Double,
+        pointerTheme: String = "system",
+        pointerSize: String = "normal"
+    ) {
         main.post {
             try {
                 val parent = contentParent() ?: return@post
@@ -133,6 +146,7 @@ class YayraTabWebviewManager(
                             }
 
                             override fun onPageFinished(view: WebView?, target: String?) {
+                                tabs[id]?.let { applyPointerThemeToPage(it) }
                                 emitEvent(id, "loading-stop")
                                 emitEvent(id, "navigated") { d ->
                                     d.put("url", view?.url ?: target ?: "")
@@ -168,16 +182,74 @@ class YayraTabWebviewManager(
                     parent.addView(entry.webView)
                     tabs[id] = entry
                 }
-                layoutEntry(entry, x, y, width, height)
-                if (!url.isNullOrBlank() && url != entry.currentUrl) {
-                    entry.currentUrl = url
-                    entry.lastReportedUrl = url
-                    entry.webView.loadUrl(url)
+                val activeEntry = entry ?: return@post
+                val nextTheme = normalizedPointerTheme(pointerTheme)
+                val nextSize = normalizedPointerSize(pointerSize)
+                val pointerChanged = activeEntry.pointerTheme != nextTheme || activeEntry.pointerSize != nextSize
+                activeEntry.pointerTheme = nextTheme
+                activeEntry.pointerSize = nextSize
+                if (pointerChanged && activeEntry.currentUrl != null) applyPointerThemeToPage(activeEntry)
+
+                layoutEntry(activeEntry, x, y, width, height)
+                if (!url.isNullOrBlank() && url != activeEntry.currentUrl) {
+                    activeEntry.currentUrl = url
+                    activeEntry.lastReportedUrl = url
+                    activeEntry.webView.loadUrl(url)
                 }
             } catch (err: Exception) {
                 emitEvent(id, "engine-error") { d -> d.put("error", err.message ?: "attach-failed") }
             }
         }
+    }
+
+    /** Update the cursor immediately, including any already-open website tab. */
+    fun setPointerTheme(id: String, theme: String, size: String) {
+        main.post {
+            val entry = tabs[id] ?: return@post
+            val nextTheme = normalizedPointerTheme(theme)
+            val nextSize = normalizedPointerSize(size)
+            if (entry.pointerTheme == nextTheme && entry.pointerSize == nextSize) return@post
+            entry.pointerTheme = nextTheme
+            entry.pointerSize = nextSize
+            applyPointerThemeToPage(entry)
+        }
+    }
+
+    private fun normalizedPointerTheme(theme: String?): String =
+        if (theme == "yayra" || theme == "high-visibility") theme else "system"
+
+    private fun normalizedPointerSize(size: String?): String =
+        if (size == "large" || size == "xlarge") size else "normal"
+
+    private fun cursorData(svg: String, hotspotX: Int, hotspotY: Int, fallback: String): String {
+        val encoded = Base64.encodeToString(svg.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+        return "url('data:image/svg+xml;base64,$encoded') $hotspotX $hotspotY, $fallback"
+    }
+
+    private fun pointerCss(theme: String, size: String): String {
+        val dimension = when (size) { "xlarge" -> 48; "large" -> 36; else -> 24 }
+        val scale = dimension / 24.0
+        val color = if (theme == "high-visibility") "#111a2e" else "#6d5df2"
+        val outline = if (theme == "high-visibility") "#ffd400" else "#ffffff"
+        val arrowStroke = if (theme == "high-visibility") 2.4 / scale else 1.6 / scale
+        val handStroke = if (theme == "high-visibility") 2.4 / scale else 1.6 / scale
+        val arrowSvg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"$dimension\" height=\"$dimension\" viewBox=\"0 0 24 24\"><path d=\"M5 2l14 10-6 1 3.5 7-2.6 1.2L10.5 14 5 18z\" fill=\"$color\" stroke=\"$outline\" stroke-width=\"$arrowStroke\" stroke-linejoin=\"round\"/></svg>"
+        val handSvg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"$dimension\" height=\"$dimension\" viewBox=\"0 0 24 24\"><path d=\"M9 11V4.5a1.5 1.5 0 0 1 3 0V10l4.6.9c1.1.2 1.9 1.2 1.9 2.3v3.3c0 2.5-2 4.5-4.5 4.5h-3.4c-1.3 0-2.6-.6-3.4-1.7L4 15.5c-.6-.9-.4-2 .5-2.6.8-.5 1.9-.3 2.5.5l2 2.6z\" fill=\"$color\" stroke=\"$outline\" stroke-width=\"$handStroke\" stroke-linejoin=\"round\"/></svg>"
+        val arrowCursor = cursorData(arrowSvg, (4 * scale).toInt(), (2 * scale).toInt(), "auto")
+        val handCursor = cursorData(handSvg, (9 * scale).toInt(), (2 * scale).toInt(), "pointer")
+        return "html, body, body * { cursor: $arrowCursor !important; }\n" +
+            "button, a, [role='button'], [role='tab'], [role='menuitem'], select, summary, input[type='button'], input[type='submit'], input[type='reset'] { cursor: $handCursor !important; }\n" +
+            "input:not([type]), input[type='text'], input[type='search'], input[type='url'], input[type='email'], input[type='password'], input[type='number'], textarea, [contenteditable='true'], [role='textbox'] { cursor: text !important; }"
+    }
+
+    private fun applyPointerThemeToPage(entry: TabEntry) {
+        val script = if (entry.pointerTheme == "system") {
+            "(function(){try{window.__yayraPointerThemeObserver?.disconnect();delete window.__yayraPointerThemeObserver;document.getElementById('yayra-custom-pointer-theme')?.remove();}catch(e){}})();"
+        } else {
+            val css = JSONObject.quote(pointerCss(entry.pointerTheme, entry.pointerSize))
+            "(function(){try{var id='yayra-custom-pointer-theme',css=$css;try{window.__yayraPointerThemeObserver?.disconnect();}catch(e){};var install=function(){var root=document.documentElement;if(!root)return;var style=document.getElementById(id);if(!style){style=document.createElement('style');style.id=id;}if(style.textContent!==css)style.textContent=css;var parent=document.head||root;if(style.parentNode!==parent)parent.appendChild(style);};install();if(typeof MutationObserver==='function'&&document.documentElement){var observer=new MutationObserver(install);observer.observe(document.documentElement,{childList:true,subtree:true});window.__yayraPointerThemeObserver=observer;}}catch(e){}})();"
+        }
+        try { entry.webView.evaluateJavascript(script, null) } catch (_: Exception) { /* best-effort styling only */ }
     }
 
     /** Reposition/resize (CSS px) - follows the DOM slot on every layout. */
