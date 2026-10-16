@@ -157,6 +157,7 @@ const api = {
     setOverlayAllApps: (enabled) => ipcRenderer.invoke('yayra:overlay-set-overlay-all-apps', enabled),
     setBubbleSize: (size) => ipcRenderer.invoke('yayra:overlay-set-bubble-size', size),
     setBubbleOpacity: (opacity) => ipcRenderer.invoke('yayra:overlay-set-bubble-opacity', opacity),
+    setBubbleShadow: (shadowPx) => ipcRenderer.invoke('yayra:overlay-set-bubble-shadow', shadowPx),
     // Mirrors the bubble's triple-click position lock from Settings.
     setPositionLocked: (locked) => ipcRenderer.invoke('yayra:overlay-set-position-locked', locked),
     // "Minimize to bubble" on desktop hides the real OS window; the native

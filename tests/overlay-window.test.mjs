@@ -448,6 +448,43 @@ test('overlayWindow: setBubbleSize live-resizes the bubble window and persists t
   assert.equal(bridge.setBubbleSize('garbage').size, 64);
 });
 
+test('overlayWindow: shadow defaults to none, persists, clamps, and updates the live bubble', () => {
+  const dir = makeTempDir();
+  const overlayStore = createOverlayStore({ fs, userDataDir: dir });
+  const { FakeBrowserWindow, instances } = makeFakeBrowserWindowClass();
+  const ipcMain = fakeIpcMain();
+  const bridge = createOverlayBridge({
+    BrowserWindow: FakeBrowserWindow,
+    app: fakeApp(),
+    ipcMain,
+    screen: fakeScreen(),
+    path,
+    preloadPath: '/fake/overlayPreload.cjs',
+    overlayStore,
+    getMainWindow: () => null
+  });
+
+  assert.equal(overlayStore.load().shadowPx, 0, 'fresh installs have no bubble shadow');
+  bridge.ensureOverlayWindow();
+  const defaultHtml = decodeURIComponent(instances[0].loadedUrl.replace('data:text/html;charset=utf-8,', ''));
+  const defaultRule = /#bubble\s*\{[^}]*\}/.exec(defaultHtml)?.[0] || '';
+  assert.ok(defaultRule.includes('filter:none'), 'default native bubble has no drop shadow');
+
+  const next = bridge.setBubbleShadow(12);
+  assert.equal(next.shadowPx, 12);
+  assert.equal(overlayStore.load().shadowPx, 12, 'shadow setting persists');
+  const updatedHtml = decodeURIComponent(instances[0].loadedUrl.replace('data:text/html;charset=utf-8,', ''));
+  const updatedRule = /#bubble\s*\{[^}]*\}/.exec(updatedHtml)?.[0] || '';
+  assert.ok(updatedRule.includes('drop-shadow(0 3px 12px'), 'the live overlay renders the selected shadow strength');
+
+  const shadowHandler = ipcMain.handlers.get('yayra:overlay-set-bubble-shadow');
+  assert.equal(typeof shadowHandler, 'function', 'the preload-facing IPC route is registered');
+  assert.equal(shadowHandler(null, 7).shadowPx, 7, 'IPC updates the persisted setting through the public handler');
+  assert.equal(bridge.setBubbleShadow(-1).shadowPx, 0, 'negative values clamp to no shadow');
+  assert.equal(bridge.setBubbleShadow(99).shadowPx, 24, 'values clamp to the supported maximum');
+  assert.equal(bridge.setBubbleShadow('not-a-number').shadowPx, 0, 'invalid values safely reset to no shadow');
+});
+
 test('overlayWindow: setBubbleOpacity re-renders the bubble with the new opacity and persists it', () => {
   const dir = makeTempDir();
   const overlayStore = createOverlayStore({ fs, userDataDir: dir });

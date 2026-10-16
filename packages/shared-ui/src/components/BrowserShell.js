@@ -280,7 +280,7 @@ export class BrowserShell {
       // System-wide floating overlay bubble (see electron/overlayWindow.cjs).
       // These mirror the Electron-side defaults so the UI shows sane values
       // even before overlayBridge.getSettings() resolves.
-      overlaySettings: { enabled: true, launchAtStartup: true, overlayAllApps: true, positionLocked: false },
+      overlaySettings: { enabled: true, launchAtStartup: true, overlayAllApps: true, positionLocked: false, shadowPx: 0 },
       passwordsItems: [],
       // API keys / tokens / secure notes living in the same encrypted vault.
       vaultKeysItems: [],
@@ -332,6 +332,7 @@ export class BrowserShell {
         closeToTray: true,
         bubbleOpacity: 0.88,
         bubbleSizePx: 64,
+        bubbleShadowPx: 0,
         frameOpacity: 0.85,
         glassmorphismBlurRadius: 24,
         savePasswordsEnabled: true,
@@ -1086,6 +1087,9 @@ export class BrowserShell {
           // persisted size so the UI shows what's actually on screen.
           if (Number.isFinite(Number(settings.size)) && Number(settings.size) > 0) {
             this.state.settings.bubbleSizePx = Number(settings.size);
+          }
+          if (Number.isFinite(Number(settings.shadowPx))) {
+            this.state.settings.bubbleShadowPx = Math.max(0, Math.min(24, Number(settings.shadowPx)));
           }
         }
       } catch (err) {
@@ -4315,6 +4319,15 @@ export class BrowserShell {
 
             <div class="fb-setting-slider-row">
               <div class="fb-slider-header">
+                <label for="fb-in-bubble-shadow">Floating Bubble Shadow</label>
+                <span id="fb-in-val-bubble-shadow">${Math.max(0, Math.min(24, Number(this.state.settings.bubbleShadowPx) || 0))}px</span>
+              </div>
+              <input type="range" id="fb-in-bubble-shadow" min="0" max="24" step="1" value="${Math.max(0, Math.min(24, Number(this.state.settings.bubbleShadowPx) || 0))}" class="fb-range-slider" />
+              <small style="color:var(--fb-text-muted);">0px removes the shadow entirely.</small>
+            </div>
+
+            <div class="fb-setting-slider-row">
+              <div class="fb-slider-header">
                 <label for="fb-in-frame-opacity">Floating Browser Frame Opacity</label>
                 <span id="fb-in-val-frame-opacity">${Math.round((this.state.settings.frameOpacity || 0.85) * 100)}%</span>
               </div>
@@ -4648,6 +4661,7 @@ export class BrowserShell {
     // Sliders & Live Preview
     const bSlider = page.querySelector('#fb-in-bubble-opacity') || page.querySelector('#fb-in-slider-bubble-opacity');
     const sizeSlider = page.querySelector('#fb-in-bubble-size');
+    const shadowSlider = page.querySelector('#fb-in-bubble-shadow');
     const fSlider = page.querySelector('#fb-in-frame-opacity') || page.querySelector('#fb-in-slider-frame-opacity');
     const blurSlider = page.querySelector('#fb-in-slider-blur');
     const previewBox = page.querySelector('#fb-in-transparency-live-preview');
@@ -4655,15 +4669,18 @@ export class BrowserShell {
     const updatePreview = () => {
       const bOp = Number(bSlider?.value || 88) / 100;
       const bSize = Math.max(40, Math.min(120, Number(sizeSlider?.value || this.state.settings.bubbleSizePx || 64)));
+      const shadowPx = Math.max(0, Math.min(24, Number(shadowSlider?.value ?? this.state.settings.bubbleShadowPx ?? 0) || 0));
       const fOp = Number(fSlider?.value || 85) / 100;
       const blurVal = Number(blurSlider?.value || 24);
 
       this.state.settings.bubbleOpacity = bOp;
       this.state.settings.bubbleSizePx = bSize;
+      this.state.settings.bubbleShadowPx = shadowPx;
       this.state.settings.frameOpacity = fOp;
       this.state.settings.glassmorphismBlurRadius = blurVal;
 
       if (page.querySelector('#fb-in-val-bubble-size')) page.querySelector('#fb-in-val-bubble-size').textContent = `${bSize}px`;
+      if (page.querySelector('#fb-in-val-bubble-shadow')) page.querySelector('#fb-in-val-bubble-shadow').textContent = `${shadowPx}px`;
       if (page.querySelector('#fb-in-val-bubble-opacity')) page.querySelector('#fb-in-val-bubble-opacity').textContent = `${Math.round(bOp * 100)}%`;
       if (page.querySelector('#fb-in-val-frame-opacity')) page.querySelector('#fb-in-val-frame-opacity').textContent = `${Math.round(fOp * 100)}%`;
       if (page.querySelector('#fb-in-val-blur')) page.querySelector('#fb-in-val-blur').textContent = `${blurVal}px`;
@@ -4678,18 +4695,21 @@ export class BrowserShell {
 
     bSlider?.addEventListener('input', updatePreview);
     sizeSlider?.addEventListener('input', updatePreview);
+    shadowSlider?.addEventListener('input', updatePreview);
     fSlider?.addEventListener('input', updatePreview);
     blurSlider?.addEventListener('input', updatePreview);
 
     page.querySelector('.fb-in-reset-transparency-btn')?.addEventListener('click', () => {
       if (bSlider) bSlider.value = '88';
       if (sizeSlider) sizeSlider.value = '64';
+      if (shadowSlider) shadowSlider.value = '0';
       if (fSlider) fSlider.value = '85';
       if (blurSlider) blurSlider.value = '24';
       updatePreview();
       this.persistSettings();
       this.overlayBridge?.setBubbleSize?.(64);
       this.overlayBridge?.setBubbleOpacity?.(0.88);
+      this.overlayBridge?.setBubbleShadow?.(0);
     });
 
     page.querySelector('.fb-in-save-btn')?.addEventListener('click', async () => {
@@ -4771,11 +4791,10 @@ export class BrowserShell {
       this.setMiniLayoutPref(desktop ? 'desktop' : 'mobile');
     });
 
-    // Transparency/size sliders already preview live on 'input'; persist
-    // the final value once the user releases the handle ('change'). Bubble
-    // size and opacity are also pushed to the native desktop bubble so the
-    // real always-on-top overlay window resizes/fades live, not just the
-    // in-page preview bubble.
+    // Transparency, size and shadow sliders preview live on 'input'; persist
+    // their final values once the user releases the handle ('change'). Bubble
+    // size, opacity and shadow are also pushed to the native desktop bubble
+    // so the real always-on-top overlay updates with the in-page preview.
     bSlider?.addEventListener('change', () => {
       this.persistSettings();
       this.overlayBridge?.setBubbleOpacity?.(this.state.settings.bubbleOpacity);
@@ -4783,6 +4802,10 @@ export class BrowserShell {
     sizeSlider?.addEventListener('change', () => {
       this.persistSettings();
       this.overlayBridge?.setBubbleSize?.(this.state.settings.bubbleSizePx);
+    });
+    shadowSlider?.addEventListener('change', () => {
+      this.persistSettings();
+      this.overlayBridge?.setBubbleShadow?.(this.state.settings.bubbleShadowPx);
     });
     fSlider?.addEventListener('change', () => this.persistSettings());
     blurSlider?.addEventListener('change', () => this.persistSettings());
@@ -10471,6 +10494,11 @@ export class BrowserShell {
           <input type="range" id="fb-slider-bubble-opacity" min="20" max="100" value="${Math.round((this.state.settings.bubbleOpacity || 0.88) * 100)}" class="fb-slider" style="width:100%;" />
         </div>
         <div>
+          <label style="display:flex; justify-content:space-between;">Bubble Shadow <span id="val-bubble-shadow">${Math.max(0, Math.min(24, Number(this.state.settings.bubbleShadowPx) || 0))}px</span></label>
+          <input type="range" id="fb-slider-bubble-shadow" min="0" max="24" step="1" value="${Math.max(0, Math.min(24, Number(this.state.settings.bubbleShadowPx) || 0))}" class="fb-slider" style="width:100%;" />
+          <small>0px means no shadow.</small>
+        </div>
+        <div>
           <label style="display:flex; justify-content:space-between;">Frame Opacity <span id="val-frame-op">${Math.round((this.state.settings.frameOpacity || 0.85) * 100)}%</span></label>
           <input type="range" id="fb-slider-frame-opacity" min="20" max="100" value="${Math.round((this.state.settings.frameOpacity || 0.85) * 100)}" class="fb-slider" style="width:100%;" />
         </div>
@@ -10489,6 +10517,7 @@ export class BrowserShell {
     `;
 
     const bubbleSlider = modal.querySelector('#fb-slider-bubble-opacity');
+    const shadowSlider = modal.querySelector('#fb-slider-bubble-shadow');
     const frameSlider = modal.querySelector('#fb-slider-frame-opacity');
     const blurSlider = modal.querySelector('#fb-slider-blur');
     const preview = modal.querySelector('#fb-transparency-live-preview');
@@ -10500,6 +10529,19 @@ export class BrowserShell {
       const lbl = modal.querySelector('#val-bubble-op');
       if (lbl) lbl.textContent = `${rawVal}%`;
       this.updateCssCustomProperties();
+    });
+
+    shadowSlider?.addEventListener('input', (e) => {
+      const rawVal = e?.target?.value !== undefined ? e.target.value : shadowSlider?.value;
+      const val = Math.max(0, Math.min(24, Math.round(Number(rawVal) || 0)));
+      this.state.settings.bubbleShadowPx = val;
+      const lbl = modal.querySelector('#val-bubble-shadow');
+      if (lbl) lbl.textContent = `${val}px`;
+      this.ensurePersistentAssistiveBubble();
+    });
+    shadowSlider?.addEventListener('change', () => {
+      this.persistSettings();
+      this.overlayBridge?.setBubbleShadow?.(this.state.settings.bubbleShadowPx);
     });
 
     frameSlider?.addEventListener('input', (e) => {
@@ -10523,11 +10565,16 @@ export class BrowserShell {
 
     modal.querySelector('.fb-reset-transparency-btn')?.addEventListener('click', () => {
       this.state.settings.bubbleOpacity = 0.88;
+      this.state.settings.bubbleShadowPx = 0;
       this.state.settings.frameOpacity = 0.85;
       this.state.settings.glassmorphismBlurRadius = 24;
       if (bubbleSlider) bubbleSlider.value = '88';
+      if (shadowSlider) shadowSlider.value = '0';
       if (frameSlider) frameSlider.value = '85';
       if (blurSlider) blurSlider.value = '24';
+      this.ensurePersistentAssistiveBubble();
+      this.persistSettings();
+      this.overlayBridge?.setBubbleShadow?.(0);
       this.updateCssCustomProperties();
     });
 
@@ -10977,6 +11024,12 @@ export class BrowserShell {
   /* -------------------------------------------------------------
    * PERSISTENT ASSISTIVETOUCH-STYLE FLOATING BUBBLE (PHASES 3, 4, 5, 20, 21)
    * ----------------------------------------------------------- */
+  getBubbleShadowFilter() {
+    const raw = Number(this.state.settings.bubbleShadowPx);
+    const shadowPx = Number.isFinite(raw) ? Math.max(0, Math.min(24, raw)) : 0;
+    return shadowPx > 0 ? `drop-shadow(0 3px ${shadowPx}px rgba(0,0,0,0.45))` : 'none';
+  }
+
   ensurePersistentAssistiveBubble() {
     if (typeof document === 'undefined') return;
 
@@ -11086,6 +11139,7 @@ export class BrowserShell {
     bubble.style.opacity = String(bubbleOpacity);
     bubble.style.width = `${bubbleSize}px`;
     bubble.style.height = `${bubbleSize}px`;
+    bubble.style.filter = this.getBubbleShadowFilter();
 
     bubble.innerHTML = `
       ${hasLoadingTab ? '<div class="yayra-bubble-loading-ring"></div>' : ''}
@@ -11112,7 +11166,7 @@ export class BrowserShell {
     // border or glass background behind the brand mark on ANY platform.
     overlay.innerHTML = `
       <div class="yayra-floating-bubble yayra-floating-orb" role="button" aria-label="Restore Yayra Browser" tabindex="0"
-        style="position:relative; width:56px; height:56px; display:flex; align-items:center; justify-content:center; background:transparent; border:none; cursor:pointer; filter:drop-shadow(0 6px 14px rgba(0,0,0,0.45));">
+        style="position:relative; width:56px; height:56px; display:flex; align-items:center; justify-content:center; background:transparent; border:none; cursor:pointer; filter:${this.getBubbleShadowFilter()};">
         <div style="width:56px; height:56px; display:flex; align-items:center; justify-content:center; pointer-events:none;">
           ${Icons.officialOrb}
         </div>

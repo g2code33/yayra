@@ -714,12 +714,13 @@ test('Settings: Floating Bubble Size slider previews live, persists on release, 
   const settingsRepo = new SettingsRepository(storage);
   const overlayCalls = [];
   const overlayBridge = {
-    getSettings: async () => ({ enabled: true, launchAtStartup: true, overlayAllApps: true, size: 64 }),
+    getSettings: async () => ({ enabled: true, launchAtStartup: true, overlayAllApps: true, size: 64, shadowPx: 0 }),
     setEnabled: async () => ({}),
     setLaunchAtStartup: async () => ({}),
     setOverlayAllApps: async () => ({}),
     setBubbleSize: (px) => { overlayCalls.push(['size', px]); return Promise.resolve({ size: px }); },
-    setBubbleOpacity: (op) => { overlayCalls.push(['opacity', op]); return Promise.resolve({ opacity: op }); }
+    setBubbleOpacity: (op) => { overlayCalls.push(['opacity', op]); return Promise.resolve({ opacity: op }); },
+    setBubbleShadow: (px) => { overlayCalls.push(['shadow', px]); return Promise.resolve({ shadowPx: px }); }
   };
 
   // BrowserShell discovers the overlay bridge via window.yayra.overlay
@@ -746,9 +747,25 @@ test('Settings: Floating Bubble Size slider previews live, persists on release, 
     // Release persists + pushes to the native overlay bubble
     slider.dispatchEvent({ type: 'change', target: slider });
     assert.deepEqual(overlayCalls.at(-1), ['size', 96], 'native desktop bubble is resized on release');
+
+    const shadowSlider = container.querySelector('#fb-in-bubble-shadow');
+    assert.ok(shadowSlider, 'bubble shadow slider must exist in settings');
+    assert.equal(shadowSlider.getAttribute('value'), '0', 'the default shadow is disabled');
+    const domBubble = document.getElementById('yayra-persistent-assistive-bubble');
+    assert.ok(domBubble, 'in-page builds render the persistent bubble');
+    assert.equal(domBubble.style.filter, 'none', 'the default in-page bubble has no shadow');
+    shadowSlider.value = '12';
+    shadowSlider.dispatchEvent({ type: 'input', target: shadowSlider });
+    assert.equal(shell.state.settings.bubbleShadowPx, 12, 'shadow previews live while dragging');
+    assert.equal(container.querySelector('#fb-in-val-bubble-shadow').textContent, '12px');
+    assert.equal(domBubble.style.filter, 'drop-shadow(0 3px 12px rgba(0,0,0,0.45))', 'the in-page bubble uses the selected shadow strength');
+    shadowSlider.dispatchEvent({ type: 'change', target: shadowSlider });
+    assert.deepEqual(overlayCalls.at(-1), ['shadow', 12], 'native desktop bubble receives the chosen shadow');
+
     await new Promise((resolve) => setTimeout(resolve, 50));
     const persisted = await settingsRepo.getSettings();
     assert.equal(persisted.bubbleSizePx, 96, 'size persisted without pressing Save');
+    assert.equal(persisted.bubbleShadowPx, 12, 'shadow persisted without pressing Save');
   } finally {
     if (prevYayra === undefined) delete globalThis.window.yayra;
     else globalThis.window.yayra = prevYayra;

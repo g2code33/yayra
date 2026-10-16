@@ -312,10 +312,13 @@ function createOverlayBridge({
 
   function buildOverlayHtml(settings) {
     const logo = logoDataUrl();
+    const rawShadowPx = Number(settings.shadowPx);
+    const shadowPx = Number.isFinite(rawShadowPx) ? Math.max(0, Math.min(24, rawShadowPx)) : 0;
+    const bubbleFilter = shadowPx > 0 ? `drop-shadow(0 3px ${shadowPx}px rgba(0,0,0,0.45))` : 'none';
     // The bubble is JUST the Yayra logo - fully transparent window, no
-    // circular plate/gradient behind it. A soft drop shadow keeps the
-    // logo legible over any app underneath. Fallback (logo asset
-    // unavailable): a bare transparent "Y" monogram, still no circle.
+    // circular plate/gradient behind it. Its shadow is off by default and
+    // user-adjustable in Settings. Fallback (logo asset unavailable): a
+    // bare transparent "Y" monogram, still no circle.
     //
     // INPUT HANDLING (why there is NO -webkit-app-region: drag here):
     // Electron drag regions are handled natively by the OS window - the
@@ -439,7 +442,7 @@ function createOverlayBridge({
     display:flex; align-items:center; justify-content:center;
     background:transparent;
     object-fit:contain;
-    filter:drop-shadow(0 3px 10px rgba(0,0,0,0.55));
+    filter:${bubbleFilter};
     opacity:${settings.opacity};
     /* 'pointer'/'move' map to REAL Windows system cursors (IDC_HAND /
        IDC_SIZEALL) so the pointer keeps the user's Windows size here.
@@ -1460,6 +1463,22 @@ function createOverlayBridge({
     return next;
   }
 
+  // Adjustable logo shadow; zero is the shipped default and removes the
+  // CSS filter entirely (no residual blur/halo around the floating bubble).
+  function setBubbleShadow(shadowPx) {
+    const raw = Number(shadowPx);
+    const val = Number.isFinite(raw) ? Math.max(0, Math.min(24, Math.round(raw))) : 0;
+    const next = overlayStore.save({ shadowPx: val });
+    if (overlayWin && !overlayWin.isDestroyed()) {
+      try {
+        overlayWin.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(buildOverlayHtml(next))}`);
+      } catch {
+        // Applied on next launch via the store.
+      }
+    }
+    return next;
+  }
+
   /**
    * Sync the customized in-app action wheel onto the bubble's double-tap
    * radial. `items` is an array of plain {id,title,url,type} (or null to
@@ -1526,6 +1545,7 @@ function createOverlayBridge({
   ipcMain.handle('yayra:overlay-set-overlay-all-apps', (_e, enabled) => setOverlayAllApps(enabled));
   ipcMain.handle('yayra:overlay-set-bubble-size', (_e, size) => setBubbleSize(size));
   ipcMain.handle('yayra:overlay-set-bubble-opacity', (_e, opacity) => setBubbleOpacity(opacity));
+  ipcMain.handle('yayra:overlay-set-bubble-shadow', (_e, shadowPx) => setBubbleShadow(shadowPx));
   ipcMain.handle('yayra:overlay-set-wheel-items', (_e, items) => setWheelItems(items));
   ipcMain.on('yayra:overlay-restore', () => restoreMainWindow());
   // Single bubble click: toggle the floating mini browser (independent of
@@ -1623,6 +1643,7 @@ function createOverlayBridge({
     setOverlayAllApps,
     setBubbleSize,
     setBubbleOpacity,
+    setBubbleShadow,
     setPositionLocked,
     togglePositionLock,
     handleBubbleTap,

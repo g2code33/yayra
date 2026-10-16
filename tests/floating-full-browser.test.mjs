@@ -311,14 +311,22 @@ test('Floating Transparency Controls: Bubble opacity, frame opacity, blur slider
 
   // Check sliders exist
   const bubbleSlider = settingsCard.querySelector('#fb-slider-bubble-opacity');
+  const shadowSlider = settingsCard.querySelector('#fb-slider-bubble-shadow');
   const frameSlider = settingsCard.querySelector('#fb-slider-frame-opacity');
   const blurSlider = settingsCard.querySelector('#fb-slider-blur');
   const previewCard = settingsCard.querySelector('#fb-transparency-live-preview');
 
   assert.ok(bubbleSlider);
+  assert.ok(shadowSlider);
+  assert.equal(shadowSlider.getAttribute('value'), '0', 'bubble shadow defaults to none');
   assert.ok(frameSlider);
   assert.ok(blurSlider);
   assert.ok(previewCard);
+
+  shadowSlider.value = '16';
+  shadowSlider.dispatchEvent(new Event('input'));
+  assert.equal(shell.state.settings.bubbleShadowPx, 16, 'shadow slider previews immediately');
+  assert.equal(settingsCard.querySelector('#val-bubble-shadow').textContent, '16px');
 
   // Change frame opacity
   frameSlider.value = '75';
@@ -334,6 +342,8 @@ test('Floating Transparency Controls: Bubble opacity, frame opacity, blur slider
   const resetBtn = settingsCard.querySelector('.fb-reset-transparency-btn');
   resetBtn.dispatchEvent(new Event('click'));
   assert.equal(shell.state.settings.bubbleOpacity, 0.88);
+  assert.equal(shell.state.settings.bubbleShadowPx, 0, 'reset returns shadow to none');
+  assert.equal(shadowSlider.value, '0');
   assert.equal(shell.state.settings.frameOpacity, 0.85);
   assert.equal(shell.state.settings.glassmorphismBlurRadius, 24);
 });
