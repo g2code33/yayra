@@ -1131,6 +1131,8 @@ function createWindow() {
     }
   });
 
+  const win = mainWindow;
+
   // PDFs queued before the window existed (OS "Open With" at cold start)
   // are delivered the moment the shell renderer finished loading - the
   // preload's listener is attached before any page script runs.
@@ -1142,7 +1144,6 @@ function createWindow() {
   // own context menu wired in electron/webviewBridge.cjs), so without this
   // right-clicking the address bar or any text field in Yayra's own UI
   // would show no menu at all.
-  const win = mainWindow;
   win.webContents.on('context-menu', (_event, params) => {
     if (win.isDestroyed()) return;
     const template = buildContextMenuTemplate({
