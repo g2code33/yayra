@@ -6453,3 +6453,93 @@ html {
   --fb-gradient-accent: linear-gradient(135deg, #92400e 0%, #78350f 52%, #713f12 100%);
   --fb-border-glass-highlight: rgba(146, 64, 14, 0.36);
 }
+
+/* Incognito stays deliberately dark even when the user's normal theme is
+   light. Scope the stronger selector after light-theme overrides so no
+   light-only white surface or dark foreground leaks onto this page. */
+.fb-browser-shell.fb-incognito-mode {
+  color-scheme: dark;
+  --fb-bg-app: #030712;
+  --fb-bg-surface: rgba(17, 24, 39, 0.92);
+  --fb-bg-surface-elevated: #111827;
+  --fb-bg-glass-card: rgba(17, 24, 39, 0.84);
+  --fb-bg-glass-input: rgba(17, 24, 39, 0.94);
+  --fb-border-glass: rgba(226, 232, 240, 0.16);
+  --fb-text-primary: #f8fafc;
+  --fb-text-secondary: #cbd5e1;
+  --fb-text-muted: #a1a1aa;
+  --fb-accent-primary: #c084fc;
+  --fb-accent-secondary: #a78bfa;
+  --fb-accent-glow: rgba(192, 132, 252, 0.3);
+  --fb-gradient-accent: linear-gradient(135deg, #c084fc 0%, #8b5cf6 55%, #6366f1 100%);
+  --fb-shadow-surface: 0 20px 40px -15px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(226, 232, 240, 0.1);
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-newtab-title {
+  color: var(--fb-text-primary);
+}
+
+.fb-incognito-title {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: #f8fafc;
+  font-size: clamp(1.6rem, 4vw, 2rem);
+  font-weight: 750;
+  letter-spacing: 0.01em;
+}
+
+.fb-incognito-title > svg {
+  width: 30px;
+  height: 30px;
+  color: #d8b4fe;
+}
+
+.fb-incognito-notice {
+  box-sizing: border-box;
+  width: min(100%, 600px);
+  margin: 0 0 18px;
+  padding: 12px 16px;
+  border: 1px solid rgba(216, 180, 254, 0.2);
+  border-radius: 12px;
+  background: rgba(31, 41, 55, 0.64);
+  color: #d1d5db;
+  font-size: 0.82rem;
+  line-height: 1.55;
+  text-align: center;
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-newtab-searchbox {
+  color: #f8fafc;
+  background: rgba(17, 24, 39, 0.96);
+  border-color: rgba(226, 232, 240, 0.2);
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.38);
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-newtab-searchbox:focus-within {
+  background: #111827;
+  border-color: #c084fc;
+  box-shadow: 0 0 0 3px rgba(192, 132, 252, 0.24);
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-newtab-search-icon {
+  color: #d8b4fe;
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-newtab-input,
+.fb-browser-shell.fb-incognito-mode .fb-newtab-input::placeholder {
+  color: #f1f5f9;
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-newtab-input::placeholder {
+  color: #a1a1aa;
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-tab-item.fb-tab-incognito .fb-tab-title {
+  color: #e9d5ff;
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-tab-item.fb-tab-incognito.active {
+  border-top-color: #c084fc;
+}

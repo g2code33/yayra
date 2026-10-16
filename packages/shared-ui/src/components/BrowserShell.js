@@ -3831,9 +3831,18 @@ export class BrowserShell {
     title.className = 'fb-newtab-title';
     title.setAttribute('role', 'img');
     title.setAttribute('aria-label', activeTab.isPrivate ? 'Incognito' : 'yayra');
-    title.innerHTML = activeTab.isPrivate ? '<span>Incognito</span>' : Icons.officialWordmark;
+    title.innerHTML = activeTab.isPrivate
+      ? `<span class="fb-incognito-title">${Icons.incognito}<span>Incognito</span></span>`
+      : Icons.officialWordmark;
     hero.appendChild(title);
     newTabPage.appendChild(hero);
+
+    if (activeTab.isPrivate) {
+      const privacyNote = document.createElement('p');
+      privacyNote.className = 'fb-incognito-notice';
+      privacyNote.textContent = 'This tab is excluded from Yayra history and session restore. Downloads and bookmarks can still be saved.';
+      newTabPage.appendChild(privacyNote);
+    }
 
     // Search Form (Google Default Search)
     const searchForm = document.createElement('form');

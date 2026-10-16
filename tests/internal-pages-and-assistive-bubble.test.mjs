@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { setupDomShim } from './dom-shim.mjs';
 
 setupDomShim();
@@ -48,6 +49,27 @@ test('In-Tab Internal Pages: Loads yayra://settings in tab with category navigat
     bubbleSlider.dispatchEvent(new Event('input'));
     assert.equal(shell.state.settings.bubbleOpacity, 0.75);
   }
+});
+
+test('Incognito new tab has a distinct privacy header and readable dark contrast in Light theme', async () => {
+  const container = document.createElement('div');
+  const shell = new BrowserShell({ container, isMobile: false, initialUrl: 'yayra://newtab' });
+  await shell.initialize();
+  shell.state.settings.theme = 'light';
+  shell.createNewTab(true);
+
+  const root = container.querySelector('.fb-browser-shell');
+  assert.ok(root.classList.contains('fb-incognito-mode'), 'private tab applies the scoped Incognito theme');
+  const title = container.querySelector('.fb-newtab-title');
+  assert.ok(title?.innerHTML.includes('fb-incognito-title') && title.innerHTML.includes('<svg'), 'Incognito has a clear privacy icon beside its title');
+  assert.match(container.querySelector('.fb-incognito-notice')?.textContent || '', /history and session restore/i);
+  assert.match(container.querySelector('.fb-incognito-notice')?.textContent || '', /downloads and bookmarks/i);
+  assert.equal(container.querySelector('.fb-dev-ad-showcase'), null, 'sponsor links are not shown in a private new tab');
+
+  const css = readFileSync(new URL('../packages/shared-ui/src/theme/design-system.css', import.meta.url), 'utf8');
+  assert.match(css, /\.fb-browser-shell\.fb-incognito-mode\s*\{[\s\S]*?--fb-text-primary:\s*#f8fafc/);
+  assert.match(css, /\.fb-browser-shell\.fb-incognito-mode \.fb-newtab-searchbox\s*\{[\s\S]*?background:\s*rgba\(17,\s*24,\s*39,\s*0\.96\)/);
+  shell.destroy();
 });
 
 test('In-Tab Internal Pages: Loads yayra://history with search filtering and visit deletion', async () => {
