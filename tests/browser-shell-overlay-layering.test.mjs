@@ -291,8 +291,9 @@ test('a thrown update check is reported as an error state with feedback - not si
 });
 
 /* -----------------------------------------------------------------
- * No-blank-flash ordering: with a capture-capable bridge the still
- * image is captured and painted BEFORE the native surface hides.
+ * Overlay ordering: capture starts before the native surface is hidden,
+ * but the view hides synchronously so chrome can never sit behind it.
+ * The fresh still is painted asynchronously over the last available one.
  * ----------------------------------------------------------------- */
 
 function installCaptureCapableWebview() {
@@ -331,7 +332,7 @@ async function waitForCondition(cond, ms = 2000) {
   return false;
 }
 
-test('no blank flash: drawer open captures the live page and paints the still BEFORE hiding the native view', async () => {
+test('drawer shows immediately: starts capture before hiding the native view and paints the fresh still asynchronously', async () => {
   const { calls, order, uninstall } = installCaptureCapableWebview();
   try {
     const { container, shell } = await makeDesktopShellOnExternalPage();
@@ -343,20 +344,19 @@ test('no blank flash: drawer open captures the live page and paints the still BE
     shell.state.isSideDrawerOpen = true;
     shell.render(container);
 
-    // Capture happens immediately, while the page is still visible.
+    // Start a fresh capture from the active page, then immediately hide the
+    // native surface so the drawer is never composited underneath the page.
     assert.deepEqual(calls.capture, [tabId], 'capture requested for the active tab');
-    assert.equal(calls.setVisible.length, 0, 'native view NOT hidden yet - no blank gap');
+    assert.equal(calls.setVisible.length, 1, 'native view is hidden synchronously');
+    assert.equal(calls.setVisible[0].visible, false);
+    assert.deepEqual(order.slice(0, 2), ['capture', 'setVisible:false'], 'capture starts immediately before the hide');
 
-    // The hide follows only after the snapshot is painted (or the decode
-    // fail-safe elapses) - never before the capture.
-    assert.ok(await waitForCondition(() => calls.setVisible.some((c) => c.visible === false)),
-      'native view eventually hidden under the painted still');
-    assert.equal(order[0], 'capture', 'capture strictly precedes the hide');
-    assert.ok(order.indexOf('setVisible:false') > order.indexOf('capture'));
-
-    // Snapshot was stored and the placeholder img carries it.
+    // The live chrome is already visible; only the higher-quality still is
+    // asynchronous and replaces the cached/empty placeholder when ready.
     const still = container.querySelector('.fb-page-snapshot-img');
     assert.ok(still, 'still image placeholder rendered');
+    assert.equal(order[0], 'capture', 'capture starts before the hide');
+    assert.ok(order.indexOf('setVisible:false') > order.indexOf('capture'));
     assert.ok(await waitForCondition(() => still.src === 'data:image/png;base64,LIVE-SNAPSHOT'),
       'freshly captured snapshot painted into the slot');
 
@@ -369,7 +369,7 @@ test('no blank flash: drawer open captures the live page and paints the still BE
   }
 });
 
-test('no blank flash: a failing capture still hides the view via the fail-safe (never hangs)', async () => {
+test('overlay stays in front even when the asynchronous snapshot capture fails', async () => {
   const { fake, calls, uninstall } = installCaptureCapableWebview();
   fake.capture = () => Promise.reject(new Error('capture backend gone'));
   try {
