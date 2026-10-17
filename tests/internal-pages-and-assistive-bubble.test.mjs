@@ -69,6 +69,12 @@ test('Incognito new tab has a distinct privacy header and readable dark contrast
   const css = readFileSync(new URL('../packages/shared-ui/src/theme/design-system.css', import.meta.url), 'utf8');
   assert.match(css, /\.fb-browser-shell\.fb-incognito-mode\s*\{[\s\S]*?--fb-text-primary:\s*#f8fafc/);
   assert.match(css, /\.fb-browser-shell\.fb-incognito-mode \.fb-newtab-searchbox\s*\{[\s\S]*?background:\s*rgba\(17,\s*24,\s*39,\s*0\.96\)/);
+  assert.match(css, /\.fb-browser-shell\.fb-incognito-mode \.fb-chrome-navbar\s*\{[^}]*background:\s*#111827/s, 'incognito toolbar stays dark when the normal theme is light');
+  assert.match(css, /\.fb-browser-shell\.fb-incognito-mode \.fb-nav-btn,\s*\n\.fb-browser-shell\.fb-incognito-mode \.fb-menu-btn\s*\{[^}]*color:\s*#f8fafc/s, 'back, forward, refresh, and Yayra menu controls are high-contrast');
+  assert.match(css, /\.fb-browser-shell\.fb-incognito-mode \.fb-toolbar-action-btn\s*\{[^}]*color:\s*#e2e8f0 !important/s, 'toolbar action glyphs override the light-theme foreground');
+  assert.match(css, /--fb-drawer-bg:\s*#0b1220;[\s\S]*?--fb-drawer-submenu-bg:\s*#111827;/, 'Incognito drawer and flyouts use readable dark surfaces');
+  assert.match(css, /\.fb-nav-btn\s*\{[^}]*color:\s*var\(--fb-text-primary\)/s, 'ordinary navigation-button styling remains unchanged');
+  assert.match(css, /\[data-theme="light"\] \.fb-chrome-navbar\s*\{[^}]*background:\s*#ffffff/s, 'ordinary light-theme toolbar styling remains intact');
   shell.destroy();
 });
 

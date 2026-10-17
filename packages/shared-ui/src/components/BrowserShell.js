@@ -265,6 +265,10 @@ export class BrowserShell {
       closedTabsHistory: [],
       historyItems: [],
       bookmarksItems: [],
+      // Full previous-session snapshot, kept separately from the compact
+      // five-item Continue prompt so a group click can reopen every member
+      // recorded in that session.
+      tabGroupRestoreTabs: [],
       // Chrome-style new tab: the user's own pinned shortcut tiles and
       // the previous session's not-manually-closed tabs ("Continue with
       // these tabs").
@@ -621,6 +625,9 @@ export class BrowserShell {
       // A body-mounted install confirmation is outside render(), but it must
       // still keep the desktop native page surface out of the way.
       Boolean(typeof document !== 'undefined' && document.getElementById('yayra-install-app-overlay')) ||
+      // Text prompts are body-mounted so they can sit above the renderer
+      // tree; on desktop they also need the native page surface hidden.
+      Boolean(typeof document !== 'undefined' && document.querySelector('.fb-text-prompt-overlay')) ||
       // The update prompt cards ("Update available - now or later?" and
       // "Update downloaded - install when?") were missing for the SAME
       // reason: with a real site open the native page surface painted
@@ -1036,7 +1043,9 @@ export class BrowserShell {
       try {
         const prev = await this.sessionRepo.getLastSession();
         const openNow = new Set(this.state.tabs.map((t) => t.url));
-        this.state.continueTabs = (prev.tabs || []).filter((t) => !openNow.has(t.url)).slice(0, 5);
+        const previousTabs = (prev.tabs || []).filter((t) => !t?.isPrivate && /^https?:\/\//i.test(t?.url || ''));
+        this.state.tabGroupRestoreTabs = previousTabs;
+        this.state.continueTabs = previousTabs.filter((t) => !openNow.has(t.url)).slice(0, 5);
         // Identifies THIS snapshot so "No thanks" dismisses exactly it
         // (a future session's tabs will prompt again).
         this.state.continueSavedAt = prev.savedAt || null;
@@ -3138,6 +3147,7 @@ export class BrowserShell {
       try {
         const up = (el) => Boolean(el) && el.hidden !== true;
         if (up(document.querySelector('.fb-update-splash'))) return false;
+        if (up(document.querySelector('.fb-text-prompt-overlay'))) return false;
         if (up(document.querySelector('.fb-tab-context-menu'))) return false;
         if (up(document.querySelector('.fb-dropdown-scrim'))) return false;
         if (up(document.querySelector('.fb-passkey-dialog-overlay'))) return false;
@@ -6643,10 +6653,17 @@ export class BrowserShell {
     return new Promise((resolve) => {
       if (typeof document === 'undefined' || !document.body) { resolve(null); return; }
       const overlay = document.createElement('div');
+      overlay.className = 'fb-text-prompt-overlay';
+      overlay.setAttribute('role', 'presentation');
       overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(8,10,16,0.62);display:flex;align-items:center;justify-content:center;';
+      const promptTitleId = `yayra-text-prompt-title-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const card = document.createElement('div');
+      card.setAttribute('role', 'dialog');
+      card.setAttribute('aria-modal', 'true');
+      card.setAttribute('aria-labelledby', promptTitleId);
       card.style.cssText = 'background:var(--fb-bg-elevated,#171a22);color:var(--fb-text-primary,#f3f4f6);border-radius:16px;padding:22px;max-width:380px;width:92%;box-shadow:0 18px 60px rgba(0,0,0,0.5);display:flex;flex-direction:column;gap:12px;';
       const h = document.createElement('strong');
+      h.id = promptTitleId;
       h.textContent = title;
       card.appendChild(h);
       if (description) {
@@ -6659,9 +6676,24 @@ export class BrowserShell {
       input.type = 'text';
       input.placeholder = placeholder;
       input.value = initialValue;
+      input.setAttribute('aria-label', title || 'Text input');
       input.style.cssText = 'padding:10px;border-radius:10px;border:1px solid var(--fb-border,#2a2f3b);background:var(--fb-bg,#101218);color:inherit;font-size:0.95rem;';
       card.appendChild(input);
-      const done = (value) => { try { overlay.remove(); } catch { /* gone */ } resolve(value); };
+      let finished = false;
+      const done = (value) => {
+        if (finished) return;
+        finished = true;
+        try { overlay.remove(); } catch { /* gone */ }
+        // Recompute without treating this prompt's own flag as another
+        // overlay, then let setPageObscured perform the native visibility
+        // transition (including the true -> false case).
+        const wasObscured = Boolean(this.state.isPageObscured);
+        this.state.isPageObscured = false;
+        const shouldRemainObscured = this.hasBlockingOverlay();
+        this.state.isPageObscured = wasObscured;
+        this.setPageObscured(shouldRemainObscured);
+        resolve(value);
+      };
       const row = document.createElement('div');
       row.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;';
       const cancel = document.createElement('button');
@@ -6671,14 +6703,22 @@ export class BrowserShell {
       const ok = document.createElement('button');
       ok.textContent = 'Save';
       ok.style.cssText = 'padding:10px 14px;border:none;border-radius:10px;font-weight:600;cursor:pointer;background:var(--fb-accent,#6d5df2);color:#fff;';
-      ok.addEventListener('click', () => done(input.value.trim() || null));
+      ok.addEventListener('click', () => done(input.value.trim()));
       row.appendChild(cancel);
       row.appendChild(ok);
       card.appendChild(row);
-      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') done(input.value.trim() || null); });
+      input.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== 'Escape') return;
+        e.preventDefault?.();
+        e.stopPropagation?.();
+        done(e.key === 'Enter' ? input.value.trim() : null);
+      });
       overlay.addEventListener('pointerdown', (e) => { if (e.target === overlay) done(null); });
       overlay.appendChild(card);
       document.body.appendChild(overlay);
+      // Electron website contents are a native surface above the HTML DOM;
+      // hiding them makes this prompt visible and clickable there.
+      this.setPageObscured(true);
       input.focus();
       input.select();
     });
@@ -7344,23 +7384,99 @@ export class BrowserShell {
     return { name, color };
   }
 
+  tabGroupIdentity(group, isPrivate = false) {
+    const safeGroup = this.sanitizeTabGroup(group);
+    if (!safeGroup) return null;
+    const privacyScope = isPrivate ? 'private::' : '';
+    return `${privacyScope}${safeGroup.name.toLocaleLowerCase()}::${safeGroup.color.toLowerCase()}`;
+  }
+
   getTabGroups() {
     const groups = new Map();
-    for (const tab of this.state.tabs || []) {
+    const addMember = (tab, fromRestore = false) => {
       const group = this.sanitizeTabGroup(tab?.group);
-      if (!group) continue;
-      const id = `${group.name.toLocaleLowerCase()}::${group.color.toLowerCase()}`;
-      if (!groups.has(id)) groups.set(id, { id, name: group.name, color: group.color, tabs: [] });
-      groups.get(id).tabs.push(tab);
-    }
-    return Array.from(groups.values());
+      if (!group) return;
+      // Private groups are ephemeral and never merge with the normal
+      // profile's groups, even when their names and colours are identical.
+      const isPrivate = fromRestore ? false : Boolean(tab.isPrivate);
+      const id = this.tabGroupIdentity(group, isPrivate);
+      if (!groups.has(id)) groups.set(id, { id, name: group.name, color: group.color, isPrivate, tabs: [], _keys: new Set() });
+      const record = groups.get(id);
+      const url = String(tab.url || '');
+      // A recovered session row and its already-open counterpart represent
+      // one member. Live duplicate tabs still remain distinct by tab id.
+      if (fromRestore && record.tabs.some((member) => member.url === url)) return;
+      const key = tab.id ? `tab:${tab.id}` : `restore:${url}`;
+      if (record._keys.has(key)) return;
+      record._keys.add(key);
+      record.tabs.push(tab);
+    };
+    for (const tab of this.state.tabs || []) addMember(tab);
+    for (const tab of this.state.tabGroupRestoreTabs || []) addMember(tab, true);
+    return Array.from(groups.values(), ({ _keys, ...group }) => group);
   }
 
   openTabGroup(groupId) {
     const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
     if (!group || !group.tabs.length) return false;
-    const target = group.tabs.find((tab) => tab.id === this.state.activeTabId) || group.tabs[0];
+    const groupData = { name: group.name, color: group.color };
+    const openedMembers = [];
+    const restoredEntries = [];
+
+    for (const member of group.tabs) {
+      const liveTab = member.id
+        ? this.state.tabs.find((tab) => tab.id === member.id)
+        : null;
+      if (liveTab) {
+        openedMembers.push(liveTab);
+        continue;
+      }
+
+      const saved = (this.state.tabGroupRestoreTabs || []).find((entry) =>
+        entry.url === member.url && this.tabGroupIdentity(entry.group, false) === group.id);
+      if (!saved || !/^https?:\/\//i.test(String(saved.url || ''))) continue;
+
+      const alreadyGrouped = this.state.tabs.find((tab) =>
+        !tab.isPrivate && tab.url === saved.url
+        && this.tabGroupIdentity(tab.group, false) === group.id);
+      if (alreadyGrouped) {
+        openedMembers.push(alreadyGrouped);
+        restoredEntries.push(saved);
+        continue;
+      }
+
+      // Reuse an identical ungrouped tab rather than opening a duplicate;
+      // tabs in a different group are left alone and get their own copy.
+      const ungrouped = this.state.tabs.find((tab) =>
+        !tab.isPrivate && tab.url === saved.url && !this.sanitizeTabGroup(tab.group));
+      if (ungrouped) {
+        ungrouped.group = groupData;
+        openedMembers.push(ungrouped);
+        restoredEntries.push(saved);
+        continue;
+      }
+
+      const restored = this.createNewTab(false, { group: groupData, render: false });
+      this.navigateActiveTab(saved.url);
+      if (saved.title) restored.title = String(saved.title).slice(0, 120);
+      openedMembers.push(restored);
+      restoredEntries.push(saved);
+    }
+
+    if (!openedMembers.length) return false;
+    if (restoredEntries.length) {
+      const restoredUrls = new Set(restoredEntries.map((entry) => entry.url));
+      this.state.tabGroupRestoreTabs = (this.state.tabGroupRestoreTabs || []).filter((entry) =>
+        !(this.tabGroupIdentity(entry.group, false) === group.id && restoredUrls.has(entry.url)));
+      this.state.continueTabs = (this.state.continueTabs || []).filter((entry) =>
+        !(this.tabGroupIdentity(entry.group, false) === group.id && restoredUrls.has(entry.url)));
+    }
+
+    const target = openedMembers[0];
     this.selectTab(target.id);
+    if (restoredEntries.length) {
+      this.showTransientNotice(`Opened ${restoredEntries.length} saved tab${restoredEntries.length === 1 ? '' : 's'} from “${group.name}”.`);
+    }
     return true;
   }
 
@@ -7380,10 +7496,15 @@ export class BrowserShell {
       return false;
     }
     for (const tab of this.state.tabs) {
-      const current = this.sanitizeTabGroup(tab.group);
-      if (current && `${current.name.toLocaleLowerCase()}::${current.color.toLowerCase()}` === groupId) {
+      if (this.tabGroupIdentity(tab.group, tab.isPrivate) === groupId) {
         tab.group = { name, color: group.color };
       }
+    }
+    for (const tab of this.state.tabGroupRestoreTabs || []) {
+      if (this.tabGroupIdentity(tab.group, false) === groupId) tab.group = { name, color: group.color };
+    }
+    for (const tab of this.state.continueTabs || []) {
+      if (this.tabGroupIdentity(tab.group, false) === groupId) tab.group = { name, color: group.color };
     }
     this.render();
     this.showTransientNotice(`Tab group renamed to “${name}”.`);
@@ -7393,23 +7514,44 @@ export class BrowserShell {
   ungroupTabGroup(groupId) {
     const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
     if (!group) return 0;
-    const memberIds = new Set(group.tabs.map((tab) => tab.id));
+    let changed = 0;
     for (const tab of this.state.tabs) {
-      if (memberIds.has(tab.id)) tab.group = null;
+      if (this.tabGroupIdentity(tab.group, tab.isPrivate) === groupId) {
+        tab.group = null;
+        changed += 1;
+      }
+    }
+    this.state.tabGroupRestoreTabs = (this.state.tabGroupRestoreTabs || []).filter((tab) =>
+      this.tabGroupIdentity(tab.group, false) !== groupId);
+    for (const tab of this.state.continueTabs || []) {
+      if (this.tabGroupIdentity(tab.group, false) === groupId) tab.group = null;
     }
     this.render();
-    this.showTransientNotice(`“${group.name}” ungrouped - its tabs stay open.`);
-    return memberIds.size;
+    this.showTransientNotice(`“${group.name}” ungrouped - its open tabs stay open.`);
+    return changed;
+  }
+
+  ungroupTab(tabId) {
+    const tab = this.state.tabs.find((candidate) => candidate.id === tabId);
+    if (!tab?.group) return false;
+    const groupId = this.tabGroupIdentity(tab.group, tab.isPrivate);
+    const name = this.sanitizeTabGroup(tab.group)?.name || 'Tab group';
+    tab.group = null;
+    // A previous-session copy of this same member should not make it appear
+    // grouped again after this tab was explicitly ungrouped.
+    this.state.tabGroupRestoreTabs = (this.state.tabGroupRestoreTabs || []).filter((entry) =>
+      !(this.tabGroupIdentity(entry.group, false) === groupId && entry.url === tab.url));
+    for (const entry of this.state.continueTabs || []) {
+      if (this.tabGroupIdentity(entry.group, false) === groupId && entry.url === tab.url) entry.group = null;
+    }
+    this.render();
+    this.showTransientNotice(`This tab was removed from “${name}”.`);
+    return true;
   }
 
   ungroupCurrentTab() {
     const tab = this.getActiveTab();
-    if (!tab?.group) return false;
-    const name = this.sanitizeTabGroup(tab.group)?.name || 'Tab group';
-    tab.group = null;
-    this.render();
-    this.showTransientNotice(`This tab was removed from “${name}”.`);
-    return true;
+    return tab ? this.ungroupTab(tab.id) : false;
   }
 
   openTabGroupsSettings() {
@@ -7445,7 +7587,7 @@ export class BrowserShell {
       details.textContent = `${group.tabs.length} tab${group.tabs.length === 1 ? '' : 's'} · ${group.tabs.map((tab) => this.getTabTitle(tab)).join(', ')}`;
       const open = document.createElement('span');
       open.className = 'fb-tab-group-picker-open';
-      open.textContent = 'Open';
+      open.textContent = group.tabs.length > 1 ? 'Open all' : 'Open';
       copy.appendChild(title);
       copy.appendChild(details);
       item.appendChild(swatch);
@@ -7515,7 +7657,7 @@ export class BrowserShell {
         <button class="fb-modal-close-btn" aria-label="Close tab groups">${Icons.close}</button>
       </div>
       <div class="fb-modal-body fb-tab-groups-modal-body">
-        <p class="fb-tab-groups-modal-description">Choose a group to switch straight to one of its tabs.</p>
+        <p class="fb-tab-groups-modal-description">Choose a group to open all of its tabs. Tabs already open stay open; the first group tab becomes active.</p>
         <div class="fb-tab-groups-picker-list"></div>
         <div class="fb-tab-groups-modal-actions">
           <button class="fb-btn fb-btn-primary fb-tab-groups-create-btn">${Icons.plus} New group</button>
@@ -7551,62 +7693,111 @@ export class BrowserShell {
     return free || BrowserShell.TAB_GROUP_COLORS[this.state.tabs.length % BrowserShell.TAB_GROUP_COLORS.length];
   }
 
-  /** Create a named, colour-coded tab group from the active tab + open a
-   *  fresh tab inside it (exactly like Chrome's "New tab group"). */
+  /** Create a named group from the active tab and a fresh tab in one render. */
   async createTabGroup() {
     const tab = this.getActiveTab();
-    if (!tab) return;
-    const name = await this._textPromptDialog({
+    if (!tab) return false;
+    const prompted = await this._textPromptDialog({
       title: 'New tab group',
-      description: 'Tabs in a group share a colour dot in the tab strip.',
+      description: 'Give this group a name. The current tab and a fresh tab will be added.',
       placeholder: 'e.g. Research, Shopping, Work',
       initialValue: ''
     });
-    if (name === null) return;
-    const groupName = String(name || '').replace(/\s+/g, ' ').trim().slice(0, 48) || 'Group';
-    const color = this._nextTabGroupColor();
-    tab.group = { name: groupName, color };
+    if (prompted === null || prompted === undefined) return false;
+    const groupName = String(prompted).replace(/\s+/g, ' ').trim().slice(0, 48);
+    if (!groupName) {
+      this.showTransientNotice('Enter a name to create the tab group.');
+      return false;
+    }
+    const existing = this.getTabGroups().find((candidate) =>
+      candidate.isPrivate === Boolean(tab.isPrivate)
+      && candidate.name.toLocaleLowerCase() === groupName.toLocaleLowerCase());
+    const group = existing
+      ? { name: existing.name, color: existing.color }
+      : { name: groupName, color: this._nextTabGroupColor() };
+    tab.group = group;
+    this.createNewTab(Boolean(tab.isPrivate), { group, render: false });
     this.render();
-    this.showTransientNotice(`Group \u201C${groupName}\u201D created - new tabs open into it until you ungroup.`);
-    this.createNewTab();
-    const fresh = this.getActiveTab();
-    if (fresh) fresh.group = { name: groupName, color };
+    this.showTransientNotice(`Group “${group.name}” created with the current tab and a new tab.`);
+    return true;
+  }
+
+  async groupTabWithPrompt(tabId, { title, description, placeholder, initialValue = '' } = {}) {
+    const tab = this.state.tabs.find((candidate) => candidate.id === tabId);
+    if (!tab) return false;
+    const prompted = await this._textPromptDialog({ title, description, placeholder, initialValue });
+    if (prompted === null || prompted === undefined) return false;
+    const groupName = String(prompted).replace(/\s+/g, ' ').trim().slice(0, 48);
+    if (!groupName) {
+      this.showTransientNotice('Group name was empty - tab left ungrouped.');
+      return false;
+    }
+    const existing = this.getTabGroups().find((candidate) =>
+      candidate.isPrivate === Boolean(tab.isPrivate)
+      && candidate.name.toLocaleLowerCase() === groupName.toLocaleLowerCase());
+    const group = existing
+      ? { name: existing.name, color: existing.color }
+      : { name: groupName, color: this._nextTabGroupColor() };
+    tab.group = group;
     this.render();
+    this.showTransientNotice(`“${this.getTabTitle(tab)}” added to group “${group.name}”.`);
+    return true;
+  }
+
+  /** Add a tab to a selected existing group without prompting. */
+  addTabToExistingGroup(tabId, groupId) {
+    const tab = this.state.tabs.find((candidate) => candidate.id === tabId);
+    const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
+    if (!tab || !group || Boolean(tab.isPrivate) !== Boolean(group.isPrivate)) return false;
+    if (this.tabGroupIdentity(tab.group, tab.isPrivate) === group.id) return true;
+    tab.group = { name: group.name, color: group.color };
+    this.render();
+    this.showTransientNotice(`“${this.getTabTitle(tab)}” added to group “${group.name}”.`);
+    return true;
   }
 
   /** Add the active tab to a named group (Chrome's "Group current tab"). */
-  async groupCurrentTab() {
+  groupCurrentTab() {
     const tab = this.getActiveTab();
-    if (!tab) return;
-    const name = await this._textPromptDialog({
+    if (!tab) return false;
+    return this.groupTabWithPrompt(tab.id, {
       title: 'Group current tab',
       description: 'Give the group a name - tabs in it share a colour dot.',
       placeholder: 'e.g. Research',
       initialValue: tab.group ? tab.group.name : ''
     });
-    if (name === null) return;
-    const groupName = String(name || '').replace(/\s+/g, ' ').trim().slice(0, 48);
-    if (!groupName) {
-      this.showTransientNotice('Group name was empty - tab left ungrouped.');
-      return;
-    }
-    const existing = this.getTabGroups().find((candidate) => candidate.name.toLocaleLowerCase() === groupName.toLocaleLowerCase());
-    tab.group = existing
-      ? { name: existing.name, color: existing.color }
-      : { name: groupName, color: this._nextTabGroupColor() };
-    this.render();
-    this.showTransientNotice(`\u201C${tab.title || 'Tab'}\u201D added to group \u201C${groupName}\u201D.`);
+  }
+
+  /** Create a group around the tab that was right-clicked in the strip. */
+  createTabGroupForTab(tabId) {
+    return this.groupTabWithPrompt(tabId, {
+      title: 'Create tab group',
+      description: 'Add this tab to a new group. You can add more tabs from their right-click menus.',
+      placeholder: 'e.g. Research',
+      initialValue: ''
+    });
   }
 
   /** Remove every tab from its group (Chrome's "Ungroup"). */
   ungroupAllTabs() {
     let count = 0;
+    const openMembers = new Set();
     for (const tab of this.state.tabs) {
       if (tab.group) {
+        const id = this.tabGroupIdentity(tab.group, tab.isPrivate);
+        openMembers.add(`${id}::${tab.url}`);
         tab.group = null;
         count += 1;
       }
     }
+    for (const tab of this.state.tabGroupRestoreTabs || []) {
+      if (tab.group) {
+        const key = `${this.tabGroupIdentity(tab.group, false)}::${tab.url}`;
+        if (!openMembers.has(key)) count += 1;
+        tab.group = null;
+      }
+    }
+    for (const tab of this.state.continueTabs || []) tab.group = null;
     this.render();
     this.showTransientNotice(count > 0
       ? `${count} tab${count === 1 ? '' : 's'} removed from their group${count === 1 ? '' : 's'}.`
@@ -8636,7 +8827,9 @@ export class BrowserShell {
         // profile; the rolling snapshot restarts from its tabs too.
         const prev = await this.sessionRepo.getLastSession();
         const openNow = new Set(this.state.tabs.map((t) => t.url));
-        this.state.continueTabs = (prev.tabs || []).filter((t) => !openNow.has(t.url)).slice(0, 5);
+        const previousTabs = (prev.tabs || []).filter((t) => !t?.isPrivate && /^https?:\/\//i.test(t?.url || ''));
+        this.state.tabGroupRestoreTabs = previousTabs;
+        this.state.continueTabs = previousTabs.filter((t) => !openNow.has(t.url)).slice(0, 5);
         this._lastSessionSnapshotJson = null;
       } catch { /* keep current */ }
     }
@@ -9911,6 +10104,44 @@ export class BrowserShell {
       </div>
     `;
 
+    // Existing groups are direct one-click entries as well as being
+    // available in the full picker. Build their labels as text nodes so a
+    // user-entered name can never be parsed as HTML.
+    const groupSubmenu = drawer.querySelector('.fb-dr-tabgroups-parent')?.parentElement?.querySelector('.fb-drawer-submenu');
+    const tabGroups = this.getTabGroups();
+    if (groupSubmenu && tabGroups.length) {
+      const separator = document.createElement('div');
+      separator.className = 'fb-drawer-separator';
+      groupSubmenu.appendChild(separator);
+      const label = document.createElement('div');
+      label.className = 'fb-submenu-section-label';
+      label.textContent = 'Open group';
+      groupSubmenu.appendChild(label);
+      for (const group of tabGroups) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'fb-drawer-item fb-dr-tg-open';
+        button.setAttribute('aria-label', `Open ${group.name} group (${group.tabs.length} tabs)`);
+        const swatch = document.createElement('span');
+        swatch.className = 'fb-drawer-group-swatch';
+        swatch.style.background = group.color;
+        const name = document.createElement('span');
+        name.className = 'fb-drawer-group-name';
+        name.textContent = group.name;
+        const count = document.createElement('small');
+        count.className = 'fb-drawer-group-count';
+        count.textContent = String(group.tabs.length);
+        button.appendChild(swatch);
+        button.appendChild(name);
+        button.appendChild(count);
+        button.addEventListener('click', () => {
+          this.state.isSideDrawerOpen = false;
+          this.openTabGroup(group.id);
+        });
+        groupSubmenu.appendChild(button);
+      }
+    }
+
     // Event Listeners
     drawer.querySelector('.fb-close-drawer-btn')?.addEventListener('click', () => {
       this.state.isSideDrawerOpen = false;
@@ -10094,11 +10325,13 @@ export class BrowserShell {
 
     drawer.querySelector('.fb-dr-tg-new')?.addEventListener('click', () => {
       this.state.isSideDrawerOpen = false;
+      this.render();
       this.createTabGroup();
     });
 
     drawer.querySelector('.fb-dr-tg-add')?.addEventListener('click', () => {
       this.state.isSideDrawerOpen = false;
+      this.render();
       this.groupCurrentTab();
     });
 
@@ -11532,7 +11765,7 @@ export class BrowserShell {
   /* -------------------------------------------------------------
    * TAB MANAGEMENT
    * ----------------------------------------------------------- */
-  createNewTab(isPrivate = false) {
+  createNewTab(isPrivate = false, { group = null, render = true } = {}) {
     // Collision-proof id: `tab-${Date.now()}` alone DUPLICATED when two tabs
     // were created in the same millisecond (fast Ctrl+T, scripted flows) -
     // aliased tabs then shared ONE pooled frame, silently overwriting each
@@ -11549,13 +11782,16 @@ export class BrowserShell {
       isPrivate,
       favicon: null
     };
+    const safeGroup = this.sanitizeTabGroup(group);
+    if (safeGroup) newTab.group = safeGroup;
 
     this.state.tabs.push(newTab);
     this.state.activeTabId = newId;
     this.state.urlInputValue = '';
     this.state.isBookmarked = false;
 
-    this.render();
+    if (render) this.render();
+    return newTab;
   }
 
   selectTab(tabId) {
@@ -11682,6 +11918,8 @@ export class BrowserShell {
 
     const menu = document.createElement('div');
     menu.className = 'fb-tab-context-menu';
+    menu.setAttribute('role', 'menu');
+    if (!tab || !tab.id) return;
 
     // Clicking/tapping OR right-clicking anywhere outside the menu must
     // dismiss BOTH the scrim and the menu (previously only the scrim was
@@ -11698,31 +11936,56 @@ export class BrowserShell {
     const tabIndex = this.state.tabs.findIndex((t) => t.id === tab.id);
     const canCloseRight = tabIndex > -1 && tabIndex < this.state.tabs.length - 1;
 
+    const currentGroupId = this.tabGroupIdentity(tab.group, tab.isPrivate);
+    const currentGroup = this.getTabGroups().find((group) => group.id === currentGroupId);
+    const availableGroups = this.getTabGroups().filter((group) =>
+      group.isPrivate === Boolean(tab.isPrivate) && group.id !== currentGroupId);
     const items = [
       { label: 'New Tab', action: () => this.createNewTab() },
-      null,
       { label: 'Reload', action: () => this.reloadTabById(tab.id) },
       { label: 'Duplicate Tab', action: () => this.duplicateTabById(tab.id) },
+      null,
+      { label: 'Create group with this tab…', action: () => this.createTabGroupForTab(tab.id) },
+      ...availableGroups.map((group) => ({
+        label: `Add to “${group.name}”`,
+        action: () => this.addTabToExistingGroup(tab.id, group.id)
+      })),
+      ...(currentGroup ? [
+        { label: `Open “${currentGroup.name}” group`, action: () => this.openTabGroup(currentGroup.id) },
+        { label: `Remove from “${currentGroup.name}”`, action: () => this.ungroupTab(tab.id) }
+      ] : []),
+      { label: 'Manage tab groups', action: () => this.openTabGroupsSettings() },
       null,
       { label: 'Close Tab', action: () => this.closeTab(tab.id) },
       { label: 'Close Other Tabs', action: () => this.closeOtherTabs(tab.id), disabled: !canCloseOthers },
       { label: 'Close Tabs to the Right', action: () => this.closeTabsToTheRight(tab.id), disabled: !canCloseRight }
     ];
 
-    menu.innerHTML = items.map((item, i) => item === null
-      ? '<div class="fb-tab-context-menu-sep"></div>'
-      : `<button type="button" class="fb-tab-context-menu-item" data-idx="${i}" ${item.disabled ? 'disabled' : ''}>${item.label}</button>`
-    ).join('');
-
-    menu.querySelectorAll('.fb-tab-context-menu-item').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const item = items[Number(btn.dataset.idx)];
+    // Use textContent for labels: group names are user-entered and must
+    // never be interpreted as markup in a tab context menu.
+    items.forEach((item, index) => {
+      if (item === null) {
+        const separator = document.createElement('div');
+        separator.className = 'fb-tab-context-menu-sep';
+        separator.setAttribute('role', 'separator');
+        menu.appendChild(separator);
+        return;
+      }
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'fb-tab-context-menu-item';
+      button.setAttribute('role', 'menuitem');
+      button.setAttribute('data-idx', String(index));
+      button.disabled = Boolean(item.disabled);
+      button.textContent = item.label;
+      button.addEventListener('click', () => {
         scrim.remove();
         menu.remove();
         this.setPageObscured(false);
-        item?.action?.();
+        item.action?.();
         this.render();
       });
+      menu.appendChild(button);
     });
 
     document.body.appendChild(scrim);
@@ -11737,8 +12000,8 @@ export class BrowserShell {
     this.setPageObscured(true);
 
     // Clamp to viewport so it never renders off-screen near the right/bottom edge.
-    const menuWidth = 220;
-    const menuHeight = items.length * 34 + 16;
+    const menuWidth = 240;
+    const menuHeight = items.reduce((height, item) => height + (item ? 34 : 12), 16);
     const left = Math.min(x, window.innerWidth - menuWidth - 8);
     const top = Math.min(y, window.innerHeight - menuHeight - 8);
     menu.style.left = `${Math.max(8, left)}px`;

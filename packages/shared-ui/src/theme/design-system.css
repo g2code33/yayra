@@ -3271,7 +3271,9 @@ html {
    ============================================================= */
 .fb-tab-context-menu {
   position: fixed;
-  width: 220px;
+  width: 240px;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
   background: #171c2b;
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 10px;
@@ -6665,6 +6667,98 @@ html {
   --fb-accent-glow: rgba(192, 132, 252, 0.3);
   --fb-gradient-accent: linear-gradient(135deg, #c084fc 0%, #8b5cf6 55%, #6366f1 100%);
   --fb-shadow-surface: 0 20px 40px -15px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(226, 232, 240, 0.1);
+  --fb-drawer-bg: #0b1220;
+  --fb-drawer-border: rgba(226, 232, 240, 0.16);
+  --fb-drawer-submenu-bg: #111827;
+  --fb-drawer-hover: rgba(226, 232, 240, 0.1);
+}
+
+/* Incognito can be used with the normal browser set to Light. Keep only the
+   incognito chrome and its menu on deliberate dark surfaces so the light
+   theme never leaves white controls/icons against white backgrounds. */
+.fb-browser-shell.fb-incognito-mode .fb-chrome-navbar {
+  color-scheme: dark;
+  background: #111827;
+  border-bottom-color: rgba(226, 232, 240, 0.12);
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-nav-btn,
+.fb-browser-shell.fb-incognito-mode .fb-menu-btn {
+  color: #f8fafc;
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-nav-btn:disabled {
+  color: #cbd5e1;
+  opacity: 0.65;
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-toolbar-action-btn {
+  color: #e2e8f0 !important;
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-toolbar-action-btn:hover {
+  color: #ffffff !important;
+  background: rgba(226, 232, 240, 0.12) !important;
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-omnibox-container {
+  background: #1f2937;
+  border-color: rgba(226, 232, 240, 0.2);
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-omnibox-container:focus-within {
+  background: #111827;
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-omnibox-group-btn,
+.fb-browser-shell.fb-incognito-mode .fb-omnibox-star {
+  color: #cbd5e1;
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-side-drawer-menu {
+  background: var(--fb-drawer-bg);
+  border-color: var(--fb-drawer-border);
+  box-shadow: -10px 0 36px rgba(0, 0, 0, 0.55);
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-drawer-item {
+  color: #cbd5e1;
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-drawer-item:hover,
+.fb-browser-shell.fb-incognito-mode .fb-drawer-item-has-submenu.open > .fb-drawer-item {
+  color: #f8fafc;
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-mobile-nav-btn:disabled {
+  color: #cbd5e1;
+  opacity: 0.65;
+}
+
+.fb-drawer-group-swatch {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 9px;
+  border-radius: 50%;
+  box-shadow: 0 0 4px rgba(0, 0, 0, 0.35);
+}
+
+.fb-drawer-group-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fb-drawer-group-count {
+  margin-left: auto;
+  color: var(--fb-text-muted);
+  font-size: 0.72rem;
+}
+
+.fb-browser-shell.fb-incognito-mode .fb-drawer-group-count {
+  color: #a1a1aa;
 }
 
 .fb-browser-shell.fb-incognito-mode .fb-newtab-title {

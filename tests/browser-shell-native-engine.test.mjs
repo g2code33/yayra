@@ -127,6 +127,39 @@ test('Native engine PRESENT (Electron desktop): external navigation NEVER create
   }
 });
 
+test('Native page yields to the tab-group name prompt and returns after Save', async () => {
+  const { calls, uninstall } = installFakeNativeWebview();
+  try {
+    const container = document.createElement('div');
+    const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+    await shell.initialize();
+    const tab = shell.getActiveTab();
+    shell.navigateActiveTab('https://example.com/');
+    shell.render(container);
+    calls.setVisible.length = 0;
+
+    const prompt = shell._textPromptDialog({ title: 'New tab group', placeholder: 'Research' });
+    const overlay = document.body.querySelector('.fb-text-prompt-overlay');
+    assert.ok(overlay, 'the accessible prompt is mounted in the document');
+    assert.equal(shell.state.isPageObscured, true, 'native content is marked as obscured');
+    assert.ok(calls.setVisible.some((call) => call.tabId === tab.id && call.visible === false), 'native page hides so the prompt can receive clicks');
+
+    shell.render(container);
+    assert.equal(shell.healStuckPageSurface(), false, 'a live text prompt prevents the stuck-surface healer from uncovering the page');
+    assert.equal(shell.state.isPageObscured, true);
+
+    const input = overlay.querySelector('input');
+    input.value = 'Research';
+    [...overlay.querySelectorAll('button')].find((button) => button.textContent === 'Save').click();
+    assert.equal(await prompt, 'Research');
+    assert.equal(shell.state.isPageObscured, false, 'native page is restored after Save');
+    assert.ok(calls.setVisible.some((call) => call.tabId === tab.id && call.visible === true), 'the live website comes back after the overlay is removed');
+    shell.destroy();
+  } finally {
+    uninstall();
+  }
+});
+
 test('Native engine: closing a tab destroys its native view', async () => {
   const { calls, uninstall } = installFakeNativeWebview();
   try {

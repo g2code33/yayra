@@ -33,10 +33,10 @@ function makeStorage() {
   };
 }
 
-async function makeShell({ storage } = {}) {
+async function makeShell({ storage, ...options } = {}) {
   if (storage) globalThis.localStorage = storage;
   const container = document.createElement('div');
-  const shell = new BrowserShell({ container, isMobile: false });
+  const shell = new BrowserShell({ container, isMobile: false, ...options });
   await shell.initialize();
   shell.render(container);
   return { shell, container };
@@ -345,6 +345,144 @@ test('TAB GROUPS: real create / group / ungroup with colour dots in the tab stri
     assert.ok(shell.state.tabs.every((t) => !t.group), 'all tabs ungrouped');
     shell.render(container);
     assert.equal(container.querySelectorAll('.fb-tab-group-dot').length, 0, 'dots disappear after ungrouping');
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('TAB GROUP PICKER: New group opens a visible, keyboard-ready prompt and publishes a clickable group', async () => {
+  const { shell, container } = await makeShell();
+  try {
+    shell.state.tabs[0].url = 'https://example.com/';
+    shell.openModal('tab-groups');
+    container.querySelector('.fb-tab-groups-create-btn').click();
+
+    const overlay = document.body.querySelector('.fb-text-prompt-overlay');
+    assert.ok(overlay, 'New group opens the custom prompt instead of silently doing nothing');
+    assert.equal(overlay.querySelector('[role="dialog"]')?.getAttribute('aria-modal'), 'true', 'the prompt exposes an accessible modal dialog');
+    assert.equal(shell.state.isPageObscured, true, 'the renderer marks the prompt as a blocking overlay');
+    assert.equal(shell.healStuckPageSurface(), false, 'render-time surface healing keeps the live prompt in front');
+
+    const input = overlay.querySelector('input');
+    input.value = 'Research';
+    input.dispatchEvent({ type: 'keydown', key: 'Enter' });
+    await flush();
+
+    assert.equal(document.body.querySelector('.fb-text-prompt-overlay'), null, 'Enter accepts and closes the prompt');
+    assert.equal(shell.state.isPageObscured, false, 'the page is restored after the prompt closes');
+    const group = shell.getTabGroups().find((candidate) => candidate.name === 'Research');
+    assert.ok(group, 'the requested group was created');
+    assert.equal(group.tabs.length, 2, 'the current tab and a fresh tab are both in the group');
+
+    shell.openModal('tab-groups');
+    const entry = container.querySelector('.fb-tab-group-picker-item');
+    assert.ok(entry, 'the new group appears immediately in the group picker');
+    assert.match(entry.getAttribute('aria-label'), /Research group \(2 tabs\)/);
+    entry.click();
+    assert.equal(shell.state.tabs.filter((tab) => tab.group?.name === 'Research').length, 2, 'opening a group keeps every group tab open');
+    assert.ok(shell.getActiveTab().group?.name === 'Research', 'the group click activates one of its member tabs');
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('TAB GROUP DRAWER: prompt actions dismiss the drawer cleanly, including on Cancel', async () => {
+  const { shell } = await makeShell();
+  try {
+    shell.state.isSideDrawerOpen = true;
+    shell.render();
+    shell.rootElement.querySelector('.fb-dr-tg-new').click();
+    assert.equal(shell.rootElement.querySelector('.fb-side-drawer-menu'), null, 'New tab group closes the drawer before opening its prompt');
+    let overlay = document.body.querySelector('.fb-text-prompt-overlay');
+    assert.ok(overlay, 'the new-group prompt is visible');
+    [...overlay.querySelectorAll('button')].find((button) => button.textContent === 'Cancel').click();
+    await flush();
+    assert.equal(document.body.querySelector('.fb-text-prompt-overlay'), null, 'Cancel closes the prompt');
+    assert.equal(shell.state.isSideDrawerOpen, false, 'Cancel does not leave stale drawer chrome visible');
+    assert.equal(shell.state.tabs.some((tab) => tab.group), false, 'cancelling leaves tabs unchanged');
+
+    shell.state.isSideDrawerOpen = true;
+    shell.render();
+    shell.rootElement.querySelector('.fb-dr-tg-add').click();
+    assert.equal(shell.rootElement.querySelector('.fb-side-drawer-menu'), null, 'Group current tab also closes the drawer first');
+    overlay = document.body.querySelector('.fb-text-prompt-overlay');
+    [...overlay.querySelectorAll('button')].find((button) => button.textContent === 'Cancel').click();
+    await flush();
+    assert.equal(shell.state.tabs.some((tab) => tab.group), false, 'cancelling group current tab leaves the tab ungrouped');
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('TAB GROUP RESTORE: selecting a previous-session group opens every saved member without replacing the current tab', async () => {
+  const sessionTabs = [
+    { url: 'https://alpha.example/', title: 'Alpha', group: { name: 'Launch', color: '#3b82f6' } },
+    { url: 'https://beta.example/docs', title: 'Beta Docs', group: { name: 'Launch', color: '#3b82f6' } },
+    { url: 'https://private.example/', title: 'Private', isPrivate: true, group: { name: 'Incognito', color: '#ef4444' } }
+  ];
+  const sessionRepo = {
+    getLastSession: async () => ({ tabs: sessionTabs, savedAt: 123 }),
+    saveSession: async () => {}
+  };
+  const { shell } = await makeShell({ storage: makeStorage(), sessionRepo });
+  try {
+    const originalTabId = shell.getActiveTab().id;
+    const savedGroup = shell.getTabGroups().find((candidate) => candidate.name === 'Launch');
+    assert.ok(savedGroup, 'recoverable grouped tabs appear before the group is restored');
+    assert.equal(savedGroup.tabs.length, 2, 'the full saved group is available even though the Continue card is capped');
+    assert.equal(shell.getTabGroups().some((candidate) => candidate.name === 'Incognito'), false, 'private session rows never reappear as normal-profile groups');
+
+    assert.equal(shell.openTabGroup(savedGroup.id), true);
+    const opened = shell.state.tabs.filter((tab) => tab.group?.name === 'Launch');
+    assert.equal(opened.length, 2, 'one click opens all saved group members');
+    assert.deepEqual(opened.map((tab) => tab.url), sessionTabs.slice(0, 2).map((tab) => tab.url));
+    assert.notEqual(shell.state.activeTabId, originalTabId, 'the original new-tab remains open; it is not overwritten');
+    assert.equal(shell.getActiveTab().url, sessionTabs[0].url, 'the first tab in the chosen group becomes active');
+    assert.equal(shell.state.continueTabs.length, 0, 'restored group members leave the Continue list');
+    assert.ok(shell.getTabGroups().some((candidate) => candidate.name === 'Launch'), 'the live group remains selectable');
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('TAB RIGHT-CLICK: group, move, open, and remove actions work for the tab under the pointer', async () => {
+  const { shell } = await makeShell();
+  try {
+    const target = shell.getActiveTab();
+    target.url = 'https://target.example/';
+    const grouped = shell.createNewTab();
+    grouped.url = 'https://grouped.example/';
+    grouped.group = { name: 'Work', color: '#10b981' };
+    shell.render();
+
+    shell.renderTabContextMenu(40, 40, target);
+    let buttons = [...document.body.querySelectorAll('.fb-tab-context-menu-item')];
+    const addToWork = buttons.find((button) => button.textContent === 'Add to “Work”');
+    assert.ok(addToWork, 'the context menu offers existing groups as direct choices');
+    addToWork.click();
+    assert.equal(target.group?.name, 'Work', 'the right-clicked tab, not only the active tab, joins the selected group');
+
+    shell.renderTabContextMenu(40, 40, target);
+    buttons = [...document.body.querySelectorAll('.fb-tab-context-menu-item')];
+    assert.ok(buttons.some((button) => button.textContent === 'Open “Work” group'), 'a grouped tab can open its whole group');
+    const remove = buttons.find((button) => button.textContent === 'Remove from “Work”');
+    assert.ok(remove, 'a grouped tab can be removed from its group');
+    remove.click();
+    assert.equal(target.group, null, 'remove action ungroups the selected tab');
+
+    // The Yayra drawer also exposes the saved/live group as a one-click
+    // entry instead of requiring the user to open Settings or the picker.
+    shell.state.isSideDrawerOpen = true;
+    shell.render();
+    const drawerEntry = shell.rootElement.querySelector('.fb-dr-tg-open');
+    assert.ok(drawerEntry, 'existing groups are selectable from the Tab groups submenu');
+    drawerEntry.click();
+    assert.equal(shell.state.isSideDrawerOpen, false, 'choosing a group closes the drawer');
+    assert.equal(shell.getActiveTab().group?.name, 'Work', 'the drawer entry opens the selected group');
   } finally {
     shell.destroy();
     delete globalThis.localStorage;
