@@ -150,7 +150,7 @@ test('NATIVE WEBSITE VIEWS: pointer style and size are sent live and System rest
   }
 });
 
-test('CSS PIN: custom pointer themes are defined for every style x size, beat inline styles, and keep native text cursors', () => {
+test('CSS PIN: custom pointer themes cover nested interactive targets and keep native text cursors', () => {
   const css = readFileSync(new URL('../packages/shared-ui/src/theme/design-system.css', import.meta.url), 'utf8');
   for (const theme of ['yayra', 'high-visibility']) {
     for (const size of ['', "[data-fb-pointer-size='large']", "[data-fb-pointer-size='xlarge']"]) {
@@ -164,10 +164,19 @@ test('CSS PIN: custom pointer themes are defined for every style x size, beat in
   }
   // Application rules must carry !important (the app's cursor styling is
   // mostly inline, and inline beats any non-important rule).
-  assert.match(css, /\[data-fb-pointer='yayra'\] \*,\s*\n\s*\[data-fb-pointer='high-visibility'\] \* \{\s*\n\s*cursor: var\(--fb-ptr-arrow, auto\) !important;/, 'the custom arrow wins over inline styles');
+  assert.match(css, /:is\(\[data-fb-pointer='yayra'\], \[data-fb-pointer='high-visibility'\]\) \* \{\s*cursor: var\(--fb-ptr-arrow, auto\) !important;/, 'the custom arrow wins over inline styles');
   assert.match(css, /cursor: var\(--fb-ptr-hand, pointer\) !important;/, 'the custom hand wins on interactive elements');
+  const handRulesStart = css.indexOf('/* Application (custom themes only');
+  const handRulesEnd = css.indexOf('/* Text entry keeps the NATIVE I-beam', handRulesStart);
+  const handRules = css.slice(handRulesStart, handRulesEnd);
+  assert.match(handRules, /:where\([\s\S]*\[role='button'\][\s\S]*\[tabindex\][\s\S]*\) \* \{\s*cursor: var\(--fb-ptr-hand, pointer\) !important;/, 'nested icons and text inside interactive controls use the hand cursor');
+  for (const selector of ['a, area[href]', "input[type='checkbox']", "input[type='submit']", "[role='combobox']", '[onclick]']) {
+    assert.ok(handRules.includes(selector), `${selector} is recognized as interactive`);
+  }
   // Text entry keeps the NATIVE I-beam (follows the OS pointer size).
-  assert.match(css, /\[data-fb-pointer\] input\[type='text'\][\s\S]{0,420}cursor: text !important;/, 'text fields keep the native I-beam');
+  assert.match(css, /\[data-fb-pointer\] input\[type='text'\][\s\S]*cursor: text !important;/, 'text fields keep the native I-beam');
+  assert.match(css, /\[data-fb-pointer\] input\[type='email'\]/, 'email fields also keep the native I-beam');
+  assert.match(css, /\[data-fb-pointer\] \[contenteditable\]:not\(\[contenteditable='false'\]\)/, 'editable regions keep the native I-beam');
 });
 
 test('CURSOR POLICY: no Chromium bitmap cursor types anywhere (the pointer stays OS-sized)', () => {

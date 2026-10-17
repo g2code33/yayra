@@ -12,11 +12,11 @@ import { BrowserShell } from '../packages/shared-ui/src/components/BrowserShell.
  *
  * The OS title bar (plain "yayra" text) and the File/Edit/View/Window menu
  * block are removed (electron/main.cjs: frame:false + setApplicationMenu(null)).
- * Yayra's tab strip becomes the title bar: it shows the official brand
- * wordmark image and renders REAL minimize/maximize/close buttons backed
- * by the window.yayra.windowControls preload bridge. On web/PWA the bridge
- * is absent and the browser supplies the window chrome, so the buttons
- * must never render there.
+ * Yayra draws its own top chrome: the tab strip shows the official brand
+ * wordmark, window controls, and a dedicated drag handle. This keeps tab
+ * clicks out of the OS titlebar path. On web/PWA the bridge is absent and
+ * the browser supplies window chrome, so native controls/drag handle must
+ * never render there.
  */
 
 function installFakeWindowControls() {
@@ -56,6 +56,18 @@ test('web/PWA (no bridge): no window-control buttons - the browser owns the wind
 
   assert.equal(shell.windowControls, null);
   assert.equal(el.querySelector('.fb-window-controls'), null);
+  assert.equal(el.querySelector('.fb-tabstrip-drag-handle'), null, 'web/PWA has no native window drag handle');
+});
+
+test('frameless tab strip limits native dragging to its dedicated handle', () => {
+  const css = readFileSync(new URL('../packages/shared-ui/src/theme/design-system.css', import.meta.url), 'utf8');
+  const tabStripRule = css.match(/\.fb-chrome-tabstrip\s*\{([\s\S]*?)\}/)?.[1] || '';
+  const dragHandleRule = css.match(/\.fb-tabstrip-drag-handle\s*\{([\s\S]*?)\}/)?.[1] || '';
+  const tabListRule = css.match(/\.fb-chrome-tabstrip \.fb-tab-item,[\s\S]*?\{([\s\S]*?)\}/)?.[1] || '';
+
+  assert.match(tabStripRule, /-webkit-app-region:\s*no-drag/, 'the tab strip no longer acts as a whole-window titlebar');
+  assert.match(dragHandleRule, /-webkit-app-region:\s*drag/, 'window movement remains available through the explicit handle');
+  assert.match(tabListRule, /-webkit-app-region:\s*no-drag/, 'tab items and their scroll area remain clickable');
 });
 
 test('Exit bridge quits the whole Electron app separately from closing only the current window', () => {
@@ -76,6 +88,7 @@ test('Electron (bridge present): real minimize/maximize/close buttons render and
 
     const controls = el.querySelector('.fb-window-controls');
     assert.ok(controls, 'window controls cluster rendered in the tab strip');
+    assert.ok(el.querySelector('.fb-tabstrip-drag-handle'), 'Electron retains window movement through a dedicated handle');
 
     el.querySelector('.fb-wc-minimize').click();
     el.querySelector('.fb-wc-maximize').click();

@@ -60,6 +60,8 @@ export function unsupportedDocumentKinds() {
   return ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'];
 }
 
+export const MAX_DOCUMENT_BYTES = 150 * 1024 * 1024;
+
 let docSeq = 0;
 
 /**
@@ -74,9 +76,11 @@ export class DocumentStore {
 
   /** Add a document; returns { id, name, bytes, type, size, openedAt }. */
   add({ name, bytes }) {
-    if (!bytes || (bytes.byteLength !== undefined && bytes.byteLength === 0)) {
-      throw new Error('empty-document');
-    }
+    const size = bytes && Number.isFinite(bytes.byteLength)
+      ? bytes.byteLength
+      : (bytes && Number.isFinite(bytes.length) ? bytes.length : 0);
+    if (size <= 0) throw new Error('empty-document');
+    if (size > MAX_DOCUMENT_BYTES) throw new Error('document-too-large');
     const cleanName = String(name || 'document.pdf').slice(0, 120);
     const type = classifyDocument(cleanName) || 'pdf';
     docSeq += 1;
@@ -86,7 +90,7 @@ export class DocumentStore {
       name: cleanName,
       bytes,
       type,
-      size: bytes.byteLength !== undefined ? bytes.byteLength : bytes.length,
+      size,
       openedAt: Date.now()
     };
     this._docs.set(id, doc);
@@ -111,6 +115,7 @@ export function createDocumentViewerState() {
   return {
     status: 'idle', numPages: 0, page: 1, zoom: 1.25,
     query: '', matches: [], matchIndex: -1, error: null,
+    progress: null, loadingStage: '',
     rotation: 0,          // 0 | 90 | 180 | 270 (user rotation steps)
     night: false,         // inverted reading mode
     outline: [],          // flattened TOC: [{ title, page, depth }]
@@ -129,23 +134,32 @@ export function createDocumentViewerState() {
  * State shape (mirrored on the tab so re-renders restore it):
  *   { status, numPages, page, zoom, query, matches, matchIndex, error }
  */
-export function createPdfViewer({ pdfjs, container, state, onStateChange = null } = {}) {
+export function createPdfViewer({ pdfjs, container, state, onStateChange = null, loadTimeoutMs = 90000 } = {}) {
   const viewerState = state || createDocumentViewerState();
   let pdfDoc = null;
+  let loadingTask = null;
   let loadToken = 0;
+  let renderToken = 0;
+  let activeLoadTimeout = null;
+  let mountedContainer = container || null;
+  let stateChange = onStateChange;
 
-  const notify = () => { try { onStateChange?.(viewerState); } catch { /* listener is optional */ } };
+  const notify = () => { try { stateChange?.(viewerState); } catch { /* listener is optional */ } };
   const setState = (patch) => { Object.assign(viewerState, patch); notify(); };
 
   const clampPage = (n) => Math.min(Math.max(1, n), Math.max(1, viewerState.numPages || 1));
 
   async function load(bytes) {
     const token = ++loadToken;
+    renderToken += 1;
     if (!pdfjs || typeof pdfjs.getDocument !== 'function') {
-      setState({ status: 'error', error: 'engine-unavailable' });
+      setState({ status: 'error', progress: null, loadingStage: '', error: 'The PDF reader is unavailable. Try again or open this file with your desktop PDF app.' });
       return viewerState;
     }
-    setState({ status: 'loading', error: null, matches: [], matchIndex: -1 });
+    setState({ status: 'loading', progress: null, loadingStage: 'Preparing PDF…', error: null, matches: [], matchIndex: -1 });
+    let task = null;
+    let timeoutId = null;
+    let timedOut = false;
     try {
       // Copy into a plain Uint8Array: PDF.js DETACHES the buffer it is
       // given (transfers it to the worker), which would neuter the
@@ -153,36 +167,78 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null 
       const data = bytes.byteLength !== undefined
         ? new Uint8Array(bytes.slice(0))
         : new Uint8Array(Buffer.from(bytes));
-      const task = pdfjs.getDocument({ data });
-      pdfDoc = await (task.promise ? task.promise : task);
+      task = pdfjs.getDocument({ data });
+      loadingTask = task;
+      if (task && typeof task === 'object' && 'onProgress' in task) {
+        task.onProgress = ({ loaded, total } = {}) => {
+          if (token !== loadToken || timedOut) return;
+          const progress = Number.isFinite(loaded) && Number.isFinite(total) && total > 0
+            ? Math.max(0, Math.min(99, Math.round((loaded / total) * 100)))
+            : null;
+          setState({ progress, loadingStage: 'Reading PDF…' });
+        };
+      }
+      const documentPromise = task && task.promise ? task.promise : Promise.resolve(task);
+      if (Number.isFinite(loadTimeoutMs) && loadTimeoutMs > 0) {
+        const timeoutPromise = new Promise((_, reject) => {
+          timeoutId = setTimeout(() => {
+            timedOut = true;
+            const error = new Error('PDF load timed out');
+            error.name = 'PDFLoadTimeoutError';
+            reject(error);
+          }, loadTimeoutMs);
+          activeLoadTimeout = timeoutId;
+          // Do not keep a test runner or a closing shell alive solely for a
+          // background PDF task; active UI loads still report their timeout.
+          timeoutId?.unref?.();
+        });
+        pdfDoc = await Promise.race([documentPromise, timeoutPromise]);
+      } else {
+        pdfDoc = await documentPromise;
+      }
       if (token !== loadToken) return viewerState; // superseded by a newer load
-      setState({ status: 'ready', numPages: pdfDoc.numPages || 1, page: clampPage(viewerState.page || 1) });
+      setState({ status: 'ready', progress: 100, loadingStage: '', numPages: pdfDoc.numPages || 1, page: clampPage(viewerState.page || 1) });
       await renderCurrent();
     } catch (err) {
       if (token !== loadToken) return viewerState;
       const name = err && err.name ? String(err.name) : '';
-      if (name === 'PasswordException') {
-        setState({ status: 'password', error: 'This PDF is password-protected. Unlocking encrypted PDFs is not available yet.' });
+      if (name === 'PDFLoadTimeoutError') {
+        try {
+          const cleanup = task?.destroy?.();
+          cleanup?.catch?.(() => {});
+        } catch { /* worker already gone */ }
+        if (loadingTask === task) loadingTask = null;
+        setState({ status: 'error', progress: null, loadingStage: '', error: 'This PDF is taking too long to open. Try again or use Desktop app to open it externally.' });
+      } else if (name === 'PasswordException') {
+        setState({ status: 'password', progress: null, loadingStage: '', error: 'This PDF is password-protected. Unlocking encrypted PDFs is not available yet.' });
       } else {
-        setState({ status: 'error', error: 'This file could not be opened as a PDF - it may be damaged or not a PDF at all.' });
+        setState({ status: 'error', progress: null, loadingStage: '', error: 'This file could not be opened as a PDF - it may be damaged or not a PDF at all.' });
       }
+    } finally {
+      if (timeoutId !== null) clearTimeout(timeoutId);
+      if (activeLoadTimeout === timeoutId) activeLoadTimeout = null;
     }
     return viewerState;
   }
 
   async function renderCurrent() {
     if (!pdfDoc || viewerState.status !== 'ready') return;
+    const token = ++renderToken;
+    const currentDocument = pdfDoc;
     const pageNum = clampPage(viewerState.page);
     try {
-      const page = await pdfDoc.getPage(pageNum);
+      const page = await currentDocument.getPage(pageNum);
+      if (token !== renderToken || currentDocument !== pdfDoc || viewerState.status !== 'ready') return;
       const scale = Math.min(4, Math.max(0.5, viewerState.zoom));
       // User rotation adds to the page's own default rotation.
       const rotation = ((page.rotate || 0) + (viewerState.rotation || 0)) % 360;
       const viewport = page.getViewport({ scale, rotation });
       // Paint only where a real canvas exists (skipped in headless tests).
-      if (container && typeof container.ownerDocument !== 'undefined' && viewerState.status === 'ready') {
+      const target = mountedContainer;
+      if (target && typeof target.ownerDocument !== 'undefined' && viewerState.status === 'ready') {
         try {
-          const canvas = container.ownerDocument.createElement('canvas');
+          const canvas = target.ownerDocument.createElement('canvas');
+          canvas.className = 'fb-doc-canvas';
           if (typeof canvas.getContext === 'function') {
             canvas.width = Math.floor(viewport.width);
             canvas.height = Math.floor(viewport.height);
@@ -193,10 +249,22 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null 
               + (viewerState.night ? ' filter:invert(1) hue-rotate(180deg);' : '');
             const ctx = canvas.getContext('2d');
             if (ctx) {
-              const prev = container.querySelector ? container.querySelector('.fb-doc-canvas') : null;
+              const prev = target.querySelector ? target.querySelector('.fb-doc-canvas') : null;
               if (prev && prev.remove) prev.remove();
-              if (container.appendChild) container.appendChild(canvas);
+              if (target.appendChild) target.appendChild(canvas);
               await page.render({ canvasContext: ctx, viewport }).promise;
+              if (token !== renderToken || currentDocument !== pdfDoc) {
+                canvas.remove?.();
+                return;
+              }
+              // If the shell re-rendered while the page was painting, move
+              // the completed canvas into the current mount instead of
+              // leaving a permanent spinner in the replaced DOM.
+              const latestTarget = mountedContainer;
+              if (latestTarget && latestTarget !== target) {
+                latestTarget.querySelector?.('.fb-doc-canvas')?.remove?.();
+                latestTarget.appendChild?.(canvas);
+              }
             }
           }
         } catch { /* headless environment - state stays authoritative */ }
@@ -271,6 +339,7 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null 
 
   /** Fit the page to the container's width (accounting for rotation). */
   async function fitToWidth() {
+    const container = mountedContainer;
     const width = container && (container.clientWidth || (container.parentElement && container.parentElement.clientWidth));
     if (!width || !pdfDoc) return viewerState;
     try {
@@ -286,6 +355,7 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null 
 
   /** Fit the whole page inside the container (width AND height). */
   async function fitToPage() {
+    const container = mountedContainer;
     const box = container && (container.parentElement || container);
     const width = box && (box.clientWidth || (box.parentElement && box.parentElement.clientWidth));
     const height = box && (box.clientHeight || (box.parentElement && box.parentElement.clientHeight));
@@ -367,15 +437,51 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null 
     return viewerState;
   }
 
+  /** Rebind a loaded/in-flight document to a fresh shell mount without
+   *  parsing the PDF a second time. This is important because BrowserShell
+   *  rebuilds its DOM on tab switches and resize-driven renders. */
+  function attach(nextContainer, nextStateChange = null) {
+    const previousContainer = mountedContainer;
+    mountedContainer = nextContainer || null;
+    if (typeof nextStateChange === 'function') stateChange = nextStateChange;
+
+    if (mountedContainer && mountedContainer !== previousContainer) {
+      const canvas = previousContainer?.querySelector?.('.fb-doc-canvas');
+      if (canvas) {
+        mountedContainer.querySelector?.('.fb-doc-canvas')?.remove?.();
+        mountedContainer.appendChild?.(canvas);
+      } else if (pdfDoc && viewerState.status === 'ready') {
+        return renderCurrent();
+      }
+    }
+    notify();
+    return Promise.resolve(viewerState);
+  }
+
   function destroy() {
-    try { pdfDoc?.destroy?.(); } catch { /* already gone */ }
+    loadToken += 1;
+    renderToken += 1;
+    if (activeLoadTimeout !== null) {
+      clearTimeout(activeLoadTimeout);
+      activeLoadTimeout = null;
+    }
+    try {
+      if (typeof loadingTask?.destroy === 'function') {
+        const cleanup = loadingTask.destroy();
+        cleanup?.catch?.(() => {});
+      } else {
+        pdfDoc?.destroy?.();
+      }
+    } catch { /* already gone */ }
+    loadingTask = null;
     pdfDoc = null;
-    setState({ status: 'idle', numPages: 0, page: 1, matches: [], matchIndex: -1 });
+    mountedContainer = null;
+    setState({ status: 'idle', numPages: 0, page: 1, progress: null, loadingStage: '', matches: [], matchIndex: -1 });
   }
 
   return {
     get state() { return viewerState; },
-    load, setPage, nextPage, prevPage, setZoom, search, nextMatch, renderCurrent, destroy,
+    load, attach, setPage, nextPage, prevPage, setZoom, search, nextMatch, renderCurrent, destroy,
     rotate, setNight, loadOutline, fitToWidth, fitToPage, handleKeydown
   };
 }

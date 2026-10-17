@@ -29,44 +29,59 @@
  * untouched; the renderer just tells this bridge where on screen to position
  * a transparent native layer for the active tab's real content.
  *
- * GOOGLE / IDENTITY PROVIDER SIGN-IN
- * -----------------------------------
- * Google (and several other identity providers) actively detect and refuse
- * to complete sign-in inside embedded browser surfaces as an anti-phishing
- * measure - see https://developers.google.com/identity/protocols/oauth2/policies#embedded-webviews.
- * An earlier version of this file tried presenting a desktop-Chrome identity
- * string (see `buildBrowserUserAgent()` below) specifically to get Google
- * sign-in itself to complete embedded. That did not work: Google also
- * inspects Client Hints (`navigator.userAgentData`, `Sec-CH-UA*` headers),
- * which a simple User-Agent string override does not change, and multiple
- * independent reports confirm Google has been actively closing this
- * loophole even for full Client Hints spoofing. Chasing that further is a
- * fragile, ever-escalating fight against Google's own anti-phishing system
- * for uncertain payoff, so Google sign-in is back on the system-browser
- * handoff path here, same as Apple/Microsoft, per Google's own
- * recommendation and RFC 8252 ("OAuth 2.0 for Native Apps").
+ * GOOGLE / IDENTITY PROVIDER AUTHENTICATION
+ * -----------------------------------------
+ * Google's OAuth policy prohibits authorization requests in embedded user
+ * agents (see https://developers.google.com/identity/protocols/oauth2/policies#embedded-webviews).
+ * Yayra therefore hands off explicit Google OAuth authorization endpoints to
+ * the system browser. Ordinary account pages, including the accounts.google.com
+ * landing page and direct account sign-in routes, are allowed to render in the
+ * WebContentsView; Google may still reject an interactive sign-in there, and
+ * Yayra does not bypass that policy or transfer the system browser's cookies.
+ * The app's own Google sign-in uses its separate external-browser + PKCE flow.
  *
- * `buildBrowserUserAgent()` is kept and still applied to every tab, but only
- * for ordinary general-purpose site compatibility (many sites show "upgrade
- * your browser" nags or misrender for a Electron/x.y.z identity string) -
- * not as an attempt to defeat any site's anti-phishing/anti-automation
- * checks, which remain in effect and are handled by the handoff below.
+ * Apple and Microsoft keep their existing system-browser handoff behavior.
+ * `buildBrowserUserAgent()` remains a general site-compatibility setting only;
+ * it is not used to spoof browser identity or defeat provider checks.
  */
 
 // Identity-provider endpoints that must be completed in the user's default
-// system browser instead of the embedded WebContentsView. Google is
-// deliberately path-scoped: accounts.google.com also serves ordinary account
-// pages, while OAuth/sign-in endpoints must never be embedded. Keep the
-// matching path policy in sync with BrowserShell.isSystemBrowserAuthHost().
+// system browser. Google is deliberately OAuth-path-scoped: account browsing
+// and basic sign-in routes stay in the native view, while authorization paths
+// are handed off. Keep this predicate in sync with BrowserShell and Android.
 const SYSTEM_BROWSER_AUTH_HOSTS = Object.freeze([
   'accounts.google.com',
   'appleid.apple.com',
   'login.live.com',
   'login.microsoftonline.com'
 ]);
-const GOOGLE_SIGN_IN_PATH = /^\/(?:o\/oauth2(?:\/|$)|oauth2(?:\/|$)|signin(?:\/|$)|servicelogin(?:\/|$)|accountchooser(?:\/|$)|v\d+\/signin(?:\/|$)|gsi\/select(?:\/|$))/i;
+const GOOGLE_OAUTH_PATH = /^\/(?:o\/oauth2(?:\/|$)|oauth2(?:\/|$)|signin\/oauth(?:\/|$)|gsi\/select(?:\/|$))/i;
 
 const WEBVIEW_EVENT_CHANNEL = 'yayra:webview-event';
+const PAGE_UNRESPONSIVE_RELOAD_DELAY_MS = 15_000;
+const PAGE_UNRESPONSIVE_RELOAD_COOLDOWN_MS = 60_000;
+const EMAIL_FIELD_FOCUSED_CHANNEL = 'yayra:email-field-focused';
+const EMAIL_ADDRESS_CAPTURED_CHANNEL = 'yayra:email-address-captured';
+const EMAIL_SUGGESTIONS_CHANNEL = 'yayra:email-suggestions';
+
+function sanitizeEmailAddress(value) {
+  const email = String(value || '').trim();
+  if (!email || email.length > 254 || /\s/.test(email)) return null;
+  const at = email.indexOf('@');
+  if (at <= 0 || at !== email.lastIndexOf('@') || at >= email.length - 1) return null;
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  if (local.length > 64 || !domain.includes('.') || domain.startsWith('.') || domain.endsWith('.') || domain.includes('..')) return null;
+  if (domain.split('.').some((label) => !label || label.length > 63)) return null;
+  return email;
+}
+
+function isHttpUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch { return false; }
+}
 
 // Sentinel pseudo-scheme the in-page WebAuthn helper uses to ask the main
 // process to open the CURRENT page in the user's default system browser
@@ -91,6 +106,22 @@ function decodeOpenExternalRequest(url) {
 }
 
 const POINTER_STYLE_ID = 'yayra-custom-pointer-theme';
+const POINTER_TEXT_CURSOR_ATTRIBUTE = 'data-yayra-selectable-text';
+const POINTER_TEXT_CURSOR_STATE = '__yayraSelectableTextCursorState';
+
+// Keep the Yayra shell and native website views aligned. Many sites put the
+// actual hovered target (an SVG, icon, or text span) inside the control, so
+// buildPointerThemeCss applies the hand cursor to both each control and all of
+// its descendants.
+const POINTER_INTERACTIVE_SELECTORS = Object.freeze([
+  'a', 'area[href]', 'button',
+  'input[type="button"]', 'input[type="submit"]', 'input[type="reset"]', 'input[type="image"]',
+  'input[type="checkbox"]', 'input[type="radio"]', 'input[type="range"]', 'input[type="file"]', 'input[type="color"]',
+  'select', 'option', 'summary', 'label',
+  '[role="button"]', '[role="link"]', '[role="tab"]', '[role="menuitem"]', '[role="menuitemcheckbox"]', '[role="menuitemradio"]',
+  '[role="combobox"]', '[role="listbox"]', '[role="option"]', '[role="checkbox"]', '[role="radio"]', '[role="switch"]', '[role="slider"]', '[role="treeitem"]', '[role="gridcell"]',
+  '[aria-haspopup]', '[onclick]', '[tabindex]:not([tabindex="-1"])'
+]);
 
 /** Builds the same custom cursor rules for a native website view as the UI uses. */
 function buildPointerThemeCss(theme, size = 'normal') {
@@ -108,11 +139,20 @@ function buildPointerThemeCss(theme, size = 'normal') {
   const handHotspot = `${Math.round(9 * scale)} ${Math.round(2 * scale)}`;
   const arrowCursor = `url("data:image/svg+xml,${encodeURIComponent(arrowSvg)}") ${arrowHotspot}, auto`;
   const handCursor = `url("data:image/svg+xml,${encodeURIComponent(handSvg)}") ${handHotspot}, pointer`;
+  const interactiveSelector = `:where(${POINTER_INTERACTIVE_SELECTORS.join(', ')})`;
+  // :not(html) gives the hand rule the same specificity as body * in the
+  // arrow rule, allowing it to win by source order without overpowering the
+  // native I-beam rules on text inputs.
+  const handTargetSelector = `${interactiveSelector}:not(html)`;
 
   return [
     `html, body, body * { cursor: ${arrowCursor} !important; }`,
-    `button, a, [role="button"], [role="tab"], [role="menuitem"], select, summary, input[type="button"], input[type="submit"], input[type="reset"] { cursor: ${handCursor} !important; }`,
-    `input:not([type]), input[type="text"], input[type="search"], input[type="url"], input[type="email"], input[type="password"], input[type="number"], textarea, [contenteditable="true"], [role="textbox"] { cursor: text !important; }`
+    `${handTargetSelector}, ${handTargetSelector} * { cursor: ${handCursor} !important; }`,
+    `input:not([type]), input[type="text"], input[type="search"], input[type="url"], input[type="email"], input[type="tel"], input[type="password"], input[type="number"], input[type="date"], input[type="time"], input[type="datetime-local"], input[type="month"], input[type="week"], textarea, [contenteditable]:not([contenteditable="false"]), [role="textbox"] { cursor: text !important; }`,
+    // The pointer-move helper marks only selectable, non-interactive text
+    // under the actual hit point. Use the native I-beam and preserve normal
+    // drag selection, even when a site styles its content with user-select:none.
+    `[${POINTER_TEXT_CURSOR_ATTRIBUTE}="true"] { cursor: text !important; user-select: text !important; -webkit-user-select: text !important; }`
   ].join('\n');
 }
 
@@ -151,6 +191,128 @@ function buildPointerThemeScript(theme, size = 'normal') {
         window.__yayraPointerThemeObserver = observer;
       }
     } catch (_err) { /* some pages lock down DOM mutation; keep the site usable */ }
+  })();`;
+}
+
+/**
+ * Custom arrows normally hide Chromium's context-sensitive I-beam. This
+ * page-local helper restores it only when the hit-tested point is over real
+ * selectable text outside an interactive control. Pointerdown marks the text
+ * synchronously so native drag-to-select starts with user-select enabled.
+ */
+function buildPointerTextCursorScript(theme) {
+  const enabled = theme === 'yayra' || theme === 'high-visibility';
+  const stateKey = JSON.stringify(POINTER_TEXT_CURSOR_STATE);
+  const attribute = JSON.stringify(POINTER_TEXT_CURSOR_ATTRIBUTE);
+  if (!enabled) {
+    return `(function () { try { window[${stateKey}]?.cleanup?.(); } catch (_err) {} })();`;
+  }
+  const interactiveSelector = JSON.stringify(POINTER_INTERACTIVE_SELECTORS.join(', '));
+  return `(function () {
+    try {
+      var stateKey = ${stateKey};
+      var attribute = ${attribute};
+      var interactiveSelector = ${interactiveSelector};
+      try { window[stateKey]?.cleanup?.(); } catch (_err) {}
+      var current = null;
+      var pending = false;
+      var scheduledFrame = null;
+      var latestPoint = null;
+      var clear = function () {
+        if (current) { try { current.removeAttribute(attribute); } catch (_err) {} }
+        current = null;
+      };
+      var isInteractive = function (target) {
+        var element = target && target.nodeType === 1 ? target : target && target.parentElement;
+        try {
+          while (element) {
+            if (element.closest && element.closest(interactiveSelector)) return true;
+            var root = element.getRootNode && element.getRootNode();
+            element = root && root.host ? root.host : null;
+          }
+        } catch (_err) { return false; }
+        return false;
+      };
+      var textElementAt = function (x, y) {
+        var range = null;
+        try {
+          if (typeof document.caretRangeFromPoint === 'function') {
+            range = document.caretRangeFromPoint(x, y);
+          } else if (typeof document.caretPositionFromPoint === 'function') {
+            var position = document.caretPositionFromPoint(x, y);
+            if (position && position.offsetNode) {
+              range = document.createRange();
+              range.setStart(position.offsetNode, position.offset);
+              range.collapse(true);
+            }
+          }
+        } catch (_err) { range = null; }
+        var node = range && range.startContainer;
+        if (!node || node.nodeType !== 3 || !String(node.nodeValue || '').trim()) return null;
+        var element = node.parentElement;
+        if (!element || isInteractive(element)) return null;
+        try {
+          var check = document.createRange();
+          check.selectNodeContents(node);
+          var rects = check.getClientRects();
+          var hit = false;
+          for (var i = 0; i < rects.length; i += 1) {
+            var rect = rects[i];
+            if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) { hit = true; break; }
+          }
+          if (!hit) return null;
+        } catch (_err) { return null; }
+        return element;
+      };
+      var update = function (point) {
+        var next = textElementAt(point.x, point.y);
+        if (next === current) return;
+        clear();
+        if (next) {
+          try { next.setAttribute(attribute, 'true'); current = next; } catch (_err) {}
+        }
+      };
+      var onMove = function (event) {
+        if (!event || event.pointerType === 'touch') { clear(); return; }
+        if (isInteractive(event.target)) { latestPoint = null; clear(); return; }
+        latestPoint = { x: event.clientX, y: event.clientY };
+        if (event.type === 'pointerdown') { update(latestPoint); return; }
+        if (pending) return;
+        pending = true;
+        var run = function () {
+          pending = false;
+          scheduledFrame = null;
+          var point = latestPoint;
+          latestPoint = null;
+          if (point) update(point);
+        };
+        if (typeof window.requestAnimationFrame === 'function') scheduledFrame = window.requestAnimationFrame(run);
+        else scheduledFrame = setTimeout(run, 16);
+      };
+      var onPointerOut = function (event) { if (!event.relatedTarget) clear(); };
+      var cleanup = function () {
+        if (scheduledFrame !== null) {
+          if (typeof window.cancelAnimationFrame === 'function') window.cancelAnimationFrame(scheduledFrame);
+          else clearTimeout(scheduledFrame);
+          scheduledFrame = null;
+        }
+        pending = false;
+        latestPoint = null;
+        document.removeEventListener('pointermove', onMove, true);
+        document.removeEventListener('mousemove', onMove, true);
+        document.removeEventListener('pointerdown', onMove, true);
+        document.removeEventListener('pointerout', onPointerOut, true);
+        window.removeEventListener('blur', clear, true);
+        clear();
+        try { delete window[stateKey]; } catch (_err) { window[stateKey] = null; }
+      };
+      document.addEventListener('pointermove', onMove, true);
+      document.addEventListener('mousemove', onMove, true);
+      document.addEventListener('pointerdown', onMove, true);
+      document.addEventListener('pointerout', onPointerOut, true);
+      window.addEventListener('blur', clear, true);
+      window[stateKey] = { cleanup: cleanup };
+    } catch (_err) { /* cursor enhancement is best-effort; never block page interaction */ }
   })();`;
 }
 
@@ -252,6 +414,124 @@ function buildWebAuthnWatchdogScript() {
 }
 
 /**
+ * Google Search can finish its document load while an AI Overview is still
+ * displaying its standalone "Thinking" status. That request is page-level
+ * activity (not WebContents.isLoading()), so the browser's ordinary loading
+ * watchdog cannot see it. Watch only Google Search results, and only reload
+ * after the visible status remains continuous for the configured timeout.
+ *
+ * A per-query sessionStorage cooldown makes this a single recovery attempt,
+ * not a reload loop. It stores only a short hash of the query URL, never the
+ * query itself. If storage is unavailable, the watchdog opts out rather than
+ * risk a reload loop.
+ */
+function buildGoogleSearchThinkingWatchdogScript({
+  timeoutMs = 120_000,
+  pollIntervalMs = 5_000,
+  reloadCooldownMs = 30 * 60_000
+} = {}) {
+  const safeDelay = (value, fallback) => {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) && numeric > 0 ? Math.floor(numeric) : fallback;
+  };
+  const config = {
+    timeoutMs: safeDelay(timeoutMs, 120_000),
+    pollIntervalMs: safeDelay(pollIntervalMs, 5_000),
+    reloadCooldownMs: safeDelay(reloadCooldownMs, 30 * 60_000)
+  };
+  return `(function () {
+  if (window.__yayraGoogleSearchThinkingWatchdog) return;
+  window.__yayraGoogleSearchThinkingWatchdog = true;
+  var initialHost = String(window.location && window.location.hostname || '').toLowerCase();
+  var googleHost = /^(?:www\\.)?google\\.[a-z]{2,}(?:\\.[a-z]{2,})?$/.test(initialHost);
+  if (!googleHost) return;
+
+  var WAIT_MS = ${config.timeoutMs};
+  var POLL_MS = ${config.pollIntervalMs};
+  var COOLDOWN_MS = ${config.reloadCooldownMs};
+  var storage;
+  try {
+    storage = window.sessionStorage;
+    if (!storage || typeof storage.getItem !== 'function' || typeof storage.setItem !== 'function') return;
+    var probe = '__yayra_google_thinking_probe';
+    storage.setItem(probe, '1');
+    storage.removeItem(probe);
+  } catch (_err) {
+    return;
+  }
+
+  function isGoogleSearch() {
+    var location = window.location || {};
+    var host = String(location.hostname || '').toLowerCase();
+    return /^(?:www\\.)?google\\.[a-z]{2,}(?:\\.[a-z]{2,})?$/.test(host)
+      && /^\\/search\\/?$/.test(String(location.pathname || ''));
+  }
+  function hash(value) {
+    var result = 2166136261;
+    for (var i = 0; i < value.length; i += 1) {
+      result ^= value.charCodeAt(i);
+      result = Math.imul(result, 16777619);
+    }
+    return (result >>> 0).toString(36);
+  }
+  function hasStandaloneThinkingStatus() {
+    var text = document.body && typeof document.body.innerText === 'string' ? document.body.innerText : '';
+    return /(?:^|\\n)\\s*Thinking(?:\\s*(?:\\.{3}|…))?\\s*(?:\\n|$)/i.test(text);
+  }
+  function recentlyReloaded(key, now) {
+    try {
+      var raw = storage.getItem(key);
+      if (raw === null) return false;
+      var last = Number(raw);
+      return !Number.isFinite(last) || now - last < COOLDOWN_MS;
+    } catch (_err) {
+      return true;
+    }
+  }
+
+  var thinkingSince = 0;
+  var observedUrl = String(window.location.href || '');
+  window.setInterval(function () {
+    try {
+      var location = window.location || {};
+      var currentUrl = String(location.href || '');
+      if (currentUrl !== observedUrl) {
+        observedUrl = currentUrl;
+        thinkingSince = 0;
+      }
+      if (!isGoogleSearch() || document.visibilityState === 'hidden' || !hasStandaloneThinkingStatus()) {
+        thinkingSince = 0;
+        return;
+      }
+
+      var now = Date.now();
+      if (!thinkingSince) {
+        thinkingSince = now;
+        return;
+      }
+      if (now - thinkingSince < WAIT_MS) return;
+
+      var searchUrl = String(location.pathname || '') + String(location.search || '');
+      var markerKey = '__yayra_google_thinking_reload_' + hash(searchUrl);
+      if (recentlyReloaded(markerKey, now)) {
+        thinkingSince = 0;
+        return;
+      }
+      try { storage.setItem(markerKey, String(now)); }
+      catch (_err) { thinkingSince = 0; return; }
+
+      // Normal reload: preserve the current tab, URL, profile and cookies.
+      // This intentionally does not clear site data or cache.
+      thinkingSince = 0;
+      if (location && typeof location.reload === 'function') location.reload();
+    } catch (_err) {
+      thinkingSince = 0;
+    }
+  }, POLL_MS);
+})();`;
+}
+
+/**
  * Builds a standard desktop Chrome User-Agent string for the current
  * platform/Chromium version, deliberately omitting the "Electron/x.y.z"
  * token Electron appends by default. Pure function (reads only static
@@ -297,7 +577,7 @@ function requiresSystemBrowserAuth(rawUrl, hosts = SYSTEM_BROWSER_AUTH_HOSTS) {
   return hosts.some((host) => {
     const normalizedHost = String(host).toLowerCase();
     if (normalizedHost === 'accounts.google.com') {
-      return hostname === normalizedHost && GOOGLE_SIGN_IN_PATH.test(parsed.pathname);
+      return hostname === normalizedHost && GOOGLE_OAUTH_PATH.test(parsed.pathname);
     }
     return hostname === normalizedHost || hostname.endsWith(`.${normalizedHost}`);
   });
@@ -466,11 +746,12 @@ function createWebviewBridge({
   // dialog. Optional: without it savePage reports { ok:false }.
   dialog = null,
   // Absolute path to electron/autofillPreload.cjs. When provided, every
-  // page view gets Chrome-style password capture/fill hooks (sandboxed,
-  // context-isolated, nothing exposed to the page). Optional so existing
-  // tests without it keep working.
+  // page view gets sandboxed password capture/fill and email suggestion hooks
+  // (context-isolated, nothing exposed to the page). Optional for test hosts.
   autofillPreloadPath = null,
-  logger = console
+  logger = console,
+  pageUnresponsiveReloadDelayMs = PAGE_UNRESPONSIVE_RELOAD_DELAY_MS,
+  pageUnresponsiveReloadCooldownMs = PAGE_UNRESPONSIVE_RELOAD_COOLDOWN_MS
 }) {
   // key -> { view, lastUrl, tabId, hostWc, hostWin }
   // key namespaces the renderer-chosen tabId by the webContents that asked
@@ -478,6 +759,18 @@ function createWebviewBridge({
   // BrowserShell instance whose generated ids ("tab-1", "tab-2", ...) would
   // otherwise collide and steal each other's native views.
   const views = new Map();
+  // Per-shell-window policy. WeakMap keeps the preference scoped to the
+  // renderer that owns the native views without retaining destroyed windows.
+  const backgroundThrottlingByHost = new WeakMap();
+
+  function cancelPageUnresponsiveReload(entry) {
+    if (!entry) return;
+    entry.pageUnresponsive = false;
+    if (entry.pageUnresponsiveReloadTimer !== null) {
+      clearTimeout(entry.pageUnresponsiveReloadTimer);
+      entry.pageUnresponsiveReloadTimer = null;
+    }
+  }
 
   function viewKey(event, tabId) {
     const senderId = event && event.sender && typeof event.sender.id === 'number' ? event.sender.id : null;
@@ -536,6 +829,17 @@ function createWebviewBridge({
     }
   }
 
+  function executePointerTextCursorFallback(frames, theme) {
+    const script = buildPointerTextCursorScript(theme);
+    for (const frame of frames) {
+      if (!frame || typeof frame.executeJavaScript !== 'function') continue;
+      try {
+        const result = frame.executeJavaScript(script, true);
+        if (result && typeof result.catch === 'function') result.catch(() => {});
+      } catch { /* keep cursor enhancement best-effort */ }
+    }
+  }
+
   function applyPointerThemeToPage(entry) {
     const wc = entry && entry.view && entry.view.webContents;
     if (!wc) return;
@@ -566,6 +870,10 @@ function createWebviewBridge({
     const size = entry.pointerSize === 'large' || entry.pointerSize === 'xlarge'
       ? entry.pointerSize
       : 'normal';
+    // CSS alone cannot distinguish a text node from blank space in a div.
+    // Use Chromium's caret hit-test in every frame to apply an I-beam only
+    // over selectable non-interactive text, including cross-origin frames.
+    executePointerTextCursorFallback(frames, theme);
     const revision = (entry.pointerCssRevision || 0) + 1;
     entry.pointerCssRevision = revision;
     const installed = entry.pointerCssEntries || new Map();
@@ -641,7 +949,11 @@ function createWebviewBridge({
     wc.on('dom-ready', () => {
       if (entry.pointerTheme !== 'system') applyPointerThemeToPage(entry);
       if (typeof wc.executeJavaScript === 'function') {
-        wc.executeJavaScript(buildWebAuthnWatchdogScript(), true).catch(() => {});
+        const watchdogs = [
+          buildWebAuthnWatchdogScript(),
+          buildGoogleSearchThinkingWatchdogScript()
+        ].join('\n');
+        wc.executeJavaScript(watchdogs, true).catch(() => {});
       }
     });
     // Apply the selected pointer to cross-origin child frames as each one
@@ -665,7 +977,52 @@ function createWebviewBridge({
         wc.reload();
       }
     });
-    wc.on('did-start-loading', () => sendTo(entry, 'loading-start'));
+    wc.on('unresponsive', () => {
+      const newlyUnresponsive = !entry.pageUnresponsive;
+      entry.pageUnresponsive = true;
+      if (entry.pageUnresponsiveReloadTimer !== null) {
+        if (newlyUnresponsive) sendTo(entry, 'page-unresponsive', { url: wc.getURL?.() || entry.lastUrl || '', recoveryScheduled: true });
+        return;
+      }
+      const lastReload = entry.lastPageUnresponsiveReloadAt || 0;
+      const recoveryScheduled = !(lastReload && Date.now() - lastReload < pageUnresponsiveReloadCooldownMs);
+      if (newlyUnresponsive) {
+        sendTo(entry, 'page-unresponsive', { url: wc.getURL?.() || entry.lastUrl || '', recoveryScheduled });
+      }
+      if (!recoveryScheduled) return;
+
+      // The shell remains usable while an individual site renderer hangs.
+      // Give Chromium a short chance to recover itself before reloading only
+      // that tab. This is delayed and rate-limited to avoid disrupting slow
+      // but healthy pages or creating a reload loop.
+      entry.pageUnresponsiveReloadTimer = setTimeout(() => {
+        entry.pageUnresponsiveReloadTimer = null;
+        if (!entry.pageUnresponsive || wc.isDestroyed?.()) return;
+        const now = Date.now();
+        if (entry.lastPageUnresponsiveReloadAt && now - entry.lastPageUnresponsiveReloadAt < pageUnresponsiveReloadCooldownMs) return;
+        entry.lastPageUnresponsiveReloadAt = now;
+        logger.warn?.(`[yayra:webview] page renderer unresponsive in tab ${entry.tabId}; reloading that page`);
+        sendTo(entry, 'page-recovery-start', { url: wc.getURL?.() || entry.lastUrl || '', reason: 'unresponsive-page' });
+        try { wc.reload(); }
+        catch (err) {
+          logger.error?.(`[yayra:webview] failed to recover unresponsive tab ${entry.tabId}`, err);
+          sendTo(entry, 'page-recovery-failed', { url: wc.getURL?.() || entry.lastUrl || '' });
+        }
+      }, pageUnresponsiveReloadDelayMs);
+      entry.pageUnresponsiveReloadTimer?.unref?.();
+    });
+    wc.on('responsive', () => {
+      const wasUnresponsive = entry.pageUnresponsive;
+      cancelPageUnresponsiveReload(entry);
+      if (wasUnresponsive) sendTo(entry, 'page-responsive', { url: wc.getURL?.() || entry.lastUrl || '' });
+    });
+    wc.on('did-start-loading', () => {
+      // A user-initiated reload/navigation is already the recovery action.
+      const wasUnresponsive = entry.pageUnresponsive;
+      cancelPageUnresponsiveReload(entry);
+      if (wasUnresponsive) sendTo(entry, 'page-recovery-start', { url: wc.getURL?.() || entry.lastUrl || '', reason: 'navigation' });
+      sendTo(entry, 'loading-start');
+    });
     wc.on('did-stop-loading', () => sendTo(entry, 'loading-stop'));
     const handoffAuthNavigation = (...args) => {
       const event = args[0];
@@ -787,7 +1144,10 @@ function createWebviewBridge({
       isPrivate: Boolean(isPrivate),
       profileId: String(profileId || 'default'),
       pointerTheme: 'system',
-      pointerSize: 'normal'
+      pointerSize: 'normal',
+      pageUnresponsive: false,
+      pageUnresponsiveReloadTimer: null,
+      lastPageUnresponsiveReloadAt: 0
     };
     views.set(key, entry);
     attachListeners(key, entry);
@@ -821,6 +1181,11 @@ function createWebviewBridge({
     }
     if (!entry) {
       entry = createView(key, tabId, isPrivate, hostWc, win, profileId);
+      const backgroundThrottling = hostWc ? backgroundThrottlingByHost.get(hostWc) : undefined;
+      if (typeof backgroundThrottling === 'boolean'
+        && typeof entry.view.webContents.setBackgroundThrottling === 'function') {
+        try { entry.view.webContents.setBackgroundThrottling(backgroundThrottling); } catch { /* keep Electron's default */ }
+      }
       win.contentView.addChildView(entry.view);
     }
 
@@ -834,8 +1199,15 @@ function createWebviewBridge({
     if (entry.lastUrl !== url) {
       entry.lastUrl = url;
       entry.view.webContents.loadURL(url).catch((err) => {
-        logger.error(`[yayra:webview] failed to load ${url}`, err);
-        sendTo(entry, 'fail-load', { errorCode: -2, errorDescription: String((err && err.message) || err), url });
+        const description = String((err && err.message) || err || 'load failed');
+        // Electron rejects a superseded loadURL() with ERR_ABORTED when the
+        // user navigates again before it settles. This is expected control
+        // flow, not a failed final navigation; did-fail-load also filters -3.
+        if (/ERR_ABORTED\s*\(-3\)|net::ERR_ABORTED/i.test(description)) return;
+        let host = '';
+        try { host = new URL(url).host; } catch { /* never log full user query text */ }
+        logger.error(`[yayra:webview] failed to load ${host || 'page'} (loadURL rejected)`);
+        sendTo(entry, 'fail-load', { errorCode: -2, errorDescription: description.slice(0, 240), url });
       });
     }
     return { handedOffToSystemBrowser: false };
@@ -1004,6 +1376,7 @@ function createWebviewBridge({
   function destroyView(key) {
     const entry = views.get(key);
     if (!entry) return;
+    cancelPageUnresponsiveReload(entry);
     const win = (entry.hostWin && !entry.hostWin.isDestroyed?.()) ? entry.hostWin : getMainWindow();
     if (win && !win.isDestroyed()) {
       try {
@@ -1033,6 +1406,36 @@ function createWebviewBridge({
   ipcMain.handle('yayra:webview-ensure', (event, { tabId, url, isPrivate, profileId, pointerTheme, pointerSize } = {}) => {
     const { hostWc, hostWin } = resolveHost(event);
     return ensureView(viewKey(event, tabId), tabId, url, { isPrivate, hostWc, hostWin, profileId, pointerTheme, pointerSize });
+  });
+  ipcMain.handle('yayra:webview-set-background-throttling', (event, { enabled } = {}) => {
+    const sender = event?.sender;
+    if (!sender || typeof enabled !== 'boolean') return { ok: false, reason: 'invalid-request', updated: 0 };
+    backgroundThrottlingByHost.set(sender, enabled);
+    let updated = 0;
+    for (const entry of views.values()) {
+      if (entry.hostWc !== sender) continue;
+      const wc = entry.view?.webContents;
+      if (!wc || wc.isDestroyed?.() || typeof wc.setBackgroundThrottling !== 'function') continue;
+      try { wc.setBackgroundThrottling(enabled); updated += 1; } catch { /* report only successful updates */ }
+    }
+    return { ok: true, enabled, updated };
+  });
+  ipcMain.handle('yayra:webview-list-task-tabs', (event) => {
+    const sender = event?.sender;
+    if (!sender) return { ok: false, reason: 'unavailable', tabs: [] };
+    const tabs = [];
+    for (const entry of views.values()) {
+      if (entry.hostWc !== sender) continue;
+      const wc = entry.view?.webContents;
+      if (!wc || wc.isDestroyed?.()) continue;
+      let pid = null;
+      try {
+        const rawPid = wc.getOSProcessId?.();
+        if (Number.isInteger(rawPid) && rawPid > 0) pid = rawPid;
+      } catch { /* renderer may be tearing down */ }
+      tabs.push({ tabId: String(entry.tabId), pid });
+    }
+    return { ok: true, tabs };
   });
   ipcMain.handle('yayra:webview-set-pointer-theme', (event, { tabId, theme, size } = {}) => setPointerTheme(viewKey(event, tabId), theme, size));
   ipcMain.handle('yayra:webview-set-bounds', (event, { tabId, bounds } = {}) => setBounds(viewKey(event, tabId), bounds));
@@ -1133,21 +1536,95 @@ function createWebviewBridge({
     const wc = entry && entry.view && entry.view.webContents;
     if (!wc || typeof wc.executeJavaScript !== 'function') return { ok: false, reason: 'no-native-page' };
     const script = `(() => {
-      const root = document.querySelector('article') || document.querySelector('main') || document.body;
-      if (!root) return { title: document.title, url: location.href, blocks: [] };
-      const nodes = root.querySelectorAll('h1, h2, h3, p, li');
-      const blocks = [];
-      for (const el of nodes) {
-        const text = (el.innerText || '').trim();
-        if (text.length < 2) continue;
-        blocks.push({ tag: el.tagName.toLowerCase(), text: text.slice(0, 4000) });
-        if (blocks.length >= 400) break;
+      const title = String(document.title || '').trim();
+      const url = String(location.href || '');
+      const siteName = document.querySelector('meta[property="og:site_name"]')?.content || location.hostname || '';
+      const hiddenByReader = (el) => {
+        if (!el || el.hidden || el.getAttribute('aria-hidden') === 'true') return true;
+        try {
+          const style = getComputedStyle(el);
+          return style.display === 'none' || style.visibility === 'hidden';
+        } catch { return false; }
+      };
+      const candidates = Array.from(document.querySelectorAll('article, main, [role="main"], [itemprop="articleBody"], .article-body, .post-content, .entry-content'));
+      let root = null;
+      let rootScore = 0;
+      for (const candidate of candidates.slice(0, 40)) {
+        const text = String(candidate.innerText || '').trim();
+        const score = text.length + (candidate.matches('article,[itemprop="articleBody"]') ? 400 : 0);
+        if (score > rootScore) { root = candidate; rootScore = score; }
       }
-      return { title: document.title, url: location.href, blocks };
+      root = root || document.body;
+      if (!root) return { title, url, siteName, language: '', wordCount: 0, blocks: [] };
+      const excluded = 'script, style, noscript, nav, header, footer, aside, form, button, input, select, textarea, [hidden], [aria-hidden="true"], [role="navigation"], [role="contentinfo"], [role="complementary"], .advertisement, .advert, .ads, .cookie-banner';
+      const safeHref = (raw) => {
+        try {
+          const resolved = new URL(raw, url);
+          return resolved.protocol === 'http:' || resolved.protocol === 'https:' ? resolved.href : '';
+        } catch { return ''; }
+      };
+      const segmentsFor = (el) => {
+        const segments = [];
+        try {
+          const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+          let node;
+          while ((node = walker.nextNode()) && segments.length < 240) {
+            const text = String(node.nodeValue || '');
+            if (!text.trim()) { if (segments.length) segments[segments.length - 1].text += text; continue; }
+            const anchor = node.parentElement?.closest('a');
+            segments.push({ text, href: anchor ? safeHref(anchor.getAttribute('href') || anchor.href || '') : '' });
+          }
+        } catch { /* text fallback is returned below */ }
+        return segments;
+      };
+      const nodes = root.querySelectorAll('h1, h2, h3, h4, p, li, blockquote, pre, figure, img');
+      const blocks = [];
+      let wordCount = 0;
+      for (const el of nodes) {
+        if (blocks.length >= 600 || hiddenByReader(el) || el.closest(excluded)) continue;
+        const tag = el.tagName.toLowerCase();
+        if (tag === 'img' && el.closest('figure')) continue;
+        if (tag === 'p' && el.closest('li')) continue;
+        let text = String(el.innerText || el.alt || '').trim();
+        if (tag === 'img') {
+          const src = safeHref(el.currentSrc || el.src || el.getAttribute('src') || '');
+          const alt = String(el.alt || '').trim();
+          if (src) blocks.push({ tag: 'img', type: 'image', src, alt, text: alt });
+          continue;
+        }
+        if (tag === 'figure') {
+          const image = el.querySelector('img');
+          const src = image ? safeHref(image.currentSrc || image.src || image.getAttribute('src') || '') : '';
+          const caption = String(el.querySelector('figcaption')?.innerText || image?.alt || '').trim();
+          if (src) { blocks.push({ tag: 'figure', type: 'figure', src, alt: String(image?.alt || ''), text: caption }); continue; }
+        }
+        if (text.length < 2) continue;
+        text = text.slice(0, 5000);
+        const segments = segmentsFor(el);
+        const type = tag === 'blockquote' ? 'quote' : tag === 'pre' ? 'code' : tag === 'li' ? 'list-item' : 'text';
+        blocks.push({ tag, type, level: /^h[1-4]$/.test(tag) ? Number(tag.slice(1)) : undefined, text, segments });
+        wordCount += text.split(/\\s+/).filter(Boolean).length;
+      }
+      return {
+        title, url, siteName,
+        language: String(document.documentElement?.lang || ''),
+        wordCount,
+        readingMinutes: Math.max(1, Math.ceil(wordCount / 220)),
+        blocks
+      };
     })()`;
     try {
       const result = await wc.executeJavaScript(script, true);
-      return { ok: true, title: result?.title || '', url: result?.url || '', blocks: Array.isArray(result?.blocks) ? result.blocks : [] };
+      return {
+        ok: true,
+        title: result?.title || '',
+        url: result?.url || '',
+        siteName: result?.siteName || '',
+        language: result?.language || '',
+        wordCount: Number.isFinite(result?.wordCount) ? result.wordCount : 0,
+        readingMinutes: Number.isFinite(result?.readingMinutes) ? result.readingMinutes : null,
+        blocks: Array.isArray(result?.blocks) ? result.blocks : []
+      };
     } catch (err) {
       logger.error?.('[yayra:webview] reader extract failed', err);
       return { ok: false, reason: 'failed' };
@@ -1178,11 +1655,11 @@ function createWebviewBridge({
     }
   });
 
-  // ---- Chrome-style password capture / autofill routing -------------
-  // The autofill preload inside a page view sends on these channels; the
-  // sender is the VIEW's webContents, so locate its entry and forward to
-  // the shell window that owns the tab. Private tabs never forward
-  // captures (the vault refuses them anyway - defense in depth).
+  // ---- Chrome-style password autofill + email recall routing ---------
+  // The isolated page preload sends on these channels; the sender is the
+  // VIEW's webContents, so locate its entry and forward to the shell window
+  // that owns the tab. Private tabs never forward captures or receive saved
+  // email suggestions (defense in depth).
   function entryForViewSender(event) {
     const sender = event && event.sender;
     if (!sender) return null;
@@ -1205,6 +1682,25 @@ function createWebviewBridge({
       if (!entry || entry.isPrivate) return;
       sendTo(entry, 'autofill-form-detected', { url: String(payload.url || entry.lastUrl || '') });
     });
+    ipcMain.on(EMAIL_FIELD_FOCUSED_CHANNEL, (event, payload = {}) => {
+      const entry = entryForViewSender(event);
+      if (!entry || entry.isPrivate) return;
+      const url = String(payload?.url || entry.lastUrl || '');
+      if (!isHttpUrl(url)) return;
+      const currentUrl = entry.view?.webContents?.getURL?.() || entry.lastUrl || '';
+      if (isHttpUrl(currentUrl)) {
+        try { if (new URL(currentUrl).origin !== new URL(url).origin) return; } catch { return; }
+      }
+      sendTo(entry, 'email-field-focused', { url });
+    });
+    ipcMain.on(EMAIL_ADDRESS_CAPTURED_CHANNEL, (event, payload = {}) => {
+      const entry = entryForViewSender(event);
+      if (!entry || entry.isPrivate) return;
+      const email = sanitizeEmailAddress(payload?.email);
+      const url = String(payload?.url || entry.lastUrl || '');
+      if (!email || !isHttpUrl(url)) return;
+      sendTo(entry, 'email-address-captured', { email, url });
+    });
   }
 
   ipcMain.handle('yayra:webview-fill-credentials', (event, { tabId, username, password } = {}) => {
@@ -1218,6 +1714,28 @@ function createWebviewBridge({
       return { filled: true };
     } catch {
       return { filled: false };
+    }
+  });
+
+  ipcMain.handle('yayra:webview-suggest-email-addresses', (event, { tabId, emails } = {}) => {
+    const entry = views.get(viewKey(event, tabId));
+    if (!entry || entry.isPrivate) return { suggested: false, count: 0 };
+    const seen = new Set();
+    const safeEmails = (Array.isArray(emails) ? emails : [])
+      .map(sanitizeEmailAddress)
+      .filter((email) => {
+        if (!email) return false;
+        const key = email.toLocaleLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .slice(0, 25);
+    try {
+      entry.view.webContents.send(EMAIL_SUGGESTIONS_CHANNEL, { emails: safeEmails });
+      return { suggested: true, count: safeEmails.length };
+    } catch {
+      return { suggested: false, count: 0 };
     }
   });
 
@@ -1237,8 +1755,10 @@ module.exports = {
   secureSystemBrowserAuthUrl,
   decodeOpenExternalRequest,
   buildWebAuthnWatchdogScript,
+  buildGoogleSearchThinkingWatchdogScript,
   buildPointerThemeCss,
   buildPointerThemeScript,
+  buildPointerTextCursorScript,
   sanitizeBounds,
   buildBrowserUserAgent,
   buildContextMenuTemplate,

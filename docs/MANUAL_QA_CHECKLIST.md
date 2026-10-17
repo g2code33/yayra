@@ -2,7 +2,7 @@
 
 Everything in this list requires a real machine/device/account. Items are
 ordered so earlier failures invalidate later sections. The automated suite
-(`npm test`, 330+ tests) covers the logic behind all of this with mocks;
+(`npm test`) covers the logic behind all of this with mocks;
 this list is the reality check.
 
 ## 0. Build sanity (any dev machine)
@@ -38,6 +38,29 @@ this list is the reality check.
 - [ ] **iOS (real device):** SFSafariViewController flow, same checks.
 - [ ] Negative: wrong/unregistered redirect URI shows Google's error (not
   a hang); airplane-mode sign-in fails with a readable error.
+
+## 1a. Google account browsing inside Yayra (separate from app-level OAuth)
+
+- [ ] **Electron desktop:** enter `https://accounts.google.com/`, an account-
+  management URL, and `https://accounts.google.com/signin/v2/identifier` in
+  the address bar. Confirm each remains in the same Yayra tab and renders in
+  the native `WebContentsView` rather than being auto-sent to Chrome.
+- [ ] If Google starts an OAuth authorization flow from one of those pages,
+  confirm that the explicit OAuth request opens in the system browser. A
+  canceled top-level redirect must leave the source tab URL/history intact,
+  clear the loading indicator, and show the non-blocking handoff notice.
+  Returning from the system browser must not reset the Yayra tab or leave a
+  permanent spinner; do not assume its cookies/session transfer to Yayra.
+- [ ] **Android:** repeat account-home, management, and basic sign-in
+  navigation in the native in-app tab WebView. Confirm explicit OAuth routes
+  use the system browser and the source tab remains selected.
+- [ ] **Web/PWA:** verify the current open-in-new-tab fallback for Google
+  account pages that refuse iframe embedding; a web page cannot override the
+  remote site's frame policy.
+- [ ] Record the exact URL and Google response if interactive sign-in is
+  rejected inside the embedded view. Rendering an account page is not proof
+  that Google permits OAuth sign-in there; do not work around a provider
+  restriction by copying cookies or spoofing browser identity.
 
 ## 2. Update pipeline — live (per docs/RELEASE-PIPELINE.md)
 

@@ -18,6 +18,9 @@ export function buildContentSecurityPolicy() {
   return [
     `default-src 'self' ${scheme}`,
     `script-src 'self' ${scheme}`,
+    // The offline PDF.js worker normally runs from the same origin; blob:
+    // is also required for its cross-origin wrapper on file:// fallbacks.
+    `worker-src 'self' blob: ${scheme}`,
     `style-src 'self' 'unsafe-inline' ${scheme}`,
     `img-src ${imgSources.join(' ')}`,
     `connect-src ${connectSources.join(' ')}`,

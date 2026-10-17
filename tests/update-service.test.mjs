@@ -36,6 +36,20 @@ test('never offers a downgrade and reports ahead distinctly', async () => {
   assert.equal(state.reason, 'installed-newer-than-release-channel');
 });
 
+test('up-to-date checks are logged as up_to_date rather than not_available', async () => {
+  const lines = [];
+  const current = { ...manifest, latest: { ...manifest.latest, linux: '1.0.44' } };
+  const service = new UpdateService({
+    target: 'linux', installedVersion: '1.0.44',
+    fetchImpl: async () => jsonResponse(current),
+    logger: (line) => lines.push(line)
+  });
+  const state = await service.check({ manual: true });
+  assert.equal(state.status, 'upToDate');
+  assert.ok(lines.some((line) => line.startsWith('[updates] up_to_date target=linux state=upToDate installed=1.0.44 available=1.0.44')));
+  assert.equal(lines.some((line) => line.includes('[updates] not_available')), false);
+});
+
 test('offline state is unknown with lastSeenAt and not upToDate', async () => {
   let online = true;
   const storage = new MemoryStorage();

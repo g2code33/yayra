@@ -50,6 +50,8 @@ const api = {
       pointerSize: pointer && pointer.size
     }),
     setPointerTheme: (tabId, theme, size) => ipcRenderer.invoke('yayra:webview-set-pointer-theme', { tabId, theme, size }),
+    setBackgroundThrottling: (enabled) => ipcRenderer.invoke('yayra:webview-set-background-throttling', { enabled }),
+    taskTabs: () => ipcRenderer.invoke('yayra:webview-list-task-tabs'),
     setBounds: (tabId, bounds) => ipcRenderer.invoke('yayra:webview-set-bounds', { tabId, bounds }),
     setVisible: (tabId, visible, options = {}) => ipcRenderer.invoke('yayra:webview-set-visible', { tabId, visible, capture: Boolean(options && options.capture) }),
     // Snapshot the live page WITHOUT hiding it - lets the renderer paint
@@ -68,6 +70,9 @@ const api = {
     destroy: (tabId) => ipcRenderer.invoke('yayra:webview-destroy', { tabId }),
     // Autofill saved credentials into the page's login form (Chrome-style).
     fillCredentials: (tabId, { username, password } = {}) => ipcRenderer.invoke('yayra:webview-fill-credentials', { tabId, username, password }),
+    // Suggest this profile's saved email addresses in a focused email field.
+    // The main process rejects private-tab requests and validates the list.
+    suggestEmailAddresses: (tabId, emails = []) => ipcRenderer.invoke('yayra:webview-suggest-email-addresses', { tabId, emails }),
     // Menu > More tools: REAL page-level actions on the native engine.
     openDevTools: (tabId) => ipcRenderer.invoke('yayra:webview-open-devtools', { tabId }),
     print: (tabId) => ipcRenderer.invoke('yayra:webview-print', { tabId }),
@@ -185,13 +190,13 @@ const api = {
     }
   },
   // Desktop-only system facilities: real process metrics for the task
-  // manager and real desktop shortcuts for "Create shortcut...".
+  // manager and real desktop shortcuts for "Create desktop shortcut...".
   system: {
     appMetrics: () => ipcRenderer.invoke('yayra:app-metrics'),
     createShortcut: ({ url, title } = {}) => ipcRenderer.invoke('yayra:create-shortcut', { url, title }),
     // Chrome-style "Install page as app...": real launcher entries that
     // reopen the site in its own minimal app window (yayra --app=<url>).
-    installPageAsApp: ({ url, title } = {}) => ipcRenderer.invoke('yayra:install-page-as-app', { url, title }),
+    installPageAsApp: ({ url, title, nameOverride } = {}) => ipcRenderer.invoke('yayra:install-page-as-app', { url, title, nameOverride }),
     installPageAsAppPreview: ({ url, title } = {}) => ipcRenderer.invoke('yayra:install-page-as-app-preview', { url, title }),
     // Local document workspace: open ONE user-picked PDF; the renderer
     // receives only the bytes (never a filesystem path).

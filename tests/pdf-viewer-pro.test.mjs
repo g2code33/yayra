@@ -258,6 +258,13 @@ test('SHELL INTEGRATION: the pro toolbar (jump-to-page, fit, rotate, night, outl
     const rows = Array.from(vp.querySelectorAll('.fb-doc-match-row'));
     assert.equal(rows.length, 2, 'the match list shows every hit');
     assert.match(rows[0].textContent, /p\.1/);
+
+    // PDF text is untrusted input: render snippets as text, never HTML.
+    shell.getActiveTab().docState.matches[0].snippet = '<img src=x onerror=alert(1)>';
+    shell._activeDocViewer.sync();
+    const safeRow = vp.querySelector('.fb-doc-match-row');
+    assert.equal(safeRow.querySelector('img'), null, 'PDF content cannot inject elements into the browser chrome');
+    assert.match(safeRow.textContent, /<img src=x onerror=alert\(1\)>/, 'the snippet remains visible as literal text');
   } finally {
     shell.destroy();
     delete globalThis.localStorage;

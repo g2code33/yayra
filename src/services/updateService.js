@@ -129,17 +129,17 @@ export class UpdateService {
       return this.#transition({ ...base, status: 'available', version: latest || minimum, force: true, download, reason: 'below-min-supported' }, 'available');
     }
     if (!latest) {
-      return this.#transition({ ...base, status: 'upToDate', reason: 'target-not-in-manifest' }, 'not_available');
+      return this.#transition({ ...base, status: 'upToDate', reason: 'target-not-in-manifest' }, 'target_not_in_manifest');
     }
     const versionCompare = compareSemver(this.installedVersion, latest);
     if (versionCompare > 0) {
-      return this.#transition({ ...base, status: 'ahead', version: latest, reason: 'installed-newer-than-release-channel' }, 'not_available');
+      return this.#transition({ ...base, status: 'ahead', version: latest, reason: 'installed-newer-than-release-channel' }, 'installed_ahead');
     }
     if (versionCompare === 0) {
-      return this.#transition({ ...base, status: 'upToDate', version: latest }, 'not_available');
+      return this.#transition({ ...base, status: 'upToDate', version: latest }, 'up_to_date');
     }
     if (!this.#rolloutEligible(manifest.rollout || {})) {
-      return this.#transition({ ...base, status: 'upToDate', version: latest, reason: 'rollout-not-eligible' }, 'not_available');
+      return this.#transition({ ...base, status: 'upToDate', version: latest, reason: 'rollout-not-eligible' }, 'rollout_pending');
     }
     return this.#transition({ ...base, status: 'available', version: latest, force: false, download }, 'available');
   }

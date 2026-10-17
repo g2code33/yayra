@@ -4,15 +4,36 @@
 
 This feature gives **Yayra itself** a real, app-level Google identity (name,
 email, profile picture), so Yayra's own UI can show "Signed in as ..." /
-"Sign out". It is **not** a way to use Gmail, Drive, or any other Google
-service logged-in *inside* Yayra's embedded browsing view — Google actively
-detects and blocks sign-in inside any embedded browser surface (WebView,
-WebContentsView, iframe, etc.) as an anti-phishing measure. See
-[Google's own policy](https://developers.google.com/identity/protocols/oauth2/policies#embedded-webviews).
-Yayra does not attempt to bypass that. `electron/webviewBridge.cjs` sends
-Google sign-in/OAuth endpoints to the user's real system browser, while
-ordinary Google pages and Search remain in the native in-app view where the
-platform allows it. System-browser cookies are not copied into Yayra.
+"Sign out". It is **not** a way to share the system browser's Google session
+with Gmail, Drive, or other pages opened in Yayra. Google documents a
+restriction on OAuth authorization requests in embedded user agents (see
+[Google's policy](https://developers.google.com/identity/protocols/oauth2/policies#embedded-webviews)); it does not classify every `accounts.google.com`
+page as an OAuth endpoint. Yayra hands off known explicit OAuth routes to the
+system browser, while account home, management, and basic sign-in pages are
+allowed to render in the native in-app view. Google may still reject or alter
+an interactive sign-in in an embedded view, so rendering those pages is not a
+promise that the login will complete. Yayra does not bypass provider policy,
+copy system-browser cookies, or spoof browser identity.
+
+## Embedded Google browsing is separate from Yayra's own sign-in
+
+On Electron, `WebContentsView` and on Android, Yayra's native tab `WebView` can
+navigate to `https://accounts.google.com/`, account-management pages, and basic
+routes such as `/signin/v2/identifier`. The current handoff classifier only
+matches these known OAuth paths on the exact `accounts.google.com` host:
+`/o/oauth2/...`, `/oauth2/...`, `/signin/oauth/...`, and `/gsi/select/...`.
+Those authorization routes are opened in the user's system browser; the
+classifier is intentionally not a complete inventory of Google's internal
+URLs and may need maintenance if Google changes its routes. If a basic sign-in
+page later redirects into an OAuth authorization flow, that explicit flow is
+still handed off.
+
+A plain web/PWA page cannot override a remote site's anti-framing headers, so
+Google account pages that refuse iframes use the existing open-in-new-tab
+fallback there. Android's native tab view and Electron's native content view
+are not iframes, but Google can still enforce its embedded-user-agent OAuth
+policy. In all cases the browser profile/cookies are separate; no Chrome
+session is imported into Yayra.
 
 The setup and architecture are documented here for Electron desktop, Web/PWA,
 and Android/iOS. The original implementation started with desktop; all three

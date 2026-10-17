@@ -713,13 +713,16 @@ function registerIpcBridges() {
       const metrics = app.getAppMetrics() || [];
       return {
         ok: true,
+        sampledAt: Date.now(),
         processes: metrics.map((m) => ({
           type: m.type || 'unknown',
           label: m.name || m.serviceName || m.type || 'process',
           pid: m.pid ?? null,
           cpu: m.cpu && Number.isFinite(m.cpu.percentCPUUsage) ? m.cpu.percentCPUUsage : null,
-          memoryMB: m.memory && Number.isFinite(m.memory.workingSetSize)
-            ? Math.round(m.memory.workingSetSize / 1024)
+          // Electron reports workingSetSize in bytes. Convert it to MiB;
+          // the renderer labels the same binary unit explicitly.
+          memoryMiB: m.memory && Number.isFinite(m.memory.workingSetSize)
+            ? Math.round((m.memory.workingSetSize / (1024 * 1024)) * 10) / 10
             : null
         }))
       };
@@ -912,7 +915,7 @@ function registerIpcBridges() {
     }
   });
 
-  // Menu > Save and share > Create shortcut...: a REAL shortcut file on
+  // Menu > Save and share > Create desktop shortcut...: a REAL shortcut file on
   // the user's desktop that opens the page in the default browser
   // (.desktop on Linux, .url on Windows, .webloc on macOS).
   ipcMain.handle('yayra:create-shortcut', (_event, { url, title } = {}) => {
@@ -1125,11 +1128,11 @@ function createWindow() {
     width: 1200,
     height: 800,
     // No OS title bar ("yayra" text) and no File/Edit/View/Window menu
-    // block: Yayra draws its OWN top chrome - the tab strip doubles as the
-    // draggable title bar, shows the brand wordmark image, and renders
-    // real minimize/maximize/close buttons via the windowControls IPC
-    // bridge (see registerIpcBridges + BrowserShell.renderDesktopLayout).
-    // On macOS the native traffic lights are kept, inset over our chrome.
+    // block: Yayra draws its OWN top chrome, with a dedicated window-drag
+    // handle and real minimize/maximize/close buttons via the windowControls
+    // IPC bridge (see registerIpcBridges + BrowserShell.renderDesktopLayout).
+    // The rest of the tab strip stays interactive instead of behaving like
+    // a native title bar. On macOS the native traffic lights are kept, inset.
     ...(process.platform === 'darwin' ? { titleBarStyle: 'hiddenInset' } : { frame: false }),
     // Dark surface behind EVERYTHING. Electron's default window background
     // is white, and every time the native page view hides/moves (menu
