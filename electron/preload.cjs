@@ -68,6 +68,9 @@ const api = {
     destroy: (tabId) => ipcRenderer.invoke('yayra:webview-destroy', { tabId }),
     // Autofill saved credentials into the page's login form (Chrome-style).
     fillCredentials: (tabId, { username, password } = {}) => ipcRenderer.invoke('yayra:webview-fill-credentials', { tabId, username, password }),
+    // Suggest this profile's saved email addresses in a focused email field.
+    // The main process rejects private-tab requests and validates the list.
+    suggestEmailAddresses: (tabId, emails = []) => ipcRenderer.invoke('yayra:webview-suggest-email-addresses', { tabId, emails }),
     // Menu > More tools: REAL page-level actions on the native engine.
     openDevTools: (tabId) => ipcRenderer.invoke('yayra:webview-open-devtools', { tabId }),
     print: (tabId) => ipcRenderer.invoke('yayra:webview-print', { tabId }),

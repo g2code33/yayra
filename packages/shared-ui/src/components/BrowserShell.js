@@ -27,6 +27,9 @@ import {
   createHistoryRepo,
   createBookmarksRepo,
   createSettingsRepo,
+  createEmailAddressesRepo,
+  DEFAULT_BOOKMARK_GROUPS,
+  DEFAULT_BOOKMARK_GROUP_ID,
   createWheelRepo,
   createShortcutsRepo,
   createSessionRepo
@@ -134,6 +137,7 @@ export class BrowserShell {
     this.navigationController = options.navigationController || null;
     this.historyRepo = options.historyRepo || null;
     this.bookmarksRepo = options.bookmarksRepo || null;
+    this.emailAddressesRepo = options.emailAddressesRepo || null;
     this.downloadsRepo = options.downloadsRepo || null;
     this.settingsRepo = options.settingsRepo || null;
     this.privacyManager = options.privacyManager || null;
@@ -174,6 +178,7 @@ export class BrowserShell {
       this.profileStorage = scoped;
       if (!this.historyRepo) this.historyRepo = createHistoryRepo(scoped);
       if (!this.bookmarksRepo) this.bookmarksRepo = createBookmarksRepo(scoped);
+      if (!this.emailAddressesRepo) this.emailAddressesRepo = createEmailAddressesRepo(scoped);
       if (!this.settingsRepo) this.settingsRepo = createSettingsRepo(scoped);
       if (!this.storageAdapter) this.storageAdapter = scoped;
       this.wheelRepo = options.wheelRepo || createWheelRepo(scoped);
@@ -186,6 +191,10 @@ export class BrowserShell {
       this.sessionRepo = options.sessionRepo || null;
     }
 
+    if (!this.emailAddressesRepo && this.storageAdapter
+      && typeof this.storageAdapter.get === 'function' && typeof this.storageAdapter.set === 'function') {
+      this.emailAddressesRepo = createEmailAddressesRepo(this.storageAdapter);
+    }
     this.passwordManager = options.passwordManager || new PasswordManager(this.storageAdapter);
     this.extensionManager = options.extensionManager || new ExtensionManager(this.storageAdapter);
     // Passkey for the Yayra account: biometric/PIN gate for revealing
@@ -265,6 +274,11 @@ export class BrowserShell {
       closedTabsHistory: [],
       historyItems: [],
       bookmarksItems: [],
+      bookmarkGroups: DEFAULT_BOOKMARK_GROUPS.map((group) => ({ ...group })),
+      bookmarkDefaultGroupId: DEFAULT_BOOKMARK_GROUP_ID,
+      bookmarksActiveGroupId: DEFAULT_BOOKMARK_GROUP_ID,
+      // Profile-scoped email addresses saved from submitted web forms.
+      rememberedEmails: [],
       // Full previous-session snapshot, kept separately from the compact
       // five-item Continue prompt so a group click can reopen every member
       // recorded in that session.
@@ -1021,9 +1035,14 @@ export class BrowserShell {
 
     if (this.bookmarksRepo && typeof this.bookmarksRepo.getAllBookmarks === 'function') {
       try {
-        this.state.bookmarksItems = await this.bookmarksRepo.getAllBookmarks();
+        await this.refreshBookmarksState();
       } catch (err) {
         console.warn('Failed to load bookmarks in BrowserShell:', err);
+      }
+    }
+    if (this.emailAddressesRepo && typeof this.emailAddressesRepo.getAllEmails === 'function') {
+      try { await this.refreshEmailAddressesState(); } catch (err) {
+        console.warn('Failed to load saved email addresses in BrowserShell:', err);
       }
     }
 
@@ -3301,6 +3320,12 @@ export class BrowserShell {
       case 'autofill-form-detected':
         this.handleAutofillFormDetected(tab, evt);
         break;
+      case 'email-field-focused':
+        this.handleEmailFieldFocused(tab, evt);
+        break;
+      case 'email-address-captured':
+        this.rememberEmailAddress(evt.email, tab, evt.url).catch(() => {});
+        break;
       case 'new-window-request':
         if (evt.url) {
           this.createNewTab();
@@ -3315,6 +3340,92 @@ export class BrowserShell {
   /* -------------------------------------------------------------
    * PASSWORD VAULT: Chrome-style remember prompt, autofill, passkeys
    * ----------------------------------------------------------- */
+
+  async refreshBookmarksState() {
+    if (this.bookmarksRepo && typeof this.bookmarksRepo.getAllBookmarks === 'function') {
+      this.state.bookmarksItems = await this.bookmarksRepo.getAllBookmarks() || [];
+    }
+    if (this.bookmarksRepo && typeof this.bookmarksRepo.getGroups === 'function') {
+      const groups = await this.bookmarksRepo.getGroups();
+      if (Array.isArray(groups) && groups.length) this.state.bookmarkGroups = groups;
+    }
+    if (this.bookmarksRepo && typeof this.bookmarksRepo.getDefaultGroupId === 'function') {
+      this.state.bookmarkDefaultGroupId = await this.bookmarksRepo.getDefaultGroupId() || DEFAULT_BOOKMARK_GROUP_ID;
+    }
+    const groups = Array.isArray(this.state.bookmarkGroups) && this.state.bookmarkGroups.length
+      ? this.state.bookmarkGroups
+      : DEFAULT_BOOKMARK_GROUPS;
+    if (!groups.some((group) => group.id === this.state.bookmarkDefaultGroupId)) {
+      this.state.bookmarkDefaultGroupId = DEFAULT_BOOKMARK_GROUP_ID;
+    }
+    if (!groups.some((group) => group.id === this.state.bookmarksActiveGroupId)) {
+      this.state.bookmarksActiveGroupId = this.state.bookmarkDefaultGroupId;
+    }
+    return this.state.bookmarksItems;
+  }
+
+  async refreshEmailAddressesState() {
+    if (!this.emailAddressesRepo || typeof this.emailAddressesRepo.getAllEmails !== 'function') return [];
+    this.state.rememberedEmails = await this.emailAddressesRepo.getAllEmails() || [];
+    return this.state.rememberedEmails;
+  }
+
+  async pushEmailSuggestionsToOpenTabs() {
+    const native = this.nativeWebview;
+    if (!native || typeof native.suggestEmailAddresses !== 'function') return;
+    const values = (Array.isArray(this.state.rememberedEmails) ? this.state.rememberedEmails : [])
+      .map((item) => typeof item === 'string' ? item : item?.email)
+      .filter((value) => typeof value === 'string');
+    const pending = this.state.tabs
+      .filter((tab) => !tab.isPrivate && /^https?:\/\//i.test(String(tab.url || '')))
+      .map((tab) => Promise.resolve(native.suggestEmailAddresses(tab.id, values)).catch(() => {}));
+    await Promise.all(pending);
+  }
+
+  async rememberEmailAddress(email, tab = null, pageUrl = '') {
+    if (!this.emailAddressesRepo || typeof this.emailAddressesRepo.addEmail !== 'function' || !tab || tab.isPrivate) return null;
+    const url = String(pageUrl || tab.url || '');
+    let parsed;
+    try { parsed = new URL(url); } catch { return null; }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    const saved = await this.emailAddressesRepo.addEmail(email);
+    if (!saved) return null;
+    try { await this.refreshEmailAddressesState(); } catch { /* the stored address remains saved */ }
+    try { await this.pushEmailSuggestionsToOpenTabs(); } catch { /* a suggestion refresh must not block form handling */ }
+    const active = this.getActiveTab();
+    if (active?.url === 'yayra://passwords') this.requestRender();
+    return saved;
+  }
+
+  async handleEmailFieldFocused(tab, evt = {}) {
+    if (!tab || tab.isPrivate || !this.emailAddressesRepo) return;
+    const native = this.nativeWebview;
+    if (!native || typeof native.suggestEmailAddresses !== 'function') return;
+    const url = String(evt.url || tab.url || '');
+    let pageOrigin;
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return;
+      pageOrigin = parsed.origin;
+    } catch { return; }
+    // Ignore a stale focus event from the document that was just navigated
+    // away from. This also prevents another page from requesting this tab's
+    // profile data during a navigation race.
+    try {
+      const current = new URL(tab.url || '');
+      if ((current.protocol === 'http:' || current.protocol === 'https:') && current.origin !== pageOrigin) return;
+    } catch { /* the first navigation event may not have reached the shell */ }
+    let emails = [];
+    try {
+      emails = typeof this.emailAddressesRepo.getAllEmails === 'function'
+        ? await this.emailAddressesRepo.getAllEmails()
+        : [];
+    } catch { return; }
+    const values = (Array.isArray(emails) ? emails : [])
+      .map((item) => typeof item === 'string' ? item : item?.email)
+      .filter((value) => typeof value === 'string');
+    try { await native.suggestEmailAddresses(tab.id, values); } catch { /* page may have navigated away */ }
+  }
 
   async refreshVaultState() {
     if (this.passwordManager) {
@@ -3361,6 +3472,9 @@ export class BrowserShell {
     try { origin = new URL(url).origin; } catch { return; }
     // Never offer to save Yayra's own internal pages.
     if (origin.startsWith('yayra://')) return;
+    // Login identifiers are useful email suggestions too. Save only to this
+    // profile, and never when the source tab is Incognito (guarded above).
+    try { await this.rememberEmailAddress(username, tab, url); } catch { /* email recall must not block password handling */ }
     // Smart profile separation: an email-shaped sign-in on a real page is
     // the signal Chrome uses for "someone else is using this browser".
     this.handleAccountSignal(username, { source: 'site-signin' });
@@ -5089,90 +5203,281 @@ export class BrowserShell {
   renderInternalBookmarksPage(viewport) {
     const page = document.createElement('div');
     page.className = 'fb-internal-page';
+    const groups = Array.isArray(this.state.bookmarkGroups) && this.state.bookmarkGroups.length
+      ? this.state.bookmarkGroups
+      : DEFAULT_BOOKMARK_GROUPS;
+    const defaultGroupId = groups.some((group) => group.id === this.state.bookmarkDefaultGroupId)
+      ? this.state.bookmarkDefaultGroupId
+      : DEFAULT_BOOKMARK_GROUP_ID;
+    const activeGroupId = groups.some((group) => group.id === this.state.bookmarksActiveGroupId)
+      ? this.state.bookmarksActiveGroupId
+      : defaultGroupId;
+    this.state.bookmarkDefaultGroupId = defaultGroupId;
+    this.state.bookmarksActiveGroupId = activeGroupId;
+    const allItems = Array.isArray(this.state.bookmarksItems) ? this.state.bookmarksItems : [];
+    const q = String(this.state.bookmarksSearchQuery || '').toLocaleLowerCase().trim();
+    const groupItems = allItems.filter((bookmark) => (bookmark.groupId || DEFAULT_BOOKMARK_GROUP_ID) === activeGroupId);
+    const items = groupItems.filter((bookmark) => !q
+      || String(bookmark.title || '').toLocaleLowerCase().includes(q)
+      || String(bookmark.url || '').toLocaleLowerCase().includes(q));
 
-    const q = (this.state.bookmarksSearchQuery || '').toLowerCase().trim();
-    const items = this.state.bookmarksItems.filter((b) => !q || (b.title && b.title.toLowerCase().includes(q)) || (b.url && b.url.toLowerCase().includes(q)));
+    const container = document.createElement('div');
+    container.className = 'fb-internal-container';
+    const header = document.createElement('header');
+    header.className = 'fb-internal-header';
+    const titleGroup = document.createElement('div');
+    titleGroup.className = 'fb-internal-title-group';
+    const titleIcon = document.createElement('span');
+    titleIcon.className = 'fb-internal-icon';
+    titleIcon.innerHTML = Icons.bookmark;
+    const title = document.createElement('h1');
+    title.className = 'fb-internal-title';
+    title.textContent = 'Bookmarks';
+    titleGroup.appendChild(titleIcon);
+    titleGroup.appendChild(title);
 
-    page.innerHTML = `
-      <div class="fb-internal-container">
-        <header class="fb-internal-header">
-          <div class="fb-internal-title-group">
-            <span class="fb-internal-icon">${Icons.bookmark}</span>
-            <h1 class="fb-internal-title">Bookmarks</h1>
-          </div>
-          <div style="display:flex; align-items:center; gap:12px;">
-            <div class="fb-internal-search">
-              <span class="fb-internal-search-icon">${Icons.search}</span>
-              <input type="text" id="fb-in-bm-search" placeholder="Search bookmarks" value="${this.state.bookmarksSearchQuery || ''}" />
-            </div>
-            <button class="fb-btn fb-btn-primary fb-in-add-bm-btn">${Icons.plus} Add Bookmark</button>
-          </div>
-        </header>
+    const headerActions = document.createElement('div');
+    headerActions.className = 'fb-bookmark-header-actions';
+    const search = document.createElement('div');
+    search.className = 'fb-internal-search';
+    const searchIcon = document.createElement('span');
+    searchIcon.className = 'fb-internal-search-icon';
+    searchIcon.innerHTML = Icons.search;
+    const searchInput = document.createElement('input');
+    searchInput.type = 'text';
+    searchInput.id = 'fb-in-bm-search';
+    searchInput.placeholder = 'Search bookmarks';
+    searchInput.value = this.state.bookmarksSearchQuery || '';
+    search.appendChild(searchIcon);
+    search.appendChild(searchInput);
+    const addButton = document.createElement('button');
+    addButton.className = 'fb-btn fb-btn-primary fb-in-add-bm-btn';
+    addButton.innerHTML = `${Icons.plus} Add Bookmark`;
+    headerActions.appendChild(search);
+    headerActions.appendChild(addButton);
+    header.appendChild(titleGroup);
+    header.appendChild(headerActions);
+    container.appendChild(header);
 
-        <div class="fb-bookmarks-folder-bar">
-          <button class="fb-folder-pill active">Bookmarks Bar</button>
-          <button class="fb-folder-pill">Mobile Bookmarks</button>
-          <button class="fb-folder-pill">Other Bookmarks</button>
-        </div>
+    const folderBar = document.createElement('div');
+    folderBar.className = 'fb-bookmarks-folder-bar';
+    for (const group of groups) {
+      const pill = document.createElement('button');
+      pill.className = `fb-folder-pill${group.id === activeGroupId ? ' active' : ''}`;
+      pill.type = 'button';
+      pill.dataset.groupId = group.id;
+      pill.setAttribute('aria-pressed', String(group.id === activeGroupId));
+      pill.textContent = group.id === defaultGroupId ? `${group.name} · Default` : group.name;
+      pill.addEventListener('click', () => {
+        this.state.bookmarksActiveGroupId = group.id;
+        this.render();
+      });
+      folderBar.appendChild(pill);
+    }
+    container.appendChild(folderBar);
 
-        <div class="fb-items-grid">
-          ${items.length > 0 ? items.map((bm) => `
-            <div class="fb-library-card" data-url="${bm.url}" data-id="${bm.id}">
-              <div class="fb-card-header">
-                <span class="fb-card-icon">${Icons.bookmark}</span>
-                <span class="fb-card-title">${bm.title || bm.url}</span>
-              </div>
-              <span class="fb-card-url">${bm.url}</span>
-              <div class="fb-card-actions">
-                <button class="fb-btn fb-btn-secondary fb-in-bm-open" data-url="${bm.url}">Open</button>
-                <button class="fb-btn fb-btn-secondary fb-in-bm-del" data-url="${bm.url}">${Icons.trash}</button>
-              </div>
-            </div>
-          `).join('') : '<div class="fb-empty-state">No bookmarks found. Click the star icon on any page to bookmark it.</div>'}
-        </div>
-      </div>
-    `;
-
-    const searchInput = page.querySelector('#fb-in-bm-search');
-    searchInput?.addEventListener('input', (e) => {
-      this.state.bookmarksSearchQuery = e.target.value;
+    const groupActions = document.createElement('div');
+    groupActions.className = 'fb-bookmark-group-actions';
+    const currentGroupLabel = document.createElement('span');
+    currentGroupLabel.className = 'fb-bookmark-default-label';
+    const defaultGroup = groups.find((group) => group.id === defaultGroupId);
+    currentGroupLabel.textContent = `New bookmarks default to ${defaultGroup?.name || 'Bookmarks Bar'}.`;
+    const groupButtons = document.createElement('div');
+    groupButtons.className = 'fb-bookmark-group-buttons';
+    const setDefaultButton = document.createElement('button');
+    setDefaultButton.className = 'fb-btn fb-btn-secondary fb-in-bm-set-default';
+    setDefaultButton.type = 'button';
+    setDefaultButton.textContent = activeGroupId === defaultGroupId ? 'Default group' : 'Make default for new bookmarks';
+    setDefaultButton.disabled = activeGroupId === defaultGroupId || typeof this.bookmarksRepo?.setDefaultGroup !== 'function';
+    setDefaultButton.addEventListener('click', async () => {
+      if (typeof this.bookmarksRepo?.setDefaultGroup !== 'function') return;
+      const result = await this.bookmarksRepo.setDefaultGroup(activeGroupId);
+      if (!result?.ok) {
+        this.showTransientNotice('Could not change the default bookmark group.');
+        return;
+      }
+      await this.refreshBookmarksState();
+      this.render();
+      this.showTransientNotice(`New bookmarks will go to ${groups.find((group) => group.id === activeGroupId)?.name || 'that group'}.`);
+    });
+    const newGroupButton = document.createElement('button');
+    newGroupButton.className = 'fb-btn fb-btn-secondary fb-in-bm-new-group';
+    newGroupButton.type = 'button';
+    newGroupButton.textContent = 'New group';
+    newGroupButton.disabled = typeof this.bookmarksRepo?.createGroup !== 'function';
+    newGroupButton.addEventListener('click', async () => {
+      if (typeof this.bookmarksRepo?.createGroup !== 'function') return;
+      const name = await this._textPromptDialog({
+        title: 'Create bookmark group',
+        description: 'Keep related bookmarks together. You can choose this group as the default for new bookmarks.',
+        placeholder: 'e.g. Work, Research, Shopping',
+        initialValue: ''
+      });
+      if (name === null) return;
+      const result = await this.bookmarksRepo.createGroup(name);
+      if (!result?.ok) {
+        this.showTransientNotice(result?.reason === 'duplicate-name'
+          ? 'A bookmark group with that name already exists.'
+          : 'Enter a name for the new bookmark group.');
+        return;
+      }
+      await this.refreshBookmarksState();
+      this.state.bookmarksActiveGroupId = result.group.id;
       this.render();
     });
-
-    page.querySelector('.fb-in-add-bm-btn')?.addEventListener('click', async () => {
-      const url = prompt('Enter Bookmark URL:', 'https://');
-      const title = prompt('Enter Bookmark Title:', 'New Bookmark');
-      if (url && this.bookmarksRepo) {
-        await this.bookmarksRepo.addBookmark({ url, title });
-        this.state.bookmarksItems = await this.bookmarksRepo.getAllBookmarks();
-        this.render();
+    const activeGroup = groups.find((group) => group.id === activeGroupId);
+    const removeGroupButton = document.createElement('button');
+    removeGroupButton.className = 'fb-btn fb-btn-secondary fb-in-bm-remove-group';
+    removeGroupButton.type = 'button';
+    removeGroupButton.textContent = 'Remove group';
+    removeGroupButton.disabled = Boolean(activeGroup?.builtIn) || typeof this.bookmarksRepo?.removeGroup !== 'function';
+    removeGroupButton.addEventListener('click', async () => {
+      if (removeGroupButton.disabled || typeof this.bookmarksRepo?.removeGroup !== 'function') return;
+      const confirmed = typeof confirm !== 'function' || confirm(`Remove “${activeGroup?.name || 'this group'}”? Its bookmarks will be kept in the default group.`);
+      if (!confirmed) return;
+      const result = await this.bookmarksRepo.removeGroup(activeGroupId);
+      if (!result?.ok) {
+        this.showTransientNotice('Could not remove that bookmark group.');
+        return;
       }
+      await this.refreshBookmarksState();
+      this.render();
+      this.showTransientNotice('Group removed; its bookmarks were kept.');
     });
+    groupButtons.appendChild(setDefaultButton);
+    groupButtons.appendChild(newGroupButton);
+    groupButtons.appendChild(removeGroupButton);
+    groupActions.appendChild(currentGroupLabel);
+    groupActions.appendChild(groupButtons);
+    container.appendChild(groupActions);
 
-    page.querySelectorAll('.fb-in-bm-open').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const url = btn.dataset.url;
-        if (url) this.navigateActiveTab(url);
-      });
-    });
-
-    page.querySelectorAll('.fb-in-bm-del').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        const url = btn.dataset.url;
-        if (this.bookmarksRepo && url) {
-          if (typeof this.bookmarksRepo.removeBookmarkByUrl === 'function') {
-            await this.bookmarksRepo.removeBookmarkByUrl(url);
-          } else if (typeof this.bookmarksRepo.removeBookmark === 'function') {
-            await this.bookmarksRepo.removeBookmark(url);
-          }
-          if (typeof this.bookmarksRepo.getAllBookmarks === 'function') {
-            this.state.bookmarksItems = await this.bookmarksRepo.getAllBookmarks();
-          }
-          this.render();
+    const grid = document.createElement('div');
+    grid.className = 'fb-items-grid';
+    const emptyState = document.createElement('div');
+    emptyState.className = 'fb-empty-state fb-bookmarks-empty-state';
+    emptyState.textContent = q
+      ? 'No bookmarks match that search in this group.'
+      : 'No bookmarks in this group yet. Star a page or use Add Bookmark to save one here.';
+    emptyState.style.display = items.length ? 'none' : '';
+    grid.appendChild(emptyState);
+    for (const bookmark of groupItems) {
+      const card = document.createElement('div');
+      card.className = 'fb-library-card';
+      card.dataset.url = bookmark.url || '';
+      card.dataset.id = bookmark.id || '';
+      card.dataset.searchText = `${bookmark.title || ''} ${bookmark.url || ''}`.toLocaleLowerCase();
+      if (q && !card.dataset.searchText.includes(q)) card.style.display = 'none';
+      const cardHeader = document.createElement('div');
+      cardHeader.className = 'fb-card-header';
+      const cardIcon = document.createElement('span');
+      cardIcon.className = 'fb-card-icon';
+      cardIcon.innerHTML = Icons.bookmark;
+      const cardTitle = document.createElement('span');
+      cardTitle.className = 'fb-card-title';
+      cardTitle.textContent = bookmark.title || bookmark.url || 'Bookmark';
+      cardHeader.appendChild(cardIcon);
+      cardHeader.appendChild(cardTitle);
+      const cardUrl = document.createElement('span');
+      cardUrl.className = 'fb-card-url';
+      cardUrl.textContent = bookmark.url || '';
+      const moveLabel = document.createElement('label');
+      moveLabel.className = 'fb-bookmark-move-label';
+      moveLabel.textContent = 'Group';
+      const moveSelect = document.createElement('select');
+      moveSelect.className = 'fb-bookmark-move-select fb-in-bm-move';
+      moveSelect.dataset.id = bookmark.id || '';
+      moveSelect.setAttribute('aria-label', `Move ${bookmark.title || bookmark.url || 'bookmark'} to group`);
+      for (const group of groups) {
+        const option = document.createElement('option');
+        option.value = group.id;
+        option.textContent = group.name;
+        option.selected = group.id === (bookmark.groupId || DEFAULT_BOOKMARK_GROUP_ID);
+        moveSelect.appendChild(option);
+      }
+      moveLabel.appendChild(moveSelect);
+      moveSelect.addEventListener('change', async (event) => {
+        const targetGroupId = event.target.value;
+        if (typeof this.bookmarksRepo?.moveBookmark !== 'function') return;
+        const result = await this.bookmarksRepo.moveBookmark(bookmark.id || bookmark.url, targetGroupId);
+        if (!result?.ok) {
+          this.showTransientNotice('Could not move that bookmark.');
+          return;
         }
+        await this.refreshBookmarksState();
+        this.render();
       });
-    });
+      const cardActions = document.createElement('div');
+      cardActions.className = 'fb-card-actions';
+      const openButton = document.createElement('button');
+      openButton.className = 'fb-btn fb-btn-secondary fb-in-bm-open';
+      openButton.type = 'button';
+      openButton.textContent = 'Open';
+      openButton.dataset.url = bookmark.url || '';
+      openButton.addEventListener('click', () => {
+        if (bookmark.url) this.navigateActiveTab(bookmark.url);
+      });
+      const removeButton = document.createElement('button');
+      removeButton.className = 'fb-btn fb-btn-secondary fb-in-bm-del';
+      removeButton.type = 'button';
+      removeButton.title = 'Remove bookmark';
+      removeButton.setAttribute('aria-label', `Remove ${bookmark.title || bookmark.url || 'bookmark'}`);
+      removeButton.innerHTML = Icons.trash;
+      removeButton.dataset.url = bookmark.url || '';
+      removeButton.addEventListener('click', async () => {
+        if (typeof this.bookmarksRepo?.removeBookmarkByUrl === 'function') {
+          await this.bookmarksRepo.removeBookmarkByUrl(bookmark.url);
+        } else if (typeof this.bookmarksRepo?.removeBookmark === 'function') {
+          await this.bookmarksRepo.removeBookmark(bookmark.url);
+        }
+        await this.refreshBookmarksState();
+        this.render();
+      });
+      cardActions.appendChild(openButton);
+      cardActions.appendChild(removeButton);
+      card.appendChild(cardHeader);
+      card.appendChild(cardUrl);
+      card.appendChild(moveLabel);
+      card.appendChild(cardActions);
+      grid.appendChild(card);
+    }
+    container.appendChild(grid);
+    page.appendChild(container);
 
+    searchInput.addEventListener('input', (event) => {
+      const value = String(event.target?.value || '');
+      const query = value.toLocaleLowerCase().trim();
+      this.state.bookmarksSearchQuery = value;
+      let visibleCount = 0;
+      for (const card of grid.querySelectorAll('.fb-library-card')) {
+        const matches = !query || String(card.dataset.searchText || '').includes(query);
+        card.style.display = matches ? '' : 'none';
+        if (matches) visibleCount += 1;
+      }
+      emptyState.textContent = query
+        ? 'No bookmarks match that search in this group.'
+        : 'No bookmarks in this group yet. Star a page or use Add Bookmark to save one here.';
+      emptyState.style.display = visibleCount ? 'none' : '';
+    });
+    addButton.addEventListener('click', async () => {
+      if (!this.bookmarksRepo) return;
+      const url = await this._textPromptDialog({
+        title: 'Add bookmark',
+        description: `Save a page to ${groups.find((group) => group.id === activeGroupId)?.name || 'this group'}.`,
+        placeholder: 'https://example.com',
+        initialValue: 'https://'
+      });
+      if (url === null || !String(url).trim()) return;
+      const title = await this._textPromptDialog({
+        title: 'Name this bookmark',
+        description: 'Leave the title blank to use the page address.',
+        placeholder: 'Bookmark title',
+        initialValue: String(url).trim()
+      });
+      if (title === null) return;
+      await this.bookmarksRepo.addBookmark({ url: String(url).trim(), title, groupId: activeGroupId });
+      await this.refreshBookmarksState();
+      this.render();
+    });
     viewport.appendChild(page);
   }
 
@@ -5345,6 +5650,12 @@ export class BrowserShell {
       || (p.title && p.title.toLowerCase().includes(q));
     const items = (section === 'keys' ? this.state.vaultKeysItems : this.state.passwordsItems).filter(match);
     const config = this.state.passwordsConfig || { savePasswordsEnabled: true, autofillEnabled: true, requirePasskeyToReveal: false, neverSaveOrigins: [] };
+    const rememberedEmails = (Array.isArray(this.state.rememberedEmails) ? this.state.rememberedEmails : [])
+      .map((item) => typeof item === 'string' ? { email: item, id: item } : item)
+      .filter((item) => item && typeof item.email === 'string');
+    const escapeText = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    })[character]);
     const passkey = this.state.passkeyInfo;
     const passkeySupported = Boolean(this.passkeyService && this.passkeyService.isSupported());
 
@@ -5462,6 +5773,26 @@ export class BrowserShell {
             </div>` : ''}
         </div>
 
+        ${section === 'passwords' ? `
+          <div class="fb-settings-group-card fb-saved-emails-card" style="margin-bottom:12px;">
+            <div class="fb-saved-emails-header">
+              <div>
+                <strong>Remembered email addresses</strong>
+                <p>Saved locally to this profile after you submit a form. Incognito tabs never save or suggest addresses. Focus an email field on a desktop webpage to choose one.</p>
+              </div>
+              <button type="button" class="fb-btn fb-btn-secondary fb-in-email-clear" ${rememberedEmails.length ? '' : 'disabled'}>Clear all</button>
+            </div>
+            <div class="fb-saved-email-list">
+              ${rememberedEmails.length
+                ? rememberedEmails.map((item) => `
+                  <div class="fb-saved-email-row">
+                    <span>${escapeText(item.email)}</span>
+                    <button type="button" class="fb-btn fb-btn-secondary fb-in-email-remove" data-email-id="${escapeAttr(item.id || item.email)}" data-email="${escapeAttr(item.email)}" aria-label="Remove ${escapeAttr(item.email)}">Remove</button>
+                  </div>`).join('')
+                : '<div class="fb-empty-state">No saved email addresses yet. Use an email on a submitted form and Yayra will remember it for this profile.</div>'}
+            </div>
+          </div>` : ''}
+
         <form class="fb-vault-add-form" id="fb-vault-add-form" style="display:none;">
           ${section === 'keys' ? `
             <input type="text" id="fb-vault-add-label" class="fb-input" placeholder="Label (e.g. OpenAI API key)" />
@@ -5535,6 +5866,25 @@ export class BrowserShell {
           this.render();
         }
       });
+    });
+
+    page.querySelectorAll('.fb-in-email-remove').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        if (!this.emailAddressesRepo || typeof this.emailAddressesRepo.removeEmail !== 'function') return;
+        const target = btn.dataset.emailId || btn.dataset.email;
+        await this.emailAddressesRepo.removeEmail(target);
+        await this.refreshEmailAddressesState();
+        await this.pushEmailSuggestionsToOpenTabs();
+        this.render();
+      });
+    });
+    page.querySelector('.fb-in-email-clear')?.addEventListener('click', async () => {
+      if (!this.emailAddressesRepo || typeof this.emailAddressesRepo.clear !== 'function') return;
+      await this.emailAddressesRepo.clear();
+      await this.refreshEmailAddressesState();
+      await this.pushEmailSuggestionsToOpenTabs();
+      this.render();
+      this.showTransientNotice('Saved email addresses cleared for this profile.');
     });
 
     // Inline add form (replaces the old triple prompt() flow).
@@ -7270,7 +7620,7 @@ export class BrowserShell {
           saved += 1;
         }
       }
-      try { this.state.bookmarksItems = await this.bookmarksRepo.getAllBookmarks(); } catch { /* keep stale list */ }
+      try { await this.refreshBookmarksState(); } catch { /* keep stale list */ }
       const active = this.getActiveTab();
       if (active) await this.updateBookmarkState(active.url);
     }
@@ -7362,7 +7712,7 @@ export class BrowserShell {
     for (const b of parsed) {
       if (!before.has(b.url)) await this.bookmarksRepo.addBookmark({ url: b.url, title: b.title });
     }
-    try { this.state.bookmarksItems = await this.bookmarksRepo.getAllBookmarks(); } catch { /* keep stale list */ }
+    try { await this.refreshBookmarksState(); } catch { /* keep stale list */ }
     const added = this.state.bookmarksItems.filter((b) => !before.has(b.url)).length;
     this.render();
     this.showTransientNotice(added > 0
@@ -8116,6 +8466,12 @@ export class BrowserShell {
       }
       if (this.bookmarksRepo?.getAllBookmarks) {
         try { fresh.bookmarks = await this.bookmarksRepo.getAllBookmarks(); } catch { /* keep current */ }
+        if (this.bookmarksRepo.getGroups) {
+          try { fresh.bookmarkGroups = await this.bookmarksRepo.getGroups(); } catch { /* keep current */ }
+        }
+        if (this.bookmarksRepo.getDefaultGroupId) {
+          try { fresh.bookmarkDefaultGroupId = await this.bookmarksRepo.getDefaultGroupId(); } catch { /* keep current */ }
+        }
       }
       if (this.downloadsBridge?.list) {
         try {
@@ -8131,13 +8487,15 @@ export class BrowserShell {
         try { fresh.shortcuts = await this.shortcutsRepo.getShortcuts(); } catch { /* keep current */ }
       }
 
-      const snapshot = JSON.stringify([fresh.history, fresh.bookmarks, fresh.downloads, fresh.settings, fresh.shortcuts]);
+      const snapshot = JSON.stringify([fresh.history, fresh.bookmarks, fresh.bookmarkGroups, fresh.bookmarkDefaultGroupId, fresh.downloads, fresh.settings, fresh.shortcuts]);
       if (snapshot === this._bgRefreshSnapshot) return false;
       const isFirstPass = this._bgRefreshSnapshot === undefined;
       this._bgRefreshSnapshot = snapshot;
 
       if (fresh.history) this.state.historyItems = fresh.history;
       if (fresh.bookmarks) this.state.bookmarksItems = fresh.bookmarks;
+      if (fresh.bookmarkGroups) this.state.bookmarkGroups = fresh.bookmarkGroups;
+      if (fresh.bookmarkDefaultGroupId) this.state.bookmarkDefaultGroupId = fresh.bookmarkDefaultGroupId;
       if (fresh.downloads) this.state.downloadsItems = fresh.downloads;
       if (fresh.downloadRoot !== undefined) this.state.downloadRoot = fresh.downloadRoot;
       if (fresh.settings) this.state.settings = { ...this.state.settings, ...fresh.settings };
@@ -8178,11 +8536,14 @@ export class BrowserShell {
     const bar = document.createElement('div');
     bar.className = 'fb-bookmarks-bar';
     bar.style.cssText = 'display:flex;align-items:center;gap:4px;padding:3px 10px;overflow-x:auto;white-space:nowrap;background:var(--fb-bg-elevated,rgba(255,255,255,0.03));border-bottom:1px solid var(--fb-border,rgba(255,255,255,0.07));min-height:28px;';
-    const items = this.state.bookmarksItems || [];
+    const allItems = this.state.bookmarksItems || [];
+    const items = allItems.filter((bookmark) => (bookmark.groupId || DEFAULT_BOOKMARK_GROUP_ID) === DEFAULT_BOOKMARK_GROUP_ID);
     if (!items.length) {
       const hint = document.createElement('span');
       hint.style.cssText = 'font-size:0.75rem;color:var(--fb-text-secondary,#9ca3af);padding:2px 6px;';
-      hint.textContent = 'No bookmarks yet - star a page and it shows up here.';
+      hint.textContent = allItems.length
+        ? 'No bookmarks in Bookmarks Bar - choose that group to pin a page here.'
+        : 'No bookmarks yet - star a page and it shows up here.';
       bar.appendChild(hint);
       return bar;
     }
@@ -8807,7 +9168,13 @@ export class BrowserShell {
       try { this.state.historyItems = await this.historyRepo.getEntries(100); } catch { /* keep current */ }
     }
     if (this.bookmarksRepo?.getAllBookmarks) {
-      try { this.state.bookmarksItems = await this.bookmarksRepo.getAllBookmarks(); } catch { /* keep current */ }
+      try { await this.refreshBookmarksState(); } catch { /* keep current */ }
+    }
+    if (this.emailAddressesRepo?.getAllEmails) {
+      try {
+        await this.refreshEmailAddressesState();
+        await this.pushEmailSuggestionsToOpenTabs();
+      } catch { /* keep current */ }
     }
     if (this.wheelRepo?.getItems) {
       try {
@@ -12178,10 +12545,7 @@ export class BrowserShell {
         this.render();
       }).catch(() => {});
     } else if (schemeUrl === 'yayra://bookmarks' && this.bookmarksRepo?.getAllBookmarks) {
-      this.bookmarksRepo.getAllBookmarks().then((items) => {
-        this.state.bookmarksItems = items || [];
-        this.render();
-      }).catch(() => {});
+      this.refreshBookmarksState().then(() => this.render()).catch(() => {});
     }
   }
 
@@ -13105,7 +13469,7 @@ export class BrowserShell {
         }
       }
       if (typeof this.bookmarksRepo.getAllBookmarks === 'function') {
-        this.state.bookmarksItems = await this.bookmarksRepo.getAllBookmarks();
+        await this.refreshBookmarksState();
       }
     }
 

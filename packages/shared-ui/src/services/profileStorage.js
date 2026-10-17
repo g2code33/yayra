@@ -128,35 +128,241 @@ export function createHistoryRepo(storage) {
 }
 
 const BOOKMARKS_KEY = 'bookmarks';
+const BOOKMARK_GROUPS_KEY = 'bookmark-groups';
+const BOOKMARK_DEFAULT_GROUP_KEY = 'bookmark-default-group';
+
+export const DEFAULT_BOOKMARK_GROUP_ID = 'bookmarks-bar';
+export const DEFAULT_BOOKMARK_GROUPS = Object.freeze([
+  Object.freeze({ id: 'bookmarks-bar', name: 'Bookmarks Bar', builtIn: true }),
+  Object.freeze({ id: 'mobile-bookmarks', name: 'Mobile Bookmarks', builtIn: true }),
+  Object.freeze({ id: 'other-bookmarks', name: 'Other Bookmarks', builtIn: true })
+]);
+
+function cleanBookmarkGroupName(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, 48);
+}
 
 export function createBookmarksRepo(storage) {
+  const readGroups = async () => {
+    const groups = DEFAULT_BOOKMARK_GROUPS.map((group) => ({ ...group }));
+    const ids = new Set(groups.map((group) => group.id));
+    const names = new Set(groups.map((group) => group.name.toLocaleLowerCase()));
+    const stored = await storage.get(BOOKMARK_GROUPS_KEY);
+    for (const candidate of Array.isArray(stored) ? stored : []) {
+      const id = String(candidate?.id || '');
+      const name = cleanBookmarkGroupName(candidate?.name);
+      if (!/^bg-[a-z0-9][a-z0-9_-]{0,80}$/i.test(id) || ids.has(id) || !name) continue;
+      const foldedName = name.toLocaleLowerCase();
+      if (names.has(foldedName)) continue;
+      ids.add(id);
+      names.add(foldedName);
+      groups.push({ id, name, builtIn: false });
+    }
+    return groups;
+  };
+
+  const defaultGroupFor = async (groups) => {
+    const stored = await storage.get(BOOKMARK_DEFAULT_GROUP_KEY);
+    const valid = groups.some((group) => group.id === stored);
+    const groupId = valid ? stored : DEFAULT_BOOKMARK_GROUP_ID;
+    if (!valid) await storage.set(BOOKMARK_DEFAULT_GROUP_KEY, groupId);
+    return groupId;
+  };
+
   const repo = {
-    async getAllBookmarks() {
-      return (await storage.get(BOOKMARKS_KEY)) || [];
+    async getGroups() {
+      return readGroups();
     },
-    async addBookmark({ url, title = '', favicon = null } = {}) {
+    async getDefaultGroupId() {
+      return defaultGroupFor(await readGroups());
+    },
+    async setDefaultGroup(groupId) {
+      const groups = await readGroups();
+      if (!groups.some((group) => group.id === groupId)) return { ok: false, reason: 'invalid-group' };
+      await storage.set(BOOKMARK_DEFAULT_GROUP_KEY, groupId);
+      return { ok: true, groupId };
+    },
+    async createGroup(name) {
+      const cleanName = cleanBookmarkGroupName(name);
+      if (!cleanName) return { ok: false, reason: 'invalid-name' };
+      const groups = await readGroups();
+      const existing = groups.find((group) => group.name.toLocaleLowerCase() === cleanName.toLocaleLowerCase());
+      if (existing) return { ok: false, reason: 'duplicate-name', group: existing };
+      const group = {
+        id: `bg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+        name: cleanName,
+        builtIn: false
+      };
+      const customGroups = groups.filter((item) => !item.builtIn);
+      customGroups.push(group);
+      await storage.set(BOOKMARK_GROUPS_KEY, customGroups);
+      return { ok: true, group };
+    },
+    async removeGroup(groupId) {
+      const groups = await readGroups();
+      const target = groups.find((group) => group.id === groupId);
+      if (!target) return { ok: false, reason: 'not-found' };
+      if (target.builtIn) return { ok: false, reason: 'built-in' };
+      const currentDefault = await defaultGroupFor(groups);
+      const nextGroups = groups.filter((group) => !group.builtIn && group.id !== groupId);
+      const nextDefault = currentDefault === groupId ? DEFAULT_BOOKMARK_GROUP_ID : currentDefault;
+      const items = await repo.getAllBookmarks();
+      let moved = 0;
+      const movedItems = items.map((item) => {
+        if (item.groupId !== groupId) return item;
+        moved += 1;
+        return { ...item, groupId: nextDefault };
+      });
+      await storage.set(BOOKMARK_GROUPS_KEY, nextGroups);
+      if (moved) await storage.set(BOOKMARKS_KEY, movedItems);
+      if (currentDefault === groupId) await storage.set(BOOKMARK_DEFAULT_GROUP_KEY, nextDefault);
+      return { ok: true, moved };
+    },
+    async getAllBookmarks() {
+      const groups = await readGroups();
+      const groupIds = new Set(groups.map((group) => group.id));
+      const defaultGroupId = await defaultGroupFor(groups);
+      const stored = await storage.get(BOOKMARKS_KEY);
+      const items = Array.isArray(stored) ? stored.filter((item) => item && typeof item === 'object' && !Array.isArray(item)) : [];
+      let migrated = items.length !== (Array.isArray(stored) ? stored.length : 0);
+      const normalized = items.map((item) => {
+        const groupId = item && groupIds.has(item.groupId) ? item.groupId : defaultGroupId;
+        if (!item || item.groupId !== groupId) migrated = true;
+        return { ...item, groupId };
+      });
+      if (migrated) await storage.set(BOOKMARKS_KEY, normalized);
+      return normalized;
+    },
+    async addBookmark({ url, title = '', favicon = null, groupId } = {}) {
       if (!url) return null;
-      const items = (await storage.get(BOOKMARKS_KEY)) || [];
-      if (items.some((b) => b.url === url)) return items.find((b) => b.url === url);
+      const groups = await readGroups();
+      const defaultGroupId = await defaultGroupFor(groups);
+      const targetGroupId = groups.some((group) => group.id === groupId) ? groupId : defaultGroupId;
+      const items = await repo.getAllBookmarks();
+      const existingIndex = items.findIndex((bookmark) => bookmark.url === url);
+      if (existingIndex >= 0) {
+        const existing = items[existingIndex];
+        // Re-adding an existing URL normally keeps its folder. An explicit
+        // group from the bookmarks page is a deliberate move.
+        if (groupId && existing.groupId !== targetGroupId) {
+          const updated = { ...existing, groupId: targetGroupId };
+          items[existingIndex] = updated;
+          await storage.set(BOOKMARKS_KEY, items);
+          return updated;
+        }
+        return existing;
+      }
       const bookmark = {
         id: `b-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        url, title: title || url, favicon: favicon || null, addedAt: Date.now()
+        url, title: title || url, favicon: favicon || null, addedAt: Date.now(), groupId: targetGroupId
       };
       items.unshift(bookmark);
       await storage.set(BOOKMARKS_KEY, items);
       return bookmark;
     },
+    async moveBookmark(urlOrId, groupId) {
+      const groups = await readGroups();
+      if (!groups.some((group) => group.id === groupId)) return { ok: false, reason: 'invalid-group' };
+      const items = await repo.getAllBookmarks();
+      const index = items.findIndex((bookmark) => bookmark.id === urlOrId || bookmark.url === urlOrId);
+      if (index < 0) return { ok: false, reason: 'not-found' };
+      const updated = { ...items[index], groupId };
+      items[index] = updated;
+      await storage.set(BOOKMARKS_KEY, items);
+      return { ok: true, bookmark: updated };
+    },
     async removeBookmark(urlOrId) {
-      const items = (await storage.get(BOOKMARKS_KEY)) || [];
-      await storage.set(BOOKMARKS_KEY, items.filter((b) => b.url !== urlOrId && b.id !== urlOrId));
+      const items = await repo.getAllBookmarks();
+      await storage.set(BOOKMARKS_KEY, items.filter((bookmark) => bookmark.url !== urlOrId && bookmark.id !== urlOrId));
     },
     async isBookmarked(url) {
-      const items = (await storage.get(BOOKMARKS_KEY)) || [];
-      return items.some((b) => b.url === url);
+      const items = await repo.getAllBookmarks();
+      return items.some((bookmark) => bookmark.url === url);
     }
   };
-  // Duck-typed alias BrowserShell probes for first.
+  // Duck-typed aliases used by existing BrowserShell call sites.
   repo.removeBookmarkByUrl = (url) => repo.removeBookmark(url);
+  repo.addBookmarkGroup = (name) => repo.createGroup(name);
+  return repo;
+}
+
+const EMAIL_ADDRESSES_KEY = 'email-addresses';
+const EMAIL_ADDRESS_LIMIT = 250;
+
+export function normalizeEmailAddress(value) {
+  const email = String(value || '').trim();
+  if (!email || email.length > 254 || /\s/.test(email)) return null;
+  const at = email.indexOf('@');
+  if (at <= 0 || at !== email.lastIndexOf('@') || at >= email.length - 1) return null;
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  if (local.length > 64 || !domain.includes('.') || domain.startsWith('.') || domain.endsWith('.') || domain.includes('..')) return null;
+  if (domain.split('.').some((label) => !label || label.length > 63)) return null;
+  return email;
+}
+
+/** Profile-scoped, local-only email suggestions (never passwords). */
+export function createEmailAddressesRepo(storage) {
+  const repo = {
+    async getAllEmails() {
+      const stored = await storage.get(EMAIL_ADDRESSES_KEY);
+      const seen = new Set();
+      let changed = false;
+      const items = [];
+      for (const value of Array.isArray(stored) ? stored : []) {
+        const source = typeof value === 'string' ? { email: value } : value;
+        const email = normalizeEmailAddress(source?.email);
+        if (!email) { changed = true; continue; }
+        const key = email.toLocaleLowerCase();
+        if (seen.has(key)) { changed = true; continue; }
+        seen.add(key);
+        const addedAt = Number(source.addedAt) || Date.now();
+        const lastUsedAt = Number(source.lastUsedAt) || addedAt;
+        items.push({
+          id: String(source.id || `e-${addedAt}-${Math.random().toString(36).slice(2, 8)}`),
+          email,
+          addedAt,
+          lastUsedAt
+        });
+      }
+      const sorted = items.sort((a, b) => b.lastUsedAt - a.lastUsedAt).slice(0, EMAIL_ADDRESS_LIMIT);
+      if (sorted.length !== items.length) changed = true;
+      if (changed) await storage.set(EMAIL_ADDRESSES_KEY, sorted);
+      return sorted;
+    },
+    async addEmail(value) {
+      const email = normalizeEmailAddress(value);
+      if (!email) return null;
+      const items = await repo.getAllEmails();
+      const key = email.toLocaleLowerCase();
+      const existing = items.find((item) => item.email.toLocaleLowerCase() === key);
+      const now = Date.now();
+      if (existing) {
+        const updated = { ...existing, lastUsedAt: now };
+        await storage.set(EMAIL_ADDRESSES_KEY, [updated, ...items.filter((item) => item.id !== existing.id)]);
+        return updated;
+      }
+      const item = {
+        id: `e-${now}-${Math.random().toString(36).slice(2, 8)}`,
+        email,
+        addedAt: now,
+        lastUsedAt: now
+      };
+      await storage.set(EMAIL_ADDRESSES_KEY, [item, ...items].slice(0, EMAIL_ADDRESS_LIMIT));
+      return item;
+    },
+    async removeEmail(emailOrId) {
+      const items = await repo.getAllEmails();
+      await storage.set(EMAIL_ADDRESSES_KEY, items.filter((item) => item.id !== emailOrId
+        && item.email.toLocaleLowerCase() !== String(emailOrId || '').trim().toLocaleLowerCase()));
+    },
+    async clear() {
+      if (typeof storage.delete === 'function') await storage.delete(EMAIL_ADDRESSES_KEY);
+      else await storage.set(EMAIL_ADDRESSES_KEY, []);
+    }
+  };
+  repo.remember = (email) => repo.addEmail(email);
+  repo.deleteEmail = (emailOrId) => repo.removeEmail(emailOrId);
   return repo;
 }
 

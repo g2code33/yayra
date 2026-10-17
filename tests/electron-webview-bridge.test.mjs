@@ -761,3 +761,47 @@ test('autofill: fill-credentials pushes saved credentials into the right page vi
   assert.equal(privResult.filled, false, 'private views are never autofilled');
   assert.equal(views[1].webContents.sent.filter((m) => m.channel === 'yayra:autofill-fill').length, 0);
 });
+
+test('email recall: focused and submitted addresses route only from non-private page views', async () => {
+  const { handlers, listeners, sentEvents, views } = makeHarness({ autofillPreloadPath: '/fake/p.cjs' });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-email', url: 'https://site.dev/login' });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-email-private', url: 'https://site.dev/login', isPrivate: true });
+
+  listeners.get('yayra:email-field-focused')({ sender: views[0].webContents }, { url: 'https://site.dev/login' });
+  listeners.get('yayra:email-address-captured')({ sender: views[0].webContents }, {
+    url: 'https://site.dev/login', email: 'ada@example.com'
+  });
+  listeners.get('yayra:email-address-captured')({ sender: views[0].webContents }, {
+    url: 'https://site.dev/login', email: 'not-an-email'
+  });
+  listeners.get('yayra:email-field-focused')({ sender: views[1].webContents }, { url: 'https://site.dev/login' });
+  listeners.get('yayra:email-address-captured')({ sender: views[1].webContents }, {
+    url: 'https://site.dev/login', email: 'private@example.com'
+  });
+
+  const routed = sentEvents.map((event) => event.payload).filter((payload) => payload?.type?.startsWith('email-'));
+  assert.equal(routed.length, 2, 'one focus event and one valid captured address are forwarded');
+  assert.equal(routed[0].type, 'email-field-focused');
+  assert.equal(routed[1].type, 'email-address-captured');
+  assert.equal(routed[1].email, 'ada@example.com');
+  assert.ok(routed.every((payload) => payload.tabId === 'tab-email'));
+});
+
+test('email recall: suggestions are sanitized, deduplicated, and never sent to a private view', async () => {
+  const { handlers, views } = makeHarness({ autofillPreloadPath: '/fake/p.cjs' });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-suggest', url: 'https://site.dev/' });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-suggest-private', url: 'https://site.dev/', isPrivate: true });
+
+  const safe = await handlers.get('yayra:webview-suggest-email-addresses')(null, {
+    tabId: 'tab-suggest', emails: ['Ada@example.com', 'ada@EXAMPLE.com', 'invalid', 'lin@example.org']
+  });
+  assert.deepEqual(safe, { suggested: true, count: 2 });
+  const pushed = views[0].webContents.sent.find((message) => message.channel === 'yayra:email-suggestions');
+  assert.deepEqual(pushed.payload.emails, ['Ada@example.com', 'lin@example.org']);
+
+  const privateResult = await handlers.get('yayra:webview-suggest-email-addresses')(null, {
+    tabId: 'tab-suggest-private', emails: ['ada@example.com']
+  });
+  assert.deepEqual(privateResult, { suggested: false, count: 0 });
+  assert.equal(views[1].webContents.sent.length, 0, 'no address is sent into an Incognito page');
+});

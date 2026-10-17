@@ -67,6 +67,28 @@ const SYSTEM_BROWSER_AUTH_HOSTS = Object.freeze([
 const GOOGLE_SIGN_IN_PATH = /^\/(?:o\/oauth2(?:\/|$)|oauth2(?:\/|$)|signin(?:\/|$)|servicelogin(?:\/|$)|accountchooser(?:\/|$)|v\d+\/signin(?:\/|$)|gsi\/select(?:\/|$))/i;
 
 const WEBVIEW_EVENT_CHANNEL = 'yayra:webview-event';
+const EMAIL_FIELD_FOCUSED_CHANNEL = 'yayra:email-field-focused';
+const EMAIL_ADDRESS_CAPTURED_CHANNEL = 'yayra:email-address-captured';
+const EMAIL_SUGGESTIONS_CHANNEL = 'yayra:email-suggestions';
+
+function sanitizeEmailAddress(value) {
+  const email = String(value || '').trim();
+  if (!email || email.length > 254 || /\s/.test(email)) return null;
+  const at = email.indexOf('@');
+  if (at <= 0 || at !== email.lastIndexOf('@') || at >= email.length - 1) return null;
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  if (local.length > 64 || !domain.includes('.') || domain.startsWith('.') || domain.endsWith('.') || domain.includes('..')) return null;
+  if (domain.split('.').some((label) => !label || label.length > 63)) return null;
+  return email;
+}
+
+function isHttpUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch { return false; }
+}
 
 // Sentinel pseudo-scheme the in-page WebAuthn helper uses to ask the main
 // process to open the CURRENT page in the user's default system browser
@@ -466,9 +488,8 @@ function createWebviewBridge({
   // dialog. Optional: without it savePage reports { ok:false }.
   dialog = null,
   // Absolute path to electron/autofillPreload.cjs. When provided, every
-  // page view gets Chrome-style password capture/fill hooks (sandboxed,
-  // context-isolated, nothing exposed to the page). Optional so existing
-  // tests without it keep working.
+  // page view gets sandboxed password capture/fill and email suggestion hooks
+  // (context-isolated, nothing exposed to the page). Optional for test hosts.
   autofillPreloadPath = null,
   logger = console
 }) {
@@ -1178,11 +1199,11 @@ function createWebviewBridge({
     }
   });
 
-  // ---- Chrome-style password capture / autofill routing -------------
-  // The autofill preload inside a page view sends on these channels; the
-  // sender is the VIEW's webContents, so locate its entry and forward to
-  // the shell window that owns the tab. Private tabs never forward
-  // captures (the vault refuses them anyway - defense in depth).
+  // ---- Chrome-style password autofill + email recall routing ---------
+  // The isolated page preload sends on these channels; the sender is the
+  // VIEW's webContents, so locate its entry and forward to the shell window
+  // that owns the tab. Private tabs never forward captures or receive saved
+  // email suggestions (defense in depth).
   function entryForViewSender(event) {
     const sender = event && event.sender;
     if (!sender) return null;
@@ -1205,6 +1226,25 @@ function createWebviewBridge({
       if (!entry || entry.isPrivate) return;
       sendTo(entry, 'autofill-form-detected', { url: String(payload.url || entry.lastUrl || '') });
     });
+    ipcMain.on(EMAIL_FIELD_FOCUSED_CHANNEL, (event, payload = {}) => {
+      const entry = entryForViewSender(event);
+      if (!entry || entry.isPrivate) return;
+      const url = String(payload?.url || entry.lastUrl || '');
+      if (!isHttpUrl(url)) return;
+      const currentUrl = entry.view?.webContents?.getURL?.() || entry.lastUrl || '';
+      if (isHttpUrl(currentUrl)) {
+        try { if (new URL(currentUrl).origin !== new URL(url).origin) return; } catch { return; }
+      }
+      sendTo(entry, 'email-field-focused', { url });
+    });
+    ipcMain.on(EMAIL_ADDRESS_CAPTURED_CHANNEL, (event, payload = {}) => {
+      const entry = entryForViewSender(event);
+      if (!entry || entry.isPrivate) return;
+      const email = sanitizeEmailAddress(payload?.email);
+      const url = String(payload?.url || entry.lastUrl || '');
+      if (!email || !isHttpUrl(url)) return;
+      sendTo(entry, 'email-address-captured', { email, url });
+    });
   }
 
   ipcMain.handle('yayra:webview-fill-credentials', (event, { tabId, username, password } = {}) => {
@@ -1218,6 +1258,28 @@ function createWebviewBridge({
       return { filled: true };
     } catch {
       return { filled: false };
+    }
+  });
+
+  ipcMain.handle('yayra:webview-suggest-email-addresses', (event, { tabId, emails } = {}) => {
+    const entry = views.get(viewKey(event, tabId));
+    if (!entry || entry.isPrivate) return { suggested: false, count: 0 };
+    const seen = new Set();
+    const safeEmails = (Array.isArray(emails) ? emails : [])
+      .map(sanitizeEmailAddress)
+      .filter((email) => {
+        if (!email) return false;
+        const key = email.toLocaleLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .slice(0, 25);
+    try {
+      entry.view.webContents.send(EMAIL_SUGGESTIONS_CHANNEL, { emails: safeEmails });
+      return { suggested: true, count: safeEmails.length };
+    } catch {
+      return { suggested: false, count: 0 };
     }
   });
 

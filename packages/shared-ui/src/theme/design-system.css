@@ -2510,6 +2510,85 @@ html {
 }
 
 /* Bookmarks & Downloads Cards */
+.fb-bookmark-header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.fb-bookmarks-folder-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.fb-folder-pill {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--fb-border-glass);
+  border-radius: 999px;
+  padding: 7px 12px;
+  background: transparent;
+  color: var(--fb-text-secondary);
+  font: 600 0.8rem/1.2 system-ui, sans-serif;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.fb-folder-pill:hover,
+.fb-folder-pill.active {
+  background: rgba(6, 182, 212, 0.14);
+  border-color: rgba(6, 182, 212, 0.5);
+  color: var(--fb-text-primary);
+}
+
+.fb-bookmark-group-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px 14px;
+  border: 1px solid var(--fb-border-glass);
+  border-radius: 12px;
+  background: var(--fb-bg-surface);
+}
+
+.fb-bookmark-default-label {
+  color: var(--fb-text-secondary);
+  font-size: 0.8rem;
+}
+
+.fb-bookmark-group-buttons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.fb-bookmark-move-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--fb-text-secondary);
+  font-size: 0.78rem;
+}
+
+.fb-bookmark-move-select {
+  min-width: 150px;
+  max-width: 70%;
+  padding: 7px 9px;
+  border: 1px solid var(--fb-border-glass);
+  border-radius: 8px;
+  background: var(--fb-bg-surface-elevated);
+  color: var(--fb-text-primary);
+  font: inherit;
+}
+
 .fb-items-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
@@ -2572,6 +2651,25 @@ html {
   gap: 8px;
   border-top: 1px solid rgba(255, 255, 255, 0.06);
   padding-top: 8px;
+}
+
+@media (max-width: 600px) {
+  .fb-bookmark-header-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+  .fb-bookmark-header-actions .fb-internal-search {
+    flex: 1 1 100%;
+  }
+  .fb-bookmark-group-actions {
+    align-items: flex-start;
+  }
+  .fb-bookmark-group-buttons {
+    width: 100%;
+  }
+  .fb-saved-emails-header {
+    flex-direction: column;
+  }
 }
 
 /* About Page In-Tab */
@@ -4424,6 +4522,47 @@ html {
   background: rgba(6, 182, 212, 0.14);
   border-color: rgba(6, 182, 212, 0.5);
   color: var(--fb-text-primary);
+}
+
+.fb-saved-emails-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.fb-saved-emails-header strong {
+  display: block;
+  color: var(--fb-text-primary);
+  font-size: 0.9rem;
+}
+
+.fb-saved-emails-header p {
+  max-width: 620px;
+  margin: 5px 0 0;
+  color: var(--fb-text-secondary);
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+
+.fb-saved-email-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.fb-saved-email-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--fb-border-glass);
+  border-radius: 9px;
+  background: var(--fb-bg-surface);
+  color: var(--fb-text-primary);
+  font-size: 0.84rem;
+  overflow-wrap: anywhere;
 }
 
 .fb-vault-count {
