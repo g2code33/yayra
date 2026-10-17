@@ -191,7 +191,7 @@ const api = {
     createShortcut: ({ url, title } = {}) => ipcRenderer.invoke('yayra:create-shortcut', { url, title }),
     // Chrome-style "Install page as app...": real launcher entries that
     // reopen the site in its own minimal app window (yayra --app=<url>).
-    installPageAsApp: ({ url, title } = {}) => ipcRenderer.invoke('yayra:install-page-as-app', { url, title }),
+    installPageAsApp: ({ url, title, nameOverride } = {}) => ipcRenderer.invoke('yayra:install-page-as-app', { url, title, nameOverride }),
     installPageAsAppPreview: ({ url, title } = {}) => ipcRenderer.invoke('yayra:install-page-as-app-preview', { url, title }),
     // Local document workspace: open ONE user-picked PDF; the renderer
     // receives only the bytes (never a filesystem path).
