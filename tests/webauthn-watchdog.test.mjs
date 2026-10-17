@@ -9,6 +9,7 @@ import {
   OPEN_EXTERNAL_SCHEME,
   decodeOpenExternalRequest,
   buildWebAuthnWatchdogScript,
+  buildGoogleSearchThinkingWatchdogScript,
   createWebviewBridge
 } from '../electron/webviewBridge.cjs';
 
@@ -169,8 +170,10 @@ test('bridge injects the watchdog into the page main world on every dom-ready', 
   views[0].webContents.emit('dom-ready');
   views[0].webContents.emit('dom-ready');
 
-  assert.equal(views[0].webContents.executedScripts.length, 2, 'injected on each document load');
-  assert.ok(views[0].webContents.executedScripts[0].includes('__yayraWebauthnWatchdog'), 'idempotence flag present - double injection is a no-op in-page');
+  assert.equal(views[0].webContents.executedScripts.length, 2, 'both watchdogs are injected together on each document load');
+  assert.ok(views[0].webContents.executedScripts[0].includes('__yayraWebauthnWatchdog'), 'passkey watchdog remains installed');
+  assert.ok(views[0].webContents.executedScripts[0].includes('__yayraGoogleSearchThinkingWatchdog'), 'Google Search timeout watchdog is installed');
+  assert.ok(buildGoogleSearchThinkingWatchdogScript().includes('location.reload()'), 'recovery uses an ordinary page reload');
 });
 
 test('bridge intercepts the open-external sentinel: opens the REAL url in the system browser and denies the popup', async () => {

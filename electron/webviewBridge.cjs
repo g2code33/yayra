@@ -58,6 +58,8 @@ const SYSTEM_BROWSER_AUTH_HOSTS = Object.freeze([
 const GOOGLE_OAUTH_PATH = /^\/(?:o\/oauth2(?:\/|$)|oauth2(?:\/|$)|signin\/oauth(?:\/|$)|gsi\/select(?:\/|$))/i;
 
 const WEBVIEW_EVENT_CHANNEL = 'yayra:webview-event';
+const PAGE_UNRESPONSIVE_RELOAD_DELAY_MS = 15_000;
+const PAGE_UNRESPONSIVE_RELOAD_COOLDOWN_MS = 60_000;
 const EMAIL_FIELD_FOCUSED_CHANNEL = 'yayra:email-field-focused';
 const EMAIL_ADDRESS_CAPTURED_CHANNEL = 'yayra:email-address-captured';
 const EMAIL_SUGGESTIONS_CHANNEL = 'yayra:email-suggestions';
@@ -284,6 +286,124 @@ function buildWebAuthnWatchdogScript() {
 }
 
 /**
+ * Google Search can finish its document load while an AI Overview is still
+ * displaying its standalone "Thinking" status. That request is page-level
+ * activity (not WebContents.isLoading()), so the browser's ordinary loading
+ * watchdog cannot see it. Watch only Google Search results, and only reload
+ * after the visible status remains continuous for the configured timeout.
+ *
+ * A per-query sessionStorage cooldown makes this a single recovery attempt,
+ * not a reload loop. It stores only a short hash of the query URL, never the
+ * query itself. If storage is unavailable, the watchdog opts out rather than
+ * risk a reload loop.
+ */
+function buildGoogleSearchThinkingWatchdogScript({
+  timeoutMs = 120_000,
+  pollIntervalMs = 5_000,
+  reloadCooldownMs = 30 * 60_000
+} = {}) {
+  const safeDelay = (value, fallback) => {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) && numeric > 0 ? Math.floor(numeric) : fallback;
+  };
+  const config = {
+    timeoutMs: safeDelay(timeoutMs, 120_000),
+    pollIntervalMs: safeDelay(pollIntervalMs, 5_000),
+    reloadCooldownMs: safeDelay(reloadCooldownMs, 30 * 60_000)
+  };
+  return `(function () {
+  if (window.__yayraGoogleSearchThinkingWatchdog) return;
+  window.__yayraGoogleSearchThinkingWatchdog = true;
+  var initialHost = String(window.location && window.location.hostname || '').toLowerCase();
+  var googleHost = /^(?:www\\.)?google\\.[a-z]{2,}(?:\\.[a-z]{2,})?$/.test(initialHost);
+  if (!googleHost) return;
+
+  var WAIT_MS = ${config.timeoutMs};
+  var POLL_MS = ${config.pollIntervalMs};
+  var COOLDOWN_MS = ${config.reloadCooldownMs};
+  var storage;
+  try {
+    storage = window.sessionStorage;
+    if (!storage || typeof storage.getItem !== 'function' || typeof storage.setItem !== 'function') return;
+    var probe = '__yayra_google_thinking_probe';
+    storage.setItem(probe, '1');
+    storage.removeItem(probe);
+  } catch (_err) {
+    return;
+  }
+
+  function isGoogleSearch() {
+    var location = window.location || {};
+    var host = String(location.hostname || '').toLowerCase();
+    return /^(?:www\\.)?google\\.[a-z]{2,}(?:\\.[a-z]{2,})?$/.test(host)
+      && /^\\/search\\/?$/.test(String(location.pathname || ''));
+  }
+  function hash(value) {
+    var result = 2166136261;
+    for (var i = 0; i < value.length; i += 1) {
+      result ^= value.charCodeAt(i);
+      result = Math.imul(result, 16777619);
+    }
+    return (result >>> 0).toString(36);
+  }
+  function hasStandaloneThinkingStatus() {
+    var text = document.body && typeof document.body.innerText === 'string' ? document.body.innerText : '';
+    return /(?:^|\\n)\\s*Thinking(?:\\s*(?:\\.{3}|…))?\\s*(?:\\n|$)/i.test(text);
+  }
+  function recentlyReloaded(key, now) {
+    try {
+      var raw = storage.getItem(key);
+      if (raw === null) return false;
+      var last = Number(raw);
+      return !Number.isFinite(last) || now - last < COOLDOWN_MS;
+    } catch (_err) {
+      return true;
+    }
+  }
+
+  var thinkingSince = 0;
+  var observedUrl = String(window.location.href || '');
+  window.setInterval(function () {
+    try {
+      var location = window.location || {};
+      var currentUrl = String(location.href || '');
+      if (currentUrl !== observedUrl) {
+        observedUrl = currentUrl;
+        thinkingSince = 0;
+      }
+      if (!isGoogleSearch() || document.visibilityState === 'hidden' || !hasStandaloneThinkingStatus()) {
+        thinkingSince = 0;
+        return;
+      }
+
+      var now = Date.now();
+      if (!thinkingSince) {
+        thinkingSince = now;
+        return;
+      }
+      if (now - thinkingSince < WAIT_MS) return;
+
+      var searchUrl = String(location.pathname || '') + String(location.search || '');
+      var markerKey = '__yayra_google_thinking_reload_' + hash(searchUrl);
+      if (recentlyReloaded(markerKey, now)) {
+        thinkingSince = 0;
+        return;
+      }
+      try { storage.setItem(markerKey, String(now)); }
+      catch (_err) { thinkingSince = 0; return; }
+
+      // Normal reload: preserve the current tab, URL, profile and cookies.
+      // This intentionally does not clear site data or cache.
+      thinkingSince = 0;
+      if (location && typeof location.reload === 'function') location.reload();
+    } catch (_err) {
+      thinkingSince = 0;
+    }
+  }, POLL_MS);
+})();`;
+}
+
+/**
  * Builds a standard desktop Chrome User-Agent string for the current
  * platform/Chromium version, deliberately omitting the "Electron/x.y.z"
  * token Electron appends by default. Pure function (reads only static
@@ -501,7 +621,9 @@ function createWebviewBridge({
   // page view gets sandboxed password capture/fill and email suggestion hooks
   // (context-isolated, nothing exposed to the page). Optional for test hosts.
   autofillPreloadPath = null,
-  logger = console
+  logger = console,
+  pageUnresponsiveReloadDelayMs = PAGE_UNRESPONSIVE_RELOAD_DELAY_MS,
+  pageUnresponsiveReloadCooldownMs = PAGE_UNRESPONSIVE_RELOAD_COOLDOWN_MS
 }) {
   // key -> { view, lastUrl, tabId, hostWc, hostWin }
   // key namespaces the renderer-chosen tabId by the webContents that asked
@@ -509,6 +631,15 @@ function createWebviewBridge({
   // BrowserShell instance whose generated ids ("tab-1", "tab-2", ...) would
   // otherwise collide and steal each other's native views.
   const views = new Map();
+
+  function cancelPageUnresponsiveReload(entry) {
+    if (!entry) return;
+    entry.pageUnresponsive = false;
+    if (entry.pageUnresponsiveReloadTimer !== null) {
+      clearTimeout(entry.pageUnresponsiveReloadTimer);
+      entry.pageUnresponsiveReloadTimer = null;
+    }
+  }
 
   function viewKey(event, tabId) {
     const senderId = event && event.sender && typeof event.sender.id === 'number' ? event.sender.id : null;
@@ -672,7 +803,11 @@ function createWebviewBridge({
     wc.on('dom-ready', () => {
       if (entry.pointerTheme !== 'system') applyPointerThemeToPage(entry);
       if (typeof wc.executeJavaScript === 'function') {
-        wc.executeJavaScript(buildWebAuthnWatchdogScript(), true).catch(() => {});
+        const watchdogs = [
+          buildWebAuthnWatchdogScript(),
+          buildGoogleSearchThinkingWatchdogScript()
+        ].join('\n');
+        wc.executeJavaScript(watchdogs, true).catch(() => {});
       }
     });
     // Apply the selected pointer to cross-origin child frames as each one
@@ -696,7 +831,34 @@ function createWebviewBridge({
         wc.reload();
       }
     });
-    wc.on('did-start-loading', () => sendTo(entry, 'loading-start'));
+    wc.on('unresponsive', () => {
+      entry.pageUnresponsive = true;
+      if (entry.pageUnresponsiveReloadTimer !== null) return;
+      const lastReload = entry.lastPageUnresponsiveReloadAt || 0;
+      if (lastReload && Date.now() - lastReload < pageUnresponsiveReloadCooldownMs) return;
+
+      // The shell remains usable while an individual site renderer hangs.
+      // Give Chromium a short chance to recover itself before reloading only
+      // that tab. This is delayed and rate-limited to avoid disrupting slow
+      // but healthy pages or creating a reload loop.
+      entry.pageUnresponsiveReloadTimer = setTimeout(() => {
+        entry.pageUnresponsiveReloadTimer = null;
+        if (!entry.pageUnresponsive || wc.isDestroyed?.()) return;
+        const now = Date.now();
+        if (entry.lastPageUnresponsiveReloadAt && now - entry.lastPageUnresponsiveReloadAt < pageUnresponsiveReloadCooldownMs) return;
+        entry.lastPageUnresponsiveReloadAt = now;
+        logger.warn?.(`[yayra:webview] page renderer unresponsive in tab ${entry.tabId}; reloading that page`);
+        try { wc.reload(); }
+        catch (err) { logger.error?.(`[yayra:webview] failed to recover unresponsive tab ${entry.tabId}`, err); }
+      }, pageUnresponsiveReloadDelayMs);
+      entry.pageUnresponsiveReloadTimer?.unref?.();
+    });
+    wc.on('responsive', () => cancelPageUnresponsiveReload(entry));
+    wc.on('did-start-loading', () => {
+      // A user-initiated reload/navigation is already the recovery action.
+      cancelPageUnresponsiveReload(entry);
+      sendTo(entry, 'loading-start');
+    });
     wc.on('did-stop-loading', () => sendTo(entry, 'loading-stop'));
     const handoffAuthNavigation = (...args) => {
       const event = args[0];
@@ -818,7 +980,10 @@ function createWebviewBridge({
       isPrivate: Boolean(isPrivate),
       profileId: String(profileId || 'default'),
       pointerTheme: 'system',
-      pointerSize: 'normal'
+      pointerSize: 'normal',
+      pageUnresponsive: false,
+      pageUnresponsiveReloadTimer: null,
+      lastPageUnresponsiveReloadAt: 0
     };
     views.set(key, entry);
     attachListeners(key, entry);
@@ -1035,6 +1200,7 @@ function createWebviewBridge({
   function destroyView(key) {
     const entry = views.get(key);
     if (!entry) return;
+    cancelPageUnresponsiveReload(entry);
     const win = (entry.hostWin && !entry.hostWin.isDestroyed?.()) ? entry.hostWin : getMainWindow();
     if (win && !win.isDestroyed()) {
       try {
@@ -1309,6 +1475,7 @@ module.exports = {
   secureSystemBrowserAuthUrl,
   decodeOpenExternalRequest,
   buildWebAuthnWatchdogScript,
+  buildGoogleSearchThinkingWatchdogScript,
   buildPointerThemeCss,
   buildPointerThemeScript,
   sanitizeBounds,

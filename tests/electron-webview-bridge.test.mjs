@@ -138,7 +138,7 @@ function createFakeWebContentsView() {
   };
 }
 
-function makeHarness({ authHosts, autofillPreloadPath } = {}) {
+function makeHarness({ authHosts, autofillPreloadPath, pageUnresponsiveReloadDelayMs, pageUnresponsiveReloadCooldownMs } = {}) {
   const handlers = new Map();
   const listeners = new Map();
   const ipcMain = {
@@ -187,7 +187,9 @@ function makeHarness({ authHosts, autofillPreloadPath } = {}) {
     getMainWindow: () => fakeWin,
     authHosts,
     autofillPreloadPath,
-    logger: { error: () => {} }
+    pageUnresponsiveReloadDelayMs,
+    pageUnresponsiveReloadCooldownMs,
+    logger: { error: () => {}, warn: () => {} }
   });
 
   return { bridge, handlers, listeners, sentEvents, fakeWin, externalCalls, views, clipboardWrites, popupCalls };
@@ -199,6 +201,36 @@ test('webview bridge: creating a tab adds a WebContentsView as a child view and 
 
   assert.equal(views.length, 1, 'exactly one native view created');
   assert.equal(fakeWin.contentView.children.length, 1, 'view attached to the window content view (not an <iframe>)');
+});
+
+test('webview bridge: a site renderer that stays unresponsive is reloaded once after a grace period', async () => {
+  const { handlers, views } = makeHarness({ pageUnresponsiveReloadDelayMs: 10, pageUnresponsiveReloadCooldownMs: 100 });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-hung', url: 'https://example.com/' });
+  const wc = views[0].webContents;
+
+  wc.emit('unresponsive');
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(wc._calls.filter((call) => call === 'reload').length, 1, 'only the affected page is reloaded');
+
+  wc.emit('responsive');
+  wc.emit('unresponsive');
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(wc._calls.filter((call) => call === 'reload').length, 1, 'cooldown blocks a repeated reload loop');
+});
+
+test('webview bridge: recovery timer is canceled if the site becomes responsive or a navigation starts', async (t) => {
+  for (const recoveryEvent of ['responsive', 'did-start-loading']) {
+    await t.test(recoveryEvent, async () => {
+      const { handlers, views } = makeHarness({ pageUnresponsiveReloadDelayMs: 20 });
+      await handlers.get('yayra:webview-ensure')(null, { tabId: `tab-cancel-${recoveryEvent}`, url: 'https://example.com/' });
+      const wc = views[0].webContents;
+      wc.emit('unresponsive');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      wc.emit(recoveryEvent);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      assert.equal(wc._calls.includes('reload'), false, `no auto reload after ${recoveryEvent}`);
+    });
+  }
 });
 
 test('webview bridge: Google account home and management pages stay in the native in-app view', async () => {
