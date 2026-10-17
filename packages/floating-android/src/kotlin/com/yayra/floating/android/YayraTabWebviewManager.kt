@@ -335,9 +335,21 @@ class YayraTabWebviewManager(
         val handSvg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"$dimension\" height=\"$dimension\" viewBox=\"0 0 24 24\"><path d=\"M9 11V4.5a1.5 1.5 0 0 1 3 0V10l4.6.9c1.1.2 1.9 1.2 1.9 2.3v3.3c0 2.5-2 4.5-4.5 4.5h-3.4c-1.3 0-2.6-.6-3.4-1.7L4 15.5c-.6-.9-.4-2 .5-2.6.8-.5 1.9-.3 2.5.5l2 2.6z\" fill=\"$color\" stroke=\"$outline\" stroke-width=\"$handStroke\" stroke-linejoin=\"round\"/></svg>"
         val arrowCursor = cursorData(arrowSvg, (4 * scale).toInt(), (2 * scale).toInt(), "auto")
         val handCursor = cursorData(handSvg, (9 * scale).toInt(), (2 * scale).toInt(), "pointer")
+        val interactiveSelector = ":where(" + listOf(
+            "a[href]", "area[href]", "button",
+            "input[type='button']", "input[type='submit']", "input[type='reset']", "input[type='image']",
+            "input[type='checkbox']", "input[type='radio']", "input[type='range']", "input[type='file']", "input[type='color']",
+            "select", "option", "summary", "label",
+            "[role='button']", "[role='link']", "[role='tab']", "[role='menuitem']", "[role='menuitemcheckbox']", "[role='menuitemradio']",
+            "[role='combobox']", "[role='listbox']", "[role='option']", "[role='checkbox']", "[role='radio']", "[role='switch']", "[role='slider']", "[role='treeitem']", "[role='gridcell']",
+            "[aria-haspopup]", "[onclick]", "[tabindex]:not([tabindex='-1'])"
+        ).joinToString(", ") + ")"
+        // :not(html) gives this hand rule the same specificity as body * in
+        // the arrow rule, without defeating the native text-cursor rules.
+        val handTargetSelector = "$interactiveSelector:not(html)"
         return "html, body, body * { cursor: $arrowCursor !important; }\n" +
-            "button, a, [role='button'], [role='tab'], [role='menuitem'], select, summary, input[type='button'], input[type='submit'], input[type='reset'] { cursor: $handCursor !important; }\n" +
-            "input:not([type]), input[type='text'], input[type='search'], input[type='url'], input[type='email'], input[type='password'], input[type='number'], textarea, [contenteditable='true'], [role='textbox'] { cursor: text !important; }"
+            "$handTargetSelector, $handTargetSelector * { cursor: $handCursor !important; }\n" +
+            "input:not([type]), input[type='text'], input[type='search'], input[type='url'], input[type='email'], input[type='tel'], input[type='password'], input[type='number'], input[type='date'], input[type='time'], input[type='datetime-local'], input[type='month'], input[type='week'], textarea, [contenteditable]:not([contenteditable='false']), [role='textbox'] { cursor: text !important; }"
     }
 
     private fun applyPointerThemeToPage(entry: TabEntry) {

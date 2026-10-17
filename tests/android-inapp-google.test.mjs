@@ -340,6 +340,10 @@ test('KOTLIN PIN: the native tab engine exists, is safe, and reports through tab
   assert.ok(manager.includes('fun setVisible('), 'visibility control');
   assert.ok(manager.includes('fun setPointerTheme('), 'website pointer preference reaches live Android tabs');
   assert.ok(manager.includes('applyPointerThemeToPage'), 'the custom cursor is injected into the page renderer');
+  assert.ok(manager.includes("input[type='checkbox']") && manager.includes("[role='combobox']"), 'native website styles recognize form and ARIA controls');
+  assert.ok(manager.includes('val handTargetSelector = "$interactiveSelector:not(html)"'), 'the hand selector includes non-link controls');
+  assert.ok(manager.includes('$handTargetSelector, $handTargetSelector *'), 'the hand cursor also covers nested icons and labels');
+  assert.ok(manager.includes("input[type='tel']") && manager.includes("[contenteditable]:not([contenteditable='false'])"), 'text-entry fields keep the native I-beam');
   assert.ok(manager.includes("style[nonce],script[nonce]"), 'site CSP nonces are reused where available so custom cursors remain visible');
   assert.ok(manager.includes('Bitmap.createBitmap'), 'hiding captures the page frame (no blank flash under chrome)');
   assert.ok(manager.includes('fun navigate('), 'omnibox navigation');

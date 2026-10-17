@@ -51,12 +51,17 @@ test('buildBrowserUserAgent: never includes the Electron identity token, on any 
   }
 });
 
-test('custom pointer CSS is self-contained, sized, and leaves text fields usable', () => {
+test('custom pointer CSS covers nested interactive controls, is self-contained, and preserves text cursors', () => {
   const css = buildPointerThemeCss('yayra', 'large');
   assert.match(css, /data:image\/svg\+xml,%3Csvg/, 'cursor art is inline (no network fetch)');
   assert.match(css, /width%3D%2236%22/, 'large cursor image uses the selected size');
-  assert.match(css, /button, a, \[role=/, 'interactive targets use the hand cursor');
-  assert.match(css, /input\[type="text"\][\s\S]*cursor: text !important/, 'text entry keeps its I-beam');
+  for (const selector of [
+    'button', '[role="button"]', '[role="combobox"]',
+    'input[type="checkbox"]', 'input[type="file"]', '[onclick]', '[tabindex]'
+  ]) assert.ok(css.includes(selector), `${selector} uses the hand cursor`);
+  assert.match(css, /:where\([^\n]+\):not\(html\), :where\([^\n]+\):not\(html\) \* \{ cursor:.*pointer !important;/, 'the hand cursor applies to interactive targets and their nested icons/text');
+  assert.match(css, /input\[type="email"\][\s\S]*cursor: text !important/, 'text entry keeps its I-beam');
+  assert.match(css, /input\[type="tel"\]/, 'telephone fields retain native text-cursor treatment');
   assert.match(buildPointerThemeCss('high-visibility', 'xlarge'), /%23ffd400/, 'high-visibility keeps its yellow outline');
   assert.match(buildPointerThemeScript('system'), /yayra-custom-pointer-theme/, 'System removes any injected cursor stylesheet');
 });

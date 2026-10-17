@@ -6519,37 +6519,51 @@ html {
   --fb-ptr-hand: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='48' height='48' viewBox='0 0 24 24'%3E%3Cpath d='M9 11V4.5a1.5 1.5 0 0 1 3 0V10l4.6.9c1.1.2 1.9 1.2 1.9 2.3v3.3c0 2.5-2 4.5-4.5 4.5h-3.4c-1.3 0-2.6-.6-3.4-1.7L4 15.5c-.6-.9-.4-2 .5-2.6.8-.5 1.9-.3 2.5.5l2 2.6z' fill='%23111a2e' stroke='%23ffd400' stroke-width='2' stroke-linejoin='round'/%3E%3C/svg%3E") 18 4, pointer;
 }
 
-/* Application (custom themes only - 'system' sets no attribute). */
-[data-fb-pointer='yayra'] *,
-[data-fb-pointer='high-visibility'] * {
+/* Application (custom themes only - 'system' sets no attribute). The
+   hand rule covers the control AND its descendants: sites often put the
+   visible label/icon inside the clickable button or link, and the global
+   arrow rule otherwise wins on that nested target. :where() keeps this
+   selector light enough for the native text-cursor rules below to win. */
+:is([data-fb-pointer='yayra'], [data-fb-pointer='high-visibility']) * {
   cursor: var(--fb-ptr-arrow, auto) !important;
 }
-[data-fb-pointer='yayra'] button,
-[data-fb-pointer='yayra'] a,
-[data-fb-pointer='yayra'] [role='button'],
-[data-fb-pointer='yayra'] [role='tab'],
-[data-fb-pointer='yayra'] [role='menuitem'],
-[data-fb-pointer='yayra'] select,
-[data-fb-pointer='yayra'] summary,
-[data-fb-pointer='yayra'] label.fb-setting-row,
-[data-fb-pointer='high-visibility'] button,
-[data-fb-pointer='high-visibility'] a,
-[data-fb-pointer='high-visibility'] [role='button'],
-[data-fb-pointer='high-visibility'] [role='tab'],
-[data-fb-pointer='high-visibility'] [role='menuitem'],
-[data-fb-pointer='high-visibility'] select,
-[data-fb-pointer='high-visibility'] summary,
-[data-fb-pointer='high-visibility'] label.fb-setting-row {
+:is([data-fb-pointer='yayra'], [data-fb-pointer='high-visibility']) :where(
+  a[href], area[href], button,
+  input[type='button'], input[type='submit'], input[type='reset'], input[type='image'],
+  input[type='checkbox'], input[type='radio'], input[type='range'], input[type='file'], input[type='color'],
+  select, option, summary, label,
+  [role='button'], [role='link'], [role='tab'], [role='menuitem'], [role='menuitemcheckbox'], [role='menuitemradio'],
+  [role='combobox'], [role='listbox'], [role='option'], [role='checkbox'], [role='radio'], [role='switch'], [role='slider'], [role='treeitem'], [role='gridcell'],
+  [aria-haspopup], [onclick], [tabindex]:not([tabindex='-1'])
+),
+:is([data-fb-pointer='yayra'], [data-fb-pointer='high-visibility']) :where(
+  a[href], area[href], button,
+  input[type='button'], input[type='submit'], input[type='reset'], input[type='image'],
+  input[type='checkbox'], input[type='radio'], input[type='range'], input[type='file'], input[type='color'],
+  select, option, summary, label,
+  [role='button'], [role='link'], [role='tab'], [role='menuitem'], [role='menuitemcheckbox'], [role='menuitemradio'],
+  [role='combobox'], [role='listbox'], [role='option'], [role='checkbox'], [role='radio'], [role='switch'], [role='slider'], [role='treeitem'], [role='gridcell'],
+  [aria-haspopup], [onclick], [tabindex]:not([tabindex='-1'])
+) * {
   cursor: var(--fb-ptr-hand, pointer) !important;
 }
 /* Text entry keeps the NATIVE I-beam (follows the OS pointer size). */
+[data-fb-pointer] input:not([type]),
 [data-fb-pointer] input[type='text'],
 [data-fb-pointer] input[type='search'],
 [data-fb-pointer] input[type='url'],
+[data-fb-pointer] input[type='email'],
+[data-fb-pointer] input[type='tel'],
 [data-fb-pointer] input[type='password'],
 [data-fb-pointer] input[type='number'],
+[data-fb-pointer] input[type='date'],
+[data-fb-pointer] input[type='time'],
+[data-fb-pointer] input[type='datetime-local'],
+[data-fb-pointer] input[type='month'],
+[data-fb-pointer] input[type='week'],
 [data-fb-pointer] textarea,
-[data-fb-pointer] [contenteditable='true'] {
+[data-fb-pointer] [contenteditable]:not([contenteditable='false']),
+[data-fb-pointer] [role='textbox'] {
   cursor: text !important;
 }
 

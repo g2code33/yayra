@@ -114,6 +114,20 @@ function decodeOpenExternalRequest(url) {
 
 const POINTER_STYLE_ID = 'yayra-custom-pointer-theme';
 
+// Keep the Yayra shell and native website views aligned. Many sites put the
+// actual hovered target (an SVG, icon, or text span) inside the control, so
+// buildPointerThemeCss applies the hand cursor to both each control and all of
+// its descendants.
+const POINTER_INTERACTIVE_SELECTORS = Object.freeze([
+  'a[href]', 'area[href]', 'button',
+  'input[type="button"]', 'input[type="submit"]', 'input[type="reset"]', 'input[type="image"]',
+  'input[type="checkbox"]', 'input[type="radio"]', 'input[type="range"]', 'input[type="file"]', 'input[type="color"]',
+  'select', 'option', 'summary', 'label',
+  '[role="button"]', '[role="link"]', '[role="tab"]', '[role="menuitem"]', '[role="menuitemcheckbox"]', '[role="menuitemradio"]',
+  '[role="combobox"]', '[role="listbox"]', '[role="option"]', '[role="checkbox"]', '[role="radio"]', '[role="switch"]', '[role="slider"]', '[role="treeitem"]', '[role="gridcell"]',
+  '[aria-haspopup]', '[onclick]', '[tabindex]:not([tabindex="-1"])'
+]);
+
 /** Builds the same custom cursor rules for a native website view as the UI uses. */
 function buildPointerThemeCss(theme, size = 'normal') {
   if (theme !== 'yayra' && theme !== 'high-visibility') return '';
@@ -130,11 +144,16 @@ function buildPointerThemeCss(theme, size = 'normal') {
   const handHotspot = `${Math.round(9 * scale)} ${Math.round(2 * scale)}`;
   const arrowCursor = `url("data:image/svg+xml,${encodeURIComponent(arrowSvg)}") ${arrowHotspot}, auto`;
   const handCursor = `url("data:image/svg+xml,${encodeURIComponent(handSvg)}") ${handHotspot}, pointer`;
+  const interactiveSelector = `:where(${POINTER_INTERACTIVE_SELECTORS.join(', ')})`;
+  // :not(html) gives the hand rule the same specificity as body * in the
+  // arrow rule, allowing it to win by source order without overpowering the
+  // native I-beam rules on text inputs.
+  const handTargetSelector = `${interactiveSelector}:not(html)`;
 
   return [
     `html, body, body * { cursor: ${arrowCursor} !important; }`,
-    `button, a, [role="button"], [role="tab"], [role="menuitem"], select, summary, input[type="button"], input[type="submit"], input[type="reset"] { cursor: ${handCursor} !important; }`,
-    `input:not([type]), input[type="text"], input[type="search"], input[type="url"], input[type="email"], input[type="password"], input[type="number"], textarea, [contenteditable="true"], [role="textbox"] { cursor: text !important; }`
+    `${handTargetSelector}, ${handTargetSelector} * { cursor: ${handCursor} !important; }`,
+    `input:not([type]), input[type="text"], input[type="search"], input[type="url"], input[type="email"], input[type="tel"], input[type="password"], input[type="number"], input[type="date"], input[type="time"], input[type="datetime-local"], input[type="month"], input[type="week"], textarea, [contenteditable]:not([contenteditable="false"]), [role="textbox"] { cursor: text !important; }`
   ].join('\n');
 }
 
