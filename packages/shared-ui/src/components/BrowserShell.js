@@ -18,7 +18,7 @@
 
 import { Icons } from '../icons/icons.js';
 import qrcode from '../vendor/qrcode.js';
-import { classifyDocument, DocumentStore, createPdfViewer, createDocumentViewerState, DOCUMENT_ENGINES } from '../services/documentWorkspace.js';
+import { classifyDocument, DocumentStore, createPdfViewer, createDocumentViewerState, DOCUMENT_ENGINES, MAX_DOCUMENT_BYTES } from '../services/documentWorkspace.js';
 import { PasswordManager } from '../../../persistence/src/PasswordManager.js';
 import { PasskeyService } from '../services/passkeyService.js';
 import { ProfileService } from '../services/profileService.js';
@@ -36,6 +36,8 @@ import {
 } from '../services/profileStorage.js';
 import { YayraAiService, AI_DEFAULTS, describeAiReason } from '../services/aiService.js';
 import { ExtensionManager, BUILT_IN_EXTENSIONS } from '../../../browser-contract/src/extensions/ExtensionManager.js';
+
+const MAX_DOCUMENT_SIZE_MB = Math.floor(MAX_DOCUMENT_BYTES / (1024 * 1024));
 
 /**
  * =========================================================================
@@ -12217,7 +12219,7 @@ export class BrowserShell {
     this._pageSnapshots.delete(tabId); // closed tab, dead preview
 
     const [closedTab] = this.state.tabs.splice(tabIndex, 1);
-    if (closedTab?.isDocument) {
+    if (closedTab?.docId) {
       const session = this._documentViewerSessions?.get(tabId);
       if (session) {
         session.disposed = true;
@@ -12230,9 +12232,19 @@ export class BrowserShell {
       }
     }
 
-    // Save to closed tabs history (for Ctrl+Shift+T restore)
-    if (closedTab && !closedTab.isPrivate && closedTab.url !== 'yayra://newtab') {
-      this.state.closedTabsHistory.unshift(closedTab);
+    // A closed PDF is intentionally not kept in the in-memory restore list:
+    // closing it releases its bytes, so advertising it to Ctrl+Shift+T would
+    // create a dead document tab. If a document tab navigated to a website,
+    // that website remains restorable without the document metadata.
+    const isDocumentUrl = String(closedTab?.url || '').startsWith('yayra://doc/');
+    if (closedTab && !closedTab.isPrivate && closedTab.url !== 'yayra://newtab' && !isDocumentUrl) {
+      const restorableTab = { ...closedTab };
+      if (restorableTab.docId) {
+        delete restorableTab.isDocument;
+        delete restorableTab.docId;
+        delete restorableTab.docState;
+      }
+      this.state.closedTabsHistory.unshift(restorableTab);
       if (this.state.closedTabsHistory.length > 25) {
         this.state.closedTabsHistory.pop();
       }
@@ -13291,6 +13303,10 @@ export class BrowserShell {
       return;
     }
     for (const file of pdfs.slice(0, 8)) {
+      if (Number.isFinite(file?.size) && file.size > MAX_DOCUMENT_BYTES) {
+        this.showTransientNotice(`PDFs larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`);
+        continue;
+      }
       try {
         const bytes = await this._readFileBytes(file);
         this.addDocumentTab({ name: file.name, bytes });
@@ -13779,7 +13795,12 @@ export class BrowserShell {
 
   getTabTitle(tab) {
     if (!tab) return 'New Tab';
-    if (tab.title && tab.title !== 'New Tab') return tab.title;
+    const documentTitle = tab.docId ? this.documentStore?.get(tab.docId)?.name : null;
+    if (String(tab.url || '').startsWith('yayra://doc/')) return documentTitle || tab.title || 'Document';
+    // A tab can navigate away from a PDF and later go Back. In that case its
+    // old filename is not the title of the current website, but the document
+    // bytes stay available until the tab itself closes.
+    if (tab.title && tab.title !== 'New Tab' && tab.title !== documentTitle) return tab.title;
     if (!tab.url || tab.url === 'yayra://newtab') return tab.isPrivate ? 'Incognito Tab' : 'New Tab';
     if (tab.url === 'yayra://settings') return 'Settings';
     if (tab.url === 'yayra://history') return 'History';
@@ -13815,7 +13836,11 @@ export class BrowserShell {
         const res = await bridge.openPdf();
         if (!res || !res.ok) {
           if (res && res.canceled) return; // user closed the picker
-          this.showTransientNotice(`Couldn\u2019t open the document${res && res.reason ? ` (${res.reason})` : ''}.`);
+          if (res?.reason === 'file-too-large') {
+            this.showTransientNotice(`PDFs larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`);
+          } else {
+            this.showTransientNotice(`Couldn\u2019t open the document${res && res.reason ? ` (${res.reason})` : ''}.`);
+          }
           return;
         }
         this.addDocumentTab({ name: res.name, bytes: res.data });
@@ -13842,15 +13867,21 @@ export class BrowserShell {
       input.addEventListener('change', () => {
         const file = input.files && input.files[0];
         if (!file) return;
+        // Reset first so the same rejected file can be selected again after
+        // the user chooses a smaller/different document.
+        input.value = '';
         if (classifyDocument(file.name) !== 'pdf') {
           this.showTransientNotice('Only PDF documents are supported right now - Word, Excel and PowerPoint are on the roadmap.');
+          return;
+        }
+        if (Number.isFinite(file.size) && file.size > MAX_DOCUMENT_BYTES) {
+          this.showTransientNotice(`PDFs larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`);
           return;
         }
         const reader = new FileReader();
         reader.onload = () => this.addDocumentTab({ name: file.name, bytes: reader.result });
         reader.onerror = () => this.showTransientNotice('Couldn\u2019t read the file.');
         reader.readAsArrayBuffer(file);
-        input.value = '';
       });
       document.body.appendChild(input);
       this._docFileInput = input;
@@ -13863,8 +13894,10 @@ export class BrowserShell {
     let doc;
     try {
       doc = this.documentStore.add({ name, bytes });
-    } catch {
-      this.showTransientNotice('That file appears to be empty.');
+    } catch (error) {
+      this.showTransientNotice(error?.message === 'document-too-large'
+        ? `PDFs larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`
+        : 'That file appears to be empty.');
       return null;
     }
     this.createNewTab();
@@ -14198,7 +14231,13 @@ export class BrowserShell {
             const row = document.createElement('div');
             row.className = 'fb-doc-match-row';
             row.style.cssText = `padding:6px 8px; margin-bottom:4px; border-radius:6px; cursor:pointer; background:${i === state.matchIndex ? 'rgba(109,93,242,0.35)' : 'rgba(255,255,255,0.04)'}; line-height:1.4;`;
-            row.innerHTML = `<strong style="color:var(--fb-text-secondary,#9aa3b2);">p.${m.page}</strong> \u2014 ${String(m.snippet || '').slice(0, 90)}`;
+            const pageNumber = document.createElement('strong');
+            pageNumber.style.cssText = 'color:var(--fb-text-secondary,#9aa3b2);';
+            pageNumber.textContent = `p.${m.page}`;
+            const snippet = document.createElement('span');
+            snippet.textContent = ` \u2014 ${String(m.snippet || '').slice(0, 90)}`;
+            row.appendChild(pageNumber);
+            row.appendChild(snippet);
             row.addEventListener('click', () => { this._activeDocViewer?.viewer.setPage(m.page); });
             matchPanel.appendChild(row);
           });
@@ -14356,8 +14395,10 @@ export class BrowserShell {
 
   getTabFavicon(tab) {
     if (!tab) return Icons.globe;
-    // Document tabs carry the document glyph, never a web favicon.
-    if (tab.isDocument) return Icons.document;
+    // A document tab carries its glyph only while it is actually displaying
+    // the local document route; navigating away keeps the PDF available for
+    // Back, but the current web page should use its own site icon.
+    if (tab.isDocument && String(tab.url || '').startsWith('yayra://doc/')) return Icons.document;
     // "Time sign" while the page is loading: the tab's icon slot becomes
     // an animated hourglass the moment loading starts, and flips back to
     // the real favicon when the page is fully loaded. Updated in place by
@@ -14724,6 +14765,9 @@ export class BrowserShell {
     }
     this._documentViewerSessions?.clear?.();
     this._activeDocViewer = null;
+    // PDF bytes are intentionally session-memory only; release them with the
+    // shell so an unmounted/closed window cannot retain an open document.
+    for (const doc of this.documentStore?.list?.() || []) this.documentStore.remove(doc.id);
     // Android overlay-permission grant watcher (poll + listeners).
     if (this._stopOverlayGrantWatch) {
       try { this._stopOverlayGrantWatch(); } catch { /* already stopped */ }
@@ -14753,6 +14797,10 @@ export class BrowserShell {
     if (this._unsubscribeTabWebEvents) { this._unsubscribeTabWebEvents(); this._unsubscribeTabWebEvents = null; }
     if (this._unsubscribeAndroidBackButton) { this._unsubscribeAndroidBackButton(); this._unsubscribeAndroidBackButton = null; }
     if (this._unsubscribeOpenPdfFile) { try { this._unsubscribeOpenPdfFile(); } catch { /* gone */ } this._unsubscribeOpenPdfFile = null; }
+    if (this._docFileInput) {
+      try { this._docFileInput.remove?.(); } catch { /* already detached */ }
+      this._docFileInput = null;
+    }
     if (this._pdfDropHandlers && typeof document !== 'undefined') {
       document.removeEventListener?.('dragover', this._pdfDropHandlers.dragover);
       document.removeEventListener?.('drop', this._pdfDropHandlers.drop);

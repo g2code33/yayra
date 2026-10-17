@@ -60,6 +60,8 @@ export function unsupportedDocumentKinds() {
   return ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'];
 }
 
+export const MAX_DOCUMENT_BYTES = 150 * 1024 * 1024;
+
 let docSeq = 0;
 
 /**
@@ -74,9 +76,11 @@ export class DocumentStore {
 
   /** Add a document; returns { id, name, bytes, type, size, openedAt }. */
   add({ name, bytes }) {
-    if (!bytes || (bytes.byteLength !== undefined && bytes.byteLength === 0)) {
-      throw new Error('empty-document');
-    }
+    const size = bytes && Number.isFinite(bytes.byteLength)
+      ? bytes.byteLength
+      : (bytes && Number.isFinite(bytes.length) ? bytes.length : 0);
+    if (size <= 0) throw new Error('empty-document');
+    if (size > MAX_DOCUMENT_BYTES) throw new Error('document-too-large');
     const cleanName = String(name || 'document.pdf').slice(0, 120);
     const type = classifyDocument(cleanName) || 'pdf';
     docSeq += 1;
@@ -86,7 +90,7 @@ export class DocumentStore {
       name: cleanName,
       bytes,
       type,
-      size: bytes.byteLength !== undefined ? bytes.byteLength : bytes.length,
+      size,
       openedAt: Date.now()
     };
     this._docs.set(id, doc);

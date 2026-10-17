@@ -12,6 +12,7 @@ import {
   unsupportedDocumentKinds,
   DOCUMENT_ENGINES,
   DocumentStore,
+  MAX_DOCUMENT_BYTES,
   createPdfViewer,
   createDocumentViewerState
 } from '../packages/shared-ui/src/services/documentWorkspace.js';
@@ -121,6 +122,8 @@ test('STORE: in-memory, no paths, unique ids, empty files refused', () => {
   assert.ok(store.remove(a.id));
   assert.equal(store.get(a.id), null);
   assert.throws(() => store.add({ name: 'empty.pdf', bytes: new Uint8Array([]) }), /empty/);
+  assert.throws(() => store.add({ name: 'too-large.pdf', bytes: { byteLength: MAX_DOCUMENT_BYTES + 1 } }), /document-too-large/,
+    'the document store enforces the same 150 MB ceiling for every open path');
 });
 
 test('VIEWER: load -> ready with page count; navigation is clamped to the document', async () => {
@@ -323,6 +326,28 @@ test('TAB INTEGRATION: PDF.js startup failures are shown with a working retry, n
   }
 });
 
+test('TAB INTEGRATION: navigating from a PDF updates the tab title, Back restores it, and closing releases bytes', async () => {
+  const { shell } = await bootShell();
+  try {
+    shell._docEngineOverride = fakePdfjs();
+    const doc = shell.addDocumentTab({ name: 'navigation.pdf', bytes: new Uint8Array([9]) });
+    const tab = shell.getActiveTab();
+    assert.equal(shell.getTabTitle(tab), 'navigation.pdf');
+
+    shell.navigateActiveTab('https://example.com/report');
+    assert.equal(shell.getTabTitle(tab), 'example.com', 'the PDF filename does not stick on the website tab');
+    assert.equal(shell.documentStore.get(doc.id)?.name, 'navigation.pdf', 'document bytes remain for Back navigation');
+
+    assert.equal(shell.goBack(), true);
+    assert.equal(tab.url, `yayra://doc/${doc.id}`);
+    assert.equal(shell.getTabTitle(tab), 'navigation.pdf', 'Back restores the local document title');
+    shell.closeTab(tab.id);
+    assert.equal(shell.documentStore.get(doc.id), null, 'closing the tab releases the in-memory document');
+  } finally {
+    shell.destroy();
+  }
+});
+
 test('TAB INTEGRATION: the Close button closes the document tab and returns to browsing', async () => {
   const { shell, container } = await bootShell();
   try {
@@ -336,6 +361,8 @@ test('TAB INTEGRATION: the Close button closes the document tab and returns to b
     assert.equal(shell.state.tabs.length, before, 'document tab closed');
     assert.equal(shell.state.tabs.every((t) => !t.isDocument), true);
     assert.equal(shell.documentStore.get(doc.id), null, 'closing the last tab releases the PDF bytes from memory');
+    assert.equal(shell.state.closedTabsHistory.some((tab) => tab.url === `yayra://doc/${doc.id}`), false,
+      'a byte-less PDF tab is never offered as a broken Ctrl+Shift+T restore');
   } finally {
     shell.destroy();
   }
@@ -394,10 +421,16 @@ test('SECURITY (source pin): the Electron document IPC returns BYTES ONLY - neve
 test('NO REGRESSION (source pin): document tabs cannot reach the web-frame path, and the session filter stays https-only', () => {
   const src = readFileSync(new URL('../packages/shared-ui/src/components/BrowserShell.js', import.meta.url), 'utf8');
   const fnStart = src.indexOf('renderViewportContent(viewport, activeTab) {');
-  const fn = src.slice(fnStart, fnStart + 2200);
-  const docAt = fn.indexOf("url.startsWith('yayra://doc/')");
+  const fnEnd = src.indexOf('\n  /* -------------------------------------------------------------\n   * EXTERNAL WEB CONTENT FRAME HELPER', fnStart);
+  assert.ok(fnStart > -1 && fnEnd > fnStart, 'the viewport router is bounded in source');
+  const fn = src.slice(fnStart, fnEnd);
+  const docAt = fn.indexOf("if (url.startsWith('yayra://doc/')");
+  const renderDocAt = fn.indexOf('this.renderDocumentViewer(viewport, activeTab)', docAt);
+  const nativeFrameAt = fn.indexOf('this.createWebContentFrame(activeTab.url', docAt);
   assert.ok(docAt > -1, 'document routing exists');
-  assert.ok(fn.indexOf('renderDocumentViewer') > docAt, 'the doc branch renders the viewer');
+  assert.ok(renderDocAt > docAt, 'the document branch renders the viewer');
+  assert.ok(nativeFrameAt > renderDocAt, 'web-frame creation is only the later else branch');
+  assert.match(fn.slice(docAt, nativeFrameAt), /if \(url\.startsWith\('yayra:\/\/doc\/'\)\)\s*\{\s*this\.renderDocumentViewer\(viewport, activeTab\);\s*\}\s*else if/, 'document routing is exclusive and cannot fall through to a web frame');
   // Session snapshots remain https-only (document tabs auto-excluded).
   const snap = src.indexOf('queueSessionSnapshot() {');
   const snapBlock = src.slice(snap, snap + 700);

@@ -133,7 +133,7 @@ Key decisions:
 - Document bytes live in memory for the tab's lifetime; closing the tab (or
   restarting) drops them — reopening is one menu click. No annotations, no
   printing, no export yet — no buttons pretend otherwise.
-- Extremely large PDFs (>150 MB) are refused by the picker contract.
+- All PDF entry paths enforce a 150 MB limit before reading/copying when the source exposes its size (native picker, browser file input, drag-and-drop), with a final in-memory store guard. Closed PDF bytes are not kept for Ctrl+Shift+T; reopen the original file from the menu.
 - Text search is exact-string, case-insensitive; no regex/diacritics folding.
 
 ## 7. Phased plan (roadmap, not implemented)

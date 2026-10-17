@@ -10,6 +10,7 @@ import { setupDomShim } from './dom-shim.mjs';
 setupDomShim();
 
 import { BrowserShell } from '../packages/shared-ui/src/components/BrowserShell.js';
+import { MAX_DOCUMENT_BYTES } from '../packages/shared-ui/src/services/documentWorkspace.js';
 
 const require = createRequire(import.meta.url);
 const { parsePdfFileArg } = require('../electron/pdfLaunch.cjs');
@@ -100,6 +101,45 @@ test('DRAG & DROP: a PDF dropped anywhere in Yayra opens in the built-in viewer'
   }
 });
 
+test('DRAG & DROP: oversized PDFs are refused before reading into memory', async () => {
+  const { shell } = await makeShell();
+  try {
+    let readCalls = 0;
+    const notices = [];
+    shell.showTransientNotice = (message) => notices.push(message);
+    await shell._openDroppedPdfFiles([{
+      name: 'huge.pdf',
+      size: MAX_DOCUMENT_BYTES + 1,
+      arrayBuffer: async () => { readCalls += 1; return new ArrayBuffer(1); }
+    }]);
+    assert.equal(readCalls, 0, 'the 150 MB guard runs before allocating file bytes');
+    assert.equal(shell.state.tabs.filter((tab) => tab.isDocument).length, 0, 'no dead document tab is created');
+    assert.match(notices[0], /150 MB/);
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('FILE PICKER: oversized PDFs are rejected before FileReader and the input can be reused', async () => {
+  const { shell } = await makeShell();
+  try {
+    const notices = [];
+    shell.showTransientNotice = (message) => notices.push(message);
+    shell._openDocumentFileInput();
+    const input = shell._docFileInput;
+    input.files = [{ name: 'huge.pdf', size: MAX_DOCUMENT_BYTES + 1 }];
+    input.value = 'selected';
+    input.dispatchEvent({ type: 'change', target: input });
+    assert.match(notices[0], /150 MB/);
+    assert.equal(input.value, '', 'reset allows selecting a different file after rejection');
+    assert.equal(shell.state.tabs.filter((tab) => tab.isDocument).length, 0);
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
 test('DRAG & DROP: non-PDF files get the honest roadmap notice, never a dead tab', async () => {
   const { shell } = await makeShell();
   try {
@@ -113,6 +153,26 @@ test('DRAG & DROP: non-PDF files get the honest roadmap notice, never a dead tab
     assert.equal(shell.isPdfDownload({ filename: 'x.bin', mime: 'application/pdf' }), true);
   } finally {
     shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('SHELL DISPOSAL: PDF byte buffers and the hidden file input are released', async () => {
+  const { shell } = await makeShell();
+  let destroyed = false;
+  try {
+    shell.addDocumentTab({ name: 'temporary.pdf', bytes: new Uint8Array([1, 2, 3]) });
+    shell._openDocumentFileInput();
+    const hiddenInput = shell._docFileInput;
+    assert.ok(hiddenInput.parentElement, 'file input is attached while the shell is active');
+
+    shell.destroy();
+    destroyed = true;
+    assert.equal(shell.documentStore.list().length, 0, 'document byte references are removed on disposal');
+    assert.equal(hiddenInput.parentElement, null, 'hidden file input is detached');
+    assert.equal(shell._docFileInput, null);
+  } finally {
+    if (!destroyed) shell.destroy();
     delete globalThis.localStorage;
   }
 });
