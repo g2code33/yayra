@@ -106,6 +106,8 @@ function decodeOpenExternalRequest(url) {
 }
 
 const POINTER_STYLE_ID = 'yayra-custom-pointer-theme';
+const POINTER_TEXT_CURSOR_ATTRIBUTE = 'data-yayra-selectable-text';
+const POINTER_TEXT_CURSOR_STATE = '__yayraSelectableTextCursorState';
 
 // Keep the Yayra shell and native website views aligned. Many sites put the
 // actual hovered target (an SVG, icon, or text span) inside the control, so
@@ -146,7 +148,11 @@ function buildPointerThemeCss(theme, size = 'normal') {
   return [
     `html, body, body * { cursor: ${arrowCursor} !important; }`,
     `${handTargetSelector}, ${handTargetSelector} * { cursor: ${handCursor} !important; }`,
-    `input:not([type]), input[type="text"], input[type="search"], input[type="url"], input[type="email"], input[type="tel"], input[type="password"], input[type="number"], input[type="date"], input[type="time"], input[type="datetime-local"], input[type="month"], input[type="week"], textarea, [contenteditable]:not([contenteditable="false"]), [role="textbox"] { cursor: text !important; }`
+    `input:not([type]), input[type="text"], input[type="search"], input[type="url"], input[type="email"], input[type="tel"], input[type="password"], input[type="number"], input[type="date"], input[type="time"], input[type="datetime-local"], input[type="month"], input[type="week"], textarea, [contenteditable]:not([contenteditable="false"]), [role="textbox"] { cursor: text !important; }`,
+    // The pointer-move helper marks only selectable, non-interactive text
+    // under the actual hit point. Use the native I-beam and preserve normal
+    // drag selection, even when a site styles its content with user-select:none.
+    `[${POINTER_TEXT_CURSOR_ATTRIBUTE}="true"] { cursor: text !important; user-select: text !important; -webkit-user-select: text !important; }`
   ].join('\n');
 }
 
@@ -185,6 +191,128 @@ function buildPointerThemeScript(theme, size = 'normal') {
         window.__yayraPointerThemeObserver = observer;
       }
     } catch (_err) { /* some pages lock down DOM mutation; keep the site usable */ }
+  })();`;
+}
+
+/**
+ * Custom arrows normally hide Chromium's context-sensitive I-beam. This
+ * page-local helper restores it only when the hit-tested point is over real
+ * selectable text outside an interactive control. Pointerdown marks the text
+ * synchronously so native drag-to-select starts with user-select enabled.
+ */
+function buildPointerTextCursorScript(theme) {
+  const enabled = theme === 'yayra' || theme === 'high-visibility';
+  const stateKey = JSON.stringify(POINTER_TEXT_CURSOR_STATE);
+  const attribute = JSON.stringify(POINTER_TEXT_CURSOR_ATTRIBUTE);
+  if (!enabled) {
+    return `(function () { try { window[${stateKey}]?.cleanup?.(); } catch (_err) {} })();`;
+  }
+  const interactiveSelector = JSON.stringify(POINTER_INTERACTIVE_SELECTORS.join(', '));
+  return `(function () {
+    try {
+      var stateKey = ${stateKey};
+      var attribute = ${attribute};
+      var interactiveSelector = ${interactiveSelector};
+      try { window[stateKey]?.cleanup?.(); } catch (_err) {}
+      var current = null;
+      var pending = false;
+      var scheduledFrame = null;
+      var latestPoint = null;
+      var clear = function () {
+        if (current) { try { current.removeAttribute(attribute); } catch (_err) {} }
+        current = null;
+      };
+      var isInteractive = function (target) {
+        var element = target && target.nodeType === 1 ? target : target && target.parentElement;
+        try {
+          while (element) {
+            if (element.closest && element.closest(interactiveSelector)) return true;
+            var root = element.getRootNode && element.getRootNode();
+            element = root && root.host ? root.host : null;
+          }
+        } catch (_err) { return false; }
+        return false;
+      };
+      var textElementAt = function (x, y) {
+        var range = null;
+        try {
+          if (typeof document.caretRangeFromPoint === 'function') {
+            range = document.caretRangeFromPoint(x, y);
+          } else if (typeof document.caretPositionFromPoint === 'function') {
+            var position = document.caretPositionFromPoint(x, y);
+            if (position && position.offsetNode) {
+              range = document.createRange();
+              range.setStart(position.offsetNode, position.offset);
+              range.collapse(true);
+            }
+          }
+        } catch (_err) { range = null; }
+        var node = range && range.startContainer;
+        if (!node || node.nodeType !== 3 || !String(node.nodeValue || '').trim()) return null;
+        var element = node.parentElement;
+        if (!element || isInteractive(element)) return null;
+        try {
+          var check = document.createRange();
+          check.selectNodeContents(node);
+          var rects = check.getClientRects();
+          var hit = false;
+          for (var i = 0; i < rects.length; i += 1) {
+            var rect = rects[i];
+            if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) { hit = true; break; }
+          }
+          if (!hit) return null;
+        } catch (_err) { return null; }
+        return element;
+      };
+      var update = function (point) {
+        var next = textElementAt(point.x, point.y);
+        if (next === current) return;
+        clear();
+        if (next) {
+          try { next.setAttribute(attribute, 'true'); current = next; } catch (_err) {}
+        }
+      };
+      var onMove = function (event) {
+        if (!event || event.pointerType === 'touch') { clear(); return; }
+        if (isInteractive(event.target)) { latestPoint = null; clear(); return; }
+        latestPoint = { x: event.clientX, y: event.clientY };
+        if (event.type === 'pointerdown') { update(latestPoint); return; }
+        if (pending) return;
+        pending = true;
+        var run = function () {
+          pending = false;
+          scheduledFrame = null;
+          var point = latestPoint;
+          latestPoint = null;
+          if (point) update(point);
+        };
+        if (typeof window.requestAnimationFrame === 'function') scheduledFrame = window.requestAnimationFrame(run);
+        else scheduledFrame = setTimeout(run, 16);
+      };
+      var onPointerOut = function (event) { if (!event.relatedTarget) clear(); };
+      var cleanup = function () {
+        if (scheduledFrame !== null) {
+          if (typeof window.cancelAnimationFrame === 'function') window.cancelAnimationFrame(scheduledFrame);
+          else clearTimeout(scheduledFrame);
+          scheduledFrame = null;
+        }
+        pending = false;
+        latestPoint = null;
+        document.removeEventListener('pointermove', onMove, true);
+        document.removeEventListener('mousemove', onMove, true);
+        document.removeEventListener('pointerdown', onMove, true);
+        document.removeEventListener('pointerout', onPointerOut, true);
+        window.removeEventListener('blur', clear, true);
+        clear();
+        try { delete window[stateKey]; } catch (_err) { window[stateKey] = null; }
+      };
+      document.addEventListener('pointermove', onMove, true);
+      document.addEventListener('mousemove', onMove, true);
+      document.addEventListener('pointerdown', onMove, true);
+      document.addEventListener('pointerout', onPointerOut, true);
+      window.addEventListener('blur', clear, true);
+      window[stateKey] = { cleanup: cleanup };
+    } catch (_err) { /* cursor enhancement is best-effort; never block page interaction */ }
   })();`;
 }
 
@@ -701,6 +829,17 @@ function createWebviewBridge({
     }
   }
 
+  function executePointerTextCursorFallback(frames, theme) {
+    const script = buildPointerTextCursorScript(theme);
+    for (const frame of frames) {
+      if (!frame || typeof frame.executeJavaScript !== 'function') continue;
+      try {
+        const result = frame.executeJavaScript(script, true);
+        if (result && typeof result.catch === 'function') result.catch(() => {});
+      } catch { /* keep cursor enhancement best-effort */ }
+    }
+  }
+
   function applyPointerThemeToPage(entry) {
     const wc = entry && entry.view && entry.view.webContents;
     if (!wc) return;
@@ -731,6 +870,10 @@ function createWebviewBridge({
     const size = entry.pointerSize === 'large' || entry.pointerSize === 'xlarge'
       ? entry.pointerSize
       : 'normal';
+    // CSS alone cannot distinguish a text node from blank space in a div.
+    // Use Chromium's caret hit-test in every frame to apply an I-beam only
+    // over selectable non-interactive text, including cross-origin frames.
+    executePointerTextCursorFallback(frames, theme);
     const revision = (entry.pointerCssRevision || 0) + 1;
     entry.pointerCssRevision = revision;
     const installed = entry.pointerCssEntries || new Map();
@@ -1615,6 +1758,7 @@ module.exports = {
   buildGoogleSearchThinkingWatchdogScript,
   buildPointerThemeCss,
   buildPointerThemeScript,
+  buildPointerTextCursorScript,
   sanitizeBounds,
   buildBrowserUserAgent,
   buildContextMenuTemplate,

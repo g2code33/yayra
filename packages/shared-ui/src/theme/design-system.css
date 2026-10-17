@@ -552,7 +552,7 @@ html {
   border-radius: 4px;
   color: var(--fb-text-muted);
   opacity: 0.58;
-  cursor: grab;
+  cursor: move;
   background-image: radial-gradient(circle, currentColor 1px, transparent 1.2px);
   background-size: 4px 4px;
   background-position: center;

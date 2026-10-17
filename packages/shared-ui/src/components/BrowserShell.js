@@ -4926,9 +4926,10 @@ export class BrowserShell {
               </div>
             </div>
             <p style="font-size:0.75rem; color:var(--fb-text-muted); margin:10px 0 0; line-height:1.5;">
-              Custom styles apply to Yayra's interface and websites opened in Yayra's built-in web views. The
-              System style keeps the native operating-system pointer and its configured size. In web/PWA mode,
-              browser security prevents restyling external sites inside cross-origin frames.
+              Custom styles apply to Yayra's interface and websites opened in Yayra's built-in web views. A
+              text cursor appears over selectable page text and dragging still selects it. The System style keeps
+              the native operating-system pointer and its configured size. In web/PWA mode, browser security
+              prevents restyling external sites inside cross-origin frames.
             </p>
           </section>
           <section class="fb-settings-group-card" id="sec-privacy" style="${activeCat === 'privacy' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { runInNewContext } from 'node:vm';
 import {
   requiresSystemBrowserAuth,
   secureSystemBrowserAuthUrl,
@@ -8,6 +9,7 @@ import {
   buildContextMenuTemplate,
   buildPointerThemeCss,
   buildPointerThemeScript,
+  buildPointerTextCursorScript,
   createWebviewBridge,
   WEBVIEW_EVENT_CHANNEL
 } from '../electron/webviewBridge.cjs';
@@ -69,8 +71,109 @@ test('custom pointer CSS covers nested interactive controls, is self-contained, 
   assert.match(css, /:where\([^\n]+\):not\(html\), :where\([^\n]+\):not\(html\) \* \{ cursor:.*pointer !important;/, 'the hand cursor applies to interactive targets and their nested icons/text');
   assert.match(css, /input\[type="email"\][\s\S]*cursor: text !important/, 'text entry keeps its I-beam');
   assert.match(css, /input\[type="tel"\]/, 'telephone fields retain native text-cursor treatment');
+  assert.match(css, /\[data-yayra-selectable-text="true"\][\s\S]*cursor: text !important[\s\S]*user-select: text !important/, 'hit-tested site text gets a native I-beam and stays selectable');
   assert.match(buildPointerThemeCss('high-visibility', 'xlarge'), /%23ffd400/, 'high-visibility keeps its yellow outline');
   assert.match(buildPointerThemeScript('system'), /yayra-custom-pointer-theme/, 'System removes any injected cursor stylesheet');
+  const textCursorScript = buildPointerTextCursorScript('yayra');
+  assert.match(textCursorScript, /caretRangeFromPoint|caretPositionFromPoint/, 'cursor selection follows actual text hit-testing');
+  assert.match(textCursorScript, /pointermove/);
+  assert.match(textCursorScript, /POINTER_TEXT_CURSOR|data-yayra-selectable-text/);
+  assert.match(textCursorScript, /interactiveSelector/, 'links and controls keep their hand cursor');
+  assert.match(buildPointerTextCursorScript('system'), /__yayraSelectableTextCursorState/, 'System removes the text-cursor listener');
+});
+
+test('custom text cursor uses caret hit-testing, excludes controls, and cleans up scheduled work', () => {
+  const documentListeners = new Map();
+  const windowListeners = new Map();
+  const frames = new Map();
+  let nextFrame = 1;
+  let hitNode = null;
+  const textBounds = { left: 0, top: 0, right: 100, bottom: 20 };
+  const document = {
+    addEventListener(type, listener) {
+      const listeners = documentListeners.get(type) || new Set();
+      listeners.add(listener);
+      documentListeners.set(type, listeners);
+    },
+    removeEventListener(type, listener) { documentListeners.get(type)?.delete(listener); },
+    caretRangeFromPoint() { return hitNode ? { startContainer: hitNode } : null; },
+    createRange() {
+      return {
+        selectNodeContents() {},
+        getClientRects() { return [textBounds]; },
+        setStart(node) { this.startContainer = node; },
+        collapse() {}
+      };
+    }
+  };
+  const window = {
+    addEventListener(type, listener) {
+      const listeners = windowListeners.get(type) || new Set();
+      listeners.add(listener);
+      windowListeners.set(type, listeners);
+    },
+    removeEventListener(type, listener) { windowListeners.get(type)?.delete(listener); },
+    requestAnimationFrame(callback) {
+      const id = nextFrame++;
+      frames.set(id, callback);
+      return id;
+    },
+    cancelAnimationFrame(id) { frames.delete(id); }
+  };
+  const makeElement = ({ interactive = false, shadowHost = null } = {}) => {
+    const attributes = new Map();
+    return {
+      nodeType: 1,
+      parentElement: null,
+      attributes,
+      closest() { return interactive ? this : null; },
+      getRootNode() { return shadowHost ? { host: shadowHost } : document; },
+      setAttribute(name, value) { attributes.set(name, value); },
+      removeAttribute(name) { attributes.delete(name); },
+      getAttribute(name) { return attributes.get(name) ?? null; }
+    };
+  };
+  const makeTextNode = (parentElement) => ({ nodeType: 3, nodeValue: 'selectable page text', parentElement });
+  const dispatch = (listeners, type, event) => {
+    for (const listener of [...(listeners.get(type) || [])]) listener({ type, ...event });
+  };
+  const flushFrame = () => {
+    const [id, callback] = frames.entries().next().value || [];
+    if (callback) {
+      frames.delete(id);
+      callback();
+    }
+  };
+
+  runInNewContext(buildPointerTextCursorScript('yayra'), { window, document, setTimeout, clearTimeout });
+  const paragraph = makeElement();
+  const paragraphText = makeTextNode(paragraph);
+  hitNode = paragraphText;
+  dispatch(documentListeners, 'pointermove', { pointerType: 'mouse', target: paragraph, clientX: 25, clientY: 10 });
+  assert.equal(paragraph.getAttribute('data-yayra-selectable-text'), null, 'hover updates are frame-batched');
+  flushFrame();
+  assert.equal(paragraph.getAttribute('data-yayra-selectable-text'), 'true', 'a caret hit over actual text marks its element');
+
+  const buttonHost = makeElement({ interactive: true });
+  const shadowText = makeElement({ shadowHost: buttonHost });
+  hitNode = makeTextNode(shadowText);
+  dispatch(documentListeners, 'pointerdown', { pointerType: 'mouse', target: shadowText, clientX: 25, clientY: 10 });
+  assert.equal(buttonHost.getAttribute('data-yayra-selectable-text'), null, 'interactive custom-element hosts are excluded across shadow boundaries');
+  assert.equal(paragraph.getAttribute('data-yayra-selectable-text'), null, 'moving into a control clears the previous I-beam marker');
+
+  const secondParagraph = makeElement();
+  hitNode = makeTextNode(secondParagraph);
+  dispatch(documentListeners, 'pointerdown', { pointerType: 'mouse', target: secondParagraph, clientX: 25, clientY: 10 });
+  assert.equal(secondParagraph.getAttribute('data-yayra-selectable-text'), 'true', 'pointerdown marks text synchronously before native drag selection begins');
+
+  const cleanup = window.__yayraSelectableTextCursorState.cleanup;
+  dispatch(documentListeners, 'pointermove', { pointerType: 'mouse', target: secondParagraph, clientX: 25, clientY: 10 });
+  assert.equal(frames.size, 1, 'a hover update is pending');
+  cleanup();
+  assert.equal(frames.size, 0, 'cleanup cancels any pending animation frame');
+  assert.equal(secondParagraph.getAttribute('data-yayra-selectable-text'), null, 'cleanup removes the text marker');
+  assert.equal([...documentListeners.values()].reduce((count, listeners) => count + listeners.size, 0), 0, 'cleanup removes document listeners');
+  assert.equal([...windowListeners.values()].reduce((count, listeners) => count + listeners.size, 0), 0, 'cleanup removes window listeners');
 });
 
 test('sanitizeBounds: clamps negative/missing values and rounds floats', () => {
@@ -362,6 +465,7 @@ test('webview bridge: user-origin pointer styles bypass site CSP, style child fr
   assert.equal(insertionCalls[0].options.cssOrigin, 'user', 'page CSP and author !important rules cannot block the native stylesheet');
   assert.ok(insertionCalls[0].css.includes('data:image/svg+xml'), 'cursor artwork is embedded, not fetched from a site');
   assert.ok(frameScripts.some((script) => script.includes("style[nonce],script[nonce]")), 'nonce-aware fallback also styles child frames');
+  assert.ok(frameScripts.filter((script) => script.includes('caretRangeFromPoint')).length >= 2, 'native text-cursor hit-testing is installed in both the main and child frames');
 
   const setTheme = handlers.get('yayra:webview-set-pointer-theme');
   assert.deepEqual(setTheme(null, { tabId: 'tab-pointer', theme: 'high-visibility', size: 'xlarge' }), { ok: true });
@@ -378,6 +482,7 @@ test('webview bridge: user-origin pointer styles bypass site CSP, style child fr
   await flushStyles();
   assert.equal(inserted.size, 0, 'System removes the installed user style');
   assert.ok(frameScripts.some((script) => script.includes('delete window.__yayraPointerThemeObserver')), 'page-owned child-frame styles are removed too');
+  assert.ok(frameScripts.some((script) => script.includes('__yayraSelectableTextCursorState') && script.includes('cleanup')), 'System removes page text-cursor listeners and markers too');
 });
 
 test('webview bridge: re-ensuring the same tab with the same URL does not reload', async () => {
