@@ -536,13 +536,32 @@ html {
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   user-select: none;
   z-index: 20;
-  /* Frameless Electron window: the tab strip IS the title bar - empty
-     areas drag the window; every interactive child opts back out below.
-     Ignored entirely by normal web browsers. */
+  /* The strip is custom chrome, but not a window-manager title bar: tabs,
+     buttons, and blank space all remain renderer-interactive. A small
+     explicit handle below is the only native drag region. This prevents
+     double-clicking anywhere on the tab strip from unexpectedly restoring
+     or minimizing the whole window. */
+  -webkit-app-region: no-drag;
+}
+
+.fb-tabstrip-drag-handle {
+  width: 9px;
+  height: 18px;
+  margin-right: 8px;
+  flex: 0 0 9px;
+  border-radius: 4px;
+  color: var(--fb-text-muted);
+  opacity: 0.58;
+  cursor: grab;
+  background-image: radial-gradient(circle, currentColor 1px, transparent 1.2px);
+  background-size: 4px 4px;
+  background-position: center;
+  background-repeat: repeat;
   -webkit-app-region: drag;
 }
 
 .fb-chrome-tabstrip .fb-tab-item,
+.fb-chrome-tabstrip .fb-tabs-scroll-container,
 .fb-chrome-tabstrip .fb-btn-newtab,
 .fb-chrome-tabstrip .fb-window-controls,
 .fb-chrome-tabstrip button {

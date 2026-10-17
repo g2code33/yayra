@@ -1125,11 +1125,11 @@ function createWindow() {
     width: 1200,
     height: 800,
     // No OS title bar ("yayra" text) and no File/Edit/View/Window menu
-    // block: Yayra draws its OWN top chrome - the tab strip doubles as the
-    // draggable title bar, shows the brand wordmark image, and renders
-    // real minimize/maximize/close buttons via the windowControls IPC
-    // bridge (see registerIpcBridges + BrowserShell.renderDesktopLayout).
-    // On macOS the native traffic lights are kept, inset over our chrome.
+    // block: Yayra draws its OWN top chrome, with a dedicated window-drag
+    // handle and real minimize/maximize/close buttons via the windowControls
+    // IPC bridge (see registerIpcBridges + BrowserShell.renderDesktopLayout).
+    // The rest of the tab strip stays interactive instead of behaving like
+    // a native title bar. On macOS the native traffic lights are kept, inset.
     ...(process.platform === 'darwin' ? { titleBarStyle: 'hiddenInset' } : { frame: false }),
     // Dark surface behind EVERYTHING. Electron's default window background
     // is white, and every time the native page view hides/moves (menu

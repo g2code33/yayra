@@ -591,9 +591,9 @@ export class BrowserShell {
   // window.yayra.windowControls (electron/preload.cjs): real minimize/
   // maximize/close for the frameless Electron main window. The OS title
   // bar (which just said "yayra") and the File/Edit/View/Window menu block
-  // are removed - Yayra's own tab strip is the title bar, so it shows the
-  // brand wordmark image and these controls instead. Absent on web/PWA,
-  // where the browser provides the window chrome.
+  // are removed - Yayra renders its own tab strip and window controls, with
+  // a small dedicated drag handle. Absent on web/PWA, where the browser
+  // provides the window chrome.
   get windowControls() {
     if (typeof window === 'undefined') return null;
     const bridge = (window.yayra && window.yayra.windowControls) || (window.ibrowse && window.ibrowse.windowControls) || null;
@@ -1655,6 +1655,19 @@ export class BrowserShell {
     tabstripBrand.setAttribute('aria-hidden', 'true');
     tabStrip.appendChild(tabstripBrand);
 
+    // Do not make the entire tab strip an OS title bar: Electron's native
+    // drag region can consume clicks and applies the desktop's double-click
+    // title-bar action (often restore/minimize) to otherwise ordinary tab
+    // interactions. Keep window movement on one small, explicit handle.
+    const winControls = this.options?.isMiniShell ? null : this.windowControls;
+    if (winControls) {
+      const dragHandle = document.createElement('span');
+      dragHandle.className = 'fb-tabstrip-drag-handle';
+      dragHandle.setAttribute('aria-hidden', 'true');
+      dragHandle.setAttribute('title', 'Drag window');
+      tabStrip.appendChild(dragHandle);
+    }
+
     const tabsScroll = document.createElement('div');
     tabsScroll.className = 'fb-tabs-scroll-container';
 
@@ -1764,16 +1777,12 @@ export class BrowserShell {
       });
     }
 
-    // REAL window controls for the frameless Electron window. The OS title
-    // bar and menu block are removed (electron/main.cjs), so the tab strip
-    // IS the title bar now: it is draggable (CSS -webkit-app-region) and
-    // these buttons genuinely minimize/maximize/close the window via IPC -
-    // unlike the old decorative cluster that was removed when the native
-    // frame was still present. Web/PWA builds never render them (the
-    // browser provides the window chrome there).
-    // The frameless mini window has its own slim titlebar (expand/hide) -
-    // never render a second min/max/close cluster there.
-    const winControls = this.options?.isMiniShell ? null : this.windowControls;
+    // REAL window controls for the frameless Electron window. The tab strip
+    // uses only the small explicit drag handle as a native draggable region;
+    // tab clicks and double-clicks stay in the renderer instead of invoking
+    // the desktop's title-bar restore/minimize action. These controls still
+    // minimize/maximize/close via IPC. Web/PWA builds omit the whole cluster;
+    // the frameless mini window keeps its own expand/hide title bar.
     if (winControls) {
       const controls = document.createElement('div');
       controls.className = 'fb-window-controls';
