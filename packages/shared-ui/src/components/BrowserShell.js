@@ -942,6 +942,10 @@ export class BrowserShell {
     this._armConnectivityAwareness();
     // Local document workspace (Phase 1: PDF) - in-memory, local-first.
     this.documentStore = new DocumentStore();
+    // Keep one PDF.js controller per document tab. The shell rebuilds its DOM
+    // on tab switches/resizes; the controller is reattached instead of
+    // reparsing the same bytes or leaving a spinner on a stale DOM node.
+    this._documentViewerSessions = new Map();
     // Android native tab webview engine bookkeeping (tab id -> engine).
     this._androidTabWebIds = new Set();
     this._androidTabWebResizeObservers = new Map();
@@ -11587,6 +11591,18 @@ export class BrowserShell {
     this._pageSnapshots.delete(tabId); // closed tab, dead preview
 
     const [closedTab] = this.state.tabs.splice(tabIndex, 1);
+    if (closedTab?.isDocument) {
+      const session = this._documentViewerSessions?.get(tabId);
+      if (session) {
+        session.disposed = true;
+        try { session.viewer?.destroy(); } catch { /* already gone */ }
+        this._documentViewerSessions.delete(tabId);
+      }
+      if (this._activeDocViewer?.tabId === tabId) this._activeDocViewer = null;
+      if (!this.state.tabs.some((tab) => tab.docId === closedTab.docId)) {
+        this.documentStore?.remove(closedTab.docId);
+      }
+    }
 
     // Save to closed tabs history (for Ctrl+Shift+T restore)
     if (closedTab && !closedTab.isPrivate && closedTab.url !== 'yayra://newtab') {
@@ -13171,26 +13187,35 @@ export class BrowserShell {
    *  main-thread parsing automatically. */
   async _pdfjsModule() {
     if (this._pdfjsLib) return this._pdfjsLib;
-    const lib = await import('../vendor/pdfjs/pdf.mjs');
-    try {
-      lib.GlobalWorkerOptions.workerSrc = new URL('../vendor/pdfjs/pdf.worker.mjs', import.meta.url).toString();
-    } catch { /* older embedders - PDF.js self-heals to main-thread */ }
-    // Standard-14 font data + CJK cmaps (vendored, offline): without
-    // these, PDFs that rely on non-embedded standard fonts (very common
-    // in simple/older documents) render with missing/degraded text, and
-    // CJK documents fail outright. Wrapped so every getDocument call the
-    // viewer makes carries them without the viewer knowing.
-    const stdFontUrl = new URL('../vendor/pdfjs/standard_fonts/', import.meta.url).toString();
-    const cMapUrl = new URL('../vendor/pdfjs/cmaps/', import.meta.url).toString();
-    const wrapped = Object.create(lib);
-    wrapped.getDocument = (params = {}) => lib.getDocument({
-      standardFontDataUrl: stdFontUrl,
-      cMapUrl,
-      cMapPacked: true,
-      ...params
-    });
-    this._pdfjsLib = wrapped;
-    return this._pdfjsLib;
+    if (!this._pdfjsLibPromise) {
+      this._pdfjsLibPromise = import('../vendor/pdfjs/pdf.mjs').then((lib) => {
+        try {
+          lib.GlobalWorkerOptions.workerSrc = new URL('../vendor/pdfjs/pdf.worker.mjs', import.meta.url).toString();
+        } catch { /* older embedders - PDF.js self-heals to main-thread */ }
+        // Standard-14 font data + CJK cmaps (vendored, offline): without
+        // these, PDFs that rely on non-embedded standard fonts (very common
+        // in simple/older documents) render with missing/degraded text, and
+        // CJK documents fail outright. Wrapped so every getDocument call the
+        // viewer makes carries them without the viewer knowing.
+        const stdFontUrl = new URL('../vendor/pdfjs/standard_fonts/', import.meta.url).toString();
+        const cMapUrl = new URL('../vendor/pdfjs/cmaps/', import.meta.url).toString();
+        const wrapped = Object.create(lib);
+        wrapped.getDocument = (params = {}) => lib.getDocument({
+          standardFontDataUrl: stdFontUrl,
+          cMapUrl,
+          cMapPacked: true,
+          ...params
+        });
+        this._pdfjsLib = wrapped;
+        return wrapped;
+      }).catch((error) => {
+        // A transient asset/worker failure should be retryable rather than
+        // pinning every future PDF tab to a rejected module promise.
+        this._pdfjsLibPromise = null;
+        throw error;
+      });
+    }
+    return this._pdfjsLibPromise;
   }
 
   /** The integrated document tab: toolbar (pages, zoom, search, close) +
@@ -13336,7 +13361,27 @@ export class BrowserShell {
     host.style.cssText = 'flex:1; min-height:0; overflow:auto; display:flex; flex-direction:column; align-items:center; gap:12px; padding:16px;';
     const statusEl = document.createElement('div');
     statusEl.className = 'fb-doc-status';
+    statusEl.setAttribute('role', 'status');
+    statusEl.setAttribute('aria-live', 'polite');
     statusEl.style.cssText = 'position:absolute; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center; gap:10px; background:var(--fb-bg-app,#191c23); color:var(--fb-text-primary,#d7dbe3); text-align:center; padding:24px; font-size:0.9rem; z-index:2;';
+    const statusMessage = document.createElement('div');
+    statusMessage.className = 'fb-doc-status-message';
+    const progressTrack = document.createElement('div');
+    progressTrack.className = 'fb-doc-progress-track';
+    progressTrack.style.cssText = 'width:min(320px,80%); height:4px; overflow:hidden; border-radius:999px; background:rgba(255,255,255,0.12); display:none;';
+    const progressFill = document.createElement('div');
+    progressFill.className = 'fb-doc-progress-fill';
+    progressFill.style.cssText = 'height:100%; width:0; border-radius:inherit; background:var(--fb-accent-primary,#6d5df2); transition:width 120ms linear;';
+    progressTrack.appendChild(progressFill);
+    const retryBtn = document.createElement('button');
+    retryBtn.type = 'button';
+    retryBtn.className = 'fb-doc-retry-btn';
+    retryBtn.textContent = 'Try again';
+    retryBtn.style.cssText = 'display:none; padding:7px 14px; border:0; border-radius:8px; background:var(--fb-accent-primary,#6d5df2); color:#fff; cursor:pointer; font-weight:600;';
+    retryBtn.addEventListener('click', () => this.retryDocumentViewer(tab.id));
+    statusEl.appendChild(statusMessage);
+    statusEl.appendChild(progressTrack);
+    statusEl.appendChild(retryBtn);
 
     // ---- Match list panel ----------------------------------------------
     const matchPanel = document.createElement('div');
@@ -13427,13 +13472,23 @@ export class BrowserShell {
           : '';
         const nightBtn = bar2.querySelector('.fb-doc-btn-night');
         if (nightBtn) nightBtn.style.background = state.night ? 'rgba(109,93,242,0.45)' : 'rgba(255,255,255,0.07)';
-        if (state.status === 'ready') { statusEl.style.display = 'none'; }
-        else {
-          statusEl.style.display = 'flex';
-          statusEl.textContent = state.status === 'loading'
-            ? 'Opening document...'
-            : (state.error || 'This document can\u2019t be displayed.');
+        const isLoading = state.status === 'loading';
+        const hasError = state.status === 'error' || state.status === 'password';
+        statusEl.style.display = state.status === 'ready' ? 'none' : 'flex';
+        statusEl.setAttribute('role', hasError ? 'alert' : 'status');
+        if (isLoading) {
+          const stage = state.loadingStage || 'Opening document…';
+          statusMessage.textContent = Number.isFinite(state.progress)
+            ? `${stage} ${Math.max(0, Math.min(100, state.progress))}%`
+            : stage;
+        } else {
+          statusMessage.textContent = state.error || (state.status === 'idle'
+            ? 'Preparing the PDF reader…'
+            : 'This document can’t be displayed.');
         }
+        progressTrack.style.display = isLoading && Number.isFinite(state.progress) ? 'block' : 'none';
+        progressFill.style.width = `${Math.max(0, Math.min(100, Number(state.progress) || 0))}%`;
+        retryBtn.style.display = state.status === 'error' ? 'inline-flex' : 'none';
         // Match list panel.
         if (state.showMatchList && state.matches.length) {
           matchPanel.style.display = 'block';
@@ -13484,19 +13539,122 @@ export class BrowserShell {
       return;
     }
 
-    // The engine (vendored PDF.js, or a test-injected fake) resolves
-    // asynchronously; the toolbar buttons drive whatever viewer is bound
-    // to THIS tab once it is ready.
-    (async () => {
-      const engine = this._docEngineOverride || await this._pdfjsModule();
-      if (this._activeDocViewer?.tabId === tab.id) return; // a newer render won
-      const viewer = createPdfViewer({ pdfjs: engine, container: host, state, onStateChange: sync });
-      this._activeDocViewer = { tabId: tab.id, viewer, sync, rerenderSidebar: renderSidebar };
-      await viewer.load(doc.bytes);
-      // Table of contents (when the PDF carries one) + first sidebar paint.
-      await viewer.loadOutline();
+    const sessions = this._documentViewerSessions || (this._documentViewerSessions = new Map());
+    let session = sessions.get(tab.id);
+    if (session && session.docId !== tab.docId) {
+      session.disposed = true;
+      try { session.viewer?.destroy(); } catch { /* already gone */ }
+      sessions.delete(tab.id);
+      session = null;
+    }
+    if (!session) {
+      session = {
+        tabId: tab.id,
+        docId: tab.docId,
+        state,
+        host,
+        sync,
+        rerenderSidebar: renderSidebar,
+        viewer: null,
+        loadPromise: null,
+        disposed: false
+      };
+      sessions.set(tab.id, session);
+    } else {
+      // BrowserShell reconstructs the viewport on ordinary renders. Move the
+      // current canvas and replace the state callback; do not start a second
+      // PDF.js worker/load for the same document.
+      session.host = host;
+      session.sync = sync;
+      session.rerenderSidebar = renderSidebar;
+      session.state = state;
+      session.viewer?.attach(host, () => {
+        if (!session.disposed) session.sync?.();
+      });
+    }
+    this._activeDocViewer = session;
+    sync();
+
+    if (!doc) {
+      state.status = 'error';
+      state.error = 'This document is no longer available (it was closed or the app restarted). Open it again from the menu.';
       sync();
+      return;
+    }
+    if (!session.viewer && !session.loadPromise) this._startDocumentViewerLoad(session, doc);
+  }
+
+  _startDocumentViewerLoad(session, doc) {
+    if (!session || session.disposed || session.loadPromise) return session?.loadPromise || null;
+    const isCurrent = () => !session.disposed
+      && this._documentViewerSessions?.get(session.tabId) === session;
+    Object.assign(session.state, {
+      status: 'loading',
+      progress: null,
+      loadingStage: 'Preparing PDF reader…',
+      error: null
+    });
+    session.sync?.();
+
+    const loadPromise = (async () => {
+      try {
+        const engine = this._docEngineOverride || await this._pdfjsModule();
+        if (!isCurrent()) return;
+        const viewer = createPdfViewer({
+          pdfjs: engine,
+          container: session.host,
+          state: session.state,
+          onStateChange: () => { if (isCurrent()) session.sync?.(); }
+        });
+        session.viewer = viewer;
+        if (this.state.activeTabId === session.tabId) this._activeDocViewer = session;
+        await viewer.load(doc.bytes);
+        if (!isCurrent()) {
+          viewer.destroy();
+          return;
+        }
+        session.sync?.();
+        // The first page is the priority. Build the TOC after it is visible
+        // so a complex outline can never hold the opening screen hostage.
+        if (session.state.status === 'ready') {
+          Promise.resolve(viewer.loadOutline())
+            .then(() => { if (isCurrent()) session.sync?.(); })
+            .catch(() => {});
+        }
+      } catch {
+        if (!isCurrent()) return;
+        Object.assign(session.state, {
+          status: 'error',
+          progress: null,
+          loadingStage: '',
+          error: 'Yayra could not start the PDF reader. Try again, or choose Desktop app to open this file instead.'
+        });
+        session.sync?.();
+      }
     })();
+    session.loadPromise = loadPromise;
+    loadPromise.finally(() => {
+      if (session.loadPromise === loadPromise) session.loadPromise = null;
+    }).catch(() => {});
+    return loadPromise;
+  }
+
+  retryDocumentViewer(tabId) {
+    const session = this._documentViewerSessions?.get(tabId);
+    const tab = this.state.tabs.find((item) => item.id === tabId);
+    const doc = tab && this.documentStore?.get(tab.docId);
+    if (!session || !tab || !doc || session.disposed || session.loadPromise) return false;
+    try { session.viewer?.destroy(); } catch { /* retry owns a fresh controller */ }
+    session.viewer = null;
+    Object.assign(session.state, {
+      status: 'loading',
+      progress: null,
+      loadingStage: 'Retrying PDF reader…',
+      error: null
+    });
+    session.sync?.();
+    this._startDocumentViewerLoad(session, doc);
+    return true;
   }
 
   getTabFavicon(tab) {
@@ -13863,6 +14021,12 @@ export class BrowserShell {
       clearTimeout(this._sessionSnapshotTimer);
       this._sessionSnapshotTimer = null;
     }
+    for (const session of this._documentViewerSessions?.values?.() || []) {
+      session.disposed = true;
+      try { session.viewer?.destroy(); } catch { /* already gone */ }
+    }
+    this._documentViewerSessions?.clear?.();
+    this._activeDocViewer = null;
     // Android overlay-permission grant watcher (poll + listeners).
     if (this._stopOverlayGrantWatch) {
       try { this._stopOverlayGrantWatch(); } catch { /* already stopped */ }

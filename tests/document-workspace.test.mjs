@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { setupDomShim } from './dom-shim.mjs';
 
 setupDomShim();
@@ -11,7 +12,8 @@ import {
   unsupportedDocumentKinds,
   DOCUMENT_ENGINES,
   DocumentStore,
-  createPdfViewer
+  createPdfViewer,
+  createDocumentViewerState
 } from '../packages/shared-ui/src/services/documentWorkspace.js';
 
 /**
@@ -59,6 +61,28 @@ function fakePdfjs({ pages = 3, texts = null, failWith = null } = {}) {
 function makeStore() {
   const store = new DocumentStore();
   return store;
+}
+
+function makeTinyPdfBytes(text = 'Fast local PDF reader') {
+  const stream = `BT /F1 18 Tf 30 70 Td (${text}) Tj ET`;
+  const objects = [
+    '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
+    '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n',
+    '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 144] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n',
+    '4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n',
+    `5 0 obj\n<< /Length ${Buffer.byteLength(stream, 'ascii')} >>\nstream\n${stream}\nendstream\nendobj\n`
+  ];
+  let pdf = '%PDF-1.4\n';
+  const offsets = [0];
+  for (const object of objects) {
+    offsets.push(Buffer.byteLength(pdf, 'ascii'));
+    pdf += object;
+  }
+  const xrefOffset = Buffer.byteLength(pdf, 'ascii');
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets.slice(1)) pdf += `${String(offset).padStart(10, '0')} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  return new Uint8Array(Buffer.from(pdf, 'ascii'));
 }
 
 test('REGISTRY: PDF is the Phase 1 engine and its capabilities are HONEST', () => {
@@ -128,6 +152,49 @@ test('VIEWER: zoom is clamped to a sane range', async () => {
   viewer.destroy();
 });
 
+test('VIEWER: reports PDF.js progress and marks parsing complete before the first page draw', async () => {
+  let resolvePdf;
+  const task = { promise: new Promise((resolve) => { resolvePdf = resolve; }), onProgress: null };
+  const state = createDocumentViewerState();
+  const viewer = createPdfViewer({ pdfjs: { getDocument: () => task }, state });
+  const loading = viewer.load(new Uint8Array([1, 2, 3]));
+  task.onProgress({ loaded: 25, total: 100 });
+  assert.equal(state.status, 'loading');
+  assert.equal(state.progress, 25);
+  assert.match(state.loadingStage, /Reading PDF/);
+  resolvePdf({
+    numPages: 1,
+    getPage: async () => ({ getViewport: () => ({ width: 100, height: 100 }), render: () => ({ promise: Promise.resolve() }) }),
+    destroy: () => {}
+  });
+  await loading;
+  assert.equal(state.status, 'ready');
+  assert.equal(state.progress, 100);
+  viewer.destroy();
+});
+
+test('VIEWER: a stalled PDF worker times out with a useful error instead of loading forever', async () => {
+  let destroyed = 0;
+  const state = createDocumentViewerState();
+  const viewer = createPdfViewer({
+    pdfjs: { getDocument: () => ({ promise: new Promise(() => {}), destroy: () => { destroyed += 1; } }) },
+    state,
+    loadTimeoutMs: 10
+  });
+  // Keep Node's event loop alive while the viewer's timeout itself is
+  // unref'd, matching a real browser where the shell stays open.
+  const keepAlive = setTimeout(() => {}, 30);
+  try {
+    await viewer.load(new Uint8Array([1, 2, 3]));
+    assert.equal(state.status, 'error');
+    assert.match(state.error, /taking too long/i);
+    assert.equal(destroyed, 1, 'the abandoned PDF.js task is cancelled');
+  } finally {
+    clearTimeout(keepAlive);
+    viewer.destroy();
+  }
+});
+
 test('VIEWER: text search finds matches across pages and jumps to the first', async () => {
   const state = { status: 'idle', numPages: 0, page: 1, zoom: 1, query: '', matches: [], matchIndex: -1, error: null };
   const viewer = createPdfViewer({ pdfjs: fakePdfjs(), container: null, state });
@@ -187,18 +254,88 @@ test('TAB INTEGRATION: a document opens in its OWN tab - never the web frame or 
   }
 });
 
+test('TAB INTEGRATION: a shell re-render during PDF loading keeps the new viewer mount attached', async () => {
+  const { shell, container } = await bootShell();
+  let finishLoad;
+  let getDocumentCalls = 0;
+  const delayedPdf = {
+    getDocument: () => {
+      getDocumentCalls += 1;
+      return { promise: new Promise((resolve) => { finishLoad = resolve; }) };
+    }
+  };
+  try {
+    shell._docEngineOverride = delayedPdf;
+    shell.addDocumentTab({ name: 'slow-report.pdf', bytes: new Uint8Array([1, 2, 3]) });
+    const tab = shell.getActiveTab();
+    assert.equal(typeof finishLoad, 'function', 'PDF load started');
+
+    // A normal browser-shell render (resize, tab state change, etc.) replaces
+    // the DOM while the worker is still parsing the PDF.
+    shell.render(container);
+    finishLoad({
+      numPages: 1,
+      getPage: async () => ({
+        rotate: 0,
+        getViewport: ({ scale = 1 } = {}) => ({ width: 600 * scale, height: 800 * scale }),
+        render: () => ({ promise: Promise.resolve() }),
+        getTextContent: async () => ({ items: [] })
+      }),
+      getOutline: async () => [],
+      destroy: () => {}
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    assert.equal(tab.docState.status, 'ready', 'the parsed document is ready');
+    assert.equal(getDocumentCalls, 1, 're-rendering reuses the in-flight PDF parse instead of starting a second worker');
+    const liveViewer = container.querySelector('.fb-doc-viewer');
+    assert.ok(liveViewer, 'the active tab has a viewer mount');
+    assert.equal(liveViewer.querySelector('.fb-doc-status').style.display, 'none',
+      'the latest mount receives the completed load state instead of staying on Opening document');
+  } finally {
+    shell.destroy();
+  }
+});
+
+test('TAB INTEGRATION: PDF.js startup failures are shown with a working retry, never a permanent spinner', async () => {
+  const { shell, container } = await bootShell();
+  let attempts = 0;
+  try {
+    shell._pdfjsModule = async () => {
+      attempts += 1;
+      throw new Error('worker bundle unavailable');
+    };
+    shell.addDocumentTab({ name: 'retry-report.pdf', bytes: new Uint8Array([1, 2, 3]) });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const tab = shell.getActiveTab();
+    const status = container.querySelector('.fb-doc-status');
+    const retry = container.querySelector('.fb-doc-retry-btn');
+    assert.equal(tab.docState.status, 'error');
+    assert.match(status.textContent, /could not start the PDF reader/i);
+    assert.equal(retry.style.display, 'inline-flex');
+    retry.click();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(attempts, 2, 'Retry starts a fresh module load attempt');
+    assert.equal(tab.docState.status, 'error', 'a repeated failure remains visible and actionable');
+  } finally {
+    shell.destroy();
+  }
+});
+
 test('TAB INTEGRATION: the Close button closes the document tab and returns to browsing', async () => {
   const { shell, container } = await bootShell();
   try {
     shell._docEngineOverride = fakePdfjs();
     const before = shell.state.tabs.length;
-    shell.addDocumentTab({ name: 'close-me.pdf', bytes: new Uint8Array([9]) });
+    const doc = shell.addDocumentTab({ name: 'close-me.pdf', bytes: new Uint8Array([9]) });
     assert.equal(shell.state.tabs.length, before + 1);
     const closeBtn = shell.viewportElement.querySelector('.fb-doc-close-btn');
     assert.ok(closeBtn, 'the dedicated close control exists');
     closeBtn.click();
     assert.equal(shell.state.tabs.length, before, 'document tab closed');
     assert.equal(shell.state.tabs.every((t) => !t.isDocument), true);
+    assert.equal(shell.documentStore.get(doc.id), null, 'closing the last tab releases the PDF bytes from memory');
   } finally {
     shell.destroy();
   }
@@ -285,9 +422,40 @@ test('PDF OFFLINE: local document bytes and the vendored PDF.js engine do not re
   const workspace = readFileSync(new URL('../packages/shared-ui/src/services/documentWorkspace.js', import.meta.url), 'utf8');
   const shell = readFileSync(new URL('../packages/shared-ui/src/components/BrowserShell.js', import.meta.url), 'utf8');
   assert.match(workspace, /pdfjs\.getDocument\(\{ data \}\)/, 'PDF.js receives the selected file bytes directly');
-  assert.match(shell, /await import\('\.\.\/vendor\/pdfjs\/pdf\.mjs'\)/, 'the PDF engine is imported from the local package');
+  assert.match(shell, /_pdfjsLibPromise\s*=\s*import\('\.\.\/vendor\/pdfjs\/pdf\.mjs'\)/, 'the PDF engine is imported once from the local package and shared across tabs');
   assert.match(shell, /new URL\('\.\.\/vendor\/pdfjs\/pdf\.worker\.mjs'/, 'the worker is also a local bundled asset');
   assert.doesNotMatch(shell, /https?:\/\/(?:cdn\.)?mozilla\.github\.io\/pdf\.js/, 'the viewer never depends on a PDF.js CDN');
+});
+
+test('PDF.js REAL ENGINE: a local PDF opens quickly and its text is searchable offline', async () => {
+  const { shell } = await bootShell();
+  try {
+    const engine = await shell._pdfjsModule();
+    const pdfjs = await import('../packages/shared-ui/src/vendor/pdfjs/pdf.mjs');
+    // Node's PDF.js factory reads native filesystem paths; the app itself
+    // uses same-origin fetch URLs in the browser/Electron renderer.
+    const nodeEngine = Object.create(engine);
+    nodeEngine.getDocument = (params = {}) => pdfjs.getDocument({
+      standardFontDataUrl: fileURLToPath(new URL('../packages/shared-ui/src/vendor/pdfjs/standard_fonts/', import.meta.url)),
+      cMapUrl: fileURLToPath(new URL('../packages/shared-ui/src/vendor/pdfjs/cmaps/', import.meta.url)),
+      cMapPacked: true,
+      ...params
+    });
+    const state = createDocumentViewerState();
+    const viewer = createPdfViewer({ pdfjs: nodeEngine, container: null, state, loadTimeoutMs: 5000 });
+    try {
+      await viewer.load(makeTinyPdfBytes());
+      assert.equal(state.status, 'ready');
+      assert.equal(state.numPages, 1);
+      await viewer.search('fast local');
+      assert.equal(state.matches.length, 1);
+      assert.match(state.matches[0].snippet, /Fast local PDF reader/);
+    } finally {
+      viewer.destroy();
+    }
+  } finally {
+    shell.destroy();
+  }
 });
 
 test('PDF FONTS: standard-14 font data and CJK cmaps are vendored and wired into every getDocument call', async () => {
