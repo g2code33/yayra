@@ -120,10 +120,10 @@ const FRAME_EMBEDDING_BLOCKED_HOSTS = [
   'bing.com'
 ];
 
-// Keep in sync with GOOGLE_SIGN_IN_PATH in electron/webviewBridge.cjs.
-// accounts.google.com has account pages as well as OAuth/sign-in endpoints,
-// so host matching alone would send ordinary account browsing outside Yayra.
-const GOOGLE_SIGN_IN_PATH = /^\/(?:o\/oauth2(?:\/|$)|oauth2(?:\/|$)|signin(?:\/|$)|servicelogin(?:\/|$)|accountchooser(?:\/|$)|v\d+\/signin(?:\/|$)|gsi\/select(?:\/|$))/i;
+// Keep in sync with GOOGLE_OAUTH_PATH in electron/webviewBridge.cjs and
+// YayraTabWebviewManager.kt. Only explicit OAuth authorization routes are
+// handed off; Google account pages and basic sign-in routes stay in Yayra.
+const GOOGLE_OAUTH_PATH = /^\/(?:o\/oauth2(?:\/|$)|oauth2(?:\/|$)|signin\/oauth(?:\/|$)|gsi\/select(?:\/|$))/i;
 
 export class BrowserShell {
   static FRAME_EMBEDDING_BLOCKED_HOSTS = FRAME_EMBEDDING_BLOCKED_HOSTS;
@@ -724,10 +724,11 @@ export class BrowserShell {
   // whole app (including this file) inside ONE Capacitor WebView. That outer
   // WebView is still a real Chromium/WebKit engine and enforces the exact
   // same X-Frame-Options / frame-ancestors restrictions against any nested
-  // <iframe> as a desktop browser would, and Google/Apple/Microsoft apply
-  // the same embedded-webview sign-in block there too. Only active when
-  // actually running as a packaged native app (`Capacitor.isNativePlatform()`),
-  // never for the plain web/PWA build, where window.Capacitor is absent.
+  // <iframe> as a desktop browser would. The native browser surface is used
+  // for explicit OAuth handoffs and for sites that cannot be framed; Google's
+  // embedded-user-agent restriction applies to OAuth authorization, not every
+  // account page. Only active when actually running as a packaged native app
+  // (`Capacitor.isNativePlatform()`), never in the plain web/PWA build.
   get capacitorBrowser() {
     if (typeof window === 'undefined') return null;
     const capacitor = window.Capacitor;
@@ -756,8 +757,9 @@ export class BrowserShell {
   // own activity window - the Android equivalent of the desktop
   // WebContentsView engine. A top-level WebView navigation has no
   // iframe/X-Frame-Options restrictions, so frame-hostile sites (Google,
-  // YouTube, X, Facebook, ...) genuinely render IN the app instead of
-  // being handed off to Chrome Custom Tabs ("open in other app").
+  // YouTube, X, Facebook, ...) can render IN the app instead of being
+  // handed off to Chrome Custom Tabs. Matching Google OAuth authorization
+  // routes are still intercepted and opened externally per Google's policy.
   get capacitorTabWeb() {
     if (typeof window === 'undefined') return null;
     const capacitor = window.Capacitor;
@@ -877,7 +879,7 @@ export class BrowserShell {
     }
   }
 
-  // Keep in sync with SYSTEM_BROWSER_AUTH_HOSTS and GOOGLE_SIGN_IN_PATH in
+  // Keep in sync with SYSTEM_BROWSER_AUTH_HOSTS and GOOGLE_OAUTH_PATH in
   // electron/webviewBridge.cjs. Duplicated rather than imported because that
   // module is CommonJS/Electron-only and this file ships in web/PWA/Capacitor.
   static SYSTEM_BROWSER_AUTH_HOSTS = ['accounts.google.com', 'appleid.apple.com', 'login.live.com', 'login.microsoftonline.com'];
@@ -895,7 +897,7 @@ export class BrowserShell {
       const hostname = parsed.hostname.toLowerCase();
       return BrowserShell.SYSTEM_BROWSER_AUTH_HOSTS.some((host) => {
         if (host === 'accounts.google.com') {
-          return hostname === host && GOOGLE_SIGN_IN_PATH.test(parsed.pathname);
+          return hostname === host && GOOGLE_OAUTH_PATH.test(parsed.pathname);
         }
         return hostname === host || hostname.endsWith(`.${host}`);
       });
@@ -2333,7 +2335,7 @@ export class BrowserShell {
     });
     // Same rule for the Android native tab engine (its hide path captures
     // the page frame natively, so the chrome keeps a page underneath it).
-    // Provider sign-in URLs are rendered as an in-tab handoff card instead.
+    // Recognized provider OAuth/auth URLs are rendered as an in-tab handoff card instead.
     this.syncAndroidTabWebVisibility(activeTab.id, !isInternalPage && !overlayOpen && !authHandoffOnly);
 
     // LOCAL DOCUMENT TABS (yayra://doc/<id>): the integrated document
@@ -2607,12 +2609,12 @@ export class BrowserShell {
 
     // No native Electron bridge here: plain web/PWA tab, or an Android/iOS
     // Capacitor build (which still runs this file inside ONE WebView, so a
-    // nested <iframe> is subject to the exact same restrictions a desktop
-    // browser tab would see). Google/Apple/Microsoft refuse to complete
-    // sign-in inside ANY embedded webview on these platforms too - hand off
-    // to the real system/in-app browser instead of attempting (and failing)
-    // to embed the sign-in page. See the matching Electron-side handoff in
-    // electron/webviewBridge.cjs for the desktop equivalent of this check.
+    // nested <iframe> is subject to the exact same framing restrictions a
+    // desktop browser tab would see). Matching Google OAuth authorization
+    // routes are handed off because Google's policy restricts embedded-user-
+    // agent OAuth; ordinary account pages are not classified as OAuth. Apple
+    // and Microsoft retain their existing provider handoff behavior. See the
+    // matching Electron-side policy in electron/webviewBridge.cjs.
     if (this.isSystemBrowserAuthHost(url)) {
       let handoff = this._systemBrowserHandoffs.get(tabId);
       if (!handoff || handoff.url !== url) {
@@ -2728,10 +2730,12 @@ export class BrowserShell {
   attachNativeWebviewSlot(wrapper, tabId, url, isPrivate) {
     wrapper.className += ' fb-native-webview-slot';
 
-    // OAuth/sign-in is handled outside the embedded WebContentsView. Keep
-    // the original tab, URL and navigationState authoritative; only the
-    // provider URL is sent to Electron for shell.openExternal(). The record
-    // is installed BEFORE the async IPC call so a fast re-render cannot open
+    // Matching provider OAuth URLs are handled outside the embedded
+    // WebContentsView. Google account/home/basic sign-in pages that do not
+    // match the explicit OAuth predicate stay in the native view. Keep the
+    // tab and navigationState authoritative; only the recognized provider
+    // URL is sent to Electron for shell.openExternal(). The record is
+    // installed BEFORE the async IPC call so a fast re-render cannot open
     // another system-browser window for the same tab+URL.
     if (this.isSystemBrowserAuthHost(url)) {
       let handoff = this._systemBrowserHandoffs.get(tabId);
@@ -3294,7 +3298,7 @@ export class BrowserShell {
         break;
       }
       case 'auth-navigation-blocked': {
-        // Android's native TabWebView cancels top-level provider sign-in
+        // Android's native TabWebView cancels matching provider OAuth/auth
         // navigations before loading them, then asks the Capacitor Browser
         // plugin for its secure system-browser surface. The current tab and
         // its history are deliberately left untouched.
@@ -12530,7 +12534,7 @@ export class BrowserShell {
     // path from opening a second tab.
     if (/^https?:\/\//i.test(targetUrl)
       && !this.nativeWebview && !this.capacitorBrowser && !this.capacitorTabWeb
-      && !this.isSystemBrowserAuthHost(targetUrl) // sign-in hosts have their OWN single handoff
+      && !this.isSystemBrowserAuthHost(targetUrl) // recognized auth endpoints have their OWN single handoff
       && typeof window !== 'undefined' && typeof window.open === 'function') {
       const serp = typeof this.getSearchIntent === 'function' ? this.getSearchIntent(targetUrl) : null;
       const blocked = this.isKnownFrameBlockedUrl(targetUrl);

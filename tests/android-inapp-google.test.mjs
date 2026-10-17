@@ -147,6 +147,11 @@ test('ANDROID: a native-page OAuth redirect is canceled, opened with Browser, an
     const activeTabId = shell.state.activeTabId;
     const history = [...tab.navigationState.historyStack];
 
+    android.deliverEvent({ id: tab.id, type: 'loading-start', url: tab.url });
+    assert.equal(tab.isLoading, true, 'an in-progress page navigation turns the loader on');
+    // YayraTabWebviewManager emits loading-stop before auth-navigation-blocked,
+    // because a canceled WebView navigation may never reach onPageFinished.
+    android.deliverEvent({ id: tab.id, type: 'loading-stop' });
     android.deliverEvent({
       id: tab.id,
       type: 'auth-navigation-blocked',
@@ -154,14 +159,15 @@ test('ANDROID: a native-page OAuth redirect is canceled, opened with Browser, an
     });
     await flush();
 
+    assert.equal(tab.isLoading, false, 'canceled OAuth navigation cannot leave the source tab spinner stuck');
     assert.deepEqual(android.calls.browserOpen, ['https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client']);
 
-    android.deliverEvent({ id: tab.id, type: 'auth-navigation-blocked', url: 'http://accounts.google.com/signin' });
+    android.deliverEvent({ id: tab.id, type: 'auth-navigation-blocked', url: 'http://accounts.google.com/o/oauth2/v2/auth?client_id=second-client' });
     await flush();
     assert.deepEqual(android.calls.browserOpen, [
       'https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client',
-      'https://accounts.google.com/signin'
-    ], 'an insecure provider URL is upgraded before it reaches the system browser');
+      'https://accounts.google.com/o/oauth2/v2/auth?client_id=second-client'
+    ], 'an insecure OAuth URL is upgraded before it reaches the system browser');
     assert.equal(shell.state.activeTabId, activeTabId);
     assert.equal(tab.url, 'https://www.google.com/search?q=ghana');
     assert.deepEqual(tab.navigationState.historyStack, history);
@@ -172,15 +178,39 @@ test('ANDROID: a native-page OAuth redirect is canceled, opened with Browser, an
   }
 });
 
-test('ANDROID: Google SIGN-IN hosts still hand off honestly (Google blocks sign-in inside embedded WebViews)', async () => {
+test('ANDROID: Google account home, management, and basic sign-in routes stay in the native in-app engine', async () => {
   const android = fakeAndroid();
   const { shell } = await makeShell();
   try {
-    const { iframe } = shell.createWebContentFrame('https://accounts.google.com/signin', { tabId: 'tab-a', allowNative: false });
+    const urls = [
+      'https://accounts.google.com/',
+      'https://accounts.google.com/ManageAccount',
+      'https://accounts.google.com/signin/v2/identifier'
+    ];
+    for (const [index, url] of urls.entries()) {
+      const { iframe } = shell.createWebContentFrame(url, { tabId: `tab-account-${index}`, allowNative: false });
+      assert.equal(iframe, null, `${url} uses the in-app native WebView, not an iframe`);
+    }
+    await flush();
+    assert.deepEqual(android.calls.attach.map((call) => call.url), urls);
+    assert.deepEqual(android.calls.browserOpen, [], 'account browsing is not automatically sent to Chrome');
+  } finally {
+    shell.destroy();
+    delete window.Capacitor;
+    delete globalThis.localStorage;
+  }
+});
+
+test('ANDROID: an explicit Google OAuth endpoint still uses the system browser', async () => {
+  const android = fakeAndroid();
+  const { shell } = await makeShell();
+  try {
+    const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client';
+    const { iframe } = shell.createWebContentFrame(authUrl, { tabId: 'tab-oauth', allowNative: false });
     await flush();
     assert.equal(iframe, null);
-    assert.equal(android.calls.attach.length, 0, 'sign-in pages never enter the in-app engine');
-    assert.deepEqual(android.calls.browserOpen, ['https://accounts.google.com/signin'], 'they open in the secure system browser instead');
+    assert.equal(android.calls.attach.length, 0, 'OAuth authorization is never embedded');
+    assert.deepEqual(android.calls.browserOpen, [authUrl]);
   } finally {
     shell.destroy();
     delete window.Capacitor;
@@ -355,8 +385,15 @@ test('KOTLIN PIN: the native tab engine exists, is safe, and reports through tab
   assert.ok(manager.includes('settings.javaScriptEnabled = true'), 'JS on (a real browser surface)');
   assert.ok(manager.includes('settings.allowFileAccess = false'), 'file access OFF');
   assert.ok(manager.includes('settings.allowContentAccess = false'), 'content access OFF');
-  assert.ok(manager.includes('isSystemBrowserAuthUrl(uri)'), 'Google auth is path-classified rather than all of google.com');
+  assert.ok(manager.includes('isSystemBrowserAuthUrl(uri)'), 'Google auth is path-classified rather than all of accounts.google.com');
+  assert.ok(manager.includes('val GOOGLE_OAUTH_PATH = Regex(') && manager.includes('signin/oauth'), 'Android hands off explicit OAuth routes');
+  assert.equal(manager.includes('signin(?:/|$)'), false, 'basic /signin pages are not part of the OAuth matcher');
   assert.ok(manager.includes('request.isForMainFrame && isSystemBrowserAuthUrl(targetUri)'), 'top-level provider redirects are stopped before loading');
+  const authNavigationGuard = manager.slice(
+    manager.indexOf('if (request.isForMainFrame && isSystemBrowserAuthUrl(targetUri))'),
+    manager.indexOf('val target = targetUri.toString()')
+  );
+  assert.ok(authNavigationGuard.includes('emitEvent(id, "loading-stop")'), 'a canceled native OAuth navigation clears the loader even when onPageFinished will not fire');
   assert.ok(manager.includes('auth-navigation-blocked'), 'the shell receives a safe handoff request');
   assert.ok(manager.includes('secureSystemBrowserAuthUrl(targetUri)'), 'HTTP provider endpoints are upgraded before handoff');
   assert.ok(manager.includes('uri.buildUpon().scheme("https")'), 'the native helper never opens auth over plaintext HTTP');

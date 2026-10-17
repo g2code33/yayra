@@ -63,15 +63,15 @@ class YayraTabWebviewManager(
 
     private companion object {
         // Keep in sync with BrowserShell.isSystemBrowserAuthHost() and
-        // electron/webviewBridge.cjs. Google account browsing is allowed in
-        // the native view; only Google sign-in/OAuth URL paths are routed out.
+        // electron/webviewBridge.cjs. Google account pages and basic sign-in
+        // routes stay in the native view; OAuth authorization routes go out.
         val SYSTEM_BROWSER_AUTH_HOSTS = setOf(
             "appleid.apple.com",
             "login.live.com",
             "login.microsoftonline.com"
         )
-        val GOOGLE_SIGN_IN_PATH = Regex(
-            "^/(?:o/oauth2(?:/|$)|oauth2(?:/|$)|signin(?:/|$)|servicelogin(?:/|$)|accountchooser(?:/|$)|v\\d+/signin(?:/|$)|gsi/select(?:/|$))",
+        val GOOGLE_OAUTH_PATH = Regex(
+            "^/(?:o/oauth2(?:/|$)|oauth2(?:/|$)|signin/oauth(?:/|$)|gsi/select(?:/|$))",
             RegexOption.IGNORE_CASE
         )
     }
@@ -88,7 +88,7 @@ class YayraTabWebviewManager(
     private fun isSystemBrowserAuthUrl(uri: Uri): Boolean {
         if (!uri.scheme.equals("https", ignoreCase = true) && !uri.scheme.equals("http", ignoreCase = true)) return false
         val host = uri.host?.lowercase() ?: return false
-        if (host == "accounts.google.com") return GOOGLE_SIGN_IN_PATH.containsMatchIn(uri.encodedPath ?: "/")
+        if (host == "accounts.google.com") return GOOGLE_OAUTH_PATH.containsMatchIn(uri.encodedPath ?: "/")
         return SYSTEM_BROWSER_AUTH_HOSTS.any { host == it || host.endsWith(".$it") }
     }
 
@@ -170,8 +170,12 @@ class YayraTabWebviewManager(
                                 val targetUri = request?.url ?: return false
                                 if (request.isForMainFrame && isSystemBrowserAuthUrl(targetUri)) {
                                     // Cancel before the provider page is loaded.
-                                    // JS opens it with Capacitor Browser, leaving
-                                    // this native tab and its history untouched.
+                                    // A canceled WebView navigation is not
+                                    // guaranteed to produce onPageFinished,
+                                    // so stop the Yayra loader explicitly.
+                                    // JS opens it with Capacitor Browser,
+                                    // leaving this tab and history untouched.
+                                    emitEvent(id, "loading-stop")
                                     emitEvent(id, "auth-navigation-blocked") { d -> d.put("url", secureSystemBrowserAuthUrl(targetUri)) }
                                     return true
                                 }
@@ -220,8 +224,9 @@ class YayraTabWebviewManager(
                         webChromeClient = object : WebChromeClient() {
                             override fun onCreateWindow(parent: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?): Boolean {
                                 // Mirror Electron: user-initiated ordinary popups
-                                // become Yayra tabs; identity-provider sign-in
-                                // popups are handed to the secure browser.
+                                // become Yayra tabs; matching Google OAuth and
+                                // existing Apple/Microsoft auth popups are sent
+                                // to the secure browser.
                                 if (!isUserGesture || resultMsg == null) return false
                                 var routed = false
                                 lateinit var popup: WebView

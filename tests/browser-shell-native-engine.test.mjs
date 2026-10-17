@@ -288,12 +288,12 @@ test('Native engine: a "navigated" event from the main process updates tab URL, 
   }
 });
 
-test('Native engine: Google sign-in handoff preserves tab id, URL, active selection, history and a visible fallback', async () => {
+test('Native engine: direct Google OAuth handoff preserves tab id, URL, active selection, history and fallback', async () => {
   const { fake, calls, uninstall } = installFakeNativeWebview();
   try {
     fake.ensure = (tabId, url) => {
       calls.ensure.push({ tabId, url });
-      return Promise.resolve({ handedOffToSystemBrowser: url.includes('accounts.google.com') });
+      return Promise.resolve({ handedOffToSystemBrowser: url.includes('/o/oauth2/') || url.includes('/gsi/select') });
     };
     const container = document.createElement('div');
     const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
@@ -302,7 +302,7 @@ test('Native engine: Google sign-in handoff preserves tab id, URL, active select
     const tabId = tab.id;
 
     shell.navigateActiveTab('https://example.com/before-sign-in');
-    shell.navigateActiveTab('https://accounts.google.com/signin/v2/identifier');
+    shell.navigateActiveTab('https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client');
     const originalHistory = [...tab.navigationState.historyStack];
     const originalIndex = tab.navigationState.currentIndex;
     shell.render(container);
@@ -312,7 +312,7 @@ test('Native engine: Google sign-in handoff preserves tab id, URL, active select
     await Promise.resolve();
 
     assert.equal(tab.id, tabId);
-    assert.equal(tab.url, 'https://accounts.google.com/signin/v2/identifier');
+    assert.equal(tab.url, 'https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client');
     assert.equal(shell.state.activeTabId, tabId);
     assert.deepEqual(tab.navigationState.historyStack, originalHistory);
     assert.equal(tab.navigationState.currentIndex, originalIndex);
@@ -320,6 +320,55 @@ test('Native engine: Google sign-in handoff preserves tab id, URL, active select
     assert.ok(shell.rootElement.querySelector('.fb-auth-handoff-fallback'), 'the tab explains why sign-in is external');
     assert.equal(calls.ensure.filter((call) => call.url === tab.url).length, 1, 're-rendering does not reopen the same auth URL');
     assert.ok(calls.setVisible.some((call) => call.tabId === tabId && call.visible === false), 'any previous native page surface is hidden, not painted over the fallback');
+  } finally {
+    uninstall();
+  }
+});
+
+test('Native engine: Google account home, management, and basic sign-in routes stay in the in-app WebContentsView', async () => {
+  const { calls, uninstall } = installFakeNativeWebview();
+  try {
+    const container = document.createElement('div');
+    const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+    await shell.initialize();
+    const tab = shell.getActiveTab();
+    const accountUrls = [
+      'https://accounts.google.com/',
+      'https://accounts.google.com/ManageAccount',
+      'https://accounts.google.com/signin/v2/identifier'
+    ];
+
+    for (const url of accountUrls) {
+      shell.navigateActiveTab(url);
+      assert.equal(shell.isSystemBrowserAuthHost(url), false, `${url} is an ordinary account page, not an OAuth authorization endpoint`);
+      assert.equal(shell.rootElement.querySelector('.fb-auth-handoff-fallback'), null, 'no automatic system-browser card replaces the account page');
+    }
+
+    assert.deepEqual(calls.ensure.map((call) => call.url), accountUrls);
+    assert.ok(shell._nativeWebviewTabIds.has(tab.id), 'the account tab continues to be owned by the native view');
+  } finally {
+    uninstall();
+  }
+});
+
+test('Native engine: loading-stop clears a canceled OAuth navigation without resetting the source tab', async () => {
+  const { fake, uninstall } = installFakeNativeWebview();
+  try {
+    const container = document.createElement('div');
+    const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+    await shell.initialize();
+    const tab = shell.getActiveTab();
+    shell.navigateActiveTab('https://mail.google.com/');
+    assert.equal(tab.isLoading, true, 'omnibox navigation starts the loader');
+
+    fake.emit({ tabId: tab.id, type: 'loading-start' });
+    fake.emit({ tabId: tab.id, type: 'loading-stop' });
+    fake.emit({ tabId: tab.id, type: 'system-browser-handoff', url: 'https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client', sourceUrl: tab.url, reason: 'navigation' });
+
+    assert.equal(tab.isLoading, false, 'the main-process cancellation event clears the loader even if Chromium emits no did-stop-loading');
+    assert.equal(tab.url, 'https://mail.google.com/', 'the source URL is preserved');
+    assert.equal(shell.state.activeTabId, tab.id);
+    assert.ok(shell._nativeWebviewTabIds.has(tab.id), 'the source WebContentsView remains associated with the tab');
   } finally {
     uninstall();
   }

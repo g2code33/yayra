@@ -29,42 +29,33 @@
  * untouched; the renderer just tells this bridge where on screen to position
  * a transparent native layer for the active tab's real content.
  *
- * GOOGLE / IDENTITY PROVIDER SIGN-IN
- * -----------------------------------
- * Google (and several other identity providers) actively detect and refuse
- * to complete sign-in inside embedded browser surfaces as an anti-phishing
- * measure - see https://developers.google.com/identity/protocols/oauth2/policies#embedded-webviews.
- * An earlier version of this file tried presenting a desktop-Chrome identity
- * string (see `buildBrowserUserAgent()` below) specifically to get Google
- * sign-in itself to complete embedded. That did not work: Google also
- * inspects Client Hints (`navigator.userAgentData`, `Sec-CH-UA*` headers),
- * which a simple User-Agent string override does not change, and multiple
- * independent reports confirm Google has been actively closing this
- * loophole even for full Client Hints spoofing. Chasing that further is a
- * fragile, ever-escalating fight against Google's own anti-phishing system
- * for uncertain payoff, so Google sign-in is back on the system-browser
- * handoff path here, same as Apple/Microsoft, per Google's own
- * recommendation and RFC 8252 ("OAuth 2.0 for Native Apps").
+ * GOOGLE / IDENTITY PROVIDER AUTHENTICATION
+ * -----------------------------------------
+ * Google's OAuth policy prohibits authorization requests in embedded user
+ * agents (see https://developers.google.com/identity/protocols/oauth2/policies#embedded-webviews).
+ * Yayra therefore hands off explicit Google OAuth authorization endpoints to
+ * the system browser. Ordinary account pages, including the accounts.google.com
+ * landing page and direct account sign-in routes, are allowed to render in the
+ * WebContentsView; Google may still reject an interactive sign-in there, and
+ * Yayra does not bypass that policy or transfer the system browser's cookies.
+ * The app's own Google sign-in uses its separate external-browser + PKCE flow.
  *
- * `buildBrowserUserAgent()` is kept and still applied to every tab, but only
- * for ordinary general-purpose site compatibility (many sites show "upgrade
- * your browser" nags or misrender for a Electron/x.y.z identity string) -
- * not as an attempt to defeat any site's anti-phishing/anti-automation
- * checks, which remain in effect and are handled by the handoff below.
+ * Apple and Microsoft keep their existing system-browser handoff behavior.
+ * `buildBrowserUserAgent()` remains a general site-compatibility setting only;
+ * it is not used to spoof browser identity or defeat provider checks.
  */
 
 // Identity-provider endpoints that must be completed in the user's default
-// system browser instead of the embedded WebContentsView. Google is
-// deliberately path-scoped: accounts.google.com also serves ordinary account
-// pages, while OAuth/sign-in endpoints must never be embedded. Keep the
-// matching path policy in sync with BrowserShell.isSystemBrowserAuthHost().
+// system browser. Google is deliberately OAuth-path-scoped: account browsing
+// and basic sign-in routes stay in the native view, while authorization paths
+// are handed off. Keep this predicate in sync with BrowserShell and Android.
 const SYSTEM_BROWSER_AUTH_HOSTS = Object.freeze([
   'accounts.google.com',
   'appleid.apple.com',
   'login.live.com',
   'login.microsoftonline.com'
 ]);
-const GOOGLE_SIGN_IN_PATH = /^\/(?:o\/oauth2(?:\/|$)|oauth2(?:\/|$)|signin(?:\/|$)|servicelogin(?:\/|$)|accountchooser(?:\/|$)|v\d+\/signin(?:\/|$)|gsi\/select(?:\/|$))/i;
+const GOOGLE_OAUTH_PATH = /^\/(?:o\/oauth2(?:\/|$)|oauth2(?:\/|$)|signin\/oauth(?:\/|$)|gsi\/select(?:\/|$))/i;
 
 const WEBVIEW_EVENT_CHANNEL = 'yayra:webview-event';
 const EMAIL_FIELD_FOCUSED_CHANNEL = 'yayra:email-field-focused';
@@ -338,7 +329,7 @@ function requiresSystemBrowserAuth(rawUrl, hosts = SYSTEM_BROWSER_AUTH_HOSTS) {
   return hosts.some((host) => {
     const normalizedHost = String(host).toLowerCase();
     if (normalizedHost === 'accounts.google.com') {
-      return hostname === normalizedHost && GOOGLE_SIGN_IN_PATH.test(parsed.pathname);
+      return hostname === normalizedHost && GOOGLE_OAUTH_PATH.test(parsed.pathname);
     }
     return hostname === normalizedHost || hostname.endsWith(`.${normalizedHost}`);
   });
