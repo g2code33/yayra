@@ -56,7 +56,7 @@ test('custom pointer CSS covers nested interactive controls, is self-contained, 
   assert.match(css, /data:image\/svg\+xml,%3Csvg/, 'cursor art is inline (no network fetch)');
   assert.match(css, /width%3D%2236%22/, 'large cursor image uses the selected size');
   for (const selector of [
-    'button', '[role="button"]', '[role="combobox"]',
+    'a, area[href]', 'button', '[role="button"]', '[role="combobox"]',
     'input[type="checkbox"]', 'input[type="file"]', '[onclick]', '[tabindex]'
   ]) assert.ok(css.includes(selector), `${selector} uses the hand cursor`);
   assert.match(css, /:where\([^\n]+\):not\(html\), :where\([^\n]+\):not\(html\) \* \{ cursor:.*pointer !important;/, 'the hand cursor applies to interactive targets and their nested icons/text');

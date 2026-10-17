@@ -6528,7 +6528,7 @@ html {
   cursor: var(--fb-ptr-arrow, auto) !important;
 }
 :is([data-fb-pointer='yayra'], [data-fb-pointer='high-visibility']) :where(
-  a[href], area[href], button,
+  a, area[href], button,
   input[type='button'], input[type='submit'], input[type='reset'], input[type='image'],
   input[type='checkbox'], input[type='radio'], input[type='range'], input[type='file'], input[type='color'],
   select, option, summary, label,
@@ -6537,7 +6537,7 @@ html {
   [aria-haspopup], [onclick], [tabindex]:not([tabindex='-1'])
 ),
 :is([data-fb-pointer='yayra'], [data-fb-pointer='high-visibility']) :where(
-  a[href], area[href], button,
+  a, area[href], button,
   input[type='button'], input[type='submit'], input[type='reset'], input[type='image'],
   input[type='checkbox'], input[type='radio'], input[type='range'], input[type='file'], input[type='color'],
   select, option, summary, label,

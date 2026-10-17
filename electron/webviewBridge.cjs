@@ -119,7 +119,7 @@ const POINTER_STYLE_ID = 'yayra-custom-pointer-theme';
 // buildPointerThemeCss applies the hand cursor to both each control and all of
 // its descendants.
 const POINTER_INTERACTIVE_SELECTORS = Object.freeze([
-  'a[href]', 'area[href]', 'button',
+  'a', 'area[href]', 'button',
   'input[type="button"]', 'input[type="submit"]', 'input[type="reset"]', 'input[type="image"]',
   'input[type="checkbox"]', 'input[type="radio"]', 'input[type="range"]', 'input[type="file"]', 'input[type="color"]',
   'select', 'option', 'summary', 'label',

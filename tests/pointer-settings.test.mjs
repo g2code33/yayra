@@ -170,7 +170,7 @@ test('CSS PIN: custom pointer themes cover nested interactive targets and keep n
   const handRulesEnd = css.indexOf('/* Text entry keeps the NATIVE I-beam', handRulesStart);
   const handRules = css.slice(handRulesStart, handRulesEnd);
   assert.match(handRules, /:where\([\s\S]*\[role='button'\][\s\S]*\[tabindex\][\s\S]*\) \* \{\s*cursor: var\(--fb-ptr-hand, pointer\) !important;/, 'nested icons and text inside interactive controls use the hand cursor');
-  for (const selector of ["input[type='checkbox']", "input[type='submit']", "[role='combobox']", '[onclick]']) {
+  for (const selector of ['a, area[href]', "input[type='checkbox']", "input[type='submit']", "[role='combobox']", '[onclick]']) {
     assert.ok(handRules.includes(selector), `${selector} is recognized as interactive`);
   }
   // Text entry keeps the NATIVE I-beam (follows the OS pointer size).

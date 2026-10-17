@@ -336,7 +336,7 @@ class YayraTabWebviewManager(
         val arrowCursor = cursorData(arrowSvg, (4 * scale).toInt(), (2 * scale).toInt(), "auto")
         val handCursor = cursorData(handSvg, (9 * scale).toInt(), (2 * scale).toInt(), "pointer")
         val interactiveSelector = ":where(" + listOf(
-            "a[href]", "area[href]", "button",
+            "a", "area[href]", "button",
             "input[type='button']", "input[type='submit']", "input[type='reset']", "input[type='image']",
             "input[type='checkbox']", "input[type='radio']", "input[type='range']", "input[type='file']", "input[type='color']",
             "select", "option", "summary", "label",
