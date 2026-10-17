@@ -3405,6 +3405,35 @@ html {
   opacity: 0.5;
 }
 
+.fb-tab-context-menu-submenu-row {
+  display: flex;
+  flex-direction: column;
+}
+
+.fb-tab-context-menu-submenu-toggle::after {
+  content: '›';
+  float: right;
+  color: var(--fb-text-secondary);
+  font-size: 1.1em;
+  line-height: 1;
+}
+
+.fb-tab-context-menu-submenu-toggle[aria-expanded="true"]::after {
+  content: '⌄';
+}
+
+.fb-tab-context-submenu {
+  flex-direction: column;
+  gap: 1px;
+  margin: 0 0 3px 10px;
+  padding-left: 8px;
+  border-left: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.fb-tab-context-submenu-item {
+  font-size: 0.82rem;
+}
+
 .fb-tab-context-menu-sep {
   height: 1px;
   background: rgba(255, 255, 255, 0.08);
@@ -6704,6 +6733,7 @@ html {
 }
 
 [data-theme="light"] .fb-tab-context-menu-sep,
+[data-theme="light"] .fb-tab-context-submenu,
 [data-theme="light"] .fb-account-profiles,
 [data-theme="light"] .fb-downloads-dropdown-header {
   border-color: rgba(15, 23, 42, 0.1);

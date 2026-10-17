@@ -3328,7 +3328,13 @@ export class BrowserShell {
         break;
       case 'new-window-request':
         if (evt.url) {
-          this.createNewTab();
+          // Links and window.open requests belong beside the tab that
+          // launched them, not at the end of the strip. Keep the source
+          // profile/privacy scope and existing tab group as well.
+          this.createNewTab(Boolean(tab.isPrivate), {
+            afterTabId: tab.id,
+            group: tab.group || null
+          });
           this.navigateActiveTab(evt.url);
         }
         break;
@@ -12132,7 +12138,7 @@ export class BrowserShell {
   /* -------------------------------------------------------------
    * TAB MANAGEMENT
    * ----------------------------------------------------------- */
-  createNewTab(isPrivate = false, { group = null, render = true } = {}) {
+  createNewTab(isPrivate = false, { group = null, render = true, afterTabId = null } = {}) {
     // Collision-proof id: `tab-${Date.now()}` alone DUPLICATED when two tabs
     // were created in the same millisecond (fast Ctrl+T, scripted flows) -
     // aliased tabs then shared ONE pooled frame, silently overwriting each
@@ -12152,7 +12158,11 @@ export class BrowserShell {
     const safeGroup = this.sanitizeTabGroup(group);
     if (safeGroup) newTab.group = safeGroup;
 
-    this.state.tabs.push(newTab);
+    const insertAfterIndex = afterTabId
+      ? this.state.tabs.findIndex((tab) => tab.id === afterTabId)
+      : -1;
+    if (insertAfterIndex >= 0) this.state.tabs.splice(insertAfterIndex + 1, 0, newTab);
+    else this.state.tabs.push(newTab);
     this.state.activeTabId = newId;
     this.state.urlInputValue = '';
     this.state.isBookmarked = false;
@@ -12313,10 +12323,13 @@ export class BrowserShell {
       { label: 'Duplicate Tab', action: () => this.duplicateTabById(tab.id) },
       null,
       { label: 'Create group with this tab…', action: () => this.createTabGroupForTab(tab.id) },
-      ...availableGroups.map((group) => ({
-        label: `Add to “${group.name}”`,
-        action: () => this.addTabToExistingGroup(tab.id, group.id)
-      })),
+      ...(availableGroups.length ? [{
+        label: 'Add to…',
+        submenu: availableGroups.map((group) => ({
+          label: group.name,
+          action: () => this.addTabToExistingGroup(tab.id, group.id)
+        }))
+      }] : []),
       ...(currentGroup ? [
         { label: `Open “${currentGroup.name}” group`, action: () => this.openTabGroup(currentGroup.id) },
         { label: `Remove from “${currentGroup.name}”`, action: () => this.ungroupTab(tab.id) }
@@ -12328,6 +12341,15 @@ export class BrowserShell {
       { label: 'Close Tabs to the Right', action: () => this.closeTabsToTheRight(tab.id), disabled: !canCloseRight }
     ];
 
+    const menuWidth = 240;
+    const baseMenuHeight = items.reduce((height, item) => height + (item ? 34 : 12), 16);
+    const positionMenu = (extraHeight = 0) => {
+      const left = Math.min(x, window.innerWidth - menuWidth - 8);
+      const top = Math.min(y, window.innerHeight - baseMenuHeight - extraHeight - 8);
+      menu.style.left = `${Math.max(8, left)}px`;
+      menu.style.top = `${Math.max(8, top)}px`;
+    };
+
     // Use textContent for labels: group names are user-entered and must
     // never be interpreted as markup in a tab context menu.
     items.forEach((item, index) => {
@@ -12338,6 +12360,48 @@ export class BrowserShell {
         menu.appendChild(separator);
         return;
       }
+
+      if (Array.isArray(item.submenu)) {
+        const groupRow = document.createElement('div');
+        groupRow.className = 'fb-tab-context-menu-submenu-row';
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'fb-tab-context-menu-item fb-tab-context-menu-submenu-toggle';
+        toggle.setAttribute('role', 'menuitem');
+        toggle.setAttribute('data-idx', String(index));
+        toggle.setAttribute('aria-haspopup', 'menu');
+        toggle.setAttribute('aria-expanded', 'false');
+        toggle.textContent = item.label;
+        const submenu = document.createElement('div');
+        submenu.className = 'fb-tab-context-submenu';
+        submenu.setAttribute('role', 'menu');
+        submenu.setAttribute('aria-label', 'Available tab groups');
+        submenu.style.display = 'none';
+        for (const child of item.submenu) {
+          const childButton = document.createElement('button');
+          childButton.type = 'button';
+          childButton.className = 'fb-tab-context-menu-item fb-tab-context-submenu-item';
+          childButton.setAttribute('role', 'menuitem');
+          childButton.textContent = child.label;
+          childButton.addEventListener('click', () => {
+            dismiss();
+            child.action?.();
+            this.render();
+          });
+          submenu.appendChild(childButton);
+        }
+        toggle.addEventListener('click', () => {
+          const expanded = toggle.getAttribute('aria-expanded') === 'true';
+          toggle.setAttribute('aria-expanded', String(!expanded));
+          submenu.style.display = expanded ? 'none' : 'flex';
+          positionMenu(expanded ? 0 : item.submenu.length * 34 + 8);
+        });
+        groupRow.appendChild(toggle);
+        groupRow.appendChild(submenu);
+        menu.appendChild(groupRow);
+        return;
+      }
+
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'fb-tab-context-menu-item';
@@ -12346,9 +12410,7 @@ export class BrowserShell {
       button.disabled = Boolean(item.disabled);
       button.textContent = item.label;
       button.addEventListener('click', () => {
-        scrim.remove();
-        menu.remove();
-        this.setPageObscured(false);
+        dismiss();
         item.action?.();
         this.render();
       });
@@ -12367,12 +12429,7 @@ export class BrowserShell {
     this.setPageObscured(true);
 
     // Clamp to viewport so it never renders off-screen near the right/bottom edge.
-    const menuWidth = 240;
-    const menuHeight = items.reduce((height, item) => height + (item ? 34 : 12), 16);
-    const left = Math.min(x, window.innerWidth - menuWidth - 8);
-    const top = Math.min(y, window.innerHeight - menuHeight - 8);
-    menu.style.left = `${Math.max(8, left)}px`;
-    menu.style.top = `${Math.max(8, top)}px`;
+    positionMenu();
   }
 
   restoreLastClosedTab() {

@@ -461,8 +461,14 @@ test('TAB RIGHT-CLICK: group, move, open, and remove actions work for the tab un
 
     shell.renderTabContextMenu(40, 40, target);
     let buttons = [...document.body.querySelectorAll('.fb-tab-context-menu-item')];
-    const addToWork = buttons.find((button) => button.textContent === 'Add to “Work”');
-    assert.ok(addToWork, 'the context menu offers existing groups as direct choices');
+    const addTo = buttons.find((button) => button.textContent === 'Add to…');
+    assert.ok(addTo, 'the context menu keeps group actions concise behind Add to…');
+    const submenu = document.body.querySelector('.fb-tab-context-submenu');
+    assert.equal(submenu.style.display, 'none', 'the group list is collapsed until requested');
+    addTo.click();
+    assert.equal(submenu.style.display, 'flex', 'selecting Add to… reveals the available tab groups');
+    const addToWork = submenu.querySelectorAll('.fb-tab-context-submenu-item').find((button) => button.textContent === 'Work');
+    assert.ok(addToWork, 'the submenu lists the existing group');
     addToWork.click();
     assert.equal(target.group?.name, 'Work', 'the right-clicked tab, not only the active tab, joins the selected group');
 
@@ -483,6 +489,52 @@ test('TAB RIGHT-CLICK: group, move, open, and remove actions work for the tab un
     drawerEntry.click();
     assert.equal(shell.state.isSideDrawerOpen, false, 'choosing a group closes the drawer');
     assert.equal(shell.getActiveTab().group?.name, 'Work', 'the drawer entry opens the selected group');
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('LINKS: a tab opened by a page is inserted beside its source and keeps its privacy/group context', async () => {
+  const { shell } = await makeShell();
+  try {
+    const first = shell.getActiveTab();
+    first.url = 'https://first.example/';
+    const source = shell.createNewTab();
+    source.url = 'https://source.example/';
+    source.group = { name: 'Research', color: '#3b82f6' };
+    const trailing = shell.createNewTab();
+    trailing.url = 'https://trailing.example/';
+    shell.selectTab(source.id);
+
+    shell.handleNativeWebviewEvent({
+      tabId: source.id,
+      type: 'new-window-request',
+      url: 'https://child.example/'
+    });
+    const child = shell.getActiveTab();
+    const sourceIndex = shell.state.tabs.findIndex((tab) => tab.id === source.id);
+    assert.equal(child.url, 'https://child.example/');
+    assert.equal(shell.state.tabs.indexOf(child), sourceIndex + 1, 'the new link tab sits directly after its source, not at the strip end');
+    assert.equal(shell.state.tabs.indexOf(trailing), sourceIndex + 2, 'existing tabs remain in order after the insertion');
+    assert.equal(child.group?.name, 'Research', 'a link opened from a group remains in that group');
+
+    const privateSource = shell.createNewTab(true);
+    privateSource.url = 'https://private.example/';
+    const privateTrailing = shell.createNewTab(true);
+    privateTrailing.url = 'https://private-trailing.example/';
+    shell.selectTab(privateSource.id);
+    shell.handleNativeWebviewEvent({
+      tabId: privateSource.id,
+      type: 'new-window-request',
+      url: 'https://private-child.example/'
+    });
+    const privateChild = shell.getActiveTab();
+    const privateSourceIndex = shell.state.tabs.findIndex((tab) => tab.id === privateSource.id);
+    assert.equal(privateChild.isPrivate, true, 'a private source opens a private child tab');
+    assert.equal(shell.state.tabs.indexOf(privateChild), privateSourceIndex + 1);
+    assert.equal(shell.state.tabs.indexOf(privateTrailing), privateSourceIndex + 2);
+    assert.equal(shell.state.tabs.indexOf(first), 0, 'unrelated normal tabs stay in place');
   } finally {
     shell.destroy();
     delete globalThis.localStorage;
