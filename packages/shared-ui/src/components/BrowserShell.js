@@ -10582,6 +10582,23 @@ export class BrowserShell {
       })
       .filter(Boolean);
     const pinnedSubmenus = new Set();
+    const hoverCloseTimers = new Map();
+    const cancelHoverClose = (entry) => {
+      const timer = hoverCloseTimers.get(entry.parent);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        hoverCloseTimers.delete(entry.parent);
+      }
+    };
+    const scheduleHoverClose = (entry) => {
+      cancelHoverClose(entry);
+      if (pinnedSubmenus.has(entry.parent)) return;
+      const timer = setTimeout(() => {
+        hoverCloseTimers.delete(entry.parent);
+        if (!pinnedSubmenus.has(entry.parent)) closeFlyout(entry);
+      }, 160);
+      hoverCloseTimers.set(entry.parent, timer);
+    };
 
     const positionFlyout = ({ button, submenu }) => {
       const drawerRect = drawer.getBoundingClientRect();
@@ -10617,6 +10634,7 @@ export class BrowserShell {
     };
 
     const closeFlyout = (entry) => {
+      cancelHoverClose(entry);
       pinnedSubmenus.delete(entry.parent);
       entry.parent.classList.remove('open');
       entry.button.setAttribute('aria-expanded', 'false');
@@ -10636,6 +10654,7 @@ export class BrowserShell {
     };
 
     const openFlyout = (entry) => {
+      cancelHoverClose(entry);
       closeOtherFlyouts(entry);
       if (entry.submenu.parentElement !== drawer) drawer.appendChild(entry.submenu);
       entry.parent.classList.add('open');
@@ -10653,13 +10672,19 @@ export class BrowserShell {
       entry.parent.addEventListener('pointerleave', (event) => {
         const nextTarget = event.relatedTarget;
         if (nextTarget && (entry.submenu.contains?.(nextTarget) || entry.parent.contains?.(nextTarget))) return;
-        if (!pinnedSubmenus.has(entry.parent)) closeFlyout(entry);
+        // Give the pointer a brief grace period to cross the gap into the
+        // flyout. relatedTarget can be null during DOM reparenting.
+        scheduleHoverClose(entry);
+      });
+
+      entry.submenu.addEventListener('pointerenter', () => {
+        cancelHoverClose(entry);
       });
 
       entry.submenu.addEventListener('pointerleave', (event) => {
         const nextTarget = event.relatedTarget;
         if (nextTarget && (entry.parent.contains?.(nextTarget) || entry.submenu.contains?.(nextTarget))) return;
-        if (!pinnedSubmenus.has(entry.parent)) closeFlyout(entry);
+        scheduleHoverClose(entry);
       });
 
       entry.button.addEventListener('click', (event) => {

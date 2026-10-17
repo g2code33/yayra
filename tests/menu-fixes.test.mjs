@@ -591,7 +591,7 @@ test('KOTTON (Kotlin pin): the Android plugin really implements installSiteAsApp
   assert.ok(ensure.includes('com.android.launcher.permission.INSTALL_SHORTCUT'), 'manifest permission injected for legacy devices');
 });
 
-test('SUBMENUS: every submenu parent opens on click, lists its items, and closes again', async () => {
+test('SUBMENUS: every submenu parent opens on hover, stays reachable, and keeps its options clickable', async () => {
   const { shell, container } = await makeShell({ storage: makeStorage() });
   try {
     shell._textPromptDialog = async () => 'G';
@@ -602,13 +602,34 @@ test('SUBMENUS: every submenu parent opens on click, lists its items, and closes
     const parents = Array.from(container.querySelectorAll('.fb-drawer-item-has-submenu'));
     assert.ok(parents.length >= 7, `all submenu groups present (${parents.length} found)`);
     const drawer = container.querySelector('.fb-side-drawer-menu');
-    const hoverParent = parents[0];
-    const hoverFlyout = hoverParent.querySelector('.fb-drawer-submenu');
-    hoverParent.dispatchEvent({ type: 'pointerenter', pointerType: 'mouse', relatedTarget: null });
-    assert.equal(hoverParent.classList.contains('open'), true, 'desktop hover opens the lateral flyout');
-    assert.equal(hoverFlyout.parentElement, drawer, 'the hover flyout is outside the scrolling list');
-    hoverParent.dispatchEvent({ type: 'pointerleave', relatedTarget: null });
-    assert.equal(hoverParent.classList.contains('open'), false, 'the hover flyout closes when the pointer leaves');
+    for (const parent of parents) {
+      const flyout = parent.querySelector('.fb-drawer-submenu');
+      parent.dispatchEvent({ type: 'pointerenter', pointerType: 'mouse', relatedTarget: null });
+      assert.equal(parent.classList.contains('open'), true, 'desktop hover opens each lateral flyout without clicking');
+      assert.equal(parent.querySelector('.fb-drawer-item').getAttribute('aria-expanded'), 'true');
+      assert.equal(flyout.parentElement, drawer, 'the hover flyout is outside the scrolling list');
+
+      // relatedTarget is sometimes null while the flyout is reparented. The
+      // grace period keeps it open long enough for the pointer to enter.
+      parent.dispatchEvent({ type: 'pointerleave', relatedTarget: null });
+      assert.equal(parent.classList.contains('open'), true, 'leaving the parent does not immediately collapse the flyout');
+      flyout.dispatchEvent({ type: 'pointerenter', pointerType: 'mouse', relatedTarget: parent });
+      await new Promise((resolve) => setTimeout(resolve, 180));
+      assert.equal(parent.classList.contains('open'), true, 'entering the flyout cancels its pending close');
+      flyout.dispatchEvent({ type: 'pointerleave', pointerType: 'mouse', relatedTarget: null });
+      await new Promise((resolve) => setTimeout(resolve, 180));
+      assert.equal(parent.classList.contains('open'), false, 'the flyout closes after the pointer leaves the whole submenu');
+    }
+
+    const touchParent = parents[0];
+    const touchButton = touchParent.querySelector('.fb-drawer-item');
+    touchParent.dispatchEvent({ type: 'pointerenter', pointerType: 'touch', relatedTarget: null });
+    assert.equal(touchParent.classList.contains('open'), false, 'touch does not depend on hover to reveal a submenu');
+    touchButton.click();
+    assert.equal(touchParent.classList.contains('open'), true, 'touch users can open the submenu with a tap');
+    touchButton.click();
+    assert.equal(touchParent.classList.contains('open'), false, 'the tap control can close it again');
+
     for (const parent of parents) {
       const button = parent.querySelector('.fb-drawer-item');
       const items = parent.querySelectorAll('.fb-drawer-item');
@@ -624,6 +645,16 @@ test('SUBMENUS: every submenu parent opens on click, lists its items, and closes
         await flush();
       }
     }
+
+    // Exercise a real option from a hover-opened flyout without clicking its
+    // parent first; this is the exact mouse interaction requested.
+    shell.closeModal();
+    shell.state.isSideDrawerOpen = true;
+    shell.render(container);
+    const historyParent = container.querySelector('.fb-dr-history-parent').parentElement;
+    historyParent.dispatchEvent({ type: 'pointerenter', pointerType: 'mouse', relatedTarget: null });
+    historyParent.querySelector('.fb-dr-tabsearch').click();
+    assert.equal(shell.state.activeModal, 'tab-switcher', 'a submenu option remains actionable after hover opens its parent');
   } finally {
     shell.destroy();
     delete globalThis.localStorage;
