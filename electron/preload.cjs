@@ -188,7 +188,7 @@ const api = {
     }
   },
   // Desktop-only system facilities: real process metrics for the task
-  // manager and real desktop shortcuts for "Create shortcut...".
+  // manager and real desktop shortcuts for "Create desktop shortcut...".
   system: {
     appMetrics: () => ipcRenderer.invoke('yayra:app-metrics'),
     createShortcut: ({ url, title } = {}) => ipcRenderer.invoke('yayra:create-shortcut', { url, title }),

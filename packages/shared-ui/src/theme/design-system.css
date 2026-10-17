@@ -4918,6 +4918,84 @@ html {
   position: relative;
 }
 
+.fb-shortcuts-settings-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+
+.fb-shortcut-settings-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--fb-border-glass);
+  border-radius: 12px;
+  background: var(--fb-bg-surface-elevated);
+  color: var(--fb-text-primary);
+  box-sizing: border-box;
+}
+
+.fb-shortcut-settings-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+}
+
+.fb-shortcut-settings-icon img {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+}
+
+.fb-shortcut-settings-copy {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.fb-shortcut-settings-copy strong,
+.fb-shortcut-settings-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fb-shortcut-settings-copy small {
+  color: var(--fb-text-muted);
+  font-size: 0.75rem;
+}
+
+.fb-shortcut-settings-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.fb-shortcuts-settings-empty {
+  margin: 0;
+  color: var(--fb-text-secondary);
+  font-size: 0.85rem;
+}
+
+@media (max-width: 600px) {
+  .fb-shortcut-settings-card {
+    flex-wrap: wrap;
+  }
+
+  .fb-shortcut-settings-actions {
+    margin-left: 44px;
+  }
+}
+
 .fb-shortcut-edit-btn {
   position: absolute;
   top: 4px;

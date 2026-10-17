@@ -4749,10 +4749,17 @@ export class BrowserShell {
             <div class="fb-tab-groups-settings-list" id="fb-in-tab-groups-list"></div>
           </section>
 
-          <!-- Shortcuts: every keyboard shortcut, system-wide hotkey and
-               bubble gesture in one reference. -->
+          <!-- Website shortcuts and every keyboard shortcut, system-wide
+               hotkey, and bubble gesture in one settings destination. -->
           <section class="fb-settings-group-card" id="sec-shortcuts" style="${activeCat === 'shortcuts' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
             <h3 class="fb-settings-group-title">${Icons.settings} Shortcuts</h3>
+            <h4 class="fb-shortcuts-subhead">New Tab website shortcuts</h4>
+            <p style="margin:0; font-size:0.82rem; color:var(--fb-text-secondary);">Pinned websites appear as tiles on the New Tab page. Add the current website from the page menu, or manage shortcuts here.</p>
+            <div class="fb-tab-group-settings-toolbar">
+              <button type="button" class="fb-btn fb-btn-primary fb-in-add-website-shortcut" ${(this.state.userShortcuts || []).length >= 12 ? 'disabled title="Remove a shortcut before adding another"' : ''}>${Icons.plus} Add website shortcut</button>
+            </div>
+            <div class="fb-shortcuts-settings-list" id="fb-in-shortcuts-list"></div>
+            <h4 class="fb-shortcuts-subhead">Keyboard shortcuts</h4>
             <p style="margin:0; font-size:0.82rem; color:var(--fb-text-secondary);">Everything Yayra answers to - in the browser, system-wide anywhere on your PC, and on the floating bubble.</p>
             <h4 class="fb-shortcuts-subhead">In the browser</h4>
             <div class="fb-shortcuts-table">
@@ -4827,7 +4834,12 @@ export class BrowserShell {
     `;
 
     this.renderTabGroupSettingsList(page.querySelector('#fb-in-tab-groups-list'));
+    this.renderShortcutsSettingsList(page.querySelector('#fb-in-shortcuts-list'));
     page.querySelector('.fb-in-create-tab-group')?.addEventListener('click', () => this.createTabGroup());
+    page.querySelector('.fb-in-add-website-shortcut')?.addEventListener('click', () => {
+      this._editingShortcut = null;
+      this.openModal('edit-shortcut');
+    });
     page.querySelector('.fb-in-group-current-tab')?.addEventListener('click', () => this.groupCurrentTab());
     page.querySelector('.fb-in-open-tab-groups')?.addEventListener('click', () => this.openModal('tab-groups'));
 
@@ -7477,7 +7489,7 @@ export class BrowserShell {
           return;
         }
         if (res && res.reason === 'unsupported-platform') {
-          this.showTransientNotice('Installing pages as apps is not supported on macOS yet - use "Create shortcut..." instead.');
+          this.showTransientNotice('Installing pages as apps is not supported on macOS yet - use "Create desktop shortcut..." instead.');
           return;
         }
         this.showTransientNotice(`Couldn't install the app${res && res.reason ? ` (${res.reason})` : ''}.`);
@@ -7502,18 +7514,72 @@ export class BrowserShell {
     this.showTransientNotice('A web page can\u2019t install another site as an app - use the Yayra desktop or Android app for that. To install Yayra itself, use your browser\u2019s install / add-to-home-screen option.');
   }
 
-  /** Real desktop shortcut for the current page (desktop app only). */
+  /** Pin the active website in Yayra's profile-scoped New Tab shortcuts. */
   async createShortcutForActivePage() {
+    const tab = this.getActiveTab();
+    let url;
+    try {
+      const parsed = new URL(String(tab?.url || '').trim());
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('not-a-website');
+      url = parsed.toString();
+    } catch {
+      this.showTransientNotice('Open a website first - only http and https pages can be added as shortcuts.');
+      return false;
+    }
+
+    if (!this.shortcutsRepo?.addShortcut || !this.shortcutsRepo?.getShortcuts) {
+      this.showTransientNotice('Yayra shortcuts are unavailable in this profile.');
+      return false;
+    }
+
+    let shortcuts = [];
+    try {
+      shortcuts = await this.shortcutsRepo.getShortcuts();
+    } catch {
+      this.showTransientNotice('Could not load your New Tab shortcuts.');
+      return false;
+    }
+    this.state.userShortcuts = Array.isArray(shortcuts) ? shortcuts : [];
+    const canonicalUrl = (value) => {
+      try { return new URL(String(value || '')).toString(); } catch { return String(value || ''); }
+    };
+    const existing = this.state.userShortcuts.find((shortcut) => canonicalUrl(shortcut.url) === url);
+    if (existing) {
+      this.render();
+      this.showTransientNotice('This website is already in your New Tab shortcuts.');
+      return existing;
+    }
+
+    const title = String(tab.title || new URL(url).hostname).replace(/\s+/g, ' ').trim().slice(0, 60) || url;
+    let created;
+    try {
+      created = await this.shortcutsRepo.addShortcut({ title, url });
+      this.state.userShortcuts = await this.shortcutsRepo.getShortcuts();
+    } catch {
+      this.showTransientNotice('Could not save this New Tab shortcut.');
+      return false;
+    }
+    this.render();
+    if (!created) {
+      this.showTransientNotice('Shortcut limit reached (12) - remove one in Settings > Shortcuts.');
+      return false;
+    }
+    this.showTransientNotice('Added to your New Tab shortcuts.');
+    return created;
+  }
+
+  /** Real OS desktop shortcut for the current page (desktop app only). */
+  async createDesktopShortcutForActivePage() {
     const tab = this.getActiveTab();
     if (this.systemBridge && typeof this.systemBridge.createShortcut === 'function' && tab) {
       try {
         const res = await this.systemBridge.createShortcut({ url: tab.url, title: tab.title || tab.url });
-        if (res && res.ok) { this.showTransientNotice(`Shortcut created on your desktop: ${res.path}`); return; }
-        this.showTransientNotice(`Couldn't create the shortcut${res && res.reason ? ` (${res.reason})` : ''}.`);
+        if (res && res.ok) { this.showTransientNotice(`Desktop shortcut created: ${res.path}`); return; }
+        this.showTransientNotice(`Couldn't create the desktop shortcut${res && res.reason ? ` (${res.reason})` : ''}.`);
         return;
       } catch { /* fall through */ }
     }
-    this.showTransientNotice('Desktop shortcuts need the desktop app - on web, use your browser\'s "Install" / "Add to home screen".');
+    this.showTransientNotice('Desktop shortcuts need the Yayra desktop app.');
   }
 
   /**
@@ -8020,6 +8086,70 @@ export class BrowserShell {
     }
   }
 
+  renderShortcutsSettingsList(container) {
+    if (!container) return;
+    container.innerHTML = '';
+    const shortcuts = Array.isArray(this.state.userShortcuts) ? this.state.userShortcuts : [];
+    if (!shortcuts.length) {
+      const empty = document.createElement('p');
+      empty.className = 'fb-shortcuts-settings-empty';
+      empty.textContent = 'No website shortcuts yet. Add one here or use “Add to New Tab shortcuts” from a website.';
+      container.appendChild(empty);
+      return;
+    }
+
+    for (const shortcut of shortcuts) {
+      const card = document.createElement('article');
+      card.className = 'fb-shortcut-settings-card';
+      const icon = document.createElement('span');
+      icon.className = 'fb-shortcut-settings-icon';
+      icon.innerHTML = this.frequentSiteIconHtml(shortcut);
+      const copy = document.createElement('span');
+      copy.className = 'fb-shortcut-settings-copy';
+      const title = document.createElement('strong');
+      title.textContent = shortcut.title || shortcut.url;
+      const url = document.createElement('small');
+      url.textContent = shortcut.url;
+      copy.appendChild(title);
+      copy.appendChild(url);
+      const actions = document.createElement('div');
+      actions.className = 'fb-shortcut-settings-actions';
+      const edit = document.createElement('button');
+      edit.type = 'button';
+      edit.className = 'fb-btn fb-btn-secondary fb-shortcut-settings-edit';
+      edit.textContent = 'Edit';
+      edit.setAttribute('aria-label', `Edit shortcut ${shortcut.title || shortcut.url}`);
+      edit.addEventListener('click', () => {
+        this._editingShortcut = shortcut;
+        this.openModal('edit-shortcut');
+      });
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'fb-btn fb-btn-secondary fb-shortcut-settings-remove';
+      remove.textContent = 'Remove';
+      remove.setAttribute('aria-label', `Remove shortcut ${shortcut.title || shortcut.url}`);
+      remove.addEventListener('click', async () => {
+        if (!this.shortcutsRepo?.removeShortcut || !this.shortcutsRepo?.getShortcuts) return;
+        remove.disabled = true;
+        try {
+          await this.shortcutsRepo.removeShortcut(shortcut.id);
+          this.state.userShortcuts = await this.shortcutsRepo.getShortcuts();
+          this.render();
+          this.showTransientNotice('Removed from your New Tab shortcuts.');
+        } catch {
+          remove.disabled = false;
+          this.showTransientNotice('Could not remove this shortcut.');
+        }
+      });
+      actions.appendChild(edit);
+      actions.appendChild(remove);
+      card.appendChild(icon);
+      card.appendChild(copy);
+      card.appendChild(actions);
+      container.appendChild(card);
+    }
+  }
+
   renderTabGroupsModal(modal) {
     modal.className = 'fb-modal-card fb-tab-groups-modal';
     modal.innerHTML = `
@@ -8347,9 +8477,11 @@ export class BrowserShell {
     let host = '';
     try { host = new URL(site.url).hostname; } catch { host = ''; }
     const letter = String(site.title || host || '?').trim().charAt(0).toUpperCase() || '?';
-    const badge = `<span class="fb-frequent-letter" style="display:none;font:700 18px/1 system-ui;">${letter}</span>`;
+    const safeLetter = letter.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const badge = `<span class="fb-frequent-letter" style="display:none;font:700 18px/1 system-ui;">${safeLetter}</span>`;
     if (!host) return badge.replace('display:none;', '');
-    return `<img src="https://icons.duckduckgo.com/ip3/${host}.ico" alt="" style="width:24px;height:24px;border-radius:6px;" `
+    const safeHost = encodeURIComponent(host);
+    return `<img src="https://icons.duckduckgo.com/ip3/${safeHost}.ico" alt="" style="width:24px;height:24px;border-radius:6px;" `
       + `onerror="this.style.display='none'; if (this.nextElementSibling) this.nextElementSibling.style.display='';" />${badge}`;
   }
 
@@ -10444,7 +10576,8 @@ export class BrowserShell {
             <button class="fb-drawer-item fb-dr-open-doc">${Icons.document} <span>Open document... (PDF)</span></button>
             <button class="fb-drawer-item fb-dr-install-app">${Icons.download} <span>Install page as app...</span></button>
             <button class="fb-drawer-item fb-dr-open-pharmagame">${Icons.sparkles} <span>Open in pharmaGAME Ai</span></button>
-            <button class="fb-drawer-item fb-dr-create-shortcut">${Icons.externalLink} <span>Create shortcut...</span></button>
+            <button class="fb-drawer-item fb-dr-create-shortcut">${Icons.externalLink} <span>Add to New Tab shortcuts</span></button>
+            ${typeof this.systemBridge?.createShortcut === 'function' ? `<button class="fb-drawer-item fb-dr-create-desktop-shortcut">${Icons.externalLink} <span>Create desktop shortcut...</span></button>` : ''}
 
             <div class="fb-submenu-section-label">Share</div>
             <button class="fb-drawer-item fb-dr-copy-link">${Icons.copy} <span>Copy link</span></button>
@@ -10940,6 +11073,12 @@ export class BrowserShell {
       this.state.isSideDrawerOpen = false;
       this.render();
       this.createShortcutForActivePage();
+    });
+
+    drawer.querySelector('.fb-dr-create-desktop-shortcut')?.addEventListener('click', () => {
+      this.state.isSideDrawerOpen = false;
+      this.render();
+      this.createDesktopShortcutForActivePage();
     });
 
     drawer.querySelector('.fb-dr-copy-link')?.addEventListener('click', () => {

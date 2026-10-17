@@ -912,7 +912,7 @@ function registerIpcBridges() {
     }
   });
 
-  // Menu > Save and share > Create shortcut...: a REAL shortcut file on
+  // Menu > Save and share > Create desktop shortcut...: a REAL shortcut file on
   // the user's desktop that opens the page in the default browser
   // (.desktop on Linux, .url on Windows, .webloc on macOS).
   ipcMain.handle('yayra:create-shortcut', (_event, { url, title } = {}) => {
