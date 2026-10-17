@@ -713,13 +713,16 @@ function registerIpcBridges() {
       const metrics = app.getAppMetrics() || [];
       return {
         ok: true,
+        sampledAt: Date.now(),
         processes: metrics.map((m) => ({
           type: m.type || 'unknown',
           label: m.name || m.serviceName || m.type || 'process',
           pid: m.pid ?? null,
           cpu: m.cpu && Number.isFinite(m.cpu.percentCPUUsage) ? m.cpu.percentCPUUsage : null,
-          memoryMB: m.memory && Number.isFinite(m.memory.workingSetSize)
-            ? Math.round(m.memory.workingSetSize / 1024)
+          // Electron reports workingSetSize in bytes. Convert it to MiB;
+          // the renderer labels the same binary unit explicitly.
+          memoryMiB: m.memory && Number.isFinite(m.memory.workingSetSize)
+            ? Math.round((m.memory.workingSetSize / (1024 * 1024)) * 10) / 10
             : null
         }))
       };

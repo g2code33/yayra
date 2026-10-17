@@ -346,6 +346,23 @@ export class BrowserShell {
         colorTheme: 'blue',
         searchEngine: 'google', // Requirement 13: Default search engine is Google
         tabSwitcherView: 'grid', // 'grid' keeps the existing preview cards; 'list' is the compact Chrome-style tab search
+        performanceIssueAlerts: true,
+        backgroundTabThrottling: true,
+        dimInactiveTabs: true,
+        tabHoverCards: true,
+        reduceMotionForPerformance: false,
+        readerTheme: 'dark',
+        readerFont: 'serif',
+        readerFontSize: 19,
+        readerLineHeight: '1.75',
+        readerLetterSpacing: '0',
+        readerLayout: 'comfortable',
+        readerLinks: true,
+        readerImages: true,
+        readerVoiceHighlight: true,
+        readerPinned: true,
+        readerSpeechRate: 1,
+        readerVoice: '',
         floatingEnabledByDefault: true,
         startFloatingOnLaunch: true,
         alwaysOnTop: true,
@@ -1031,6 +1048,14 @@ export class BrowserShell {
         console.warn('Failed to load settings in BrowserShell:', err);
       }
     }
+    // Apply the saved background-tab policy to this window's native pages.
+    // The main process remembers it for views created later in this window.
+    try {
+      const webview = this.nativeWebview;
+      if (typeof webview?.setBackgroundThrottling === 'function') {
+        await webview.setBackgroundThrottling(this.state.settings.backgroundTabThrottling !== false);
+      }
+    } catch { /* the web/PWA build has no native webview policy bridge */ }
 
     if (this.historyRepo && typeof this.historyRepo.getEntries === 'function') {
       try {
@@ -1296,6 +1321,10 @@ export class BrowserShell {
   }
 
   render(container = null) {
+    if (this._tabHoverTimer) clearTimeout(this._tabHoverTimer);
+    this._tabHoverTimer = null;
+    this._activeTabHoverCard?.remove?.();
+    this._activeTabHoverCard = null;
     // Global theme tokens must reach body-mounted dialogs too, not just
     // the shell node that render() rebuilds. Pointer preference follows the
     // same lifecycle and is also forwarded to the native website surfaces.
@@ -1350,6 +1379,7 @@ export class BrowserShell {
     shell.className = `fb-browser-shell ${this.state.isMobile ? 'fb-mobile-layout' : 'fb-desktop-layout'} ${isPrivate ? 'fb-incognito-mode' : ''}`;
     shell.setAttribute('data-theme', this.resolveEffectiveTheme());
     shell.setAttribute('data-color-theme', this.state.settings.colorTheme || 'blue');
+    shell.setAttribute('data-reduced-motion', this.state.settings.reduceMotionForPerformance ? 'true' : 'false');
     shell.setAttribute('data-floating-mode', this.state.desktopFloatingMode);
 
     // Apply frame transparency
@@ -1679,11 +1709,52 @@ export class BrowserShell {
     this.state.tabs.forEach((tab, index) => {
       const isActive = tab.id === this.state.activeTabId;
       const tabEl = document.createElement('div');
-      tabEl.className = `fb-tab-item ${isActive ? 'active' : ''} ${tab.isPrivate ? 'fb-tab-incognito' : ''}`;
+      tabEl.className = `fb-tab-item ${isActive ? 'active' : ''} ${tab.isPrivate ? 'fb-tab-incognito' : ''} ${!isActive && this.state.settings.dimInactiveTabs !== false ? 'fb-tab-inactive-dim' : ''}`;
       tabEl.setAttribute('role', 'tab');
       tabEl.setAttribute('aria-selected', isActive ? 'true' : 'false');
       tabEl.setAttribute('draggable', 'true');
       tabEl.dataset.tabId = tab.id;
+
+      if (this.state.settings.tabHoverCards !== false) {
+        const titleText = this.getTabTitle(tab);
+        let addressText = String(tab.url || '');
+        try { addressText = new URL(tab.url).host + new URL(tab.url).pathname; } catch { /* internal or empty URL */ }
+        tabEl.setAttribute('title', `${titleText}${addressText ? ` — ${addressText}` : ''}`);
+        const showHoverCard = () => {
+          if (this._tabHoverTimer) clearTimeout(this._tabHoverTimer);
+          this._tabHoverTimer = setTimeout(() => {
+            if (typeof document === 'undefined' || !document.body) return;
+            this._activeTabHoverCard?.remove?.();
+            const card = document.createElement('div');
+            card.className = 'fb-tab-hover-card';
+            const cardTitle = document.createElement('strong');
+            cardTitle.textContent = titleText;
+            const cardAddress = document.createElement('span');
+            cardAddress.textContent = addressText || 'New Tab';
+            card.appendChild(cardTitle);
+            card.appendChild(cardAddress);
+            const rect = tabEl.getBoundingClientRect?.();
+            const width = typeof window !== 'undefined' ? (Number(window.innerWidth) || 1280) : 1280;
+            const height = typeof window !== 'undefined' ? (Number(window.innerHeight) || 800) : 800;
+            const left = Math.max(8, Math.min(Number(rect?.left) || 8, width - 296));
+            const top = Math.max(8, Math.min((Number(rect?.bottom) || 0) + 8, height - 96));
+            card.style.left = `${left}px`;
+            card.style.top = `${top}px`;
+            document.body.appendChild(card);
+            this._activeTabHoverCard = card;
+          }, 450);
+        };
+        const hideHoverCard = () => {
+          if (this._tabHoverTimer) clearTimeout(this._tabHoverTimer);
+          this._tabHoverTimer = null;
+          this._activeTabHoverCard?.remove?.();
+          this._activeTabHoverCard = null;
+        };
+        tabEl.addEventListener('mouseenter', showHoverCard);
+        tabEl.addEventListener('mouseleave', hideHoverCard);
+        tabEl.addEventListener('focus', showHoverCard);
+        tabEl.addEventListener('blur', hideHoverCard);
+      }
 
       // Favicon / Orb Icon
       const faviconWrap = document.createElement('span');
@@ -3249,6 +3320,31 @@ export class BrowserShell {
       case 'loading-stop':
         this.updateTabLoading(tabId, false);
         break;
+      case 'page-unresponsive':
+        if (this.state.settings.performanceIssueAlerts !== false) {
+          const name = tab.title || 'This page';
+          this.showTransientNotice(evt.recoveryScheduled
+            ? `${name} is not responding. Yayra will wait briefly before attempting a recovery reload.`
+            : `${name} is not responding. A recent recovery attempt is still in its cooldown; try Reload or close the tab.`);
+        }
+        break;
+      case 'page-recovery-start':
+        if (this.state.settings.performanceIssueAlerts !== false) {
+          this.showTransientNotice(evt.reason === 'navigation'
+            ? 'Page navigation started; the waiting recovery reload was canceled.'
+            : 'Yayra is attempting to reload the unresponsive page.');
+        }
+        break;
+      case 'page-responsive':
+        if (this.state.settings.performanceIssueAlerts !== false) {
+          this.showTransientNotice(`${tab.title || 'The page'} is responding again.`);
+        }
+        break;
+      case 'page-recovery-failed':
+        if (this.state.settings.performanceIssueAlerts !== false) {
+          this.showTransientNotice('Yayra could not start the recovery reload. You can retry Reload or close the tab.');
+        }
+        break;
       case 'navigated': {
         const previousUrl = tab.url;
         const pendingHandoff = this._systemBrowserHandoffs.get(tabId);
@@ -3268,7 +3364,7 @@ export class BrowserShell {
           navigationState.historyStack.push(tab.url);
           navigationState.currentIndex = navigationState.historyStack.length - 1;
         }
-        if (!tab.isPrivate && this.historyRepo && tab.url !== 'yayra://newtab') {
+        if (!tab.isPrivate && this.historyRepo && /^https?:\/\//i.test(tab.url || '')) {
           const recorded = typeof this.historyRepo.recordVisit === 'function'
             ? this.historyRepo.recordVisit(tab.url, tab.title, tab.favicon)
             : (typeof this.historyRepo.addEntry === 'function' ? this.historyRepo.addEntry(tab.url, tab.title, tab.favicon) : null);
@@ -3296,10 +3392,27 @@ export class BrowserShell {
       case 'favicon-updated':
         tab.favicon = evt.favicon || tab.favicon;
         break;
-      case 'fail-load':
+      case 'fail-load': {
         this.updateTabLoading(tabId, false);
-        console.warn(`[yayra] native webview failed to load ${evt.url}: ${evt.errorDescription} (${evt.errorCode})`);
+        const description = String(evt.errorDescription || '');
+        const code = Number(evt.errorCode);
+        if (code === -3 || /ERR_ABORTED\s*\(-3\)|net::ERR_ABORTED/i.test(description)) break;
+        let host = '';
+        try { host = new URL(evt.url).host; } catch { /* do not expose the full address or search query in logs */ }
+        console.warn(`[yayra] native webview failed to load ${host || 'page'} (error ${Number.isFinite(code) ? code : 'unknown'})`);
+        if (tabId === this.state.activeTabId) {
+          const key = `${host}:${code}`;
+          this._nativeLoadFailureNotices ||= new Map();
+          const lastNoticeAt = this._nativeLoadFailureNotices.get(key) || 0;
+          if (Date.now() - lastNoticeAt > 5000) {
+            this._nativeLoadFailureNotices.set(key, Date.now());
+            this.showTransientNotice(host
+              ? `Yayra couldn't finish loading ${host} (error ${Number.isFinite(code) ? code : 'unknown'}). Check the connection and try Reload.`
+              : 'Yayra could not finish loading this page. Check the connection and try Reload.');
+          }
+        }
         break;
+      }
       case 'system-browser-handoff': {
         // Direct auth URLs have an in-tab fallback card; popups and blocked
         // redirects leave the relying site visible and get this non-blocking
@@ -4164,18 +4277,20 @@ export class BrowserShell {
 
       // Recent History: a proper card (same design language as the
       // continue-tabs card) - click a row to open it, or copy its link.
-      if (this.state.historyItems.length > 0) {
+      const recentWebHistory = (this.state.historyItems || []).filter((item) => /^https?:\/\//i.test(String(item?.url || ''))).slice(0, 5);
+      if (recentWebHistory.length > 0) {
         const recentHist = document.createElement('div');
         recentHist.className = 'fb-continue-card fb-newtab-history';
         recentHist.innerHTML = `
           <div class="fb-continue-card-head">${this.state.isMobile ? 'Suggestions' : 'Recent history'}</div>
-          ${this.state.historyItems.slice(0, 5).map((h) => {
+          ${recentWebHistory.map((h) => {
             let host = h.url;
-            try { host = new URL(h.url).hostname; } catch { /* keep url */ }
+            try { host = new URL(h.url).hostname; } catch { /* filtered above */ }
             const safeUrl = String(h.url).replace(/"/g, '&quot;');
+            const faviconHtml = this.getTabFavicon({ url: h.url, favicon: h.favicon || null, isLoading: false });
             return `
             <div class="fb-continue-item fb-history-quick-item" data-url="${safeUrl}" role="button" tabindex="0" title="${safeUrl}">
-              <img class="fb-continue-favicon" src="https://icons.duckduckgo.com/ip3/${host}.ico" alt="" loading="lazy" onerror="this.style.visibility='hidden'" />
+              <span class="fb-continue-favicon fb-continue-favicon-wrap">${faviconHtml}</span>
               <span class="fb-continue-text">
                 <span class="fb-continue-title">${String(h.title || h.url).replace(/</g, '&lt;')}</span>
                 <span class="fb-continue-meta">${host}</span>
@@ -4426,6 +4541,12 @@ export class BrowserShell {
         <button class="fb-settings-nav-item ${activeCat === 'appearance' ? 'active' : ''}" data-cat="appearance" data-category="appearance">
           ${Icons.moon} <span>Appearance</span>
         </button>
+        <button class="fb-settings-nav-item ${activeCat === 'reader' ? 'active' : ''}" data-cat="reader" data-category="reader">
+          ${Icons.readingMode} <span>Reading Mode</span>
+        </button>
+        <button class="fb-settings-nav-item ${activeCat === 'performance' ? 'active' : ''}" data-cat="performance" data-category="performance">
+          ${Icons.performance} <span>Performance</span>
+        </button>
         <button class="fb-settings-nav-item ${activeCat === 'pointer' ? 'active' : ''}" data-cat="pointer" data-category="pointer">
           ${Icons.lens} <span>Pointer</span>
         </button>
@@ -4663,6 +4784,120 @@ export class BrowserShell {
             </div>
           </section>
 
+          <!-- Reading Mode preferences -->
+          <section class="fb-settings-group-card" id="sec-reader" style="${activeCat === 'reader' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
+            <h3 class="fb-settings-group-title">${Icons.readingMode} Reading Mode</h3>
+            <p>Choose how distraction-free articles look and sound. These preferences are saved on this profile and can also be changed while reading.</p>
+            <div class="fb-setting-row">
+              <label for="fb-in-reader-theme">Color theme</label>
+              <select id="fb-in-reader-theme" class="fb-select" data-reader-pref="readerTheme">
+                <option value="dark" ${(this.state.settings.readerTheme || 'dark') === 'dark' ? 'selected' : ''}>Dark</option>
+                <option value="light" ${this.state.settings.readerTheme === 'light' ? 'selected' : ''}>Light</option>
+                <option value="sepia" ${this.state.settings.readerTheme === 'sepia' ? 'selected' : ''}>Sepia</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-reader-font">Font</label>
+              <select id="fb-in-reader-font" class="fb-select" data-reader-pref="readerFont">
+                <option value="serif" ${(this.state.settings.readerFont || 'serif') === 'serif' ? 'selected' : ''}>Serif</option>
+                <option value="sans" ${this.state.settings.readerFont === 'sans' ? 'selected' : ''}>Sans serif</option>
+                <option value="mono" ${this.state.settings.readerFont === 'mono' ? 'selected' : ''}>Monospace</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-reader-size">Text size</label>
+              <input id="fb-in-reader-size" type="range" min="14" max="30" step="1" value="${Math.max(14, Math.min(30, Number(this.state.settings.readerFontSize) || 19))}" data-reader-pref="readerFontSize" />
+              <output id="fb-in-reader-size-value">${Math.max(14, Math.min(30, Number(this.state.settings.readerFontSize) || 19))} px</output>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-reader-line-height">Line height</label>
+              <select id="fb-in-reader-line-height" class="fb-select" data-reader-pref="readerLineHeight">
+                <option value="1.5" ${String(this.state.settings.readerLineHeight || '1.75') === '1.5' ? 'selected' : ''}>Compact</option>
+                <option value="1.75" ${String(this.state.settings.readerLineHeight || '1.75') === '1.75' ? 'selected' : ''}>Comfortable</option>
+                <option value="2" ${String(this.state.settings.readerLineHeight || '1.75') === '2' ? 'selected' : ''}>Relaxed</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-reader-spacing">Letter spacing</label>
+              <select id="fb-in-reader-spacing" class="fb-select" data-reader-pref="readerLetterSpacing">
+                <option value="-0.02" ${String(this.state.settings.readerLetterSpacing ?? '0') === '-0.02' ? 'selected' : ''}>Tight</option>
+                <option value="0" ${String(this.state.settings.readerLetterSpacing ?? '0') === '0' ? 'selected' : ''}>Normal</option>
+                <option value="0.03" ${String(this.state.settings.readerLetterSpacing ?? '0') === '0.03' ? 'selected' : ''}>Wide</option>
+                <option value="0.06" ${String(this.state.settings.readerLetterSpacing ?? '0') === '0.06' ? 'selected' : ''}>Extra wide</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-reader-layout">Reading width</label>
+              <select id="fb-in-reader-layout" class="fb-select" data-reader-pref="readerLayout">
+                <option value="narrow" ${this.state.settings.readerLayout === 'narrow' ? 'selected' : ''}>Narrow</option>
+                <option value="comfortable" ${(this.state.settings.readerLayout || 'comfortable') === 'comfortable' ? 'selected' : ''}>Comfortable</option>
+                <option value="wide" ${this.state.settings.readerLayout === 'wide' ? 'selected' : ''}>Wide</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-reader-rate">Read aloud speed</label>
+              <select id="fb-in-reader-rate" class="fb-select" data-reader-pref="readerSpeechRate">
+                <option value="0.75" ${Number(this.state.settings.readerSpeechRate || 1) === 0.75 ? 'selected' : ''}>0.75×</option>
+                <option value="1" ${Number(this.state.settings.readerSpeechRate || 1) === 1 ? 'selected' : ''}>1×</option>
+                <option value="1.25" ${Number(this.state.settings.readerSpeechRate || 1) === 1.25 ? 'selected' : ''}>1.25×</option>
+                <option value="1.5" ${Number(this.state.settings.readerSpeechRate || 1) === 1.5 ? 'selected' : ''}>1.5×</option>
+                <option value="2" ${Number(this.state.settings.readerSpeechRate || 1) === 2 ? 'selected' : ''}>2×</option>
+              </select>
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Show links</strong><p>Keep links visible and actionable in the clean article.</p></div>
+              <input type="checkbox" data-reader-pref="readerLinks" ${this.state.settings.readerLinks !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Show images</strong><p>Include page images alongside extracted article text.</p></div>
+              <input type="checkbox" data-reader-pref="readerImages" ${this.state.settings.readerImages !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Highlight read-aloud text</strong><p>Highlight the current sentence while supported system speech is playing.</p></div>
+              <input type="checkbox" data-reader-pref="readerVoiceHighlight" ${this.state.settings.readerVoiceHighlight !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Pin Reading Mode controls</strong><p>Keep the reader toolbar at the top while you scroll.</p></div>
+              <input type="checkbox" data-reader-pref="readerPinned" ${this.state.settings.readerPinned !== false ? 'checked' : ''} />
+            </div>
+          </section>
+
+          <!-- Performance settings stay separate from Task Manager metrics. -->
+          <section class="fb-settings-group-card" id="sec-performance" style="${activeCat === 'performance' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
+            <h3 class="fb-settings-group-title">${Icons.performance} Performance</h3>
+            <p>Control background-page activity and tab-strip behavior. Yayra throttles hidden pages when enabled; it does not discard tabs or promise memory savings. Use Task Manager for live process measurements.</p>
+            <div class="fb-performance-metrics" aria-label="Live application metrics">
+              <div class="fb-performance-metric"><span>Open tabs</span><strong id="fb-performance-tabs-value">${this.state.tabs.length}</strong></div>
+              <div class="fb-performance-metric"><span>CPU</span><strong id="fb-performance-cpu-value">—</strong></div>
+              <div class="fb-performance-metric"><span>Working set</span><strong id="fb-performance-memory-value">—</strong></div>
+            </div>
+            <p class="fb-performance-status" id="fb-performance-metrics-status" aria-live="polite">Waiting for desktop metrics…</p>
+            <div class="fb-performance-actions">
+              <button type="button" class="fb-btn fb-btn-secondary fb-performance-refresh">${Icons.refresh} Refresh metrics</button>
+              <button type="button" class="fb-btn fb-btn-primary fb-performance-open-taskmgr">${Icons.taskManager} Open Task Manager</button>
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Performance issue alerts</strong><p>Notify when Yayra receives an unresponsive-page event from the native webview.</p></div>
+              <input type="checkbox" id="fb-in-performance-alerts" ${this.state.settings.performanceIssueAlerts !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Throttle background tabs</strong><p>Allow hidden web pages to reduce background CPU work. Media and live updates may be affected by the page itself.</p></div>
+              <input type="checkbox" id="fb-in-performance-throttle" ${this.state.settings.backgroundTabThrottling !== false ? 'checked' : ''} ${this.nativeWebview?.setBackgroundThrottling ? '' : 'disabled'} />
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Dim inactive tabs</strong><p>Use a softer label treatment for tabs that are not selected.</p></div>
+              <input type="checkbox" id="fb-in-performance-dim-tabs" ${this.state.settings.dimInactiveTabs !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Show tab hover cards</strong><p>Show a title and website address when you pause over a tab.</p></div>
+              <input type="checkbox" id="fb-in-performance-hover-cards" ${this.state.settings.tabHoverCards !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Reduce interface motion</strong><p>Reduce animated transitions in Yayra's interface.</p></div>
+              <input type="checkbox" id="fb-in-performance-reduce-motion" ${this.state.settings.reduceMotionForPerformance ? 'checked' : ''} />
+            </div>
+          </section>
+
           <!-- Privacy & Security -->
           <section class="fb-settings-group-card" id="sec-pointer" style="${activeCat === 'pointer' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
             <h3 class="fb-settings-group-title">${Icons.lens} Pointer</h3>
@@ -4856,8 +5091,10 @@ export class BrowserShell {
       });
     });
 
-    // Yayra Updates section actions
+    // Section-specific controls are immediate-apply and profile-persisted.
     this.bindUpdatesSettingsActions(page);
+    this.bindReaderSettingsActions(page);
+    this.bindPerformanceSettingsActions(page);
 
     // Search filter
     const searchInput = page.querySelector('#fb-in-settings-search') || page.querySelector('#fb-settings-search-input');
@@ -5137,6 +5374,125 @@ export class BrowserShell {
     });
 
     viewport.appendChild(page);
+  }
+
+  bindReaderSettingsActions(page) {
+    if (!page?.querySelectorAll) return;
+    for (const control of page.querySelectorAll('[data-reader-pref]') || []) {
+      const eventName = control.type === 'range' ? 'input' : 'change';
+      control.addEventListener(eventName, (event) => {
+        const key = control.getAttribute('data-reader-pref');
+        if (!key) return;
+        let value;
+        if (control.type === 'checkbox') value = Boolean(event?.target?.checked ?? control.checked);
+        else if (key === 'readerFontSize' || key === 'readerSpeechRate') value = Number(event?.target?.value ?? control.value);
+        else value = String(event?.target?.value ?? control.value ?? '');
+        if ((key === 'readerFontSize' || key === 'readerSpeechRate') && !Number.isFinite(value)) return;
+        this.state.settings[key] = value;
+        if (key === 'readerFontSize') {
+          const output = page.querySelector('#fb-in-reader-size-value');
+          if (output) output.textContent = `${value} px`;
+        }
+        this.persistSettings();
+      });
+    }
+  }
+
+  bindPerformanceSettingsActions(page) {
+    if (!page?.querySelector) return;
+    const bind = (selector, key, afterChange) => {
+      const control = page.querySelector(selector);
+      control?.addEventListener('change', (event) => {
+        const checked = Boolean(event?.target?.checked ?? control.checked);
+        this.state.settings[key] = checked;
+        this.persistSettings();
+        afterChange?.(checked, control);
+      });
+    };
+
+    bind('#fb-in-performance-alerts', 'performanceIssueAlerts');
+    bind('#fb-in-performance-throttle', 'backgroundTabThrottling', async (enabled, control) => {
+      try {
+        const result = await this.nativeWebview?.setBackgroundThrottling?.(enabled);
+        if (!result?.ok) {
+          this.state.settings.backgroundTabThrottling = !enabled;
+          control.checked = !enabled;
+          this.persistSettings();
+          this.showTransientNotice('Could not apply background-tab throttling in this window.');
+          return;
+        }
+        this.showTransientNotice(enabled ? 'Background-tab throttling enabled.' : 'Background-tab throttling disabled.');
+      } catch {
+        this.state.settings.backgroundTabThrottling = !enabled;
+        control.checked = !enabled;
+        this.persistSettings();
+        this.showTransientNotice('Could not apply background-tab throttling in this window.');
+      }
+    });
+    bind('#fb-in-performance-dim-tabs', 'dimInactiveTabs', () => this.refreshTabAppearance());
+    bind('#fb-in-performance-hover-cards', 'tabHoverCards', (enabled) => {
+      if (!enabled && typeof document !== 'undefined') {
+        document.body?.querySelector('.fb-tab-hover-card')?.remove();
+      }
+    });
+    bind('#fb-in-performance-reduce-motion', 'reduceMotionForPerformance', (enabled) => {
+      const value = enabled ? 'true' : 'false';
+      document.documentElement?.setAttribute('data-reduced-motion', value);
+      document.body?.setAttribute('data-reduced-motion', value);
+      this.rootElement?.setAttribute('data-reduced-motion', value);
+    });
+
+    page.querySelector('.fb-performance-open-taskmgr')?.addEventListener('click', () => this.openTaskManagerModal());
+    const refreshButton = page.querySelector('.fb-performance-refresh');
+    const refresh = async () => {
+      const tabsValue = page.querySelector('#fb-performance-tabs-value');
+      const cpuValue = page.querySelector('#fb-performance-cpu-value');
+      const memoryValue = page.querySelector('#fb-performance-memory-value');
+      const status = page.querySelector('#fb-performance-metrics-status');
+      if (tabsValue) tabsValue.textContent = String(this.state.tabs.length);
+      if (!cpuValue || !memoryValue || !status) return;
+      if (typeof this.systemBridge?.appMetrics !== 'function') {
+        cpuValue.textContent = 'Unavailable';
+        memoryValue.textContent = 'Unavailable';
+        status.textContent = 'Live process metrics require the Yayra desktop app. The tab count is from this window.';
+        return;
+      }
+      if (refreshButton) refreshButton.disabled = true;
+      status.textContent = 'Refreshing live process metrics…';
+      try {
+        const metrics = await this.systemBridge.appMetrics();
+        if (!metrics?.ok || !Array.isArray(metrics.processes)) {
+          cpuValue.textContent = '—';
+          memoryValue.textContent = '—';
+          status.textContent = 'The desktop app did not return process metrics.';
+          return;
+        }
+        const cpu = metrics.processes.map((item) => item.cpu).filter(Number.isFinite);
+        const memory = metrics.processes.map((item) => item.memoryMiB).filter(Number.isFinite);
+        cpuValue.textContent = cpu.length ? `${cpu.reduce((sum, value) => sum + value, 0).toFixed(1)}%` : '—';
+        memoryValue.textContent = memory.length ? `${memory.reduce((sum, value) => sum + value, 0).toFixed(1)} MiB` : '—';
+        const sampled = Number.isFinite(metrics.sampledAt) ? new Date(metrics.sampledAt).toLocaleTimeString() : 'just now';
+        status.textContent = `${metrics.processes.length} desktop process(es) · updated ${sampled}. CPU is measured since the prior sample.`;
+      } catch {
+        cpuValue.textContent = '—';
+        memoryValue.textContent = '—';
+        status.textContent = 'Could not read live process metrics.';
+      } finally {
+        if (refreshButton) refreshButton.disabled = false;
+      }
+    };
+    refreshButton?.addEventListener('click', refresh);
+    refresh();
+  }
+
+  refreshTabAppearance() {
+    if (typeof document === 'undefined') return;
+    const root = this.rootElement || document;
+    for (const tabEl of root.querySelectorAll?.('.fb-tab-item') || []) {
+      const tabId = (tabEl.dataset && tabEl.dataset.tabId) || tabEl.getAttribute?.('data-tab-id');
+      const inactive = tabId !== this.state.activeTabId;
+      tabEl.classList?.toggle('fb-tab-inactive-dim', inactive && this.state.settings.dimInactiveTabs !== false);
+    }
   }
 
   /* -------------------------------------------------------------
@@ -7592,49 +7948,286 @@ export class BrowserShell {
    */
   async openReadingMode() {
     const tab = this.getActiveTab();
-    if (this.nativeWebview && typeof this.nativeWebview.readerExtract === 'function' && tab) {
-      try {
-        const res = await this.nativeWebview.readerExtract(tab.id);
-        if (res && res.ok && Array.isArray(res.blocks) && res.blocks.length) {
-          this.renderReaderOverlay(res);
-          return;
-        }
-      } catch { /* fall through */ }
-      this.showTransientNotice("This page doesn't have readable article text.");
-      return;
+    if (!this.nativeWebview || typeof this.nativeWebview.readerExtract !== 'function' || !tab) {
+      this.showTransientNotice('Reading Mode can extract external page content in the Yayra desktop app.');
+      return false;
     }
-    this.showTransientNotice('Reading mode needs the desktop app - web pages here live in frames Yayra may not read.');
+    try {
+      const result = await this.nativeWebview.readerExtract(tab.id);
+      const blocks = Array.isArray(result?.blocks) ? result.blocks : [];
+      if (result?.ok && blocks.some((block) => String(block?.text || '').trim().length > 1)) {
+        this.renderReaderOverlay({ ...result, blocks, title: result.title || tab.title || 'Untitled article', url: result.url || tab.url });
+        return true;
+      }
+    } catch { /* extraction is best effort; the page remains open */ }
+    this.showTransientNotice("This page doesn't have readable article text.");
+    return false;
   }
 
-  renderReaderOverlay({ title, url, blocks }) {
+  renderReaderOverlay(result = {}) {
     if (typeof document === 'undefined' || !document.body) return;
-    document.getElementById('yayra-reader-overlay')?.remove();
+    document.getElementById('yayra-reader-overlay')?._yayraFinish?.();
+    const blocks = Array.isArray(result.blocks) ? result.blocks.slice(0, 600) : [];
+    const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+    const webUrl = (value) => { try { const u = new URL(String(value || ''), result.url); return /^https?:$/.test(u.protocol) ? u.href : ''; } catch { return ''; } };
+    const speech = [];
+    const sections = [];
+    let html = '';
+    let listOpen = false;
+    const closeList = () => { if (listOpen) { html += '</ul>'; listOpen = false; } };
+    for (let index = 0; index < blocks.length; index += 1) {
+      const block = blocks[index] || {};
+      const tag = String(block.tag || '').toLowerCase();
+      const type = String(block.type || 'text');
+      const text = String(block.text || block.alt || '').trim();
+      const src = webUrl(block.src);
+      if ((type === 'image' || type === 'figure' || tag === 'img' || tag === 'figure') && src) {
+        closeList();
+        html += `<figure class="fb-reader-figure"><img src="${esc(src)}" alt="${esc(block.alt || text)}" loading="lazy" /><figcaption>${esc(text)}</figcaption></figure>`;
+        continue;
+      }
+      if (text.length < 2) continue;
+      const id = `fb-reader-block-${index}`;
+      const speechIndex = speech.push(text) - 1;
+      const speechAttr = `id="${id}" data-reader-speech="${speechIndex}"`;
+      const segments = Array.isArray(block.segments) ? block.segments : [];
+      const richText = segments.length ? segments.map((segment) => {
+        const segmentText = esc(segment?.text || '');
+        const href = webUrl(segment?.href);
+        return href ? `<a href="#" data-reader-href="${esc(href)}">${segmentText}</a>` : segmentText;
+      }).join('') : esc(text);
+      if (/^h[1-4]$/.test(tag)) {
+        closeList();
+        sections.push({ id, text, speechIndex, level: Number(tag.slice(1)) });
+        const level = Math.min(4, Math.max(2, Number(tag.slice(1)) || 2));
+        html += `<h${level} ${speechAttr}>${richText}</h${level}>`;
+      } else if (type === 'list-item' || tag === 'li') {
+        if (!listOpen) { html += '<ul class="fb-reader-list">'; listOpen = true; }
+        html += `<li ${speechAttr}>${richText}</li>`;
+      } else {
+        closeList();
+        const element = type === 'quote' || tag === 'blockquote' ? 'blockquote' : type === 'code' || tag === 'pre' ? 'pre' : 'p';
+        html += `<${element} ${speechAttr}>${richText}</${element}>`;
+      }
+    }
+    closeList();
+    if (!speech.length) return;
+    const theme = ['dark', 'light', 'sepia'].includes(this.state.settings.readerTheme) ? this.state.settings.readerTheme : 'dark';
+    const fontSize = Math.max(14, Math.min(30, Number(this.state.settings.readerFontSize) || 19));
+    const minutes = Math.max(1, Number(result.readingMinutes) || Math.ceil(speech.join(' ').split(/\s+/).length / 220));
+    const toc = sections.map((section) => `<button type="button" class="fb-reader-toc-link" data-reader-section="${section.id}" data-level="${section.level}">${esc(section.text)}</button>`).join('');
     const overlay = document.createElement('div');
     overlay.id = 'yayra-reader-overlay';
-    overlay.style.cssText = 'position:fixed;inset:0;z-index:99998;background:var(--fb-bg,#101218);overflow:auto;';
-    const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;');
-    const body = blocks.map((b) => {
-      if (b.tag === 'h1' || b.tag === 'h2' || b.tag === 'h3') return `<h2 style="font:700 1.25rem/1.4 Georgia,serif;margin:1.4em 0 0.4em;">${esc(b.text)}</h2>`;
-      if (b.tag === 'li') return `<li style="margin:0.3em 0;">${esc(b.text)}</li>`;
-      return `<p style="margin:0.8em 0;">${esc(b.text)}</p>`;
-    }).join('');
+    overlay.className = 'fb-reader-overlay';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-label', 'Reading Mode');
     overlay.innerHTML = `
-      <div style="position:sticky;top:0;display:flex;justify-content:flex-end;padding:12px;background:linear-gradient(var(--fb-bg,#101218),transparent);">
-        <button class="fb-reader-close" style="padding:8px 16px;border:none;border-radius:10px;font-weight:600;cursor:pointer;background:var(--fb-bg-elevated,#232734);color:var(--fb-text-primary,#f3f4f6);">Close reader</button>
-      </div>
-      <article style="max-width:680px;margin:0 auto;padding:12px 20px 80px;color:var(--fb-text-primary,#e8eaf0);font:400 1.05rem/1.75 Georgia,serif;">
-        <h1 style="font:700 1.7rem/1.3 Georgia,serif;">${esc(title)}</h1>
-        <p style="font-size:0.8rem;color:var(--fb-text-secondary,#9ca3af);word-break:break-all;">${esc(url)}</p>
-        ${body}
-      </article>`;
+      <header class="fb-reader-topbar">
+        <div class="fb-reader-toolbar">
+          <button type="button" class="fb-reader-play" aria-label="Read aloud" title="Read aloud">${Icons.play}</button>
+          <button type="button" class="fb-reader-prev" aria-label="Previous section" title="Previous section">${Icons.arrowLeft}</button>
+          <button type="button" class="fb-reader-next" aria-label="Next section" title="Next section">${Icons.arrowRight}</button>
+          <button type="button" class="fb-reader-stop" aria-label="Stop reading" title="Stop reading">${Icons.stop}</button>
+          <label class="fb-reader-rate-label">Speed <select class="fb-reader-rate" aria-label="Read aloud speed"><option value="0.75">0.75×</option><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
+          <button type="button" class="fb-reader-smaller" aria-label="Decrease text size">A−</button><span class="fb-reader-size-value">${fontSize}px</span><button type="button" class="fb-reader-larger" aria-label="Increase text size">A+</button>
+          <button type="button" class="fb-reader-settings-toggle" aria-expanded="false" aria-controls="fb-reader-settings">${Icons.settings}<span>Settings</span></button>
+          <button type="button" class="fb-reader-pin" aria-pressed="${this.state.settings.readerPinned !== false}" title="Pin reader controls">${Icons.pin}</button>
+          <button type="button" class="fb-reader-close" aria-label="Close Reading Mode">${Icons.close}</button>
+        </div>
+        <div class="fb-reader-progress" role="progressbar" aria-label="Reading progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+        <section class="fb-reader-settings" id="fb-reader-settings" hidden>
+          <label>Theme <select data-reader-pref="readerTheme"><option value="dark">Dark</option><option value="light">Light</option><option value="sepia">Sepia</option></select></label>
+          <label>Font <select data-reader-pref="readerFont"><option value="serif">Serif</option><option value="sans">Sans serif</option><option value="mono">Monospace</option></select></label>
+          <label>Text size <input type="range" min="14" max="30" step="1" data-reader-pref="readerFontSize" value="${fontSize}" /></label>
+          <label>Line height <select data-reader-pref="readerLineHeight"><option value="1.5">Compact</option><option value="1.75">Comfortable</option><option value="2">Relaxed</option></select></label>
+          <label>Letter spacing <select data-reader-pref="readerLetterSpacing"><option value="-0.02">Tight</option><option value="0">Normal</option><option value="0.03">Wide</option><option value="0.06">Extra wide</option></select></label>
+          <label>Width <select data-reader-pref="readerLayout"><option value="narrow">Narrow</option><option value="comfortable">Comfortable</option><option value="wide">Wide</option></select></label>
+          <label>Voice <select class="fb-reader-voice" data-reader-pref="readerVoice"><option value="">System default</option></select></label>
+          <label class="fb-reader-check"><input type="checkbox" data-reader-pref="readerLinks" /> Show links</label>
+          <label class="fb-reader-check"><input type="checkbox" data-reader-pref="readerImages" /> Show images</label>
+          <label class="fb-reader-check"><input type="checkbox" data-reader-pref="readerVoiceHighlight" /> Highlight read-aloud text</label>
+          <p class="fb-reader-speech-status" aria-live="polite"></p>
+        </section>
+      </header>
+      <div class="fb-reader-layout">
+        <nav class="fb-reader-toc" aria-label="Article sections">${toc || '<p>No headings in this article.</p>'}</nav>
+        <main class="fb-reader-article" data-reader-content>
+          <p class="fb-reader-source">${esc(result.siteName || (() => { try { return new URL(result.url).hostname; } catch { return ''; } })())} · ${minutes} min read · ${Number(result.wordCount) || speech.join(' ').split(/\s+/).filter(Boolean).length} words</p>
+          <h1>${esc(result.title || 'Untitled article')}</h1>
+          <div class="fb-reader-content">${html}</div>
+        </main>
+      </div>`;
+    overlay.dataset.theme = theme;
     document.body.appendChild(overlay);
-    // DESKTOP: hide the native page view (with snapshot) so the reader is
-    // visible above it; restore the live page on close.
     if (this.nativeWebview) this.setPageObscured(true);
-    overlay.querySelector('.fb-reader-close')?.addEventListener('click', () => {
+
+    const content = overlay.querySelector('.fb-reader-content');
+    const panel = overlay.querySelector('.fb-reader-settings');
+    const playButton = overlay.querySelector('.fb-reader-play');
+    const speechStatus = overlay.querySelector('.fb-reader-speech-status');
+    const synth = typeof window !== 'undefined' ? window.speechSynthesis : null;
+    const Utterance = typeof window !== 'undefined' ? window.SpeechSynthesisUtterance : null;
+    const supportsSpeech = Boolean(synth && Utterance);
+    let closed = false;
+    let voiceList = [];
+    let speechState = 'stopped';
+    let speechIndex = 0;
+    let speechToken = 0;
+    let currentUtterance = null;
+    let currentSection = 0;
+    const clearHighlight = () => content?.querySelectorAll('.is-speaking').forEach((node) => node.classList.remove('is-speaking'));
+    const updatePlay = () => {
+      if (!playButton) return;
+      playButton.innerHTML = speechState === 'speaking' ? Icons.pause : Icons.play;
+      playButton.setAttribute('aria-label', speechState === 'paused' ? 'Resume reading' : speechState === 'speaking' ? 'Pause reading' : 'Read aloud');
+    };
+    const refreshVoices = () => {
+      if (!synth || !overlay.isConnected) return;
+      try { voiceList = synth.getVoices() || []; } catch { voiceList = []; }
+      const select = overlay.querySelector('.fb-reader-voice');
+      if (!select) return;
+      const selected = this.state.settings.readerVoice || '';
+      select.innerHTML = '<option value="">System default</option>';
+      for (const voice of voiceList) {
+        const option = document.createElement('option');
+        option.value = voice.voiceURI || voice.name;
+        option.textContent = `${voice.name}${voice.lang ? ` (${voice.lang})` : ''}`;
+        select.appendChild(option);
+      }
+      select.value = selected;
+    };
+    const applyPrefs = () => {
+      const settings = this.state.settings;
+      overlay.dataset.theme = ['dark', 'light', 'sepia'].includes(settings.readerTheme) ? settings.readerTheme : 'dark';
+      overlay.dataset.font = ['serif', 'sans', 'mono'].includes(settings.readerFont) ? settings.readerFont : 'serif';
+      overlay.dataset.layout = ['narrow', 'comfortable', 'wide'].includes(settings.readerLayout) ? settings.readerLayout : 'comfortable';
+      overlay.dataset.showLinks = settings.readerLinks === false ? 'false' : 'true';
+      overlay.dataset.showImages = settings.readerImages === false ? 'false' : 'true';
+      overlay.dataset.highlight = settings.readerVoiceHighlight === false ? 'false' : 'true';
+      content?.style.setProperty('--fb-reader-font-size', `${Math.max(14, Math.min(30, Number(settings.readerFontSize) || 19))}px`);
+      content?.style.setProperty('--fb-reader-line-height', String(settings.readerLineHeight || '1.75'));
+      content?.style.setProperty('--fb-reader-letter-spacing', `${Number(settings.readerLetterSpacing) || 0}em`);
+      overlay.classList.toggle('is-pinned', settings.readerPinned !== false);
+      const sizeValue = overlay.querySelector('.fb-reader-size-value');
+      if (sizeValue) sizeValue.textContent = `${Math.max(14, Math.min(30, Number(settings.readerFontSize) || 19))}px`;
+      for (const control of overlay.querySelectorAll('[data-reader-pref]')) {
+        const key = control.getAttribute('data-reader-pref');
+        const value = settings[key];
+        if (control.type === 'checkbox') control.checked = value !== false;
+        else if (value !== undefined && value !== null) control.value = String(value);
+      }
+      const rate = overlay.querySelector('.fb-reader-rate');
+      if (rate) rate.value = String(settings.readerSpeechRate || 1);
+    };
+    const persistPref = (key, value) => {
+      this.state.settings[key] = value;
+      this.persistSettings();
+      applyPrefs();
+    };
+    const stopSpeech = (reset = true) => {
+      speechToken += 1;
+      try { synth?.cancel(); } catch { /* speech engine may be gone */ }
+      speechState = 'stopped'; currentUtterance = null;
+      if (reset) speechIndex = 0;
+      clearHighlight(); updatePlay();
+    };
+    const speak = (index, chained = false, scroll = false) => {
+      if (!supportsSpeech || !speech.length || closed) return;
+      if (index >= speech.length) { speechIndex = 0; speechState = 'stopped'; updatePlay(); return; }
+      if (!chained) { try { synth.cancel(); } catch { /* ignore */ } }
+      const token = ++speechToken;
+      speechIndex = index;
+      currentUtterance = new Utterance(speech[index]);
+      currentUtterance.rate = Math.max(0.5, Math.min(2, Number(this.state.settings.readerSpeechRate) || 1));
+      const voice = voiceList.find((item) => (item.voiceURI || item.name) === this.state.settings.readerVoice);
+      if (voice) currentUtterance.voice = voice;
+      currentUtterance.onstart = () => { if (token === speechToken && !closed) { speechState = 'speaking'; updatePlay(); } };
+      currentUtterance.onboundary = (event) => {
+        if (token !== speechToken || this.state.settings.readerVoiceHighlight === false) return;
+        const node = content?.querySelector(`[data-reader-speech="${index}"]`);
+        if (node) { node.classList.add('is-speaking'); node.style.setProperty('--fb-reader-voice-progress', `${Math.min(100, Math.round((event.charIndex / Math.max(1, speech[index].length)) * 100))}%`); }
+      };
+      currentUtterance.onend = () => {
+        if (token !== speechToken || closed) return;
+        clearHighlight();
+        if (index + 1 < speech.length) speak(index + 1, true);
+        else { speechState = 'stopped'; speechIndex = 0; currentUtterance = null; updatePlay(); }
+      };
+      currentUtterance.onerror = () => { if (token === speechToken && !closed) { speechState = 'stopped'; updatePlay(); if (speechStatus) speechStatus.textContent = 'Speech playback stopped by the system.'; } };
+      speechState = 'speaking'; updatePlay();
+      if (scroll) content?.querySelector(`[data-reader-speech="${index}"]`)?.scrollIntoView?.({ block: 'center', behavior: this.state.settings.reduceMotionForPerformance ? 'auto' : 'smooth' });
+      try { synth.speak(currentUtterance); } catch { speechState = 'stopped'; updatePlay(); }
+    };
+    const close = () => {
+      if (closed) return;
+      closed = true; stopSpeech();
+      try { synth?.removeEventListener?.('voiceschanged', refreshVoices); } catch { /* optional */ }
       overlay.remove();
+      if (this._readerOverlayCleanup === close) this._readerOverlayCleanup = null;
       if (this.nativeWebview) this.setPageObscured(false);
+    };
+    overlay._yayraFinish = close;
+    this._readerOverlayCleanup = close;
+    overlay.querySelector('.fb-reader-close')?.addEventListener('click', close);
+    overlay.querySelector('.fb-reader-settings-toggle')?.addEventListener('click', (event) => {
+      const button = event.currentTarget;
+      panel.hidden = !panel.hidden;
+      button.setAttribute('aria-expanded', panel.hidden ? 'false' : 'true');
     });
+    overlay.querySelector('.fb-reader-pin')?.addEventListener('click', () => persistPref('readerPinned', this.state.settings.readerPinned === false));
+    overlay.querySelector('.fb-reader-play')?.addEventListener('click', () => {
+      if (!supportsSpeech) { if (speechStatus) speechStatus.textContent = 'Read aloud is not supported in this browser build.'; return; }
+      if (speechState === 'paused') { try { synth.resume(); speechState = 'speaking'; updatePlay(); } catch { /* optional */ } }
+      else if (speechState === 'speaking') { try { synth.pause(); speechState = 'paused'; updatePlay(); } catch { /* optional */ } }
+      else speak(speechIndex, false, true);
+    });
+    overlay.querySelector('.fb-reader-stop')?.addEventListener('click', () => stopSpeech());
+    overlay.querySelector('.fb-reader-rate')?.addEventListener('change', (event) => persistPref('readerSpeechRate', Number(event.target.value) || 1));
+    overlay.querySelector('.fb-reader-smaller')?.addEventListener('click', () => persistPref('readerFontSize', Math.max(14, (Number(this.state.settings.readerFontSize) || 19) - 1)));
+    overlay.querySelector('.fb-reader-larger')?.addEventListener('click', () => persistPref('readerFontSize', Math.min(30, (Number(this.state.settings.readerFontSize) || 19) + 1)));
+    overlay.querySelector('.fb-reader-prev')?.addEventListener('click', () => goSection(-1));
+    overlay.querySelector('.fb-reader-next')?.addEventListener('click', () => goSection(1));
+    for (const control of overlay.querySelectorAll('[data-reader-pref]')) {
+      control.addEventListener(control.type === 'range' ? 'input' : 'change', (event) => {
+        const key = control.getAttribute('data-reader-pref');
+        const value = control.type === 'checkbox' ? Boolean(event.target.checked)
+          : ['readerFontSize', 'readerSpeechRate'].includes(key) ? Number(event.target.value)
+            : String(event.target.value || '');
+        persistPref(key, value);
+      });
+    }
+    const scrollToSection = (index) => {
+      if (!sections.length) return;
+      currentSection = Math.max(0, Math.min(sections.length - 1, index));
+      const section = sections[currentSection];
+      stopSpeech(false);
+      speechIndex = section.speechIndex;
+      overlay.querySelector(`#${section.id}`)?.scrollIntoView?.({ block: 'start', behavior: this.state.settings.reduceMotionForPerformance ? 'auto' : 'smooth' });
+      for (const item of overlay.querySelectorAll('.fb-reader-toc-link')) item.classList.toggle('active', item.getAttribute('data-reader-section') === section.id);
+    };
+    function goSection(delta) { scrollToSection(currentSection + delta); }
+    overlay.querySelectorAll('.fb-reader-toc-link').forEach((button, index) => button.addEventListener('click', () => scrollToSection(index)));
+    content?.addEventListener('click', (event) => {
+      const link = event.target?.closest?.('[data-reader-href]');
+      if (!link || this.state.settings.readerLinks === false) return;
+      event.preventDefault();
+      const href = webUrl(link.getAttribute('data-reader-href'));
+      if (!href) return;
+      close(); this.navigateActiveTab(href);
+    });
+    const progress = overlay.querySelector('.fb-reader-progress');
+    const updateProgress = () => {
+      if (!progress) return;
+      const max = Math.max(1, overlay.scrollHeight - overlay.clientHeight);
+      const value = Math.max(0, Math.min(100, Math.round((overlay.scrollTop / max) * 100)));
+      progress.setAttribute('aria-valuenow', String(value));
+      progress.querySelector('span').style.width = `${value}%`;
+    };
+    overlay.addEventListener('scroll', updateProgress, { passive: true });
+    if (supportsSpeech) { if (speechStatus) speechStatus.textContent = 'Read aloud uses your system speech voices.'; refreshVoices(); synth.addEventListener?.('voiceschanged', refreshVoices); }
+    else if (speechStatus) speechStatus.textContent = 'Read aloud is not available in this browser build.';
+    applyPrefs(); updatePlay(); updateProgress();
   }
 
   /**
@@ -7644,60 +8237,167 @@ export class BrowserShell {
    */
   async openTaskManagerModal() {
     if (typeof document === 'undefined' || !document.body) return;
+    this._taskManagerCleanup?.();
     document.getElementById('yayra-taskmgr-overlay')?.remove();
-
-    let metrics = null;
-    if (this.systemBridge && typeof this.systemBridge.appMetrics === 'function') {
-      try { metrics = await this.systemBridge.appMetrics(); } catch { metrics = null; }
-    }
-    const heap = (typeof performance !== 'undefined' && performance.memory)
-      ? Math.round(performance.memory.usedJSHeapSize / (1024 * 1024))
-      : null;
-
-    const esc = (s) => String(s || '').replace(/</g, '&lt;');
-    let rowsHtml = '';
-    if (metrics && Array.isArray(metrics.processes) && metrics.processes.length) {
-      rowsHtml = metrics.processes.map((p) => `
-        <tr>
-          <td style="padding:6px 10px;border-bottom:1px solid rgba(255,255,255,0.06);">${esc(p.label || p.type)}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid rgba(255,255,255,0.06);text-align:right;">${p.pid ?? '-'}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid rgba(255,255,255,0.06);text-align:right;">${Number.isFinite(p.cpu) ? `${p.cpu.toFixed(1)}%` : '-'}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid rgba(255,255,255,0.06);text-align:right;">${Number.isFinite(p.memoryMB) ? `${p.memoryMB} MB` : '-'}</td>
-        </tr>`).join('');
-    }
-    const heapLine = heap !== null
-      ? `<p style="margin:8px 0 0;font-size:0.8rem;color:var(--fb-text-secondary,#9ca3af);">This window's JS heap: ${heap} MB &middot; ${this.state.tabs.length} tab(s) open</p>`
-      : `<p style="margin:8px 0 0;font-size:0.8rem;color:var(--fb-text-secondary,#9ca3af);">${this.state.tabs.length} tab(s) open</p>`;
-    const table = rowsHtml
-      ? `<table style="width:100%;border-collapse:collapse;font-size:0.84rem;">
-           <thead><tr>
-             <th style="text-align:left;padding:6px 10px;color:var(--fb-text-secondary,#9ca3af);font-weight:600;">Process</th>
-             <th style="text-align:right;padding:6px 10px;color:var(--fb-text-secondary,#9ca3af);font-weight:600;">PID</th>
-             <th style="text-align:right;padding:6px 10px;color:var(--fb-text-secondary,#9ca3af);font-weight:600;">CPU</th>
-             <th style="text-align:right;padding:6px 10px;color:var(--fb-text-secondary,#9ca3af);font-weight:600;">Memory</th>
-           </tr></thead><tbody>${rowsHtml}</tbody></table>`
-      : '<p style="margin:0;font-size:0.84rem;color:var(--fb-text-secondary,#9ca3af);">Per-process metrics are only available in the desktop app. Your browser\'s own task manager (Shift+Esc in Chrome) covers this tab here.</p>';
 
     const overlay = document.createElement('div');
     overlay.id = 'yayra-taskmgr-overlay';
-    overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(8,10,16,0.62);display:flex;align-items:center;justify-content:center;';
+    overlay.className = 'fb-taskmgr-overlay';
     overlay.innerHTML = `
-      <div style="background:var(--fb-bg-elevated,#171a22);color:var(--fb-text-primary,#f3f4f6);border-radius:16px;padding:22px;max-width:560px;width:94%;max-height:72vh;overflow:auto;box-shadow:0 18px 60px rgba(0,0,0,0.5);">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
-          <strong style="font-size:1.05rem;">Performance &amp; Task Manager</strong>
-          <button class="fb-taskmgr-close" style="border:none;background:transparent;color:inherit;font-size:18px;cursor:pointer;">×</button>
+      <section class="fb-taskmgr-panel" role="dialog" aria-modal="true" aria-labelledby="fb-taskmgr-title">
+        <header class="fb-taskmgr-header">
+          <div><h2 id="fb-taskmgr-title">Task Manager</h2><p>Live process readings from the Yayra desktop app.</p></div>
+          <button type="button" class="fb-taskmgr-close" aria-label="Close Task Manager">${Icons.close}</button>
+        </header>
+        <div class="fb-taskmgr-summary">
+          <div><span>Open tabs</span><strong data-metric="tabs">${this.state.tabs.length}</strong></div>
+          <div><span>Total CPU</span><strong data-metric="cpu">—</strong></div>
+          <div><span>Working set</span><strong data-metric="memory">—</strong></div>
         </div>
-        ${table}
-        ${heapLine}
-      </div>`;
+        <p class="fb-taskmgr-status" aria-live="polite">Fetching live metrics…</p>
+        <section class="fb-taskmgr-section">
+          <h3>Tabs</h3>
+          <div class="fb-taskmgr-table-wrap"><table><thead><tr><th>Tab</th><th>PID</th><th>CPU</th><th>Memory</th><th></th></tr></thead><tbody data-rows="tabs"></tbody></table></div>
+        </section>
+        <section class="fb-taskmgr-section">
+          <h3>Desktop processes</h3>
+          <div class="fb-taskmgr-table-wrap"><table><thead><tr><th>Process</th><th>PID</th><th>CPU</th><th>Memory</th></tr></thead><tbody data-rows="processes"></tbody></table></div>
+        </section>
+        <footer class="fb-taskmgr-footer"><span data-heap>Renderer JS heap: not exposed by this build.</span><button type="button" class="fb-btn fb-btn-secondary fb-taskmgr-refresh">${Icons.refresh} Refresh</button></footer>
+      </section>`;
     document.body.appendChild(overlay);
     if (this.nativeWebview) this.setPageObscured(true);
+
+    const processRows = overlay.querySelector('[data-rows="processes"]');
+    const tabRows = overlay.querySelector('[data-rows="tabs"]');
+    const status = overlay.querySelector('.fb-taskmgr-status');
+    const refreshButton = overlay.querySelector('.fb-taskmgr-refresh');
+    const clearRows = (tbody) => { if (tbody) tbody.innerHTML = ''; };
+    const addCell = (row, value, className = '') => {
+      const cell = document.createElement('td');
+      if (className) cell.className = className;
+      cell.textContent = value == null || value === '' ? '—' : String(value);
+      row.appendChild(cell);
+      return cell;
+    };
+    const addEmptyRow = (tbody, colspan, message) => {
+      const row = document.createElement('tr');
+      const cell = document.createElement('td');
+      cell.colSpan = colspan;
+      cell.className = 'fb-taskmgr-empty';
+      cell.textContent = message;
+      row.appendChild(cell);
+      tbody?.appendChild(row);
+    };
+    const formatCpu = (value) => Number.isFinite(value) ? `${value.toFixed(1)}%` : '—';
+    const formatMemory = (value) => Number.isFinite(value) ? `${value.toFixed(1)} MiB` : '—';
+    let closed = false;
+    let refreshing = false;
+    let timer = null;
     const close = () => {
+      if (closed) return;
+      closed = true;
+      if (timer) clearInterval(timer);
+      timer = null;
       overlay.remove();
+      if (this._taskManagerCleanup === close) this._taskManagerCleanup = null;
       if (this.nativeWebview) this.setPageObscured(false);
     };
-    overlay.addEventListener('pointerdown', (e) => { if (e.target === overlay) close(); });
+    overlay._yayraFinish = close;
+    this._taskManagerCleanup = close;
+
+    const refresh = async () => {
+      if (closed || refreshing) return;
+      refreshing = true;
+      if (refreshButton) refreshButton.disabled = true;
+      clearRows(processRows);
+      clearRows(tabRows);
+      const tabValue = overlay.querySelector('[data-metric="tabs"]');
+      if (tabValue) tabValue.textContent = String(this.state.tabs.length);
+      try {
+        const [metrics, tabProcesses] = await Promise.all([
+          typeof this.systemBridge?.appMetrics === 'function' ? Promise.resolve().then(() => this.systemBridge.appMetrics()).catch(() => null) : Promise.resolve(null),
+          typeof this.nativeWebview?.taskTabs === 'function' ? Promise.resolve().then(() => this.nativeWebview.taskTabs()).catch(() => null) : Promise.resolve(null)
+        ]);
+        if (closed) return;
+        const processes = metrics?.ok && Array.isArray(metrics.processes) ? metrics.processes : [];
+        const cpuValues = processes.map((p) => p.cpu).filter(Number.isFinite);
+        const memoryValues = processes.map((p) => p.memoryMiB).filter(Number.isFinite);
+        const cpuValue = overlay.querySelector('[data-metric="cpu"]');
+        const memoryValue = overlay.querySelector('[data-metric="memory"]');
+        if (cpuValue) cpuValue.textContent = cpuValues.length ? formatCpu(cpuValues.reduce((sum, value) => sum + value, 0)) : '—';
+        if (memoryValue) memoryValue.textContent = memoryValues.length ? formatMemory(memoryValues.reduce((sum, value) => sum + value, 0)) : '—';
+
+        const processByPid = new Map(processes.map((p) => [Number(p.pid), p]).filter(([pid]) => Number.isInteger(pid) && pid > 0));
+        const tabPid = new Map((Array.isArray(tabProcesses?.tabs) ? tabProcesses.tabs : []).map((item) => [String(item.tabId), Number(item.pid) || null]));
+        const pidCounts = new Map();
+        for (const pid of tabPid.values()) if (pid) pidCounts.set(pid, (pidCounts.get(pid) || 0) + 1);
+
+        if (!this.state.tabs.length) addEmptyRow(tabRows, 5, 'No open tabs.');
+        else for (const tab of this.state.tabs) {
+          const row = document.createElement('tr');
+          const titleCell = document.createElement('td');
+          titleCell.className = 'fb-taskmgr-tab-title';
+          const title = document.createElement('strong');
+          title.textContent = this.getTabTitle(tab) || 'Untitled tab';
+          const address = document.createElement('small');
+          try { address.textContent = new URL(tab.url).host; } catch { address.textContent = tab.url || 'New Tab'; }
+          titleCell.appendChild(title); titleCell.appendChild(address); row.appendChild(titleCell);
+          const pid = tabPid.get(String(tab.id));
+          const process = pid ? processByPid.get(pid) : null;
+          addCell(row, pid || '—');
+          addCell(row, pid && pidCounts.get(pid) > 1 ? 'Shared' : formatCpu(process?.cpu));
+          addCell(row, pid && pidCounts.get(pid) > 1 ? 'Shared' : formatMemory(process?.memoryMiB));
+          const actionCell = document.createElement('td');
+          const closeTabButton = document.createElement('button');
+          closeTabButton.type = 'button'; closeTabButton.className = 'fb-taskmgr-close-tab';
+          closeTabButton.setAttribute('data-close-tab', String(tab.id)); closeTabButton.textContent = 'Close';
+          closeTabButton.setAttribute('aria-label', `Close ${this.getTabTitle(tab)}`);
+          actionCell.appendChild(closeTabButton); row.appendChild(actionCell);
+          tabRows?.appendChild(row);
+        }
+
+        if (!metrics?.ok) addEmptyRow(processRows, 4, 'Desktop process metrics are unavailable in this build.');
+        else if (!processes.length) addEmptyRow(processRows, 4, 'No process metrics were returned.');
+        else for (const process of processes) {
+          const row = document.createElement('tr');
+          addCell(row, `${process.label || 'Process'}${process.type ? ` · ${process.type}` : ''}`);
+          addCell(row, process.pid);
+          addCell(row, formatCpu(process.cpu));
+          addCell(row, formatMemory(process.memoryMiB));
+          processRows?.appendChild(row);
+        }
+        if (status) {
+          const sampled = Number.isFinite(metrics?.sampledAt) ? new Date(metrics.sampledAt).toLocaleTimeString() : 'just now';
+          status.textContent = metrics?.ok
+            ? `Updated ${sampled}. CPU is sampled between readings; shared renderer processes are labelled as shared.`
+            : 'Live process rows require the Yayra desktop app; tab names remain available here.';
+        }
+        const heap = typeof performance !== 'undefined' && Number.isFinite(performance.memory?.usedJSHeapSize)
+          ? `${(performance.memory.usedJSHeapSize / (1024 * 1024)).toFixed(1)} MiB`
+          : 'not exposed by this build';
+        const heapLabel = overlay.querySelector('[data-heap]');
+        if (heapLabel) heapLabel.textContent = `This shell renderer JS heap: ${heap}`;
+      } catch {
+        if (status) status.textContent = 'Could not refresh process metrics. Use Refresh to try again.';
+        addEmptyRow(processRows, 4, 'Metrics are temporarily unavailable.');
+      } finally {
+        refreshing = false;
+        if (!closed && refreshButton) refreshButton.disabled = false;
+      }
+    };
+
+    overlay.addEventListener('click', (event) => {
+      const button = event.target?.closest?.('[data-close-tab]');
+      const tabId = button?.getAttribute('data-close-tab');
+      if (tabId) this.closeTab(tabId);
+      if (event.target === overlay) close();
+    });
     overlay.querySelector('.fb-taskmgr-close')?.addEventListener('click', close);
+    refreshButton?.addEventListener('click', refresh);
+    refresh();
+    timer = setInterval(refresh, 2000);
+    timer?.unref?.();
   }
 
   /** Bookmark every open web tab (menu + Ctrl+Shift+D). */
@@ -7997,6 +8697,12 @@ export class BrowserShell {
   openTabGroupsSettings() {
     this.state.settingsActiveCategory = 'tab-groups';
     this.state.activeSettingsCategory = 'tab-groups';
+    this.openInternalPage('yayra://settings');
+  }
+
+  openPerformanceSettings() {
+    this.state.settingsActiveCategory = 'performance';
+    this.state.activeSettingsCategory = 'performance';
     this.openInternalPage('yayra://settings');
   }
 
@@ -8704,13 +9410,12 @@ export class BrowserShell {
       return bar;
     }
     for (const bm of items.slice(0, 30)) {
-      let host = '';
-      try { host = new URL(bm.url).hostname; } catch { host = ''; }
+      const icon = this.getTabFavicon({ url: bm.url, favicon: bm.favicon || null, isLoading: false });
       const chip = document.createElement('button');
       chip.className = 'fb-bookmarks-bar-item';
       chip.title = bm.url;
       chip.style.cssText = 'display:inline-flex;align-items:center;gap:6px;max-width:170px;padding:3px 8px;border:none;border-radius:8px;background:transparent;color:var(--fb-text-primary,#e8eaf0);cursor:pointer;font:500 12px/1.2 system-ui;overflow:hidden;';
-      chip.innerHTML = `${host ? `<img src="https://icons.duckduckgo.com/ip3/${host}.ico" alt="" style="width:14px;height:14px;border-radius:4px;flex:none;" onerror="this.remove()" />` : ''}<span style="overflow:hidden;text-overflow:ellipsis;">${String(bm.title || bm.url).replace(/</g, '&lt;')}</span>`;
+      chip.innerHTML = `<span class="fb-continue-favicon-wrap">${icon}</span><span style="overflow:hidden;text-overflow:ellipsis;">${String(bm.title || bm.url).replace(/</g, '&lt;')}</span>`;
       chip.addEventListener('click', () => this.navigateActiveTab(bm.url));
       bar.appendChild(chip);
     }
@@ -11135,7 +11840,7 @@ export class BrowserShell {
     drawer.querySelector('.fb-dr-performance')?.addEventListener('click', () => {
       this.state.isSideDrawerOpen = false;
       this.render();
-      this.openTaskManagerModal();
+      this.openPerformanceSettings();
     });
 
     drawer.querySelector('.fb-dr-task-mgr')?.addEventListener('click', () => {
@@ -11276,12 +11981,11 @@ export class BrowserShell {
           ` : `
             <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:8px;">
               ${bookmarks.map((bm) => {
-                let domain = bm.url;
-                try { domain = new URL(bm.url).hostname; } catch {}
+                const icon = this.getTabFavicon({ url: bm.url, favicon: bm.favicon || null, isLoading: false });
                 return `
                 <div style="display:flex; align-items:center; justify-content:space-between; padding:6px 10px; background:rgba(255,255,255,0.04); border-radius:8px; border:1px solid rgba(255,255,255,0.08);">
                   <div style="display:flex; align-items:center; gap:8px; overflow:hidden;">
-                    <img src="https://icons.duckduckgo.com/ip3/${domain}.ico" style="width:16px; height:16px; border-radius:50%;" alt="" />
+                    <span class="fb-continue-favicon-wrap">${icon}</span>
                     <span style="font-size:0.825rem; white-space:nowrap; text-overflow:ellipsis; overflow:hidden;">${bm.title || bm.url}</span>
                   </div>
                   <button class="fb-btn fb-btn-primary fb-add-bm-to-wheel-btn" data-url="${bm.url}" data-title="${bm.title || bm.url}" style="padding:2px 8px; font-size:11px;">+ Add</button>
@@ -11974,6 +12678,7 @@ export class BrowserShell {
     const phrases = [];
     const items = (this.state.historyItems || []).slice(0, 300);
     for (const item of items) {
+      if (!/^https?:\/\//i.test(String(item?.url || ''))) continue;
       try {
         const parsed = new URL(item.url);
         const phrase = parsed.searchParams.get('q') || parsed.searchParams.get('query') || parsed.searchParams.get('p');
@@ -12016,38 +12721,64 @@ export class BrowserShell {
   }
 
   getLocalSearchSuggestions(query) {
-    const normalized = String(query || '').trim().toLowerCase();
-    if (!normalized) return [];
+    const raw = String(query || '').trim();
+    const normalized = raw.toLowerCase();
+    if (!normalized || raw.length > 120 || /[\r\n]/.test(raw)) return [];
+    const webItems = (items) => (items || []).filter((item) => /^https?:\/\//i.test(String(item?.url || '')));
     const remembered = [
       ...this.getRememberedSearchPhrases(),
-      ...(this.state.historyItems || []).map((item) => item.title || item.url),
-      ...(this.state.bookmarksItems || []).map((item) => item.title || item.url),
-      ...(this.state.tabs || []).map((tab) => tab.title || tab.url)
+      ...webItems(this.state.historyItems).map((item) => item.title || item.url),
+      ...webItems(this.state.bookmarksItems).map((item) => item.title || item.url),
+      ...webItems(this.state.tabs).map((tab) => tab.title || tab.url)
     ];
-    const common = [
-      `${query} news`,
-      `${query} near me`,
-      `${query} today`,
-      `${query} website`
-    ];
+    const common = [`${raw} news`, `${raw} near me`, `${raw} today`, `${raw} website`];
     return [...new Set([...remembered, ...common].filter((item) => String(item).toLowerCase().includes(normalized)))].slice(0, 8);
   }
 
   async getGoogleSearchSuggestions(query) {
-    const local = this.getLocalSearchSuggestions(query);
+    const raw = String(query || '').trim();
+    const generation = (this._suggestionGeneration || 0) + 1;
+    this._suggestionGeneration = generation;
+    if (this._suggestionsDebounceTimer) clearTimeout(this._suggestionsDebounceTimer);
+    this._suggestionsDebounceTimer = null;
+    this._suggestionsDebounceResolve?.();
+    this._suggestionsDebounceResolve = null;
+    this.searchSuggestionController?.abort();
+    this.searchSuggestionController = null;
+    const local = this.getLocalSearchSuggestions(raw);
+    // Do not send pasted logs, multiline text, internal Yayra routes, or
+    // arbitrarily long free-form content to the remote suggestion service.
+    if (/^yayra:\/\//i.test(raw)) return [];
+    if (raw.length < 2 || raw.length > 120 || /[\r\n]/.test(raw) || /^https?:\/\//i.test(raw)) return local;
+    if (Date.now() < (this._suggestionsRetryAfter || 0)) return local;
     if (typeof fetch !== 'function') return local;
+    await new Promise((resolve) => {
+      this._suggestionsDebounceResolve = resolve;
+      this._suggestionsDebounceTimer = setTimeout(() => {
+        this._suggestionsDebounceTimer = null;
+        this._suggestionsDebounceResolve = null;
+        resolve();
+      }, 180);
+    });
+    if (generation !== this._suggestionGeneration) return local;
     try {
       this.searchSuggestionController?.abort();
       this.searchSuggestionController = typeof AbortController === 'function' ? new AbortController() : null;
-      const response = await fetch(`https://yayra-updates-api.g2code335.workers.dev/api/suggestions?q=${encodeURIComponent(query)}`, {
+      const response = await fetch(`https://yayra-updates-api.g2code335.workers.dev/api/suggestions?q=${encodeURIComponent(raw)}`, {
         headers: { accept: 'application/json' },
         signal: this.searchSuggestionController?.signal
       });
-      if (!response.ok) return local;
+      if (generation !== this._suggestionGeneration) return local;
+      if (!response.ok) {
+        this._suggestionsRetryAfter = Date.now() + 60_000;
+        return local;
+      }
       const payload = await response.json();
+      if (generation !== this._suggestionGeneration) return local;
       const remote = Array.isArray(payload?.[1]) ? payload[1].filter((item) => typeof item === 'string') : [];
       return [...new Set([...remote, ...local])].slice(0, 8);
-    } catch {
+    } catch (error) {
+      if (error?.name !== 'AbortError') this._suggestionsRetryAfter = Date.now() + 60_000;
       return local;
     }
   }
@@ -12883,8 +13614,8 @@ export class BrowserShell {
     this.state.urlInputValue = this.getDisplayUrl(targetUrl);
     this.updateBookmarkState(targetUrl);
 
-    // Record history if not in private mode and not internal newtab
-    if (!activeTab.isPrivate && this.historyRepo && targetUrl !== 'yayra://newtab') {
+    // History is for visited websites, never Yayra's own settings/tool pages.
+    if (!activeTab.isPrivate && this.historyRepo && /^https?:\/\//i.test(targetUrl)) {
       const recorded = typeof this.historyRepo.recordVisit === 'function'
         ? this.historyRepo.recordVisit(targetUrl, activeTab.title, activeTab.favicon)
         : (typeof this.historyRepo.addEntry === 'function' ? this.historyRepo.addEntry(targetUrl, activeTab.title, activeTab.favicon) : null);
@@ -13199,16 +13930,18 @@ export class BrowserShell {
     const continueEntries = [];
     const seenContinue = new Set(this.state.tabs.map((t) => t.url));
     for (const t of (this.state.continueTabs || [])) {
-      if (seenContinue.has(t.url)) continue;
-      seenContinue.add(t.url);
-      continueEntries.push({ url: t.url, title: t.title || t.url, reason: 'From last session', group: t.group });
+      const url = String(t?.url || '');
+      if (!url || seenContinue.has(url)) continue;
+      seenContinue.add(url);
+      continueEntries.push({ url, favicon: t.favicon || null, title: t.title || url, reason: 'From last session', group: t.group });
       if (continueEntries.length >= 5) break;
     }
     for (const site of frequentSites) {
+      const url = String(site?.url || '');
       if (continueEntries.length >= 5) break;
-      if (seenContinue.has(site.url)) continue;
-      seenContinue.add(site.url);
-      continueEntries.push({ url: site.url, title: site.title || site.url, reason: 'You visit often' });
+      if (!/^https?:\/\//i.test(url) || seenContinue.has(url)) continue;
+      seenContinue.add(url);
+      continueEntries.push({ url, favicon: site.favicon || null, title: site.title || url, reason: 'You visit often' });
     }
     const continueSnapshotId = this.state.continueSavedAt || 'no-snapshot-id';
     const continueDismissed = this.state.settings.continueDismissedAt === continueSnapshotId;
@@ -13219,12 +13952,18 @@ export class BrowserShell {
       <div class="fb-continue-card-head">Continue with these tabs?</div>
       ${continueEntries.map((entry) => {
         let host = entry.url;
-        try { host = new URL(entry.url).hostname; } catch { /* keep url */ }
+        try {
+          const parsed = new URL(entry.url);
+          host = parsed.protocol === 'yayra:' ? 'Yayra' : parsed.hostname;
+        } catch { /* keep the visible label for a non-URL tab */ }
+        const icon = this.getTabFavicon({ url: entry.url, favicon: entry.favicon, isLoading: false });
+        const safeUrl = String(entry.url).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+        const safeTitle = String(entry.title || entry.url).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
         return `
-        <button class="fb-continue-item" data-url="${String(entry.url).replace(/"/g, '&quot;')}">
-          <img class="fb-continue-favicon" src="https://icons.duckduckgo.com/ip3/${host}.ico" alt="" loading="lazy" onerror="this.style.visibility='hidden'" />
+        <button class="fb-continue-item" data-url="${safeUrl}">
+          <span class="fb-continue-favicon fb-continue-favicon-wrap">${icon}</span>
           <span class="fb-continue-text">
-            <span class="fb-continue-title">${String(entry.title).replace(/</g, '&lt;')}</span>
+            <span class="fb-continue-title">${safeTitle}</span>
             <span class="fb-continue-meta">${host} &bull; ${entry.reason}</span>
           </span>
         </button>`;
@@ -13997,10 +14736,12 @@ export class BrowserShell {
     if (typeof document === 'undefined') return this.resolveEffectiveTheme();
     const theme = this.resolveEffectiveTheme();
     const colorTheme = this.state.settings.colorTheme || 'blue';
+    const reducedMotion = this.state.settings.reduceMotionForPerformance ? 'true' : 'false';
     const roots = [document.documentElement, document.body].filter(Boolean);
     for (const root of roots) {
       root.setAttribute?.('data-theme', theme);
       root.setAttribute?.('data-color-theme', colorTheme);
+      root.setAttribute?.('data-reduced-motion', reducedMotion);
       root.style?.setProperty?.('color-scheme', theme);
     }
     return theme;
@@ -14956,9 +15697,18 @@ export class BrowserShell {
       // Tab-strip right-click menu + its scrim (state lives outside render()).
       detach(document.body.querySelector('.fb-tab-context-menu'), 'tab context menu');
       detach(document.body.querySelector('.fb-dropdown-scrim'), 'dropdown scrim');
-      // Body-appended dialogs (each also has its own close button).
-      detach(document.getElementById('yayra-reader-overlay'), 'reader');
-      detach(document.getElementById('yayra-taskmgr-overlay'), 'task manager');
+      // Body-appended dialogs (each also has its own close button). Run
+      // their cleanup hooks so speech and periodic metric refreshes stop too.
+      const readerDialog = document.getElementById('yayra-reader-overlay');
+      if (readerDialog && typeof readerDialog._yayraFinish === 'function') {
+        readerDialog._yayraFinish();
+        dismissed = true;
+      } else detach(readerDialog, 'reader');
+      const taskManagerDialog = document.getElementById('yayra-taskmgr-overlay');
+      if (taskManagerDialog && typeof taskManagerDialog._yayraFinish === 'function') {
+        taskManagerDialog._yayraFinish();
+        dismissed = true;
+      } else detach(taskManagerDialog, 'task manager');
       detach(document.getElementById('yayra-url-qr-overlay'), 'QR dialog');
       const installDialog = document.getElementById('yayra-install-app-overlay');
       if (installDialog) {

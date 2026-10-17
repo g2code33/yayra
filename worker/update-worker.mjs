@@ -267,7 +267,15 @@ async function proxySuggestions(request, url, headers, ctx) {
   const query = (url.searchParams.get('q') || '').trim().slice(0, 200);
   if (!query) return new Response(JSON.stringify(['', []]), { status: 200, headers });
   const upstreamUrl = `https://suggestqueries.google.com/complete/search?client=firefox&hl=en&q=${encodeURIComponent(query)}`;
-  return proxyJson(upstreamUrl, headers, {}, ctx, 'public, max-age=60');
+  const upstream = await proxyJson(upstreamUrl, headers, {}, ctx, 'public, max-age=60');
+  if (upstream.ok) return upstream;
+  // Suggestions are optional. Return the same empty payload shape on an
+  // upstream outage instead of leaking a noisy 502 into every address-bar
+  // keystroke; the client still has profile-local suggestions to show.
+  return new Response(JSON.stringify([query, []]), {
+    status: 200,
+    headers: { ...headers, 'cache-control': 'no-store', 'x-yayra-suggestions': 'fallback' }
+  });
 }
 
 /**

@@ -50,6 +50,8 @@ const api = {
       pointerSize: pointer && pointer.size
     }),
     setPointerTheme: (tabId, theme, size) => ipcRenderer.invoke('yayra:webview-set-pointer-theme', { tabId, theme, size }),
+    setBackgroundThrottling: (enabled) => ipcRenderer.invoke('yayra:webview-set-background-throttling', { enabled }),
+    taskTabs: () => ipcRenderer.invoke('yayra:webview-list-task-tabs'),
     setBounds: (tabId, bounds) => ipcRenderer.invoke('yayra:webview-set-bounds', { tabId, bounds }),
     setVisible: (tabId, visible, options = {}) => ipcRenderer.invoke('yayra:webview-set-visible', { tabId, visible, capture: Boolean(options && options.capture) }),
     // Snapshot the live page WITHOUT hiding it - lets the renderer paint

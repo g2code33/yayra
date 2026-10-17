@@ -46,6 +46,19 @@ test('update worker proxies browser-safe suggestions and release metadata with C
 // optional GITHUB_TOKEN binding raises that to the authenticated 5,000/hour
 // quota instead; this proves the header is actually attached when present,
 // and that we still work (just unauthenticated) when it isn't configured.
+test('suggestions endpoint degrades to a valid empty payload when Google suggestions are unavailable', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('upstream unavailable', { status: 503 });
+  try {
+    const response = await worker.fetch(new Request('https://yayra-updates-api.g2code335.workers.dev/api/suggestions?q=long%20query'), {});
+    assert.equal(response.status, 200, 'optional suggestion failure is not exposed as a repeated browser 502');
+    assert.deepEqual(await response.json(), ['long query', []]);
+    assert.equal(response.headers.get('x-yayra-suggestions'), 'fallback');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('update worker attaches GITHUB_TOKEN as a Bearer header when bound, and omits it when not configured', async () => {
   const originalFetch = globalThis.fetch;
   const seenHeaders = [];

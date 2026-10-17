@@ -100,6 +100,8 @@ function createFakeWebContents() {
     goForward: () => { if (forwardStack.length) backStack.push(forwardStack.pop()); calls.push('goForward'); },
     setWindowOpenHandler: (fn) => { windowOpenHandler = fn; },
     setUserAgent: (ua) => { userAgent = ua; },
+    setBackgroundThrottling: (enabled) => calls.push(['setBackgroundThrottling', enabled]),
+    getOSProcessId: () => 4242,
     get userAgent() { return userAgent; },
     on: (event, fn) => {
       if (!listeners.has(event)) listeners.set(event, []);
@@ -203,16 +205,78 @@ test('webview bridge: creating a tab adds a WebContentsView as a child view and 
   assert.equal(fakeWin.contentView.children.length, 1, 'view attached to the window content view (not an <iframe>)');
 });
 
+test('webview bridge: superseded ERR_ABORTED navigation is silent but a final ERR_FAILED remains visible', async () => {
+  const { handlers, views, sentEvents } = makeHarness();
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-errors', url: 'https://example.com/' });
+  const webContents = views[0].webContents;
+  webContents.emit('did-fail-load', {}, -3, 'net::ERR_ABORTED (-3)', 'https://example.com/old', true);
+  assert.equal(sentEvents.some((event) => event.payload.type === 'fail-load'), false, 'superseded navigation does not reach the shell as an error');
+
+  webContents.emit('did-fail-load', {}, -2, 'net::ERR_FAILED (-2)', 'https://example.com/final', true);
+  assert.ok(sentEvents.some((event) => event.payload.type === 'fail-load' && event.payload.errorCode === -2), 'a genuine active failure is still surfaced');
+  webContents.emit('did-fail-load', {}, -2, 'net::ERR_FAILED (-2)', 'https://example.com/iframe', false);
+  assert.equal(sentEvents.filter((event) => event.payload.type === 'fail-load').length, 1, 'subframe errors are not misreported as top-level navigation failures');
+});
+
+test('webview task metrics and background throttling are scoped to the requesting shell window', async () => {
+  const { handlers, views } = makeHarness();
+  const hostA = { id: 101, send() {}, isDestroyed: () => false };
+  const hostB = { id: 202, send() {}, isDestroyed: () => false };
+  const ensure = handlers.get('yayra:webview-ensure');
+  await ensure({ sender: hostA }, { tabId: 'tab-1', url: 'https://a.example/' });
+  const applied = await handlers.get('yayra:webview-set-background-throttling')({ sender: hostA }, { enabled: false });
+  assert.deepEqual(applied, { ok: true, enabled: false, updated: 1 });
+  assert.deepEqual(views[0].webContents._calls.at(-1), ['setBackgroundThrottling', false]);
+
+  await ensure({ sender: hostA }, { tabId: 'tab-2', url: 'https://b.example/' });
+  assert.deepEqual(views[1].webContents._calls.at(-1), ['setBackgroundThrottling', false], 'future tabs inherit the shell window preference');
+  await ensure({ sender: hostB }, { tabId: 'tab-1', url: 'https://other.example/' });
+  assert.equal(views[2].webContents._calls.some((call) => Array.isArray(call) && call[0] === 'setBackgroundThrottling'), false, 'another shell keeps Electron default');
+
+  const taskTabs = await handlers.get('yayra:webview-list-task-tabs')({ sender: hostA });
+  assert.equal(taskTabs.ok, true);
+  assert.deepEqual(taskTabs.tabs, [{ tabId: 'tab-1', pid: 4242 }, { tabId: 'tab-2', pid: 4242 }]);
+  const otherTabs = await handlers.get('yayra:webview-list-task-tabs')({ sender: hostB });
+  assert.deepEqual(otherTabs.tabs, [{ tabId: 'tab-1', pid: 4242 }]);
+});
+
+test('reader extraction returns bounded article metadata and safe link-aware blocks', async () => {
+  const { handlers, views } = makeHarness();
+  const host = { id: 303, send() {}, isDestroyed: () => false };
+  await handlers.get('yayra:webview-ensure')({ sender: host }, { tabId: 'article', url: 'https://news.example/story' });
+  let script = '';
+  views[0].webContents.executeJavaScript = async (source, userGesture) => {
+    script = source;
+    assert.equal(userGesture, true);
+    return {
+      title: 'A story', url: 'https://news.example/story', siteName: 'News', language: 'en',
+      wordCount: 12, readingMinutes: 1,
+      blocks: [{ tag: 'p', type: 'text', text: 'Read this story.', segments: [{ text: 'Read this story.', href: 'https://news.example/story' }] }]
+    };
+  };
+  const result = await handlers.get('yayra:webview-reader-extract')({ sender: host }, { tabId: 'article' });
+  assert.equal(result.ok, true);
+  assert.equal(result.siteName, 'News');
+  assert.equal(result.wordCount, 12);
+  assert.equal(result.blocks[0].segments[0].href, 'https://news.example/story');
+  assert.ok(script.includes(String.raw`text.split(/\s+/)`), 'reader word counts split on whitespace in the page context');
+  assert.match(script, /resolved\.protocol === 'http:' \|\| resolved\.protocol === 'https:'/);
+  assert.match(script, /blocks\.length >= 600/, 'extraction work is bounded');
+});
+
 test('webview bridge: a site renderer that stays unresponsive is reloaded once after a grace period', async () => {
-  const { handlers, views } = makeHarness({ pageUnresponsiveReloadDelayMs: 10, pageUnresponsiveReloadCooldownMs: 100 });
+  const { handlers, views, sentEvents } = makeHarness({ pageUnresponsiveReloadDelayMs: 10, pageUnresponsiveReloadCooldownMs: 100 });
   await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-hung', url: 'https://example.com/' });
   const wc = views[0].webContents;
 
   wc.emit('unresponsive');
+  assert.ok(sentEvents.some((event) => event.payload.type === 'page-unresponsive' && event.payload.recoveryScheduled), 'shell receives the actual recovery state');
   await new Promise((resolve) => setTimeout(resolve, 25));
   assert.equal(wc._calls.filter((call) => call === 'reload').length, 1, 'only the affected page is reloaded');
+  assert.ok(sentEvents.some((event) => event.payload.type === 'page-recovery-start'), 'shell is told when the bridge begins a reload attempt');
 
   wc.emit('responsive');
+  assert.ok(sentEvents.some((event) => event.payload.type === 'page-responsive'), 'shell can announce a responsive page');
   wc.emit('unresponsive');
   await new Promise((resolve) => setTimeout(resolve, 25));
   assert.equal(wc._calls.filter((call) => call === 'reload').length, 1, 'cooldown blocks a repeated reload loop');

@@ -631,6 +631,9 @@ function createWebviewBridge({
   // BrowserShell instance whose generated ids ("tab-1", "tab-2", ...) would
   // otherwise collide and steal each other's native views.
   const views = new Map();
+  // Per-shell-window policy. WeakMap keeps the preference scoped to the
+  // renderer that owns the native views without retaining destroyed windows.
+  const backgroundThrottlingByHost = new WeakMap();
 
   function cancelPageUnresponsiveReload(entry) {
     if (!entry) return;
@@ -832,10 +835,18 @@ function createWebviewBridge({
       }
     });
     wc.on('unresponsive', () => {
+      const newlyUnresponsive = !entry.pageUnresponsive;
       entry.pageUnresponsive = true;
-      if (entry.pageUnresponsiveReloadTimer !== null) return;
+      if (entry.pageUnresponsiveReloadTimer !== null) {
+        if (newlyUnresponsive) sendTo(entry, 'page-unresponsive', { url: wc.getURL?.() || entry.lastUrl || '', recoveryScheduled: true });
+        return;
+      }
       const lastReload = entry.lastPageUnresponsiveReloadAt || 0;
-      if (lastReload && Date.now() - lastReload < pageUnresponsiveReloadCooldownMs) return;
+      const recoveryScheduled = !(lastReload && Date.now() - lastReload < pageUnresponsiveReloadCooldownMs);
+      if (newlyUnresponsive) {
+        sendTo(entry, 'page-unresponsive', { url: wc.getURL?.() || entry.lastUrl || '', recoveryScheduled });
+      }
+      if (!recoveryScheduled) return;
 
       // The shell remains usable while an individual site renderer hangs.
       // Give Chromium a short chance to recover itself before reloading only
@@ -848,15 +859,25 @@ function createWebviewBridge({
         if (entry.lastPageUnresponsiveReloadAt && now - entry.lastPageUnresponsiveReloadAt < pageUnresponsiveReloadCooldownMs) return;
         entry.lastPageUnresponsiveReloadAt = now;
         logger.warn?.(`[yayra:webview] page renderer unresponsive in tab ${entry.tabId}; reloading that page`);
+        sendTo(entry, 'page-recovery-start', { url: wc.getURL?.() || entry.lastUrl || '', reason: 'unresponsive-page' });
         try { wc.reload(); }
-        catch (err) { logger.error?.(`[yayra:webview] failed to recover unresponsive tab ${entry.tabId}`, err); }
+        catch (err) {
+          logger.error?.(`[yayra:webview] failed to recover unresponsive tab ${entry.tabId}`, err);
+          sendTo(entry, 'page-recovery-failed', { url: wc.getURL?.() || entry.lastUrl || '' });
+        }
       }, pageUnresponsiveReloadDelayMs);
       entry.pageUnresponsiveReloadTimer?.unref?.();
     });
-    wc.on('responsive', () => cancelPageUnresponsiveReload(entry));
+    wc.on('responsive', () => {
+      const wasUnresponsive = entry.pageUnresponsive;
+      cancelPageUnresponsiveReload(entry);
+      if (wasUnresponsive) sendTo(entry, 'page-responsive', { url: wc.getURL?.() || entry.lastUrl || '' });
+    });
     wc.on('did-start-loading', () => {
       // A user-initiated reload/navigation is already the recovery action.
+      const wasUnresponsive = entry.pageUnresponsive;
       cancelPageUnresponsiveReload(entry);
+      if (wasUnresponsive) sendTo(entry, 'page-recovery-start', { url: wc.getURL?.() || entry.lastUrl || '', reason: 'navigation' });
       sendTo(entry, 'loading-start');
     });
     wc.on('did-stop-loading', () => sendTo(entry, 'loading-stop'));
@@ -1017,6 +1038,11 @@ function createWebviewBridge({
     }
     if (!entry) {
       entry = createView(key, tabId, isPrivate, hostWc, win, profileId);
+      const backgroundThrottling = hostWc ? backgroundThrottlingByHost.get(hostWc) : undefined;
+      if (typeof backgroundThrottling === 'boolean'
+        && typeof entry.view.webContents.setBackgroundThrottling === 'function') {
+        try { entry.view.webContents.setBackgroundThrottling(backgroundThrottling); } catch { /* keep Electron's default */ }
+      }
       win.contentView.addChildView(entry.view);
     }
 
@@ -1030,8 +1056,15 @@ function createWebviewBridge({
     if (entry.lastUrl !== url) {
       entry.lastUrl = url;
       entry.view.webContents.loadURL(url).catch((err) => {
-        logger.error(`[yayra:webview] failed to load ${url}`, err);
-        sendTo(entry, 'fail-load', { errorCode: -2, errorDescription: String((err && err.message) || err), url });
+        const description = String((err && err.message) || err || 'load failed');
+        // Electron rejects a superseded loadURL() with ERR_ABORTED when the
+        // user navigates again before it settles. This is expected control
+        // flow, not a failed final navigation; did-fail-load also filters -3.
+        if (/ERR_ABORTED\s*\(-3\)|net::ERR_ABORTED/i.test(description)) return;
+        let host = '';
+        try { host = new URL(url).host; } catch { /* never log full user query text */ }
+        logger.error(`[yayra:webview] failed to load ${host || 'page'} (loadURL rejected)`);
+        sendTo(entry, 'fail-load', { errorCode: -2, errorDescription: description.slice(0, 240), url });
       });
     }
     return { handedOffToSystemBrowser: false };
@@ -1231,6 +1264,36 @@ function createWebviewBridge({
     const { hostWc, hostWin } = resolveHost(event);
     return ensureView(viewKey(event, tabId), tabId, url, { isPrivate, hostWc, hostWin, profileId, pointerTheme, pointerSize });
   });
+  ipcMain.handle('yayra:webview-set-background-throttling', (event, { enabled } = {}) => {
+    const sender = event?.sender;
+    if (!sender || typeof enabled !== 'boolean') return { ok: false, reason: 'invalid-request', updated: 0 };
+    backgroundThrottlingByHost.set(sender, enabled);
+    let updated = 0;
+    for (const entry of views.values()) {
+      if (entry.hostWc !== sender) continue;
+      const wc = entry.view?.webContents;
+      if (!wc || wc.isDestroyed?.() || typeof wc.setBackgroundThrottling !== 'function') continue;
+      try { wc.setBackgroundThrottling(enabled); updated += 1; } catch { /* report only successful updates */ }
+    }
+    return { ok: true, enabled, updated };
+  });
+  ipcMain.handle('yayra:webview-list-task-tabs', (event) => {
+    const sender = event?.sender;
+    if (!sender) return { ok: false, reason: 'unavailable', tabs: [] };
+    const tabs = [];
+    for (const entry of views.values()) {
+      if (entry.hostWc !== sender) continue;
+      const wc = entry.view?.webContents;
+      if (!wc || wc.isDestroyed?.()) continue;
+      let pid = null;
+      try {
+        const rawPid = wc.getOSProcessId?.();
+        if (Number.isInteger(rawPid) && rawPid > 0) pid = rawPid;
+      } catch { /* renderer may be tearing down */ }
+      tabs.push({ tabId: String(entry.tabId), pid });
+    }
+    return { ok: true, tabs };
+  });
   ipcMain.handle('yayra:webview-set-pointer-theme', (event, { tabId, theme, size } = {}) => setPointerTheme(viewKey(event, tabId), theme, size));
   ipcMain.handle('yayra:webview-set-bounds', (event, { tabId, bounds } = {}) => setBounds(viewKey(event, tabId), bounds));
   ipcMain.handle('yayra:webview-set-visible', (event, { tabId, visible, capture } = {}) => setVisible(viewKey(event, tabId), visible, { capture }));
@@ -1330,21 +1393,95 @@ function createWebviewBridge({
     const wc = entry && entry.view && entry.view.webContents;
     if (!wc || typeof wc.executeJavaScript !== 'function') return { ok: false, reason: 'no-native-page' };
     const script = `(() => {
-      const root = document.querySelector('article') || document.querySelector('main') || document.body;
-      if (!root) return { title: document.title, url: location.href, blocks: [] };
-      const nodes = root.querySelectorAll('h1, h2, h3, p, li');
-      const blocks = [];
-      for (const el of nodes) {
-        const text = (el.innerText || '').trim();
-        if (text.length < 2) continue;
-        blocks.push({ tag: el.tagName.toLowerCase(), text: text.slice(0, 4000) });
-        if (blocks.length >= 400) break;
+      const title = String(document.title || '').trim();
+      const url = String(location.href || '');
+      const siteName = document.querySelector('meta[property="og:site_name"]')?.content || location.hostname || '';
+      const hiddenByReader = (el) => {
+        if (!el || el.hidden || el.getAttribute('aria-hidden') === 'true') return true;
+        try {
+          const style = getComputedStyle(el);
+          return style.display === 'none' || style.visibility === 'hidden';
+        } catch { return false; }
+      };
+      const candidates = Array.from(document.querySelectorAll('article, main, [role="main"], [itemprop="articleBody"], .article-body, .post-content, .entry-content'));
+      let root = null;
+      let rootScore = 0;
+      for (const candidate of candidates.slice(0, 40)) {
+        const text = String(candidate.innerText || '').trim();
+        const score = text.length + (candidate.matches('article,[itemprop="articleBody"]') ? 400 : 0);
+        if (score > rootScore) { root = candidate; rootScore = score; }
       }
-      return { title: document.title, url: location.href, blocks };
+      root = root || document.body;
+      if (!root) return { title, url, siteName, language: '', wordCount: 0, blocks: [] };
+      const excluded = 'script, style, noscript, nav, header, footer, aside, form, button, input, select, textarea, [hidden], [aria-hidden="true"], [role="navigation"], [role="contentinfo"], [role="complementary"], .advertisement, .advert, .ads, .cookie-banner';
+      const safeHref = (raw) => {
+        try {
+          const resolved = new URL(raw, url);
+          return resolved.protocol === 'http:' || resolved.protocol === 'https:' ? resolved.href : '';
+        } catch { return ''; }
+      };
+      const segmentsFor = (el) => {
+        const segments = [];
+        try {
+          const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+          let node;
+          while ((node = walker.nextNode()) && segments.length < 240) {
+            const text = String(node.nodeValue || '');
+            if (!text.trim()) { if (segments.length) segments[segments.length - 1].text += text; continue; }
+            const anchor = node.parentElement?.closest('a');
+            segments.push({ text, href: anchor ? safeHref(anchor.getAttribute('href') || anchor.href || '') : '' });
+          }
+        } catch { /* text fallback is returned below */ }
+        return segments;
+      };
+      const nodes = root.querySelectorAll('h1, h2, h3, h4, p, li, blockquote, pre, figure, img');
+      const blocks = [];
+      let wordCount = 0;
+      for (const el of nodes) {
+        if (blocks.length >= 600 || hiddenByReader(el) || el.closest(excluded)) continue;
+        const tag = el.tagName.toLowerCase();
+        if (tag === 'img' && el.closest('figure')) continue;
+        if (tag === 'p' && el.closest('li')) continue;
+        let text = String(el.innerText || el.alt || '').trim();
+        if (tag === 'img') {
+          const src = safeHref(el.currentSrc || el.src || el.getAttribute('src') || '');
+          const alt = String(el.alt || '').trim();
+          if (src) blocks.push({ tag: 'img', type: 'image', src, alt, text: alt });
+          continue;
+        }
+        if (tag === 'figure') {
+          const image = el.querySelector('img');
+          const src = image ? safeHref(image.currentSrc || image.src || image.getAttribute('src') || '') : '';
+          const caption = String(el.querySelector('figcaption')?.innerText || image?.alt || '').trim();
+          if (src) { blocks.push({ tag: 'figure', type: 'figure', src, alt: String(image?.alt || ''), text: caption }); continue; }
+        }
+        if (text.length < 2) continue;
+        text = text.slice(0, 5000);
+        const segments = segmentsFor(el);
+        const type = tag === 'blockquote' ? 'quote' : tag === 'pre' ? 'code' : tag === 'li' ? 'list-item' : 'text';
+        blocks.push({ tag, type, level: /^h[1-4]$/.test(tag) ? Number(tag.slice(1)) : undefined, text, segments });
+        wordCount += text.split(/\\s+/).filter(Boolean).length;
+      }
+      return {
+        title, url, siteName,
+        language: String(document.documentElement?.lang || ''),
+        wordCount,
+        readingMinutes: Math.max(1, Math.ceil(wordCount / 220)),
+        blocks
+      };
     })()`;
     try {
       const result = await wc.executeJavaScript(script, true);
-      return { ok: true, title: result?.title || '', url: result?.url || '', blocks: Array.isArray(result?.blocks) ? result.blocks : [] };
+      return {
+        ok: true,
+        title: result?.title || '',
+        url: result?.url || '',
+        siteName: result?.siteName || '',
+        language: result?.language || '',
+        wordCount: Number.isFinite(result?.wordCount) ? result.wordCount : 0,
+        readingMinutes: Number.isFinite(result?.readingMinutes) ? result.readingMinutes : null,
+        blocks: Array.isArray(result?.blocks) ? result.blocks : []
+      };
     } catch (err) {
       logger.error?.('[yayra:webview] reader extract failed', err);
       return { ok: false, reason: 'failed' };
