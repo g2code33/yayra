@@ -259,6 +259,8 @@ export class BrowserShell {
       isMobile: options.isMobile !== undefined ? options.isMobile : this.checkMobileViewport(),
       urlInputValue: initialTabs[0]?.url || 'yayra://newtab',
       activeModal: null, // 'menu', 'tab-switcher', 'sponsored-manager', etc.
+      tabSwitcherSearchQuery: '',
+      tabSwitcherRecentlyClosedExpanded: false,
       isSideDrawerOpen: false,
       isSecurityDropdownOpen: false,
       isRadialLauncherOpen: false,
@@ -343,6 +345,7 @@ export class BrowserShell {
         theme: 'dark',
         colorTheme: 'blue',
         searchEngine: 'google', // Requirement 13: Default search engine is Google
+        tabSwitcherView: 'grid', // 'grid' keeps the existing preview cards; 'list' is the compact Chrome-style tab search
         floatingEnabledByDefault: true,
         startFloatingOnLaunch: true,
         alwaysOnTop: true,
@@ -11189,7 +11192,9 @@ export class BrowserShell {
     if (!this.state.activeModal) return;
 
     const backdrop = document.createElement('div');
-    backdrop.className = `fb-modal-backdrop ${this.state.activeModal === 'search-overlay' ? 'fb-search-backdrop' : ''}`;
+    const isCompactTabSearch = this.state.activeModal === 'tab-switcher'
+      && this.state.settings.tabSwitcherView === 'list';
+    backdrop.className = `fb-modal-backdrop ${this.state.activeModal === 'search-overlay' ? 'fb-search-backdrop' : ''} ${isCompactTabSearch ? 'fb-tab-search-list-backdrop' : ''}`;
     backdrop.addEventListener('click', (e) => {
       if (e.target === backdrop) this.closeModal();
     });
@@ -11456,16 +11461,25 @@ export class BrowserShell {
   }
 
   renderTabSwitcherModal(modal) {
+    if (this.state.settings.tabSwitcherView === 'list') {
+      this.renderTabSwitcherListModal(modal);
+      return;
+    }
+
     modal.className = 'fb-modal-card fb-modal-tab-switcher fb-mobile-tabswitcher-card';
     modal.innerHTML = `
       <div class="fb-modal-header">
         <h2 class="fb-modal-title">${Icons.tabs} Tabs (${this.state.tabs.length})</h2>
-        <div style="display:flex; gap:8px;">
+        <div class="fb-tab-switcher-header-actions">
+          <div class="fb-tab-search-view-switch" role="group" aria-label="Tab search view">
+            <button type="button" class="fb-tab-search-view-btn" data-tab-search-view="grid" aria-pressed="true">Cards</button>
+            <button type="button" class="fb-tab-search-view-btn" data-tab-search-view="list" aria-pressed="false">List</button>
+          </div>
           <button class="fb-btn fb-btn-primary fb-mobile-addtab-btn">${Icons.plus} New Tab</button>
-          <button class="fb-modal-close-btn">${Icons.close}</button>
+          <button class="fb-modal-close-btn" aria-label="Close tab search">${Icons.close}</button>
         </div>
       </div>
-      <div class="fb-modal-body fb-mobile-tabs-grid">
+      <div class="fb-modal-body fb-mobile-tabs-grid fb-tabswitcher-grid">
         ${this.state.tabs.map((tab) => {
           // Real page preview: the last capturePage() snapshot of this
           // tab's native view (taken when overlays open, when switching
@@ -11492,6 +11506,7 @@ export class BrowserShell {
       </div>
     `;
 
+    this.bindTabSwitcherViewButtons(modal);
     modal.querySelector('.fb-modal-close-btn')?.addEventListener('click', () => this.closeModal());
     modal.querySelector('.fb-mobile-addtab-btn')?.addEventListener('click', () => {
       this.closeModal();
@@ -11510,13 +11525,185 @@ export class BrowserShell {
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
         this.closeTab(btn.dataset.tabId);
-        if (this.state.tabs.length === 0) {
-          this.closeModal();
-        } else {
-          this.renderTabSwitcherModal(modal);
-        }
+        if (this.state.tabs.length === 0) this.closeModal();
       });
     });
+  }
+
+  bindTabSwitcherViewButtons(modal) {
+    modal.querySelectorAll('.fb-tab-search-view-btn').forEach((button) => {
+      button.addEventListener('click', () => {
+        this.setTabSwitcherView(button.getAttribute('data-tab-search-view'));
+      });
+    });
+  }
+
+  setTabSwitcherView(view) {
+    const nextView = view === 'list' ? 'list' : 'grid';
+    if (this.state.settings.tabSwitcherView === nextView) return;
+    this.state.settings.tabSwitcherView = nextView;
+    this.persistSettings();
+    this.render();
+  }
+
+  renderTabSwitcherListModal(modal) {
+    const escapeHtml = (value) => String(value || '').replace(/[&<>"']/g, (char) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    })[char]);
+    const query = this.state.tabSwitcherSearchQuery || '';
+    const recentlyExpanded = Boolean(this.state.tabSwitcherRecentlyClosedExpanded);
+    const tabs = this.state.tabs;
+    const closedTabs = (this.state.closedTabsHistory || [])
+      .map((tab, index) => ({ tab, index }))
+      .filter(({ tab }) => tab && !tab.isPrivate);
+
+    modal.className = 'fb-modal-card fb-modal-tab-switcher fb-tab-search-list-panel';
+    modal.innerHTML = `
+      <div class="fb-tab-search-list-header">
+        <div class="fb-tab-search-searchbox">
+          <span class="fb-tab-search-search-icon">${Icons.search}</span>
+          <input type="search" class="fb-tab-search-input" placeholder="Search tabs" aria-label="Search tabs" value="${escapeHtml(query)}" />
+          <kbd>Ctrl+Shift+A</kbd>
+        </div>
+        <div class="fb-tab-search-list-actions">
+          <div class="fb-tab-search-view-switch" role="group" aria-label="Tab search view">
+            <button type="button" class="fb-tab-search-view-btn" data-tab-search-view="grid" aria-pressed="false">Cards</button>
+            <button type="button" class="fb-tab-search-view-btn" data-tab-search-view="list" aria-pressed="true">List</button>
+          </div>
+          <button type="button" class="fb-tab-search-newtab-btn" title="Open a new tab">${Icons.plus}<span>New Tab</span></button>
+          <button type="button" class="fb-modal-close-btn" aria-label="Close tab search">${Icons.close}</button>
+        </div>
+      </div>
+      <div class="fb-tab-search-list-scroll">
+        <section class="fb-tab-search-section">
+          <div class="fb-tab-search-section-title"><span>Open Tabs</span><span class="fb-tab-search-count">${tabs.length}</span></div>
+          <div class="fb-tab-search-open-list"></div>
+          <p class="fb-tab-search-empty fb-tab-search-open-empty" style="display:none;"></p>
+        </section>
+        <section class="fb-tab-search-section fb-tab-search-recent-section">
+          <button type="button" class="fb-tab-search-recent-toggle" aria-expanded="${recentlyExpanded}">
+            <span>Recently Closed</span><span class="fb-tab-search-count">${closedTabs.length}</span><span class="fb-tab-search-chevron">${recentlyExpanded ? '⌄' : '›'}</span>
+          </button>
+          <div class="fb-tab-search-closed-list" style="display:${recentlyExpanded ? 'flex' : 'none'};"></div>
+          <p class="fb-tab-search-empty fb-tab-search-closed-empty" style="display:none;"></p>
+        </section>
+      </div>
+    `;
+
+    this.bindTabSwitcherViewButtons(modal);
+    modal.querySelector('.fb-modal-close-btn')?.addEventListener('click', () => this.closeModal());
+    modal.querySelector('.fb-tab-search-newtab-btn')?.addEventListener('click', () => {
+      this.closeModal();
+      this.createNewTab();
+    });
+
+    const openList = modal.querySelector('.fb-tab-search-open-list');
+    const closedList = modal.querySelector('.fb-tab-search-closed-list');
+    const openEmpty = modal.querySelector('.fb-tab-search-open-empty');
+    const closedEmpty = modal.querySelector('.fb-tab-search-closed-empty');
+    const recentToggle = modal.querySelector('.fb-tab-search-recent-toggle');
+    const searchInput = modal.querySelector('.fb-tab-search-input');
+    if (searchInput) searchInput.value = query;
+    const tabSubtitle = (tab) => {
+      const url = String(tab?.url || '');
+      if (!url || url === 'yayra://newtab') return 'New Tab';
+      if (url.startsWith('yayra://')) return url.slice('yayra://'.length).split(/[?#]/, 1)[0];
+      try {
+        const parsed = new URL(url);
+        return `${parsed.host}${parsed.pathname === '/' ? '' : parsed.pathname}`;
+      } catch { return url; }
+    };
+    const makeTabRow = (tab, { closed = false, index = -1 } = {}) => {
+      const titleText = this.getTabTitle(tab);
+      const row = document.createElement('div');
+      const isActive = !closed && tab.id === this.state.activeTabId;
+      row.className = `fb-tab-search-row ${closed ? 'is-closed' : ''} ${isActive ? 'is-active' : ''}`;
+      row.dataset.searchText = `${titleText} ${tab.url || ''}`.toLocaleLowerCase();
+
+      const select = document.createElement('button');
+      select.type = 'button';
+      select.className = 'fb-tab-search-row-main';
+      select.setAttribute('aria-label', `${closed ? 'Reopen' : 'Switch to'} ${titleText}`);
+      if (isActive) select.setAttribute('aria-current', 'page');
+      const icon = document.createElement('span');
+      icon.className = 'fb-tab-search-row-icon';
+      icon.innerHTML = this.getTabFavicon(tab);
+      const copy = document.createElement('span');
+      copy.className = 'fb-tab-search-row-copy';
+      const title = document.createElement('strong');
+      title.className = 'fb-tab-search-row-title';
+      title.textContent = titleText;
+      const subtitle = document.createElement('small');
+      subtitle.className = 'fb-tab-search-row-subtitle';
+      subtitle.textContent = closed ? `${tabSubtitle(tab)} · Recently closed` : `${tabSubtitle(tab)}${isActive ? ' · Current tab' : ''}`;
+      copy.appendChild(title);
+      copy.appendChild(subtitle);
+      select.appendChild(icon);
+      select.appendChild(copy);
+      row.appendChild(select);
+
+      if (!closed) {
+        const close = document.createElement('button');
+        close.type = 'button';
+        close.className = 'fb-tab-search-row-close';
+        close.innerHTML = Icons.close;
+        close.setAttribute('aria-label', `Close ${titleText}`);
+        close.addEventListener('click', (event) => {
+          event.stopPropagation();
+          this.closeTab(tab.id);
+        });
+        row.appendChild(close);
+      }
+
+      select.addEventListener('click', () => {
+        if (closed) this.reopenClosedTabAt(index);
+        else {
+          this.selectTab(tab.id);
+          this.closeModal();
+        }
+      });
+      return row;
+    };
+
+    tabs.forEach((tab) => openList.appendChild(makeTabRow(tab)));
+    closedTabs.forEach(({ tab, index }) => closedList.appendChild(makeTabRow(tab, { closed: true, index })));
+
+    const applySearch = ({ autoExpandRecent = false } = {}) => {
+      const currentQuery = String(searchInput?.value || '').trim().toLocaleLowerCase();
+      this.state.tabSwitcherSearchQuery = currentQuery;
+      let openMatches = 0;
+      let closedMatches = 0;
+      openList.querySelectorAll('.fb-tab-search-row').forEach((row) => {
+        const matches = !currentQuery || (row.dataset.searchText || '').includes(currentQuery);
+        row.style.display = matches ? '' : 'none';
+        if (matches) openMatches += 1;
+      });
+      closedList.querySelectorAll('.fb-tab-search-row').forEach((row) => {
+        const matches = !currentQuery || (row.dataset.searchText || '').includes(currentQuery);
+        row.style.display = matches ? '' : 'none';
+        if (matches) closedMatches += 1;
+      });
+      openEmpty.textContent = currentQuery ? 'No matching open tabs.' : 'No open tabs.';
+      openEmpty.style.display = openMatches ? 'none' : 'block';
+      closedEmpty.textContent = currentQuery ? 'No matching recently closed tabs.' : 'No recently closed tabs.';
+      if (autoExpandRecent && currentQuery && closedMatches) {
+        this.state.tabSwitcherRecentlyClosedExpanded = true;
+      }
+      const expanded = this.state.tabSwitcherRecentlyClosedExpanded;
+      closedList.style.display = expanded ? 'flex' : 'none';
+      closedEmpty.style.display = expanded && !closedMatches ? 'block' : 'none';
+      recentToggle.setAttribute('aria-expanded', String(expanded));
+      const chevron = recentToggle.querySelector('.fb-tab-search-chevron');
+      if (chevron) chevron.textContent = expanded ? '⌄' : '›';
+    };
+
+    searchInput?.addEventListener('input', () => applySearch({ autoExpandRecent: true }));
+    recentToggle?.addEventListener('click', () => {
+      this.state.tabSwitcherRecentlyClosedExpanded = recentToggle.getAttribute('aria-expanded') !== 'true';
+      applySearch();
+    });
+    applySearch();
+    searchInput?.focus();
   }
 
   renderHistoryModal(modal) {
@@ -13765,6 +13952,10 @@ export class BrowserShell {
   }
 
   openModal(modalName) {
+    if (modalName === 'tab-switcher') {
+      this.state.tabSwitcherSearchQuery = '';
+      this.state.tabSwitcherRecentlyClosedExpanded = false;
+    }
     this.state.activeModal = modalName;
     this.render();
   }
@@ -13860,9 +14051,33 @@ export class BrowserShell {
     this.render();
   }
 
+  reopenClosedTabAt(index) {
+    if (!Number.isInteger(index) || index < 0 || index >= this.state.closedTabsHistory.length) return null;
+    const [closedTab] = this.state.closedTabsHistory.splice(index, 1);
+    if (!closedTab) return null;
+    const newTab = {
+      ...closedTab,
+      id: `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      url: closedTab.url || 'yayra://newtab',
+      title: closedTab.title || this.getTabTitle(closedTab),
+      isSecure: true,
+      canGoBack: false,
+      canGoForward: false,
+      isLoading: false,
+      isPrivate: false
+    };
+    this.state.tabs.push(newTab);
+    this.state.activeTabId = newTab.id;
+    this.state.urlInputValue = newTab.url;
+    this.state.activeModal = null;
+    this.render();
+    return newTab;
+  }
+
   reopenLastClosedTab() {
     if (this.state.closedTabsHistory.length === 0) return null;
-    const lastClosed = this.state.closedTabsHistory.pop();
+    // closeTab() prepends newly closed tabs, so the most recent entry is first.
+    const lastClosed = this.state.closedTabsHistory.shift();
     const newTab = {
       id: 'tab-' + Math.random().toString(36).substring(2, 9),
       url: lastClosed.url || 'yayra://newtab',
