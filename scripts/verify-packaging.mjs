@@ -4,6 +4,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { dimensions } from './lib/png.mjs';
+import { inspectAsarPackage } from './lib/asar-package.mjs';
 import { findPackagedWindowsExecutable } from './lib/windows-package-layout.mjs';
 
 const root = process.cwd();
@@ -81,11 +82,12 @@ const packagedAsars = [
 ].filter(([, asarPath]) => existsSync(asarPath));
 if (packagedAsars.length) {
   for (const [target, asarPath] of packagedAsars) {
-    const asar = spawnSync(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['asar', 'list', asarPath], { cwd: root, encoding: 'utf8' });
-    assert(asar.status === 0, `${target} app.asar listing failed: ${asar.stderr || asar.stdout}`);
-    assert(asar.stdout.includes('/dist/index.html'), `${target} app.asar did not include dist/index.html`);
-    assert(asar.stdout.includes('/dist/packages/shared-ui/src/vendor/pdfjs/pdf.mjs'), `${target} app.asar did not include the PDF.js engine`);
-    assert(asar.stdout.includes('/dist/packages/shared-ui/src/vendor/pdfjs/pdf.worker.mjs'), `${target} app.asar did not include the PDF.js worker`);
+    const asar = inspectAsarPackage(asarPath);
+    assert(asar.ok, `${target} app.asar listing failed: ${asar.error}`);
+    if (!asar.ok) continue;
+    assert(asar.entries.has('dist/index.html'), `${target} app.asar did not include dist/index.html`);
+    assert(asar.entries.has('dist/packages/shared-ui/src/vendor/pdfjs/pdf.mjs'), `${target} app.asar did not include the PDF.js engine`);
+    assert(asar.entries.has('dist/packages/shared-ui/src/vendor/pdfjs/pdf.worker.mjs'), `${target} app.asar did not include the PDF.js worker`);
   }
 } else {
   console.log('packaging layout note: no unpacked desktop app is present; package a desktop target to inspect its real app.asar contents');
