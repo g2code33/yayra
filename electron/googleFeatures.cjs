@@ -1,10 +1,5 @@
 'use strict';
 
-const GOOGLE_FEATURE_URLS = Object.freeze({
-  voice: 'https://www.google.com/',
-  lens: 'https://lens.google.com/'
-});
-
 const GOOGLE_LENS_UPLOAD_ORIGIN = 'https://lens.google.com';
 const GOOGLE_LENS_UPLOAD_PATH = '/v3/upload';
 const GOOGLE_LENS_MAX_BYTES = 20 * 1024 * 1024;
@@ -55,6 +50,7 @@ function isGoogleLensResultUrl(value) {
   try {
     const parsed = new URL(value);
     return parsed.protocol === 'https:'
+      && parsed.hostname !== 'accounts.google.com'
       && (parsed.hostname === 'lens.google.com' || parsed.hostname.endsWith('.google.com'));
   } catch {
     return false;
@@ -94,7 +90,6 @@ async function uploadGoogleLensImage({ netFetch, data, name, type, language, sta
 }
 
 module.exports = {
-  GOOGLE_FEATURE_URLS,
   GOOGLE_LENS_MAX_BYTES,
   GOOGLE_LENS_MIME_TYPES,
   buildGoogleLensUploadUrl,

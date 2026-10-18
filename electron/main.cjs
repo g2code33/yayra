@@ -22,7 +22,7 @@ const { createPasskeyBridge } = require('./passkeyBridge.cjs');
 const { configureWebsiteWebAuthn } = require('./websiteWebAuthn.cjs');
 const { createWebsitePasskeyProvider } = require('./websitePasskeyProvider.cjs');
 const { configureTrustedMediaPermissions } = require('./trustedMediaPermissions.cjs');
-const { GOOGLE_FEATURE_URLS, uploadGoogleLensImage } = require('./googleFeatures.cjs');
+const { uploadGoogleLensImage } = require('./googleFeatures.cjs');
 const { createPhoneApproval } = require('./phoneApproval.cjs');
 const { createOverlayBridge } = require('./overlayWindow.cjs');
 const { createOverlayStore } = require('./overlayStore.cjs');
@@ -738,26 +738,6 @@ function registerIpcBridges() {
     if (!senderWindow(event)) return false;
     app.quit();
     return true;
-  });
-
-  // Google-owned feature escape hatch. Desktop Electron does not ship
-  // Chrome's proprietary remote speech-recognition service, so Google voice
-  // search must continue in the user's full system browser when Chromium's
-  // local/on-device recognizer is unavailable. The enum prevents a
-  // compromised renderer from turning this into an arbitrary URL launcher.
-  ipcMain.handle('yayra:open-google-feature', async (event, payload = {}) => {
-    if (!senderWindow(event)) return { ok: false, reason: 'untrusted-sender' };
-    const key = String(payload?.feature || '');
-    const url = Object.prototype.hasOwnProperty.call(GOOGLE_FEATURE_URLS, key)
-      ? GOOGLE_FEATURE_URLS[key]
-      : null;
-    if (!url) return { ok: false, reason: 'unknown-feature' };
-    try {
-      await shell.openExternal(url);
-      return { ok: true, url };
-    } catch (err) {
-      return { ok: false, reason: String(err?.message || 'open-failed') };
-    }
   });
 
   // Electron renderer fetches are CORS-constrained. Upload the user-selected

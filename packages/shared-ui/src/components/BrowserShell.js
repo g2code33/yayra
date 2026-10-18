@@ -485,6 +485,11 @@ export class BrowserShell {
     // Keeping it here prevents chrome re-renders from reopening the system
     // browser while the original tab URL/history remain intact.
     this._systemBrowserHandoffs = new Map();
+    // Voice Search and Lens are Google features, but their pages/results
+    // must remain in Yayra's own site engine. This tab-scoped marker also
+    // suppresses web/PWA window.open fallbacks so these controls can never
+    // launch the user's external browser.
+    this._inAppOnlyGoogleTabs = new Set();
     this._nativeWebviewResizeObservers = new Map();
     this._lastAppliedNativePointerConfig = null;
     this._lastAppliedAndroidPointerConfig = null;
@@ -2880,6 +2885,32 @@ export class BrowserShell {
   }
 
   /**
+   * Browser/PWA limitation for Voice/Lens only. Google denies iframe
+   * embedding, but these controls are explicitly in-app-only, so never fall
+   * through to window.open or a Capacitor/system browser. Installed desktop
+   * and Android builds use native website surfaces and never see this card.
+   */
+  buildGoogleInAppOnlyFallback(url) {
+    const fallback = document.createElement('div');
+    fallback.className = 'fb-frame-blocked-fallback fb-google-in-app-only-fallback';
+    fallback.style.cssText = 'position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; background:var(--fb-bg-app,#060b19); color:var(--fb-text-primary,#f8fafc); text-align:center; padding:24px; z-index:1;';
+    let feature = 'Google';
+    try { if (new URL(url).hostname.toLowerCase() === 'lens.google.com') feature = 'Google Lens'; } catch { /* validated earlier */ }
+    fallback.innerHTML = `
+      <strong style="font-size:1rem;">${feature} stayed in Yayra</strong>
+      <div style="font-size:0.86rem; max-width:420px; line-height:1.55; color:var(--fb-text-secondary,#94a3b8);">Google blocks this page from being embedded by a browser or PWA. Yayra did not open another browser. Use the Yayra desktop or mobile app to view it in Yayra's built-in website engine.</div>
+      <button type="button" class="fb-btn fb-google-in-app-back-btn" style="padding:8px 16px;">Back in Yayra</button>
+    `;
+    fallback.querySelector('.fb-google-in-app-back-btn')?.addEventListener('click', () => {
+      const activeTab = this.getActiveTab();
+      if (activeTab) this._inAppOnlyGoogleTabs.delete(activeTab.id);
+      if (this.goBack()) this.render();
+      else this.navigateActiveTab('yayra://newtab');
+    });
+    return fallback;
+  }
+
+  /**
    * Recognise a SEARCH-RESULTS url and extract its query: Google, Bing,
    * Yahoo, Startpage and DuckDuckGo SERPs. Returns { engine, query } or
    * null. VERIFIED Oct 2026: NO major search engine - including
@@ -3083,6 +3114,14 @@ export class BrowserShell {
       // Facebook genuinely open IN Yayra, no "open in other app" handoff.
       if (tabId && this.capacitorTabWeb) {
         this.attachAndroidTabWebview(wrapper, tabId, url);
+        return { wrapper, iframe: null };
+      }
+      // Voice/Lens explicitly promised to remain inside Yayra. A plain web
+      // page cannot override Google's frame policy, so keep an honest card
+      // here instead of allowing either auto-external path below.
+      if (this.isGoogleFeatureInAppOnly(tabId, url)) {
+        wrapper.appendChild(this.buildGoogleInAppOnlyFallback(url));
+        if (typeof onLoaded === 'function') onLoaded();
         return { wrapper, iframe: null };
       }
       // SEARCHES: no major engine allows embedded results anymore
@@ -3747,6 +3786,7 @@ export class BrowserShell {
         const pendingHandoff = this._systemBrowserHandoffs.get(tabId);
         if (pendingHandoff && evt.url && pendingHandoff.url !== evt.url) this._systemBrowserHandoffs.delete(tabId);
         tab.url = evt.url || tab.url;
+        if (!this.isGoogleOwnedUrl(tab.url)) this._inAppOnlyGoogleTabs.delete(tabId);
         tab.isSecure = (tab.url || '').startsWith('https://');
         tab.canGoBack = Boolean(evt.canGoBack);
         tab.canGoForward = Boolean(evt.canGoForward);
@@ -4571,25 +4611,43 @@ export class BrowserShell {
     return `https://lens.google.com${path}?${params.toString()}`;
   }
 
-  async openGoogleFeatureExternally(feature) {
+  isGoogleOwnedUrl(value) {
+    try {
+      const parsed = new URL(value);
+      const host = parsed.hostname.toLowerCase();
+      return parsed.protocol === 'https:'
+        && (host === 'google.com' || host.endsWith('.google.com'));
+    } catch {
+      return false;
+    }
+  }
+
+  isGoogleFeatureInAppOnly(tabId, value) {
+    return Boolean(tabId)
+      && this._inAppOnlyGoogleTabs.has(tabId)
+      && this.isGoogleOwnedUrl(value);
+  }
+
+  /**
+   * Google Voice Search and Lens are allowed to navigate, but ONLY through
+   * the active Yayra tab. Electron uses its WebContentsView, Android uses its
+   * native tab WebView, and web/PWA gets an honest in-tab limitation instead
+   * of window.open. No system-browser bridge is consulted by this path.
+   */
+  openGoogleFeatureInYayra(feature, resultUrl = '') {
     const urls = {
       voice: 'https://www.google.com/',
       lens: 'https://lens.google.com/'
     };
-    if (!Object.prototype.hasOwnProperty.call(urls, feature)) return false;
-    const bridge = this.systemBridge;
-    if (bridge && typeof bridge.openGoogleFeature === 'function') {
-      try {
-        const result = await bridge.openGoogleFeature(feature);
-        if (result?.ok) return true;
-      } catch { /* fall through to the platform browser */ }
-    }
-    try {
-      await this.openExternally(urls[feature]);
-      return true;
-    } catch {
-      return false;
-    }
+    const target = resultUrl || urls[feature];
+    if (!Object.prototype.hasOwnProperty.call(urls, feature)
+      || !this.isGoogleOwnedUrl(target)
+      || this.isSystemBrowserAuthHost(target)) return false;
+    const tab = this.getActiveTab();
+    if (!tab) return false;
+    this._inAppOnlyGoogleTabs.add(tab.id);
+    this.navigateActiveTab(target);
+    return true;
   }
 
   async uploadGoogleLensNatively(file, startedAt) {
@@ -4638,9 +4696,11 @@ export class BrowserShell {
   /**
    * Google Lens handoff shown over the new-tab page. Image URLs navigate to
    * Google's public upload-by-URL route in the active Yayra tab. Local image
-   * files go straight to lens.google.com: through a trusted native transport
-   * on Electron/Android (avoids renderer CORS and popup failures), or through
-   * Google's own multipart form on web/PWA. No Yayra server sees the image.
+   * files go straight to lens.google.com through a trusted native transport
+   * on Electron/Android (avoids renderer CORS and popup failures). Web/PWA
+   * keeps the chooser in place rather than opening an external browser, since
+   * Google forbids its result page from being embedded. No Yayra server sees
+   * the image.
    */
   openGoogleLensSearch(viewport) {
     if (!viewport || typeof document === 'undefined') return;
@@ -4662,7 +4722,7 @@ export class BrowserShell {
           <h2 id="fb-google-lens-title">Search any image with Lens</h2>
           <button type="button" class="fb-google-lens-close" aria-label="Close Google Lens">${Icons.close}</button>
         </header>
-        <form class="fb-google-lens-upload-form" action="${escapeAttr(initialUploadUrl)}" method="post" enctype="multipart/form-data" target="_blank" rel="noopener">
+        <form class="fb-google-lens-upload-form" action="${escapeAttr(initialUploadUrl)}" method="post" enctype="multipart/form-data" data-yayra-in-app-only="true">
           <label class="fb-google-lens-dropzone">
             <span class="fb-google-lens-art" aria-hidden="true">${Icons.lens}</span>
             <span>Drag an image here or <span class="fb-google-lens-upload-link">upload a file</span></span>
@@ -4682,6 +4742,9 @@ export class BrowserShell {
     const uploadForm = overlay.querySelector('.fb-google-lens-upload-form');
     const fileInput = overlay.querySelector('.fb-google-lens-file');
     const urlInput = overlay.querySelector('.fb-google-lens-url');
+    // Defense in depth: an Enter key or synthetic submit must never navigate
+    // the shell document or create a new browsing context.
+    uploadForm?.addEventListener('submit', (event) => event.preventDefault());
 
     const submitLocalImage = async () => {
       const file = fileInput?.files?.[0];
@@ -4716,35 +4779,19 @@ export class BrowserShell {
           }
         } catch { /* malformed native result is rejected */ }
         close();
-        if (nativeResult?.ok && safeResultUrl) {
-          this.navigateActiveTab(safeResultUrl);
-          return;
-        }
-        await this.openGoogleFeatureExternally('lens');
-        this.showTransientNotice('Google Lens opened directly. Choose the image again to continue.');
+        if (nativeResult?.ok && safeResultUrl
+          && this.openGoogleFeatureInYayra('lens', safeResultUrl)) return;
+        this.openGoogleFeatureInYayra('lens');
+        this.showTransientNotice('Google Lens stayed in this Yayra tab. Choose the image again to continue.');
         return;
       }
 
-      // Web/PWA: use the same multipart contract as Chromium's new-tab Lens
-      // form. `submit()` is intentional (Chrome does the same) so no local
-      // validation handler can intercept the Google navigation.
-      uploadForm.action = this.buildGoogleLensUrl('/v3/upload', {
-        entrypoint: 'cntpubb',
-        startedAt
-      });
-      uploadForm.target = '_blank';
-      uploadForm.rel = 'noopener';
-      try {
-        if (typeof uploadForm.submit === 'function') uploadForm.submit();
-        else if (typeof uploadForm.requestSubmit === 'function') uploadForm.requestSubmit();
-        else throw new Error('form-submit-unavailable');
-        this.showTransientNotice('Opening your image directly in Google Lens...');
-        setTimeout(close, 0);
-      } catch {
-        close();
-        await this.openGoogleFeatureExternally('lens');
-        this.showTransientNotice('Google Lens opened directly. Choose the image again to continue.');
-      }
+      // A browser/PWA cannot POST a local file into Google's frame-hostile
+      // Lens page without navigating the whole Yayra app or opening another
+      // browser tab. Neither is acceptable: keep the chooser in Yayra and be
+      // explicit. Desktop and Android use the native direct-to-Google upload
+      // transports above, so installed Yayra apps retain the complete flow.
+      this.showTransientNotice('To keep Lens inside Yayra, local image upload requires the Yayra desktop or mobile app. No external browser was opened.');
     };
 
     const submitImageUrl = () => {
@@ -4768,7 +4815,7 @@ export class BrowserShell {
         return;
       }
       close();
-      this.navigateActiveTab(this.buildGoogleLensUrl('/uploadbyurl', {
+      this.openGoogleFeatureInYayra('lens', this.buildGoogleLensUrl('/uploadbyurl', {
         entrypoint: 'cntpubu',
         imageUrl: imageUrl.href,
         startedAt: Date.now()
@@ -4837,7 +4884,7 @@ export class BrowserShell {
           <div id="fb-google-voice-status" class="fb-google-voice-status">Waiting...</div>
           <div class="fb-google-voice-transcript"></div>
           <div class="fb-google-voice-help" hidden></div>
-          <button type="button" class="fb-google-voice-google-btn" hidden>Open Google Voice Search</button>
+          <button type="button" class="fb-google-voice-google-btn" hidden>Open Google in Yayra</button>
         </div>
         <div class="fb-google-voice-mic-container">
           <div class="fb-google-voice-volume">
@@ -4919,12 +4966,12 @@ export class BrowserShell {
           break;
         case 'language-not-supported':
           status.textContent = 'This language isn’t supported';
-          help.textContent = 'Continue on Google to choose another input method.';
+          help.textContent = 'Continue to Google inside Yayra to choose another input method.';
           setHidden(googleButton, false);
           break;
         default:
-          status.textContent = 'Voice search is unavailable here';
-          help.textContent = 'Open Google Voice Search in your full browser to use Google’s own microphone service.';
+          status.textContent = 'Voice recognition is unavailable here';
+          help.textContent = 'Open Google inside this Yayra tab to continue without launching another browser.';
           setHidden(googleButton, false);
           break;
       }
@@ -4939,7 +4986,7 @@ export class BrowserShell {
       status.textContent = 'Searching...';
       if (searchInput) searchInput.value = finalText;
       dismiss({ abort: false });
-      this.navigateActiveTab(`https://www.google.com/search?q=${encodeURIComponent(finalText)}`);
+      this.openGoogleFeatureInYayra('voice', `https://www.google.com/search?q=${encodeURIComponent(finalText)}`);
       return true;
     };
 
@@ -5099,10 +5146,9 @@ export class BrowserShell {
       }
       startRecognition();
     });
-    googleButton?.addEventListener('click', async () => {
+    googleButton?.addEventListener('click', () => {
       dismiss();
-      const opened = await this.openGoogleFeatureExternally('voice');
-      if (!opened) this.navigateActiveTab('https://www.google.com/');
+      this.openGoogleFeatureInYayra('voice');
     });
 
     overlay.focus?.();
@@ -13045,7 +13091,7 @@ export class BrowserShell {
     drawer.querySelector('.fb-dr-lens')?.addEventListener('click', () => {
       this.state.isSideDrawerOpen = false;
       const url = activeTab.url || 'https://yayra.app';
-      this.navigateActiveTab(`https://lens.google.com/uploadbyurl?url=${encodeURIComponent(url)}`);
+      this.openGoogleFeatureInYayra('lens', `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(url)}`);
     });
 
     drawer.querySelector('.fb-dr-translate')?.addEventListener('click', () => {
@@ -14607,6 +14653,7 @@ export class BrowserShell {
 
     this.destroyNativeWebview(tabId);
     this._systemBrowserHandoffs.delete(tabId);
+    this._inAppOnlyGoogleTabs.delete(tabId);
     this._pageSnapshots.delete(tabId); // closed tab, dead preview
 
     const [closedTab] = this.state.tabs.splice(tabIndex, 1);
@@ -14900,6 +14947,11 @@ export class BrowserShell {
     if (!query) return;
 
     const targetUrl = this.interpretUrl(query);
+    const googleFeatureInAppOnly = this.isGoogleFeatureInAppOnly(activeTab.id, targetUrl);
+    // Leaving Google ends the special Voice/Lens routing promise for this
+    // tab. Other ordinary Google navigations remain in-app while the user is
+    // still following the Voice/Lens result chain.
+    if (!googleFeatureInAppOnly) this._inAppOnlyGoogleTabs.delete(activeTab.id);
     // An explicit navigation (including re-entering the same auth URL) is a
     // fresh attempt, unlike a render. It may therefore launch the browser once
     // again; passive chrome updates may not.
@@ -14945,6 +14997,7 @@ export class BrowserShell {
     // honest already-opened state; the per tab+url keys keep the render
     // path from opening a second tab.
     if (/^https?:\/\//i.test(targetUrl)
+      && !googleFeatureInAppOnly
       && !this.nativeWebview && !this.capacitorBrowser && !this.capacitorTabWeb
       && !this.isSystemBrowserAuthHost(targetUrl) // recognized auth endpoints have their OWN single handoff
       && typeof window !== 'undefined' && typeof window.open === 'function') {
@@ -15033,6 +15086,7 @@ export class BrowserShell {
     if (navigationState.currentIndex <= 0) return false;
     navigationState.currentIndex -= 1;
     activeTab.url = navigationState.historyStack[navigationState.currentIndex];
+    if (!this.isGoogleOwnedUrl(activeTab.url)) this._inAppOnlyGoogleTabs.delete(activeTab.id);
     activeTab.title = this.getTabTitle(activeTab);
     activeTab.isSecure = activeTab.url.startsWith('https://') || activeTab.url.startsWith('yayra://');
     activeTab.canGoBack = navigationState.currentIndex > 0;
@@ -15055,6 +15109,7 @@ export class BrowserShell {
     if (navigationState.currentIndex >= navigationState.historyStack.length - 1) return false;
     navigationState.currentIndex += 1;
     activeTab.url = navigationState.historyStack[navigationState.currentIndex];
+    if (!this.isGoogleOwnedUrl(activeTab.url)) this._inAppOnlyGoogleTabs.delete(activeTab.id);
     activeTab.title = this.getTabTitle(activeTab);
     activeTab.isSecure = activeTab.url.startsWith('https://') || activeTab.url.startsWith('yayra://');
     activeTab.canGoBack = navigationState.currentIndex > 0;
@@ -17267,6 +17322,7 @@ export class BrowserShell {
       try { this._stopOverlayGrantWatch(); } catch { /* already stopped */ }
       this._stopOverlayGrantWatch = null;
     }
+    this._inAppOnlyGoogleTabs?.clear?.();
     if (this.webFrameLayer) {
       this.webFrameLayer.remove();
       this.webFrameLayer = null;

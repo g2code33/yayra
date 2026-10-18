@@ -204,9 +204,6 @@ const api = {
   // manager and real desktop shortcuts for "Create desktop shortcut...".
   system: {
     appMetrics: () => ipcRenderer.invoke('yayra:app-metrics'),
-    // Google-owned feature handoffs. The main process accepts only this
-    // bounded enum; arbitrary external URLs are deliberately not exposed.
-    openGoogleFeature: (feature) => ipcRenderer.invoke('yayra:open-google-feature', { feature }),
     // Direct image bytes -> Google's official Lens endpoint. The image never
     // passes through a Yayra server and the main process validates type/size.
     googleLensUpload: ({ name, type, data, language, startedAt } = {}) => ipcRenderer.invoke('yayra:google-lens-upload', {

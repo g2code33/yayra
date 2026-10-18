@@ -1693,8 +1693,8 @@ button.fb-site-passkey-indicator {
   opacity: 1;
 }
 
-/* Google Lens stays a first-party Google handoff: Yayra supplies the same
-   upload/URL chooser, then sends the image directly to lens.google.com. */
+/* Google Lens stays a first-party Google in-Yayra flow: Yayra supplies the
+   upload/URL chooser, then loads Google's result in the same Yayra tab. */
 .fb-google-lens-overlay {
   position: absolute;
   inset: 0;

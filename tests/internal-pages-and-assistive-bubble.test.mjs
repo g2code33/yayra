@@ -271,6 +271,9 @@ test('In-Tab Internal Pages: Redesigned yayra://newtab with search box and focus
   assert.equal(lensUploadUrl.searchParams.get('re'), 'df');
   assert.equal(lensUploadUrl.searchParams.get('s'), '4');
   assert.equal(lensOverlay.querySelector('.fb-google-lens-file')?.getAttribute('name'), 'encoded_image');
+  assert.equal(lensOverlay.querySelector('.fb-google-lens-upload-form')?.getAttribute('target'), null,
+    'Lens never targets a new/external browser window');
+  assert.equal(lensOverlay.querySelector('.fb-google-lens-upload-form')?.getAttribute('data-yayra-in-app-only'), 'true');
   lensOverlay.querySelector('.fb-google-lens-url').value = 'https://example.com/cat.png';
   lensOverlay.querySelector('.fb-google-lens-url-search').click();
   const lensUrl = new URL(lensTarget);
@@ -343,19 +346,17 @@ test('In-Tab Internal Pages: Redesigned yayra://newtab with search box and focus
     delete window.SpeechRecognition;
     searchbox.querySelector('.fb-newtab-mic-btn').click();
     const fallbackOverlay = container.querySelector('.fb-google-voice-overlay');
-    assert.equal(fallbackOverlay.querySelector('.fb-google-voice-status').textContent, 'Voice search is unavailable here');
+    assert.equal(fallbackOverlay.querySelector('.fb-google-voice-status').textContent, 'Voice recognition is unavailable here');
     assert.equal(fallbackOverlay.querySelector('.fb-google-voice-google-btn').hasAttribute('hidden'), false,
-      'unsupported sessions provide an explicit Google fallback');
+      'unsupported sessions provide an explicit in-Yayra Google fallback');
     const fallbackButton = fallbackOverlay.querySelector('.fb-google-voice-google-btn');
-    assert.match(fallbackButton.textContent, /Google Voice Search/);
-    let googleVoiceHandoff = null;
-    shell.openGoogleFeatureExternally = async (feature) => {
-      googleVoiceHandoff = feature;
-      return true;
-    };
+    assert.match(fallbackButton.textContent, /Google in Yayra/);
+    lensTarget = null;
     fallbackButton.click();
     await new Promise((resolve) => setTimeout(resolve, 0));
-    assert.equal(googleVoiceHandoff, 'voice', 'fallback hands control to Google’s own voice-search surface');
+    assert.equal(lensTarget, 'https://www.google.com/',
+      'fallback navigates the active Yayra tab instead of handing off to an external browser');
+    assert.equal(shell._inAppOnlyGoogleTabs.has(shell.getActiveTab().id), true);
     assert.equal(container.querySelector('.fb-google-voice-overlay'), null);
 
     window.Capacitor = {

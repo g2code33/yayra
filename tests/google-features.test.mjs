@@ -5,19 +5,10 @@ import { readFileSync } from 'node:fs';
 
 const require = createRequire(import.meta.url);
 const {
-  GOOGLE_FEATURE_URLS,
   GOOGLE_LENS_MAX_BYTES,
   buildGoogleLensUploadUrl,
   uploadGoogleLensImage
 } = require('../electron/googleFeatures.cjs');
-
-test('Google features: external handoffs are a closed Google-only enum', () => {
-  assert.deepEqual(GOOGLE_FEATURE_URLS, {
-    voice: 'https://www.google.com/',
-    lens: 'https://lens.google.com/'
-  });
-  assert.equal(GOOGLE_FEATURE_URLS['https://example.com'], undefined);
-});
 
 test('Google Lens: native uploads use Chromium current endpoint contract and multipart image field', async () => {
   let request = null;
@@ -77,6 +68,14 @@ test('Google Lens: native transport rejects unsafe payloads and non-Google resul
     type: 'image/png'
   });
   assert.equal(untrustedRedirect.ok, false);
+
+  const authRedirect = await uploadGoogleLensImage({
+    netFetch: async () => ({ ok: true, status: 200, url: 'https://accounts.google.com/o/oauth2/auth' }),
+    data: new Uint8Array([1]),
+    name: 'safe.png',
+    type: 'image/png'
+  });
+  assert.equal(authRedirect.ok, false, 'Lens cannot redirect into the external OAuth handoff path');
 });
 
 test('Google Lens: URL builder normalizes invalid locale input', () => {
@@ -85,13 +84,15 @@ test('Google Lens: URL builder normalizes invalid locale input', () => {
   assert.equal(url.searchParams.get('st'), '42');
 });
 
-test('Desktop Google features: preload and trusted main-process handlers are connected', () => {
+test('Desktop Google features: Lens upload is connected but external Voice/Lens handoff IPC does not exist', () => {
   const main = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
   const preload = readFileSync(new URL('../electron/preload.cjs', import.meta.url), 'utf8');
   assert.match(main, /ipcMain\.handle\('yayra:google-lens-upload'/);
-  assert.match(main, /ipcMain\.handle\('yayra:open-google-feature'/);
   assert.match(preload, /googleLensUpload:[\s\S]*yayra:google-lens-upload/);
-  assert.match(preload, /openGoogleFeature:[\s\S]*yayra:open-google-feature/);
+  assert.doesNotMatch(main, /yayra:open-google-feature/,
+    'main process cannot launch Voice or Lens in the system browser');
+  assert.doesNotMatch(preload, /openGoogleFeature|yayra:open-google-feature/,
+    'renderer is not exposed an external Google-feature launcher');
 });
 
 test('Android Google features: native speech result and direct Lens upload are wired into the Capacitor plugin', () => {
