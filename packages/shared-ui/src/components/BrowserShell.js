@@ -1971,7 +1971,9 @@ export class BrowserShell {
         const titleText = this.getTabTitle(tab);
         let addressText = String(tab.url || '');
         try { addressText = new URL(tab.url).host + new URL(tab.url).pathname; } catch { /* internal or empty URL */ }
-        tabEl.setAttribute('title', `${titleText}${addressText ? ` — ${addressText}` : ''}`);
+        // The custom hover card replaces the native `title` tooltip. Keeping
+        // both produced the doubled black-on-black labels seen on New Tab.
+        tabEl.setAttribute('aria-label', `${titleText}${addressText ? `, ${addressText}` : ''}`);
         const showHoverCard = () => {
           if (this._tabHoverTimer) clearTimeout(this._tabHoverTimer);
           this._tabHoverTimer = setTimeout(() => {
@@ -1979,6 +1981,7 @@ export class BrowserShell {
             this._activeTabHoverCard?.remove?.();
             const card = document.createElement('div');
             card.className = 'fb-tab-hover-card';
+            card.setAttribute('role', 'tooltip');
             const cardTitle = document.createElement('strong');
             cardTitle.textContent = titleText;
             const cardAddress = document.createElement('span');
@@ -1988,7 +1991,8 @@ export class BrowserShell {
             const rect = tabEl.getBoundingClientRect?.();
             const width = typeof window !== 'undefined' ? (Number(window.innerWidth) || 1280) : 1280;
             const height = typeof window !== 'undefined' ? (Number(window.innerHeight) || 800) : 800;
-            const left = Math.max(8, Math.min(Number(rect?.left) || 8, width - 296));
+            const cardWidth = Math.min(280, Math.max(0, width - 16));
+            const left = Math.max(8, Math.min(Number(rect?.left) || 8, width - cardWidth - 8));
             const top = Math.max(8, Math.min((Number(rect?.bottom) || 0) + 8, height - 96));
             card.style.left = `${left}px`;
             card.style.top = `${top}px`;
@@ -8588,35 +8592,36 @@ export class BrowserShell {
   }
 
   /** Generic single-line text prompt (window.prompt is dead in Electron renderers). */
-  _textPromptDialog({ title, description = '', placeholder = '', initialValue = '' } = {}) {
+  _textPromptDialog({ title, description = '', placeholder = '', initialValue = '', placement = 'center' } = {}) {
     return new Promise((resolve) => {
       if (typeof document === 'undefined' || !document.body) { resolve(null); return; }
+      const isTabGroupPrompt = placement === 'tab-groups';
       const overlay = document.createElement('div');
-      overlay.className = 'fb-text-prompt-overlay';
+      overlay.className = `fb-text-prompt-overlay${isTabGroupPrompt ? ' fb-text-prompt-tab-groups' : ''}`;
       overlay.setAttribute('role', 'presentation');
-      overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(8,10,16,0.62);display:flex;align-items:center;justify-content:center;';
       const promptTitleId = `yayra-text-prompt-title-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const card = document.createElement('div');
+      card.className = 'fb-text-prompt-dialog';
       card.setAttribute('role', 'dialog');
       card.setAttribute('aria-modal', 'true');
       card.setAttribute('aria-labelledby', promptTitleId);
-      card.style.cssText = 'background:var(--fb-bg-elevated,#171a22);color:var(--fb-text-primary,#f3f4f6);border-radius:16px;padding:22px;max-width:380px;width:92%;box-shadow:0 18px 60px rgba(0,0,0,0.5);display:flex;flex-direction:column;gap:12px;';
       const h = document.createElement('strong');
       h.id = promptTitleId;
+      h.className = 'fb-text-prompt-title';
       h.textContent = title;
       card.appendChild(h);
       if (description) {
         const p = document.createElement('p');
+        p.className = 'fb-text-prompt-description';
         p.textContent = description;
-        p.style.cssText = 'margin:0;font-size:0.84rem;color:var(--fb-text-secondary,#9ca3af);line-height:1.5;';
         card.appendChild(p);
       }
       const input = document.createElement('input');
       input.type = 'text';
+      input.className = 'fb-text-prompt-input';
       input.placeholder = placeholder;
       input.value = initialValue;
       input.setAttribute('aria-label', title || 'Text input');
-      input.style.cssText = 'padding:10px;border-radius:10px;border:1px solid var(--fb-border,#2a2f3b);background:var(--fb-bg,#101218);color:inherit;font-size:0.95rem;';
       card.appendChild(input);
       let finished = false;
       const done = (value) => {
@@ -8634,14 +8639,16 @@ export class BrowserShell {
         resolve(value);
       };
       const row = document.createElement('div');
-      row.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;';
+      row.className = 'fb-text-prompt-actions';
       const cancel = document.createElement('button');
+      cancel.type = 'button';
+      cancel.className = 'fb-text-prompt-button fb-text-prompt-cancel';
       cancel.textContent = 'Cancel';
-      cancel.style.cssText = 'padding:10px 14px;border:none;border-radius:10px;font-weight:600;cursor:pointer;background:var(--fb-bg,#232734);color:inherit;';
       cancel.addEventListener('click', () => done(null));
       const ok = document.createElement('button');
+      ok.type = 'button';
+      ok.className = 'fb-text-prompt-button fb-text-prompt-save';
       ok.textContent = 'Save';
-      ok.style.cssText = 'padding:10px 14px;border:none;border-radius:10px;font-weight:600;cursor:pointer;background:var(--fb-accent,#6d5df2);color:#fff;';
       ok.addEventListener('click', () => done(input.value.trim()));
       row.appendChild(cancel);
       row.appendChild(ok);
@@ -9828,7 +9835,8 @@ export class BrowserShell {
       title: 'Rename tab group',
       description: 'Choose a name for this group of tabs.',
       placeholder: 'e.g. Research, Shopping, Work',
-      initialValue: group.name
+      initialValue: group.name,
+      placement: 'tab-groups'
     });
     if (prompted === null || prompted === undefined) return false;
     const name = String(prompted).replace(/\s+/g, ' ').trim().slice(0, 48);
@@ -10117,7 +10125,8 @@ export class BrowserShell {
       title: 'New tab group',
       description: 'Give this group a name. The current tab and a fresh tab will be added.',
       placeholder: 'e.g. Research, Shopping, Work',
-      initialValue: ''
+      initialValue: '',
+      placement: 'tab-groups'
     });
     if (prompted === null || prompted === undefined) return false;
     const groupName = String(prompted).replace(/\s+/g, ' ').trim().slice(0, 48);
@@ -10141,7 +10150,13 @@ export class BrowserShell {
   async groupTabWithPrompt(tabId, { title, description, placeholder, initialValue = '' } = {}) {
     const tab = this.state.tabs.find((candidate) => candidate.id === tabId);
     if (!tab) return false;
-    const prompted = await this._textPromptDialog({ title, description, placeholder, initialValue });
+    const prompted = await this._textPromptDialog({
+      title,
+      description,
+      placeholder,
+      initialValue,
+      placement: 'tab-groups'
+    });
     if (prompted === null || prompted === undefined) return false;
     const groupName = String(prompted).replace(/\s+/g, ' ').trim().slice(0, 48);
     if (!groupName) {

@@ -364,6 +364,10 @@ test('TAB GROUP PICKER: New group opens a visible, keyboard-ready prompt and pub
 
     const overlay = document.body.querySelector('.fb-text-prompt-overlay');
     assert.ok(overlay, 'New group opens the custom prompt instead of silently doing nothing');
+    assert.ok(overlay.classList.contains('fb-text-prompt-tab-groups'),
+      'the group-name prompt stays in the compact upper-left tab-group position');
+    assert.ok(overlay.querySelector('.fb-text-prompt-dialog'),
+      'the prompt uses the theme-safe opaque dialog surface');
     assert.equal(overlay.querySelector('[role="dialog"]')?.getAttribute('aria-modal'), 'true', 'the prompt exposes an accessible modal dialog');
     assert.equal(shell.state.isPageObscured, true, 'the renderer marks the prompt as a blocking overlay');
     assert.equal(shell.healStuckPageSurface(), false, 'render-time surface healing keeps the live prompt in front');
