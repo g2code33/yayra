@@ -330,14 +330,17 @@ test('webview task metrics and background throttling are scoped to the requestin
   const hostB = { id: 202, send() {}, isDestroyed: () => false };
   const ensure = handlers.get('yayra:webview-ensure');
   await ensure({ sender: hostA }, { tabId: 'tab-1', url: 'https://a.example/' });
-  const applied = await handlers.get('yayra:webview-set-background-throttling')({ sender: hostA }, { enabled: false });
-  assert.deepEqual(applied, { ok: true, enabled: false, updated: 1 });
-  assert.deepEqual(views[0].webContents._calls.at(-1), ['setBackgroundThrottling', false]);
+  assert.deepEqual(views[0].webContents._calls.at(-1), ['setBackgroundThrottling', false],
+    'live-sites is the fail-open default even before a renderer preference arrives');
+  const applied = await handlers.get('yayra:webview-set-background-throttling')({ sender: hostA }, { enabled: true });
+  assert.deepEqual(applied, { ok: true, enabled: true, updated: 1 });
+  assert.deepEqual(views[0].webContents._calls.at(-1), ['setBackgroundThrottling', true]);
 
   await ensure({ sender: hostA }, { tabId: 'tab-2', url: 'https://b.example/' });
-  assert.deepEqual(views[1].webContents._calls.at(-1), ['setBackgroundThrottling', false], 'future tabs inherit the shell window preference');
+  assert.deepEqual(views[1].webContents._calls.at(-1), ['setBackgroundThrottling', true], 'future tabs inherit the shell window preference');
   await ensure({ sender: hostB }, { tabId: 'tab-1', url: 'https://other.example/' });
-  assert.equal(views[2].webContents._calls.some((call) => Array.isArray(call) && call[0] === 'setBackgroundThrottling'), false, 'another shell keeps Electron default');
+  assert.deepEqual(views[2].webContents._calls.at(-1), ['setBackgroundThrottling', false],
+    'another shell independently defaults to live sites');
 
   const taskTabs = await handlers.get('yayra:webview-list-task-tabs')({ sender: hostA });
   assert.equal(taskTabs.ok, true);

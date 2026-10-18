@@ -1548,10 +1548,16 @@ function createWebviewBridge({
     }
     if (!entry) {
       entry = createView(key, tabId, isPrivate, hostWc, win, profileId);
-      const backgroundThrottling = hostWc ? backgroundThrottlingByHost.get(hostWc) : undefined;
-      if (typeof backgroundThrottling === 'boolean'
-        && typeof entry.view.webContents.setBackgroundThrottling === 'function') {
-        try { entry.view.webContents.setBackgroundThrottling(backgroundThrottling); } catch { /* keep Electron's default */ }
+      const configuredBackgroundThrottling = hostWc ? backgroundThrottlingByHost.get(hostWc) : undefined;
+      // Live-sites is fail-open: even if the renderer's startup preference
+      // IPC raced or an older preload never sent it, background pages keep
+      // timers/media/sockets active instead of silently freezing. A user can
+      // still explicitly enable throttling from Performance settings.
+      const backgroundThrottling = typeof configuredBackgroundThrottling === 'boolean'
+        ? configuredBackgroundThrottling
+        : false;
+      if (typeof entry.view.webContents.setBackgroundThrottling === 'function') {
+        try { entry.view.webContents.setBackgroundThrottling(backgroundThrottling); } catch { /* unsupported Electron host */ }
       }
       win.contentView.addChildView(entry.view);
     }

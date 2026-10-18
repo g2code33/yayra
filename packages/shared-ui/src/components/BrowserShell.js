@@ -347,7 +347,12 @@ export class BrowserShell {
         searchEngine: 'google', // Requirement 13: Default search engine is Google
         tabSwitcherView: 'grid', // 'grid' keeps the existing preview cards; 'list' is the compact Chrome-style tab search
         performanceIssueAlerts: true,
-        backgroundTabThrottling: true,
+        // Live-sites mode is the default: background tabs keep timers,
+        // media, sockets and real-time page updates active. The legacy
+        // throttling field stays synchronized for stored-settings/backward
+        // compatibility, but the positive keepSitesLive setting owns UI.
+        keepSitesLive: true,
+        backgroundTabThrottling: false,
         dimInactiveTabs: true,
         tabHoverCards: true,
         reduceMotionForPerformance: false,
@@ -1048,12 +1053,19 @@ export class BrowserShell {
         console.warn('Failed to load settings in BrowserShell:', err);
       }
     }
-    // Apply the saved background-tab policy to this window's native pages.
-    // The main process remembers it for views created later in this window.
+    // v1 live-sites policy: old profiles may carry the previous default
+    // `backgroundTabThrottling:true`, but they have no keepSitesLive key.
+    // The new positive setting defaults to true, so existing installs also
+    // become live immediately after upgrading rather than needing a manual
+    // preference reset. Keep the legacy field synchronized for older code.
+    this.state.settings.backgroundTabThrottling = this.state.settings.keepSitesLive === false;
+
+    // Apply the saved live-sites policy to this window's native pages. The
+    // main process remembers it for views created later in this window.
     try {
       const webview = this.nativeWebview;
       if (typeof webview?.setBackgroundThrottling === 'function') {
-        await webview.setBackgroundThrottling(this.state.settings.backgroundTabThrottling !== false);
+        await webview.setBackgroundThrottling(this.state.settings.keepSitesLive === false);
       }
     } catch { /* the web/PWA build has no native webview policy bridge */ }
 
@@ -1373,6 +1385,7 @@ export class BrowserShell {
       target.innerHTML = '';
     }
     const activeTab = this.getActiveTab();
+    const activeTabWasLoading = Boolean(activeTab?.isLoading);
     const isPrivate = activeTab?.isPrivate;
 
     const shell = document.createElement('div');
@@ -1480,6 +1493,13 @@ export class BrowserShell {
     target.appendChild(shell);
     this.rootElement = shell;
 
+    // A pooled frame can begin a real navigation while this render is being
+    // assembled. Reconcile only when that state actually changed; ordinary
+    // renders leave favicons/controls untouched and avoid needless churn.
+    if (activeTab && Boolean(activeTab.isLoading) !== activeTabWasLoading) {
+      this.refreshLoadingUi(activeTab.id);
+    }
+
     // Maintain persistent assistive bubble in the DOM
     this.ensurePersistentAssistiveBubble();
 
@@ -1586,6 +1606,11 @@ export class BrowserShell {
           }
         }, 450);
       });
+      iframe.addEventListener('error', () => {
+        // Network/frame failures must settle the chrome immediately too;
+        // leaving an eternal loader forces users to guess and refresh.
+        this.updateTabLoading(tab.id, false);
+      });
       host.appendChild(iframe);
       layer.appendChild(host);
       this.webFrames.set(tab.id, frame);
@@ -1598,6 +1623,10 @@ export class BrowserShell {
       frame.blockedFallbackShown = false;
       const stale = frame.host.querySelector ? frame.host.querySelector('.fb-frame-blocked-fallback') : null;
       if (stale) stale.remove();
+      // This includes memory-saver rehydration: loading begins because a
+      // real iframe navigation begins, not because chrome happened to
+      // re-render. The matching load/error event settles it live.
+      this.updateTabLoading(tab.id, true);
       frame.iframe.src = tab.url;
     }
     frame.lastMountedAt = ++this._pooledFrameEpoch; // monotonic: eviction order is always exact mount order
@@ -2397,6 +2426,16 @@ export class BrowserShell {
     toolbarActions.appendChild(menuBtn);
 
     navbar.appendChild(toolbarActions);
+    // Native WebContentsViews paint above the HTML viewport, so the viewport
+    // strip alone can be hidden behind the site surface. Mirror it at the
+    // bottom edge of renderer-owned chrome where it is always visible.
+    const chromeProgress = document.createElement('div');
+    chromeProgress.className = 'fb-page-loading-bar fb-chrome-site-loading-bar';
+    chromeProgress.setAttribute('role', 'progressbar');
+    chromeProgress.setAttribute('aria-label', 'Website loading');
+    chromeProgress.setAttribute('aria-valuetext', activeTab.isLoading ? 'Loading website' : 'Website loaded');
+    chromeProgress.style.display = activeTab.isLoading ? 'block' : 'none';
+    navbar.appendChild(chromeProgress);
     root.appendChild(navbar);
 
     // Persistent "Restore pages?" bar: docked INTO the chrome (never
@@ -2513,6 +2552,13 @@ export class BrowserShell {
       safariTabbar.appendChild(button);
     });
     topBar.appendChild(safariTabbar);
+    const mobileChromeProgress = document.createElement('div');
+    mobileChromeProgress.className = 'fb-page-loading-bar fb-chrome-site-loading-bar';
+    mobileChromeProgress.setAttribute('role', 'progressbar');
+    mobileChromeProgress.setAttribute('aria-label', 'Website loading');
+    mobileChromeProgress.setAttribute('aria-valuetext', activeTab.isLoading ? 'Loading website' : 'Website loaded');
+    mobileChromeProgress.style.display = activeTab.isLoading ? 'block' : 'none';
+    topBar.appendChild(mobileChromeProgress);
     root.appendChild(topBar);
     // Same persistent restore prompt on mobile - docked, never lost.
     this.renderRestoreBar(root);
@@ -2679,12 +2725,20 @@ export class BrowserShell {
     this.activeWebFrameTabId = null;
     if (!activeTab) return;
 
-    // Page Loading Progress Bar
-    if (activeTab.isLoading) {
-      const progressBar = document.createElement('div');
-      progressBar.className = 'fb-page-loading-bar';
-      viewport.appendChild(progressBar);
-    }
+    // Always mount the active site's loading strip. Link clicks can begin a
+    // navigation entirely inside the native page/iframe, AFTER this chrome
+    // was rendered; a conditionally-created bar did not exist to turn on,
+    // so those real loads looked frozen until some unrelated refresh. Engine
+    // events now toggle this stable node in place with zero page rebuild.
+    const progressBar = document.createElement('div');
+    progressBar.className = 'fb-page-loading-bar';
+    progressBar.setAttribute('role', 'progressbar');
+    progressBar.setAttribute('aria-label', 'Website loading');
+    progressBar.setAttribute('aria-valuetext', activeTab.isLoading ? 'Loading website' : 'Website loaded');
+    progressBar.setAttribute('data-tab-id', activeTab.id);
+    progressBar.style.display = activeTab.isLoading ? 'block' : 'none';
+    viewport.setAttribute('aria-busy', activeTab.isLoading ? 'true' : 'false');
+    viewport.appendChild(progressBar);
 
     const url = activeTab.url || '';
     const isInternalPage = !url || url === 'about:blank' || url.startsWith('yayra://');
@@ -2765,6 +2819,13 @@ export class BrowserShell {
       }
       viewport.appendChild(webViewContainer);
     }
+
+    // A newly-created pooled iframe marks itself loading while this render
+    // is still being assembled. Reconcile the stable strip once more so the
+    // very first frame already reflects that state (no second render needed).
+    progressBar.style.display = activeTab.isLoading ? 'block' : 'none';
+    progressBar.setAttribute('aria-valuetext', activeTab.isLoading ? 'Loading website' : 'Website loaded');
+    viewport.setAttribute('aria-busy', activeTab.isLoading ? 'true' : 'false');
   }
 
   /* -------------------------------------------------------------
@@ -3046,6 +3107,7 @@ export class BrowserShell {
 
     const iframe = document.createElement('iframe');
     if (frameClassName) iframe.className = frameClassName;
+    if (tabId) this.updateTabLoading(tabId, true);
     iframe.src = url;
     iframe.style.cssText = 'flex:1; border:none; width:100%; height:100%;';
     iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-popups');
@@ -3079,6 +3141,11 @@ export class BrowserShell {
           // — navigation succeeded, nothing to do.
         }
       }, 450);
+    });
+    iframe.addEventListener('error', () => {
+      if (typeof onLoaded === 'function') onLoaded();
+      if (tabId) this.updateTabLoading(tabId, false);
+      showBlockedFallback();
     });
 
     wrapper.appendChild(iframe);
@@ -5989,8 +6056,8 @@ export class BrowserShell {
               <input type="checkbox" id="fb-in-performance-alerts" ${this.state.settings.performanceIssueAlerts !== false ? 'checked' : ''} />
             </div>
             <div class="fb-setting-toggle-row">
-              <div><strong>Throttle background tabs</strong><p>Allow hidden web pages to reduce background CPU work. Media and live updates may be affected by the page itself.</p></div>
-              <input type="checkbox" id="fb-in-performance-throttle" ${this.state.settings.backgroundTabThrottling !== false ? 'checked' : ''} ${this.nativeWebview?.setBackgroundThrottling ? '' : 'disabled'} />
+              <div><strong>Keep background sites live</strong><p>Keep timers, media, sockets and real-time page updates active when you switch tabs. Turn this off only when you prefer lower background CPU use.</p></div>
+              <input type="checkbox" id="fb-in-performance-live-sites" ${this.state.settings.keepSitesLive !== false ? 'checked' : ''} ${this.nativeWebview?.setBackgroundThrottling ? '' : 'disabled'} />
             </div>
             <div class="fb-setting-toggle-row">
               <div><strong>Dim inactive tabs</strong><p>Use a softer label treatment for tabs that are not selected.</p></div>
@@ -6520,22 +6587,31 @@ export class BrowserShell {
     };
 
     bind('#fb-in-performance-alerts', 'performanceIssueAlerts');
-    bind('#fb-in-performance-throttle', 'backgroundTabThrottling', async (enabled, control) => {
+    bind('#fb-in-performance-live-sites', 'keepSitesLive', async (enabled, control) => {
+      // Electron's API is phrased negatively (throttling enabled), while the
+      // user-facing promise is positive (sites stay live). Keep both stored
+      // fields synchronized so old profiles and new builds agree.
+      this.state.settings.backgroundTabThrottling = !enabled;
+      this.persistSettings();
       try {
-        const result = await this.nativeWebview?.setBackgroundThrottling?.(enabled);
+        const result = await this.nativeWebview?.setBackgroundThrottling?.(!enabled);
         if (!result?.ok) {
-          this.state.settings.backgroundTabThrottling = !enabled;
+          this.state.settings.keepSitesLive = !enabled;
+          this.state.settings.backgroundTabThrottling = enabled;
           control.checked = !enabled;
           this.persistSettings();
-          this.showTransientNotice('Could not apply background-tab throttling in this window.');
+          this.showTransientNotice('Could not change the background live-sites policy in this window.');
           return;
         }
-        this.showTransientNotice(enabled ? 'Background-tab throttling enabled.' : 'Background-tab throttling disabled.');
+        this.showTransientNotice(enabled
+          ? 'Background sites now stay live and update immediately.'
+          : 'Background site throttling enabled to reduce CPU use.');
       } catch {
-        this.state.settings.backgroundTabThrottling = !enabled;
+        this.state.settings.keepSitesLive = !enabled;
+        this.state.settings.backgroundTabThrottling = enabled;
         control.checked = !enabled;
         this.persistSettings();
-        this.showTransientNotice('Could not apply background-tab throttling in this window.');
+        this.showTransientNotice('Could not change the background live-sites policy in this window.');
       }
     });
     bind('#fb-in-performance-dim-tabs', 'dimInactiveTabs', () => this.refreshTabAppearance());
@@ -8920,7 +8996,9 @@ export class BrowserShell {
         const editedName = await this._installPageAsAppDialog({
           title,
           url: tab.url,
-          iconHtml: this.getTabFavicon(tab)
+          // An app identity must stay stable while the page is loading; the
+          // animated tab hourglass is navigation chrome, never an app icon.
+          iconHtml: this.getTabFavicon(tab, { showLoading: false })
         });
         if (editedName === null) { this.showTransientNotice('Install cancelled.'); return; }
         shortcutName = editedName;
@@ -8956,7 +9034,9 @@ export class BrowserShell {
           const editedName = await this._installPageAsAppDialog({
             title: installName,
             url: tab.url,
-            iconHtml: this.getTabFavicon(tab)
+            // Show the site's identity even when the live page is currently
+            // navigating; loading chrome is not a usable launcher icon.
+            iconHtml: this.getTabFavicon(tab, { showLoading: false })
           });
           if (editedName === null) { this.showTransientNotice('Install cancelled.'); return; }
           finalName = editedName;
@@ -10738,7 +10818,7 @@ export class BrowserShell {
         <div class="fb-nav-controls">
           <button class="fb-nav-btn fb-mini-back-btn" title="Back" aria-label="Back" ${activeTab.canGoBack ? '' : 'disabled'}>${Icons.arrowLeft}</button>
           <button class="fb-nav-btn fb-mini-fwd-btn" title="Forward" aria-label="Forward" ${activeTab.canGoForward ? '' : 'disabled'}>${Icons.arrowRight}</button>
-          <button class="fb-nav-btn fb-mini-reload-btn" title="Reload" aria-label="Reload">${Icons.refresh}</button>
+          <button class="fb-nav-btn fb-mini-reload-btn" title="${activeTab.isLoading ? 'Stop loading this page' : 'Reload'}" aria-label="${activeTab.isLoading ? 'Stop' : 'Reload'}">${activeTab.isLoading ? Icons.stop : Icons.refresh}</button>
         </div>
         <div class="fb-omnibox-container fb-mini-omnibox-container">
           <div class="fb-toolbar-brand" title="Yayra">
@@ -10796,7 +10876,8 @@ export class BrowserShell {
     });
 
     win.querySelector('.fb-mini-reload-btn')?.addEventListener('click', () => {
-      this.reload();
+      if (this.getActiveTab()?.isLoading) this.stopLoading();
+      else this.reload();
     });
 
     win.querySelector('.fb-mini-star-btn')?.addEventListener('click', async () => {
@@ -10875,6 +10956,14 @@ export class BrowserShell {
     // Render In-Mini Viewport Content (Full features of Yayra)
     const miniViewport = win.querySelector('.fb-mini-viewport');
     if (miniViewport) {
+      const miniProgress = document.createElement('div');
+      miniProgress.className = 'fb-page-loading-bar';
+      miniProgress.setAttribute('role', 'progressbar');
+      miniProgress.setAttribute('aria-label', 'Website loading');
+      miniProgress.setAttribute('aria-valuetext', activeTab.isLoading ? 'Loading website' : 'Website loaded');
+      miniProgress.style.display = activeTab.isLoading ? 'block' : 'none';
+      miniViewport.setAttribute('aria-busy', activeTab.isLoading ? 'true' : 'false');
+      miniViewport.appendChild(miniProgress);
       const url = activeTab.url || '';
       if (!url || url === 'yayra://newtab' || url === 'about:blank') {
         this.renderNewTabPage(miniViewport, activeTab);
@@ -15274,8 +15363,20 @@ export class BrowserShell {
         tab.loadingStartedAt = Date.now();
         this._ensureLoadingWatchdog();
       }
-      const countEl = this.rootElement?.querySelector('.fb-page-loading-bar');
-      if (countEl) countEl.style.display = isLoading ? 'block' : 'none';
+      // The loading strip is permanently mounted, so an engine event from a
+      // link click can toggle it even though no Yayra render/navigation ran.
+      // Include the body-mounted popup mini, not only the main shell tree.
+      if (tabId === this.state.activeTabId && typeof document !== 'undefined') {
+        const roots = [this.rootElement, document.getElementById?.('yayra-floating-popup-window')].filter(Boolean);
+        for (const root of roots) {
+          for (const bar of root.querySelectorAll?.('.fb-page-loading-bar') || []) {
+            bar.style.display = tab.isLoading ? 'block' : 'none';
+            bar.setAttribute('aria-valuetext', tab.isLoading ? 'Loading website' : 'Website loaded');
+          }
+          const viewport = root.querySelector?.('.fb-browser-viewport') || root.querySelector?.('.fb-mini-viewport');
+          viewport?.setAttribute?.('aria-busy', tab.isLoading ? 'true' : 'false');
+        }
+      }
       if (changed) this.refreshLoadingUi(tabId);
       this.ensurePersistentAssistiveBubble();
     }
@@ -15359,30 +15460,35 @@ export class BrowserShell {
     if (typeof document === 'undefined') return;
     const tab = this.state.tabs.find((t) => t.id === tabId);
     if (!tab) return;
-    const root = this.rootElement || document;
-    if (!root || typeof root.querySelectorAll !== 'function') return;
+    const roots = [this.rootElement, document.getElementById?.('yayra-floating-popup-window')]
+      .filter((root, index, all) => root && typeof root.querySelectorAll === 'function' && all.indexOf(root) === index);
+    if (!roots.length) return;
 
-    // Reload/stop button(s) - only the ACTIVE tab drives the toolbar.
-    if (tabId === this.state.activeTabId) {
-      for (const selector of ['.fb-nav-reload', '.fb-mobile-refresh-btn']) {
-        const btn = root.querySelector(selector);
-        if (!btn) continue;
-        btn.innerHTML = tab.isLoading ? Icons.stop : Icons.refresh;
-        btn.setAttribute('title', tab.isLoading ? 'Stop loading this page (Esc)' : 'Reload this page (Ctrl+R)');
-        btn.setAttribute('aria-label', tab.isLoading ? 'Stop' : 'Reload');
+    for (const root of roots) {
+      // Reload/stop button(s) - only the ACTIVE tab drives each toolbar,
+      // including the full mobile layout and the body-mounted popup mini.
+      if (tabId === this.state.activeTabId) {
+        for (const selector of ['.fb-nav-reload', '.fb-mobile-refresh-btn', '.fb-mini-reload-btn']) {
+          const btn = root.querySelector(selector);
+          if (!btn) continue;
+          btn.innerHTML = tab.isLoading ? Icons.stop : Icons.refresh;
+          btn.setAttribute('title', tab.isLoading ? 'Stop loading this page (Esc)' : 'Reload this page (Ctrl+R)');
+          btn.setAttribute('aria-label', tab.isLoading ? 'Stop' : 'Reload');
+        }
       }
-    }
 
-    // The tab's icon slot: hourglass while loading, favicon when done.
-    for (const tabEl of root.querySelectorAll('.fb-tab-item') || []) {
-      const elTabId = (tabEl.dataset && tabEl.dataset.tabId)
-        || (typeof tabEl.getAttribute === 'function' ? tabEl.getAttribute('data-tab-id') : null);
-      if (elTabId !== tabId) continue;
-      const favicon = tabEl.querySelector?.('.fb-tab-favicon');
-      if (favicon) {
-        favicon.innerHTML = this.getTabFavicon(tab);
-        // Fresh <img> from innerHTML: re-attach the CSP-safe fallbacks.
-        this.bindTabLogoFallbacks(favicon);
+      // Every tab strip is live, even for a background tab: hourglass while
+      // loading, favicon the moment that tab's engine reports completion.
+      for (const tabEl of root.querySelectorAll('.fb-tab-item') || []) {
+        const elTabId = (tabEl.dataset && tabEl.dataset.tabId)
+          || (typeof tabEl.getAttribute === 'function' ? tabEl.getAttribute('data-tab-id') : null);
+        if (elTabId !== tabId) continue;
+        const favicon = tabEl.querySelector?.('.fb-tab-favicon');
+        if (favicon) {
+          favicon.innerHTML = this.getTabFavicon(tab);
+          // Fresh <img> from innerHTML: re-attach the CSP-safe fallbacks.
+          this.bindTabLogoFallbacks(favicon);
+        }
       }
     }
   }
@@ -16718,7 +16824,7 @@ export class BrowserShell {
     return true;
   }
 
-  getTabFavicon(tab) {
+  getTabFavicon(tab, { showLoading = true } = {}) {
     if (!tab) return Icons.globe;
     // A document tab carries its glyph only while it is actually displaying
     // the local document route; navigating away keeps the PDF available for
@@ -16728,7 +16834,7 @@ export class BrowserShell {
     // an animated hourglass the moment loading starts, and flips back to
     // the real favicon when the page is fully loaded. Updated in place by
     // refreshLoadingUi() - never via a flickery full re-render.
-    if (tab.isLoading) return `<span class="fb-tab-loading-hourglass">${Icons.hourglass}</span>`;
+    if (showLoading && tab.isLoading) return `<span class="fb-tab-loading-hourglass">${Icons.hourglass}</span>`;
     const url = tab.url || '';
     if (url.startsWith('yayra://settings')) return Icons.settings;
     if (url.startsWith('yayra://history')) return Icons.history;
@@ -17085,10 +17191,12 @@ export class BrowserShell {
     }
     // Esc: Close Overlays
     else if (e.key === 'Escape') {
-      // FREEZE RECOVERY: one key gives the whole UI back - every state
-      // overlay AND every body-appended dialog (see dismissAllOverlays).
+      // FREEZE RECOVERY first: close any open chrome. With no overlay, Esc
+      // follows browser convention and stops the active site's real load.
       const dismissed = this.dismissAllOverlays();
-      if (dismissed && typeof e.preventDefault === 'function') e.preventDefault();
+      const shouldStop = !dismissed && Boolean(this.getActiveTab()?.isLoading);
+      if (shouldStop) this.stopLoading();
+      if ((dismissed || shouldStop) && typeof e.preventDefault === 'function') e.preventDefault();
     }
   }
 
@@ -17184,6 +17292,10 @@ export class BrowserShell {
     this._pdfDropArmed = false;
     if (this.bubbleOverlay) {
       this.bubbleOverlay.remove();
+    }
+    if (typeof document !== 'undefined') {
+      document.getElementById('yayra-floating-popup-window')?.remove();
+      document.querySelectorAll?.('.fb-duplicate-popup-window')?.forEach?.((win) => win.remove());
     }
     const persistentBubble = typeof document !== 'undefined' ? (document.getElementById('yayra-persistent-assistive-bubble') || document.getElementById('yayra-floating-bubble-persistent')) : null;
     if (persistentBubble) {
