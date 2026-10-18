@@ -16,3 +16,18 @@
 | **Required Permissions** | `SYSTEM_ALERT_WINDOW`, `FOREGROUND_SERVICE`, `INTERNET` | None (Standard user privileges `asInvoker`) | None (Standard user privileges) |
 | **Packaging Formats** | **APK** (`.apk`) & **AAB** (`.aab`) | **64-bit EXE** (NSIS + Portable) & **64-bit MSI** | **64-bit DEB** (`.deb`) & **AppImage** |
 | **Distribution Requirements** | Sideload APK / Google Play AAB | Standalone installer / Enterprise MSI | Debian APT repository / Standalone DEB / AppImage (No mandatory Snap) |
+
+## Website passkeys in the Electron desktop shell
+
+Website passkeys use Chromium's standards-based WebAuthn implementation. They are not implemented by Yayra's vault-unlock passkey and Yayra never substitutes its own credential into a website ceremony.
+
+| WebAuthn path | Windows | macOS | Linux |
+|---|---|---|---|
+| Request recognition | ✅ At document start for genuine `navigator.credentials.create/get({ publicKey })` calls | ✅ Same | ✅ Same |
+| Built-in platform authenticator | ✅ Windows Hello, when available to Chromium | ✅ Touch ID / Secure Enclave only when the signed app contains a dedicated `keychain-access-groups` entitlement; Yayra discovers that exact group and configures Electron after readiness | ➖ No Electron platform authenticator is advertised |
+| USB/NFC roaming security key | ✅ Chromium WebAuthn path | ⚠️ Supported when the key can complete without Electron-supplied PIN UI | ⚠️ Supported when the key can complete without Electron-supplied PIN UI |
+| Discoverable account selection | ✅ Native Yayra account chooser; callback completes exactly once | ✅ Same | ✅ Same |
+| Conditional mediation | ✅ Remains passive and does not show a false stuck-request warning | ✅ Same | ✅ Same |
+| Phone / synced / browser-owned hybrid flow | ↗ Open the exact HTTPS page in the system browser | ↗ Same | ↗ Same |
+
+The shell receives only bounded lifecycle metadata: request ID, create/get action, relying-party ID, mediation/attachment type, success, and error name. Challenges, user handles, account names, credential IDs, attestation, authenticator data, and signatures are not sent to Yayra's renderer. Website and relying-party validation is performed in both the isolated page preload and the Electron main process.

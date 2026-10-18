@@ -63,6 +63,10 @@ const PAGE_UNRESPONSIVE_RELOAD_COOLDOWN_MS = 60_000;
 const EMAIL_FIELD_FOCUSED_CHANNEL = 'yayra:email-field-focused';
 const EMAIL_ADDRESS_CAPTURED_CHANNEL = 'yayra:email-address-captured';
 const EMAIL_SUGGESTIONS_CHANNEL = 'yayra:email-suggestions';
+// Main-world WebAuthn observer -> isolated page preload -> this bridge.
+// Payloads contain only RP/action/status metadata, never challenges, user
+// handles, credential IDs, authenticator data, or signatures.
+const SITE_PASSKEY_REQUEST_CHANNEL = 'yayra:site-passkey-request';
 
 function sanitizeEmailAddress(value) {
   const email = String(value || '').trim();
@@ -331,85 +335,249 @@ function buildPointerTextCursorScript(theme) {
  * just awaits navigator.credentials.get() while showing "Waiting for
  * input from browser interaction..." with no way out.
  *
- * This watchdog wraps navigator.credentials.get/create for publicKey
- * requests only. If a request is still unsettled after ~6s it shows a
- * small in-page banner explaining what works (USB key / picking another
- * 2FA method on the page) and offering to reopen the page in the user's
- * real browser. The banner removes itself the moment the request settles
- * either way, so working flows (Windows Hello, a touched USB key) never
- * see it. Password-manager credentials.get() calls (no publicKey) are
- * untouched.
+ * This observer wraps navigator.credentials.get/create for publicKey
+ * requests only. Every genuine request is identified by relying-party ID and
+ * reported (metadata only) to Yayra chrome. If the ceremony is not instantly
+ * completed, an in-page helper explains the active device/security-key path
+ * and provides a one-click system-browser fallback for phone/synced passkeys.
+ * Success removes it immediately; an honest failure remains briefly with the
+ * fallback instead of leaving the user at a dead spinner. Passive conditional
+ * mediation stays silent, and password-manager credentials.get() calls (no
+ * publicKey) are untouched.
  */
 function buildWebAuthnWatchdogScript() {
   return `(function () {
   if (window.__yayraWebauthnWatchdog) return;
   window.__yayraWebauthnWatchdog = true;
   if (!window.PublicKeyCredential || !navigator.credentials) return;
-  var WAIT_MS = window.__yayraWebauthnWaitMs || 6000;
+  var WAIT_MS = Number(window.__yayraWebauthnWaitMs) > 0 ? Number(window.__yayraWebauthnWaitMs) : 350;
+  var LONG_WAIT_MS = Number(window.__yayraWebauthnLongWaitMs) > WAIT_MS ? Number(window.__yayraWebauthnLongWaitMs) : 8000;
   var banner = null;
-  var pending = 0;
-  var timer = null;
+  var bannerMessage = null;
+  var currentRequest = null;
+  var pending = Object.create(null);
+  var sequence = 0;
+  var platformAuthenticator = null;
+
+  function requestCount() { return Object.keys(pending).length; }
+  function safeRpId(options) {
+    var value = '';
+    try {
+      value = options.publicKey.rpId || (options.publicKey.rp && options.publicKey.rp.id) || '';
+      if (!value && window.location && window.location.hostname) value = window.location.hostname;
+    } catch (_err) { value = ''; }
+    value = String(value || '').trim().toLowerCase();
+    return value && value.length <= 253 && /^[a-z0-9.-]+$/.test(value) ? value : 'this site';
+  }
+  function requestMeta(action, options) {
+    var selection = options && options.publicKey && options.publicKey.authenticatorSelection;
+    var attachment = selection && selection.authenticatorAttachment;
+    return {
+      requestId: 'yayra-wa-' + Date.now().toString(36) + '-' + (++sequence),
+      action: action,
+      rpId: safeRpId(options),
+      conditional: Boolean(options && options.mediation === 'conditional'),
+      attachment: attachment === 'platform' || attachment === 'cross-platform' ? attachment : 'any',
+      dismissed: false,
+      timer: null,
+      longTimer: null
+    };
+  }
+  function notify(phase, meta, success, errorName) {
+    if (typeof window.postMessage !== 'function') return;
+    try {
+      window.postMessage({
+        source: 'yayra-site-passkey',
+        version: 1,
+        phase: phase,
+        requestId: meta.requestId,
+        action: meta.action,
+        rpId: meta.rpId,
+        conditional: meta.conditional,
+        attachment: meta.attachment,
+        success: typeof success === 'boolean' ? success : undefined,
+        errorName: errorName ? String(errorName).slice(0, 64) : undefined
+      }, '*');
+    } catch (_err) { /* notification is an enhancement; WebAuthn keeps running */ }
+  }
   function removeBanner() {
     if (!banner) return;
     if (banner.remove) banner.remove();
     else if (banner.parentNode) banner.parentNode.removeChild(banner);
     banner = null;
+    bannerMessage = null;
+    currentRequest = null;
   }
-  function showBanner() {
-    if (banner || !document.body) return;
-    banner = document.createElement('div');
-    banner.id = 'yayra-webauthn-helper';
-    banner.setAttribute('style', 'position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:2147483647;max-width:540px;background:#111827;color:#e5e7eb;border:1px solid rgba(255,255,255,0.18);border-radius:12px;padding:14px 16px;font:13px/1.5 system-ui,sans-serif;box-shadow:0 12px 40px rgba(0,0,0,0.55);');
-    var msg = document.createElement('div');
-    msg.textContent = 'Still waiting for a passkey. If you have a USB security key, plug it in and touch it now. Passkeys saved on a phone or synced in another browser are not available inside the desktop app - choose a different option on this page (such as an authenticator code), or finish this step in your regular browser.';
-    var row = document.createElement('div');
-    row.setAttribute('style', 'margin-top:10px;display:flex;gap:8px;justify-content:flex-end;');
-    var openBtn = document.createElement('button');
-    openBtn.id = 'yayra-webauthn-open-external';
-    openBtn.textContent = 'Open in my browser';
-    openBtn.setAttribute('style', 'border:none;border-radius:8px;padding:6px 12px;background:#3b82f6;color:#fff;cursor:pointer;font:600 12px system-ui,sans-serif;');
-    openBtn.addEventListener('click', function () {
-      window.open('yayra-openexternal://' + encodeURIComponent(window.location.href));
-    });
-    var dismissBtn = document.createElement('button');
-    dismissBtn.id = 'yayra-webauthn-dismiss';
-    dismissBtn.textContent = 'Dismiss';
-    dismissBtn.setAttribute('style', 'border:none;border-radius:8px;padding:6px 12px;background:rgba(255,255,255,0.12);color:#e5e7eb;cursor:pointer;font:600 12px system-ui,sans-serif;');
-    dismissBtn.addEventListener('click', removeBanner);
-    row.appendChild(openBtn);
-    row.appendChild(dismissBtn);
-    banner.appendChild(msg);
-    banner.appendChild(row);
-    document.body.appendChild(banner);
+  function description(meta, state, errorName) {
+    var site = meta.rpId === 'this site' ? 'This site' : meta.rpId;
+    var verb = meta.action === 'create' ? 'create a new passkey' : 'use a passkey';
+    if (state === 'failed') {
+      return 'Yayra recognized the passkey request from ' + site + ', but the authenticator did not complete it' +
+        (errorName ? ' (' + errorName + ')' : '') + '. Try your device prompt or a USB/NFC security key, or open this page in your system browser for a phone or synced passkey.';
+    }
+    var text = site + ' is asking to ' + verb + '. The secure Chromium WebAuthn request is active in Yayra. ';
+    if (platformAuthenticator === true) {
+      text += 'Complete the Windows Hello or Touch ID prompt, or use a security key.';
+    } else if (platformAuthenticator === false) {
+      text += 'A built-in device authenticator is not exposed in this session; a compatible USB/NFC security key can still work when no unsupported PIN prompt is needed. Phone and synced passkeys can be used by opening this page in your system browser.';
+    } else {
+      text += 'Complete your device prompt or insert and touch your security key.';
+    }
+    if (state === 'waiting') text += ' Yayra is still waiting without blocking the page.';
+    return text;
   }
-  function watch(original) {
+  function renderBanner(meta, state, errorName) {
+    if (!meta || meta.dismissed || !document.body) return;
+    currentRequest = meta;
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'yayra-webauthn-helper';
+      banner.setAttribute('role', 'status');
+      banner.setAttribute('aria-live', 'polite');
+      banner.setAttribute('style', 'position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:2147483647;width:min(560px,calc(100vw - 32px));box-sizing:border-box;background:#111827;color:#e5e7eb;border:1px solid rgba(255,255,255,0.18);border-radius:12px;padding:14px 16px;font:13px/1.5 system-ui,sans-serif;box-shadow:0 12px 40px rgba(0,0,0,0.55);');
+      var heading = document.createElement('strong');
+      heading.textContent = 'Passkey request active';
+      heading.setAttribute('style', 'display:block;margin-bottom:4px;color:#f8fafc;font-size:13px;');
+      bannerMessage = document.createElement('div');
+      bannerMessage.id = 'yayra-webauthn-message';
+      var row = document.createElement('div');
+      row.setAttribute('style', 'margin-top:10px;display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;');
+      var openBtn = document.createElement('button');
+      openBtn.id = 'yayra-webauthn-open-external';
+      openBtn.textContent = 'Use system browser';
+      openBtn.setAttribute('style', 'border:none;border-radius:8px;padding:6px 12px;background:#3b82f6;color:#fff;cursor:pointer;font:600 12px system-ui,sans-serif;');
+      openBtn.addEventListener('click', function () {
+        window.open('yayra-openexternal://' + encodeURIComponent(window.location.href));
+      });
+      var dismissBtn = document.createElement('button');
+      dismissBtn.id = 'yayra-webauthn-dismiss';
+      dismissBtn.textContent = 'Continue here';
+      dismissBtn.setAttribute('style', 'border:none;border-radius:8px;padding:6px 12px;background:rgba(255,255,255,0.12);color:#e5e7eb;cursor:pointer;font:600 12px system-ui,sans-serif;');
+      dismissBtn.addEventListener('click', function () {
+        if (currentRequest) currentRequest.dismissed = true;
+        removeBanner();
+      });
+      row.appendChild(openBtn);
+      row.appendChild(dismissBtn);
+      banner.appendChild(heading);
+      banner.appendChild(bannerMessage);
+      banner.appendChild(row);
+      document.body.appendChild(banner);
+    }
+    if (bannerMessage) bannerMessage.textContent = description(meta, state, errorName);
+  }
+  function scheduleHelper(meta) {
+    if (meta.conditional) return;
+    meta.timer = setTimeout(function () {
+      meta.timer = null;
+      if (pending[meta.requestId]) renderBanner(meta, 'active');
+    }, WAIT_MS);
+    if (meta.timer && typeof meta.timer.unref === 'function') meta.timer.unref();
+    meta.longTimer = setTimeout(function () {
+      meta.longTimer = null;
+      if (pending[meta.requestId]) renderBanner(meta, 'waiting');
+    }, LONG_WAIT_MS);
+    if (meta.longTimer && typeof meta.longTimer.unref === 'function') meta.longTimer.unref();
+  }
+  function scheduleFailureRemoval(meta) {
+    var timer = setTimeout(function () { if (currentRequest === meta) removeBanner(); }, 15000);
+    if (timer && typeof timer.unref === 'function') timer.unref();
+  }
+  function settle(meta, success, error, alreadyReported) {
+    if (!pending[meta.requestId]) return;
+    if (meta.timer) clearTimeout(meta.timer);
+    if (meta.longTimer) clearTimeout(meta.longTimer);
+    delete pending[meta.requestId];
+    var errorName = typeof error === 'string' ? error : (error && error.name ? String(error.name) : '');
+    if (!alreadyReported) notify('settled', meta, success, errorName);
+    if (!success && !meta.conditional && !meta.dismissed) {
+      renderBanner(meta, 'failed', errorName);
+      scheduleFailureRemoval(meta);
+    } else if (requestCount() === 0) {
+      removeBanner();
+    }
+  }
+  function watch(original, action) {
     return function (options) {
-      var result = original.apply(navigator.credentials, arguments);
-      if (!options || !options.publicKey || !result || typeof result.then !== 'function') return result;
-      pending += 1;
-      if (!timer) {
-        timer = setTimeout(function () {
-          timer = null;
-          if (pending > 0) showBanner();
-        }, WAIT_MS);
-      }
-      var settle = function () {
-        pending = pending > 0 ? pending - 1 : 0;
-        if (pending === 0) {
-          if (timer) { clearTimeout(timer); timer = null; }
-          removeBanner();
+      if (!options || !options.publicKey) return original.apply(navigator.credentials, arguments);
+      var meta = requestMeta(action, options);
+      notify('started', meta);
+      var result;
+      try {
+        result = original.apply(navigator.credentials, arguments);
+      } catch (error) {
+        notify('settled', meta, false, error && error.name);
+        if (!meta.conditional) {
+          renderBanner(meta, 'failed', error && error.name);
+          scheduleFailureRemoval(meta);
         }
-      };
-      result.then(settle, settle);
+        throw error;
+      }
+      if (!result || typeof result.then !== 'function') {
+        notify('settled', meta, false, 'InvalidStateError');
+        return result;
+      }
+      pending[meta.requestId] = meta;
+      scheduleHelper(meta);
+      result.then(function () { settle(meta, true); }, function (error) { settle(meta, false, error); });
       return result;
     };
   }
-  try {
-    navigator.credentials.get = watch(navigator.credentials.get.bind(navigator.credentials));
-    navigator.credentials.create = watch(navigator.credentials.create.bind(navigator.credentials));
-  } catch (_err) {
-    // Site froze the credentials container - leave it untouched.
+  function install(name, action) {
+    var original = navigator.credentials[name];
+    if (typeof original !== 'function') return;
+    var wrapped = watch(original, action);
+    try {
+      Object.defineProperty(navigator.credentials, name, { configurable: true, writable: true, value: wrapped });
+    } catch (_err) {
+      try { navigator.credentials[name] = wrapped; } catch (_ignored) { /* frozen by site/embedder */ }
+    }
   }
+  try {
+    var capability = window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable;
+    if (typeof capability === 'function') {
+      Promise.resolve(capability.call(window.PublicKeyCredential)).then(function (available) {
+        platformAuthenticator = Boolean(available);
+        if (currentRequest && bannerMessage) bannerMessage.textContent = description(currentRequest, 'active');
+      }, function () { platformAuthenticator = false; });
+    }
+  } catch (_err) { platformAuthenticator = null; }
+
+  // Electron 44+ installs a tiny main-world observer from the isolated preload
+  // at document start. Subscribe to it so even requests made before dom-ready
+  // are recognized, while this script remains the helper-UI owner. Older
+  // Electron/test hosts fall back to wrapping the native methods here.
+  var earlyObserver = window.__yayraSitePasskeyObserver;
+  var subscribed = false;
+  if (earlyObserver && earlyObserver.version === 1 && typeof earlyObserver.subscribe === 'function') {
+    try {
+      earlyObserver.subscribe(function (event) {
+        if (!event || typeof event.requestId !== 'string' || !/^yayra-wa-[a-z0-9-]{1,80}$/i.test(event.requestId)) return;
+        if (event.phase === 'started') {
+          if (pending[event.requestId]) return;
+          var meta = {
+            requestId: event.requestId,
+            action: event.action === 'create' ? 'create' : 'get',
+            rpId: typeof event.rpId === 'string' ? event.rpId : 'this site',
+            conditional: Boolean(event.conditional),
+            attachment: event.attachment === 'platform' || event.attachment === 'cross-platform' ? event.attachment : 'any',
+            dismissed: false,
+            timer: null,
+            longTimer: null
+          };
+          pending[meta.requestId] = meta;
+          scheduleHelper(meta);
+          return;
+        }
+        if (event.phase === 'settled' && pending[event.requestId]) {
+          settle(pending[event.requestId], event.success === true, String(event.errorName || ''), true);
+        }
+      });
+      subscribed = true;
+    } catch (_err) { subscribed = false; }
+  }
+  if (!subscribed || (earlyObserver.methods && earlyObserver.methods.get === false)) install('get', 'get');
+  if (!subscribed || (earlyObserver.methods && earlyObserver.methods.create === false)) install('create', 'create');
 })();`;
 }
 
@@ -759,6 +927,10 @@ function createWebviewBridge({
   // BrowserShell instance whose generated ids ("tab-1", "tab-2", ...) would
   // otherwise collide and steal each other's native views.
   const views = new Map();
+  // One discoverable-credential chooser per persistent/private Session.
+  // Without this Electron cancels navigator.credentials.get() whenever an
+  // authenticator returns accounts, making valid site passkeys look broken.
+  const webAuthnSessionListeners = new WeakMap();
   // Per-shell-window policy. WeakMap keeps the preference scoped to the
   // renderer that owns the native views without retaining destroyed windows.
   const backgroundThrottlingByHost = new WeakMap();
@@ -770,6 +942,20 @@ function createWebviewBridge({
       clearTimeout(entry.pageUnresponsiveReloadTimer);
       entry.pageUnresponsiveReloadTimer = null;
     }
+  }
+
+  function cancelSitePasskeyRequests(entry, errorName = 'AbortError') {
+    if (!entry?.sitePasskeyRequests?.size) return;
+    for (const [requestId, meta] of entry.sitePasskeyRequests) {
+      sendTo(entry, 'webauthn-request', {
+        phase: 'settled',
+        requestId,
+        ...meta,
+        success: false,
+        errorName
+      });
+    }
+    entry.sitePasskeyRequests.clear();
   }
 
   function viewKey(event, tabId) {
@@ -797,6 +983,124 @@ function createWebviewBridge({
     const win = getMainWindow();
     if (!win || win.isDestroyed()) return;
     win.webContents.send(WEBVIEW_EVENT_CHANNEL, message);
+  }
+
+  function entryForWebAuthnFrame(ses, frame) {
+    let target = null;
+    try { target = frame?.top || frame || null; } catch { return null; }
+    if (!target) return null;
+    for (const entry of views.values()) {
+      const wc = entry.view?.webContents;
+      if (!wc || wc.session !== ses) continue;
+      try {
+        if (wc.mainFrame === target || wc.mainFrame?.framesInSubtree?.includes?.(target)) return entry;
+      } catch { /* frame navigated while the chooser opened */ }
+    }
+    return null;
+  }
+
+  function passkeyAccountLabel(account, index) {
+    const clean = (value) => String(value || '')
+      .replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/gi, '')
+      .trim()
+      .slice(0, 96);
+    const displayName = clean(account?.displayName);
+    const name = clean(account?.name);
+    if (displayName && name && displayName !== name) return `${displayName} (${name})`;
+    return displayName || name || `Passkey ${index + 1}`;
+  }
+
+  function installWebAuthnAccountChooser(ses) {
+    if (!ses || typeof ses.on !== 'function' || webAuthnSessionListeners.has(ses)) return;
+    const listener = (_event, details = {}, callback) => {
+      let completed = false;
+      const finish = (credentialId = undefined) => {
+        if (completed) return;
+        completed = true;
+        try { callback(typeof credentialId === 'string' ? credentialId : undefined); } catch { /* request expired */ }
+      };
+      const accounts = (Array.isArray(details.accounts) ? details.accounts : [])
+        .filter((account) => typeof account?.credentialId === 'string'
+          && account.credentialId.length > 0 && account.credentialId.length <= 4096);
+      if (!accounts.length) { finish(); return; }
+
+      const rawRelyingPartyId = typeof details.relyingPartyId === 'string'
+        ? details.relyingPartyId.trim().toLowerCase()
+        : '';
+      const relyingPartyId = rawRelyingPartyId.length <= 253 && /^[a-z0-9.-]+$/i.test(rawRelyingPartyId)
+        ? rawRelyingPartyId
+        : 'this site';
+      const entry = entryForWebAuthnFrame(ses, details.frame);
+      // Electron documents a null frame after navigation/destruction. Do not
+      // attach an account chooser to an unrelated tab/window in that race.
+      if (!entry) { finish(); return; }
+      sendTo(entry, 'webauthn-account-selection', { relyingPartyId, accountCount: accounts.length });
+      const owner = entry.hostWin && !entry.hostWin.isDestroyed?.() ? entry.hostWin : getMainWindow();
+
+      // Match a mainstream browser's account sheet. The WebAuthn operation
+      // remains pending until one callback is made, so every error/cancel
+      // path below funnels through finish() exactly once.
+      if (dialog && typeof dialog.showMessageBox === 'function' && accounts.length <= 8) {
+        const labels = accounts.map(passkeyAccountLabel);
+        const cancelId = labels.length;
+        const options = {
+          type: 'question',
+          title: 'Choose a passkey',
+          message: `Choose a passkey for ${relyingPartyId}`,
+          detail: 'The site requested a discoverable passkey. Yayra will send only your selected credential to the site’s secure WebAuthn ceremony.',
+          buttons: [...labels, 'Cancel'],
+          defaultId: 0,
+          cancelId,
+          noLink: true
+        };
+        let prompt;
+        try {
+          prompt = owner && !owner.isDestroyed?.()
+            ? dialog.showMessageBox(owner, options)
+            : dialog.showMessageBox(options);
+        } catch (err) {
+          logger.warn?.(`[yayra:webauthn] account chooser failed: ${err?.message || err}`);
+          finish();
+          return;
+        }
+        Promise.resolve(prompt).then((result) => {
+          const index = Number(result?.response);
+          finish(Number.isInteger(index) && index >= 0 && index < accounts.length
+            ? accounts[index].credentialId
+            : undefined);
+        }, () => finish());
+        return;
+      }
+
+      if (Menu && typeof Menu.buildFromTemplate === 'function') {
+        try {
+          const template = [
+            { label: `Choose a passkey for ${relyingPartyId}`, enabled: false },
+            { type: 'separator' },
+            ...accounts.map((account, index) => ({
+              label: passkeyAccountLabel(account, index),
+              click: () => finish(account.credentialId)
+            })),
+            { type: 'separator' },
+            { label: 'Cancel', click: () => finish() }
+          ];
+          const menu = Menu.buildFromTemplate(template);
+          menu.popup({
+            ...(owner && !owner.isDestroyed?.() ? { window: owner } : {}),
+            callback: () => finish()
+          });
+          return;
+        } catch (err) {
+          logger.warn?.(`[yayra:webauthn] account menu failed: ${err?.message || err}`);
+        }
+      }
+
+      // A single unambiguous account remains usable in stripped-down hosts
+      // without dialog/Menu implementations. Never guess among many users.
+      finish(accounts.length === 1 ? accounts[0].credentialId : undefined);
+    };
+    webAuthnSessionListeners.set(ses, listener);
+    ses.on('select-webauthn-account', listener);
   }
 
   function navState(webContents) {
@@ -1020,6 +1324,7 @@ function createWebviewBridge({
       // A user-initiated reload/navigation is already the recovery action.
       const wasUnresponsive = entry.pageUnresponsive;
       cancelPageUnresponsiveReload(entry);
+      cancelSitePasskeyRequests(entry, 'AbortError');
       if (wasUnresponsive) sendTo(entry, 'page-recovery-start', { url: wc.getURL?.() || entry.lastUrl || '', reason: 'navigation' });
       sendTo(entry, 'loading-start');
     });
@@ -1150,6 +1455,7 @@ function createWebviewBridge({
       lastPageUnresponsiveReloadAt: 0
     };
     views.set(key, entry);
+    installWebAuthnAccountChooser(view.webContents.session);
     attachListeners(key, entry);
     return entry;
   }
@@ -1377,6 +1683,7 @@ function createWebviewBridge({
     const entry = views.get(key);
     if (!entry) return;
     cancelPageUnresponsiveReload(entry);
+    cancelSitePasskeyRequests(entry, 'AbortError');
     const win = (entry.hostWin && !entry.hostWin.isDestroyed?.()) ? entry.hostWin : getMainWindow();
     if (win && !win.isDestroyed()) {
       try {
@@ -1391,6 +1698,10 @@ function createWebviewBridge({
 
   function destroyAll() {
     for (const key of Array.from(views.keys())) destroyView(key);
+    for (const [ses, listener] of webAuthnSessionListeners) {
+      try { ses.removeListener?.('select-webauthn-account', listener); } catch { /* app is quitting */ }
+    }
+    webAuthnSessionListeners.clear();
   }
 
   // Destroys only the views owned by one shell window (used when the main
@@ -1701,6 +2012,55 @@ function createWebviewBridge({
       if (!email || !isHttpUrl(url)) return;
       sendTo(entry, 'email-address-captured', { email, url });
     });
+    ipcMain.on(SITE_PASSKEY_REQUEST_CHANNEL, (event, payload = {}) => {
+      const entry = entryForViewSender(event);
+      if (!entry) return;
+      const phase = payload.phase === 'started' || payload.phase === 'settled' ? payload.phase : null;
+      const action = payload.action === 'create' || payload.action === 'get' ? payload.action : null;
+      const requestId = typeof payload.requestId === 'string' && /^yayra-wa-[a-z0-9-]{1,80}$/i.test(payload.requestId)
+        ? payload.requestId
+        : null;
+      const rpId = typeof payload.rpId === 'string' && payload.rpId.length <= 253
+        && /^[a-z0-9.-]+$/i.test(payload.rpId)
+        ? payload.rpId.toLowerCase()
+        : null;
+      if (!phase || !action || !requestId || !rpId) return;
+
+      let page;
+      try { page = new URL(entry.view?.webContents?.getURL?.() || entry.lastUrl || ''); } catch { return; }
+      const trustworthy = page.protocol === 'https:'
+        || ((page.protocol === 'http:' || page.protocol === 'https:')
+          && /^(?:localhost|127(?:\.\d{1,3}){3}|\[?::1\]?)$/i.test(page.hostname));
+      const host = page.hostname.toLowerCase();
+      if (!trustworthy || (rpId !== host && !host.endsWith(`.${rpId}`))) return;
+
+      entry.sitePasskeyRequests ||= new Map();
+      let requestMeta = {
+        action,
+        rpId,
+        conditional: Boolean(payload.conditional),
+        attachment: payload.attachment === 'platform' || payload.attachment === 'cross-platform'
+          ? payload.attachment
+          : 'any'
+      };
+      if (phase === 'started') {
+        if (entry.sitePasskeyRequests.size >= 8 || entry.sitePasskeyRequests.has(requestId)) return;
+        entry.sitePasskeyRequests.set(requestId, requestMeta);
+      } else {
+        requestMeta = entry.sitePasskeyRequests.get(requestId);
+        if (!requestMeta) return;
+        entry.sitePasskeyRequests.delete(requestId);
+      }
+      sendTo(entry, 'webauthn-request', {
+        phase,
+        requestId,
+        ...requestMeta,
+        success: phase === 'settled' ? payload.success === true : undefined,
+        errorName: typeof payload.errorName === 'string' && /^[A-Za-z]+Error$/.test(payload.errorName)
+          ? payload.errorName.slice(0, 64)
+          : ''
+      });
+    });
   }
 
   ipcMain.handle('yayra:webview-fill-credentials', (event, { tabId, username, password } = {}) => {
@@ -1749,6 +2109,7 @@ function createWebviewBridge({
 
 module.exports = {
   WEBVIEW_EVENT_CHANNEL,
+  SITE_PASSKEY_REQUEST_CHANNEL,
   SYSTEM_BROWSER_AUTH_HOSTS,
   OPEN_EXTERNAL_SCHEME,
   requiresSystemBrowserAuth,

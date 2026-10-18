@@ -190,9 +190,11 @@ function createFakeWebContents() {
   let backStack = [];
   let forwardStack = [];
   let userAgent = null;
+  let currentUrl = '';
   const calls = [];
   return {
-    loadURL: async () => {},
+    loadURL: async (url) => { currentUrl = String(url || ''); },
+    getURL: () => currentUrl,
     reload: () => { calls.push('reload'); },
     stop: () => {},
     close: () => { destroyed = true; },
@@ -235,7 +237,6 @@ function createFakeWebContents() {
 
 function createFakeWebContentsView() {
   const webContents = createFakeWebContents();
-  webContents.loadURL = async () => {};
   return {
     webContents,
     bounds: null,
@@ -243,7 +244,7 @@ function createFakeWebContentsView() {
   };
 }
 
-function makeHarness({ authHosts, autofillPreloadPath, pageUnresponsiveReloadDelayMs, pageUnresponsiveReloadCooldownMs } = {}) {
+function makeHarness({ authHosts, autofillPreloadPath, pageUnresponsiveReloadDelayMs, pageUnresponsiveReloadCooldownMs, webauthnSession, Dialog } = {}) {
   const handlers = new Map();
   const listeners = new Map();
   const ipcMain = {
@@ -267,6 +268,7 @@ function makeHarness({ authHosts, autofillPreloadPath, pageUnresponsiveReloadDel
   const WebContentsView = function FakeWebContentsView(opts) {
     const view = createFakeWebContentsView();
     view.__options = opts || null;
+    if (webauthnSession) view.webContents.session = webauthnSession;
     view.webContents.sent = [];
     view.webContents.send = (channel, payload) => view.webContents.sent.push({ channel, payload });
     views.push(view);
@@ -288,6 +290,7 @@ function makeHarness({ authHosts, autofillPreloadPath, pageUnresponsiveReloadDel
     ipcMain,
     shell,
     Menu,
+    dialog: Dialog,
     clipboard,
     getMainWindow: () => fakeWin,
     authHosts,
@@ -958,6 +961,136 @@ test('webview bridge: set-visible(false) without capture, or with a failing capt
   const failed = await handlers.get('yayra:webview-set-visible')(null, { tabId: 'tab-1', visible: false, capture: true });
   assert.equal(failed, undefined, 'capture failure degrades to a plain hide');
   assert.deepEqual(views[0].bounds, { x: 0, y: 0, width: 0, height: 0 });
+});
+
+/* -----------------------------------------------------------------
+ * Standards-based website passkey routing / account selection
+ * ----------------------------------------------------------------- */
+
+test('website passkeys: valid lifecycle metadata reaches only the owning shell and hostile/replayed events are dropped', async () => {
+  const { handlers, listeners, sentEvents, views } = makeHarness({ autofillPreloadPath: '/fake/p.cjs' });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-passkey', url: 'https://login.github.com/security' });
+  const route = listeners.get('yayra:site-passkey-request');
+  const sender = views[0].webContents;
+  const started = {
+    source: 'yayra-site-passkey',
+    phase: 'started',
+    requestId: 'yayra-wa-request-0001',
+    action: 'create',
+    rpId: 'github.com',
+    attachment: 'platform',
+    conditional: false,
+    challenge: 'must-never-cross-the-bridge',
+    userName: 'private@example.com'
+  };
+
+  route({ sender }, started);
+  const forwarded = sentEvents.find((event) => event.payload?.type === 'webauthn-request');
+  assert.ok(forwarded, 'a real origin-bound request is recognized immediately');
+  assert.deepEqual(forwarded.payload, {
+    type: 'webauthn-request',
+    tabId: 'tab-passkey',
+    phase: 'started',
+    requestId: 'yayra-wa-request-0001',
+    action: 'create',
+    rpId: 'github.com',
+    conditional: false,
+    attachment: 'platform',
+    success: undefined,
+    errorName: ''
+  });
+  assert.equal(JSON.stringify(forwarded).includes('private@example.com'), false, 'identity metadata is stripped');
+  assert.equal(JSON.stringify(forwarded).includes('must-never-cross'), false, 'ceremony secrets are stripped');
+
+  route({ sender }, { ...started, requestId: 'yayra-wa-hostile-001', rpId: 'evil.example' });
+  assert.equal(sentEvents.filter((event) => event.payload?.type === 'webauthn-request').length, 1, 'unrelated RP IDs cannot spoof browser chrome');
+
+  route({ sender }, {
+    source: started.source,
+    phase: 'settled',
+    requestId: started.requestId,
+    action: 'get',
+    rpId: 'login.github.com',
+    conditional: true,
+    attachment: 'cross-platform',
+    success: true
+  });
+  const lifecycle = sentEvents.filter((event) => event.payload?.type === 'webauthn-request');
+  assert.equal(lifecycle.length, 2);
+  assert.equal(lifecycle[1].payload.action, 'create', 'settle cannot rewrite immutable start metadata');
+  assert.equal(lifecycle[1].payload.rpId, 'github.com');
+  assert.equal(lifecycle[1].payload.conditional, false);
+  route({ sender }, {
+    source: started.source,
+    phase: 'settled',
+    requestId: started.requestId,
+    action: started.action,
+    rpId: started.rpId,
+    success: false,
+    errorName: 'NotAllowedError'
+  });
+  assert.equal(sentEvents.filter((event) => event.payload?.type === 'webauthn-request').length, 2, 'a settled request cannot be replayed');
+});
+
+test('website passkeys: discoverable-account chooser is installed once per Session and always completes exactly once', async () => {
+  const sessionListeners = new Map();
+  const webauthnSession = {
+    on(event, listener) { sessionListeners.set(event, listener); },
+    listenerCount(event) { return sessionListeners.has(event) ? 1 : 0; }
+  };
+  const shownDialogs = [];
+  const Dialog = {
+    async showMessageBox(_owner, options) {
+      shownDialogs.push(options);
+      return { response: 1 };
+    }
+  };
+  const { handlers, sentEvents, views } = makeHarness({ webauthnSession, Dialog });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-account-1', url: 'https://github.com/login' });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-account-2', url: 'https://github.com/settings' });
+  const requestingFrame = {};
+  views[0].webContents.mainFrame = requestingFrame;
+  assert.equal(webauthnSession.listenerCount('select-webauthn-account'), 1, 'one listener serves every tab in the same Session');
+
+  const credentialA = 'AQID';
+  const credentialB = 'BAUG';
+  const callbacks = [];
+  sessionListeners.get('select-webauthn-account')(
+    {},
+    {
+      relyingPartyId: 'github.com',
+      frame: requestingFrame,
+      accounts: [
+        { credentialId: credentialA, name: 'ada@example.com', displayName: 'Ada' },
+        { credentialId: credentialB, name: 'grace@example.com', displayName: 'Grace' }
+      ]
+    },
+    (credentialId) => callbacks.push(credentialId)
+  );
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(shownDialogs.length, 1);
+  assert.match(shownDialogs[0].message, /github\.com/);
+  assert.equal(callbacks.length, 1, 'Electron callback is completed exactly once');
+  assert.equal(callbacks[0], credentialB, 'the selected credential ID is returned unchanged');
+  const notice = sentEvents.find((event) => event.payload?.type === 'webauthn-account-selection');
+  assert.deepEqual(notice?.payload, {
+    tabId: 'tab-account-1',
+    type: 'webauthn-account-selection',
+    relyingPartyId: 'github.com',
+    accountCount: 2
+  });
+  assert.equal(JSON.stringify(notice).includes('ada@example.com'), false, 'account identities stay in native chooser UI');
+
+  const canceled = [];
+  sessionListeners.get('select-webauthn-account')(
+    {},
+    { relyingPartyId: 'github.com', frame: null, accounts: [{ credentialId: credentialA, name: 'Ada' }] },
+    (credentialId) => canceled.push(credentialId)
+  );
+  assert.deepEqual(canceled, [undefined], 'a navigated/destroyed requesting frame is canceled exactly once');
+  assert.equal(shownDialogs.length, 1, 'no chooser is attached to an unrelated fallback window');
 });
 
 /* -----------------------------------------------------------------

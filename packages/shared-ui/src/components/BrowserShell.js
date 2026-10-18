@@ -2221,6 +2221,22 @@ export class BrowserShell {
     this.bindSearchSuggestions(omniboxInput);
     this.omniboxInput = omniboxInput;
 
+    // Standards-based site passkey ceremony indicator. This appears only
+    // while a site has an active navigator.credentials create/get request;
+    // the actual secret/signature remains entirely inside Chromium + the OS
+    // authenticator/security key and never enters Yayra's renderer.
+    if (activeTab.sitePasskeyRequest) {
+      const request = activeTab.sitePasskeyRequest;
+      const indicator = document.createElement('div');
+      indicator.className = 'fb-site-passkey-indicator';
+      indicator.setAttribute('role', 'status');
+      indicator.setAttribute('aria-live', 'polite');
+      indicator.setAttribute('title', `${request.rpId || 'This site'} is ${request.action === 'create' ? 'creating' : 'requesting'} a passkey. Complete the device or security-key prompt.`);
+      indicator.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="15" r="4"></circle><path d="m11 12 9-9m-4 4 3 3m-6 0 3 3"></path></svg>'
+        + `<span>${request.action === 'create' ? 'Creating passkey' : 'Passkey active'}</span>`;
+      omnibox.appendChild(indicator);
+    }
+
     // Bookmark Star Icon
     const starBtn = document.createElement('button');
     starBtn.className = `fb-omnibox-star ${this.state.isBookmarked ? 'bookmarked' : ''}`;
@@ -3533,6 +3549,10 @@ export class BrowserShell {
 
     switch (type) {
       case 'loading-start':
+        // A top-level load invalidates the document that owned any prior
+        // WebAuthn request. Main sends an explicit AbortError settle first;
+        // this is a final UI-side stale-indicator guard.
+        if (tab.sitePasskeyRequest) delete tab.sitePasskeyRequest;
         this.updateTabLoading(tabId, true);
         break;
       case 'loading-stop':
@@ -3565,6 +3585,7 @@ export class BrowserShell {
         break;
       case 'navigated': {
         const previousUrl = tab.url;
+        if (tab.sitePasskeyRequest && evt.url && evt.url !== previousUrl) delete tab.sitePasskeyRequest;
         const pendingHandoff = this._systemBrowserHandoffs.get(tabId);
         if (pendingHandoff && evt.url && pendingHandoff.url !== evt.url) this._systemBrowserHandoffs.delete(tabId);
         tab.url = evt.url || tab.url;
@@ -3661,6 +3682,45 @@ export class BrowserShell {
         this.showTransientNotice(host ? `Cache cleared for ${host} - reloading from the network.` : 'Hard reload - cache bypassed.');
         break;
       }
+      case 'webauthn-request': {
+        // A real website called navigator.credentials.create/get. Keep a
+        // visible browser-chrome indicator while Chromium/OS/security-key UI
+        // owns the ceremony, and clear it on every settle/navigation path.
+        // Conditional mediation is intentionally quiet until a user chooses
+        // an account; those passive requests can remain pending for a page's
+        // entire lifetime by design.
+        if (evt.phase === 'started' && !evt.conditional) {
+          tab.sitePasskeyRequest = {
+            requestId: evt.requestId,
+            action: evt.action,
+            rpId: evt.rpId,
+            attachment: evt.attachment,
+            startedAt: Date.now()
+          };
+          if (tabId === this.state.activeTabId) this.requestRender();
+        } else if (evt.phase === 'settled') {
+          const current = tab.sitePasskeyRequest;
+          if (current?.requestId === evt.requestId) {
+            delete tab.sitePasskeyRequest;
+            if (tabId === this.state.activeTabId) this.requestRender();
+          }
+          if (tabId === this.state.activeTabId && evt.success) {
+            this.showTransientNotice(evt.action === 'create'
+              ? `Passkey created for ${evt.rpId || 'this site'}.`
+              : `Passkey sign-in completed for ${evt.rpId || 'this site'}.`);
+          } else if (tabId === this.state.activeTabId && evt.errorName && evt.errorName !== 'AbortError') {
+            this.showTransientNotice(`The passkey request from ${evt.rpId || 'this site'} did not complete. You can retry with your device/security key or use the system-browser option.`);
+          }
+        }
+        break;
+      }
+      case 'webauthn-account-selection':
+        // The native chooser is already in front; this notice makes the
+        // reason explicit if the OS/menu appears away from the page surface.
+        if (tabId === this.state.activeTabId) {
+          this.showTransientNotice(`${evt.relyingPartyId || 'This site'} found ${Number(evt.accountCount) || 0} passkey account${Number(evt.accountCount) === 1 ? '' : 's'} - choose one to continue.`);
+        }
+        break;
       case 'autofill-captured':
         // Chrome-style: a login was submitted inside the page. Offer to
         // remember it (never for private tabs - checked again in the vault).
@@ -6356,6 +6416,18 @@ export class BrowserShell {
               <p>Ask for biometrics/PIN before showing or copying any stored password or key (5-minute unlock).</p>
             </div>
             <input type="checkbox" id="fb-in-toggle-passkey-gate" ${config.requirePasskeyToReveal ? 'checked' : ''} ${passkey ? '' : 'disabled'} />
+          </div>
+        </div>
+
+        <div class="fb-settings-group-card fb-site-passkeys-card" style="margin-bottom:12px;">
+          <div class="fb-setting-toggle-row">
+            <div>
+              <strong>Website passkeys</strong>
+              <p>${this.nativeWebview
+                ? 'Always active. Yayra recognizes secure sites when they call WebAuthn to create or use a passkey, shows an active indicator, uses available OS/device prompts and compatible USB/NFC security keys, and provides a system-browser fallback for phone or synced passkeys.'
+                : 'Handled automatically by your browser when a secure site asks to create or use a passkey.'}</p>
+            </div>
+            <span class="fb-site-passkeys-ready" role="status">Active</span>
           </div>
         </div>
 

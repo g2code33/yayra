@@ -19,6 +19,7 @@ const { resolveGoogleClientId, resolveGoogleClientSecret } = require('./googleAu
 const { createDownloadsStore } = require('./downloadsStore.cjs');
 const { createDownloadsBridge } = require('./downloadsBridge.cjs');
 const { createPasskeyBridge } = require('./passkeyBridge.cjs');
+const { configureWebsiteWebAuthn } = require('./websiteWebAuthn.cjs');
 const { createPhoneApproval } = require('./phoneApproval.cjs');
 const { createOverlayBridge } = require('./overlayWindow.cjs');
 const { createOverlayStore } = require('./overlayStore.cjs');
@@ -463,6 +464,12 @@ app.whenReady().then(async () => {
   // doomed process - the relaunch handler registered above takes over.
   if (relaunchingForX11) return;
   if (!isPrimaryInstance) return;
+
+  // Website WebAuthn is Chromium-owned and separate from Yayra's internal
+  // vault-unlock key. Roaming security keys are available without setup;
+  // on macOS, enable Touch ID only when the exact access group is present in
+  // the signed app entitlements (the helper refuses invented/default groups).
+  configureWebsiteWebAuthn({ app });
 
   // One glance at the terminal must answer "which backend is this
   // instance on?" - it decides whether the bubble can move and overlay.

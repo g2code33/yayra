@@ -13,7 +13,7 @@
 // Nothing here is exposed to the page: no contextBridge API is published,
 // listeners run in the isolated preload world only.
 
-const { ipcRenderer } = require('electron');
+const { ipcRenderer, contextBridge } = require('electron');
 
 const CAPTURE_CHANNEL = 'yayra:autofill-captured';
 const DETECTED_CHANNEL = 'yayra:autofill-form-detected';
@@ -21,6 +21,181 @@ const FILL_CHANNEL = 'yayra:autofill-fill';
 const EMAIL_FIELD_FOCUSED_CHANNEL = 'yayra:email-field-focused';
 const EMAIL_ADDRESS_CAPTURED_CHANNEL = 'yayra:email-address-captured';
 const EMAIL_SUGGESTIONS_CHANNEL = 'yayra:email-suggestions';
+const SITE_PASSKEY_REQUEST_CHANNEL = 'yayra:site-passkey-request';
+
+// The WebAuthn observer runs in the page's MAIN world because that is where
+// sites call navigator.credentials. It posts metadata-only lifecycle events;
+// this isolated preload validates and forwards them to Yayra chrome. A site
+// can already render arbitrary content in its own tab, so spoofed messages
+// are constrained to this sender/origin and rate-limited here. No challenge,
+// credential ID, user handle, authenticator data, or signature ever crosses.
+const activeSitePasskeyRequests = new Map();
+window.addEventListener('message', (event) => {
+  if (event.source !== window) return;
+  const payload = event.data;
+  if (!payload || payload.source !== 'yayra-site-passkey' || payload.version !== 1) return;
+  const phase = payload.phase === 'started' || payload.phase === 'settled' ? payload.phase : null;
+  const action = payload.action === 'create' || payload.action === 'get' ? payload.action : null;
+  const requestId = typeof payload.requestId === 'string' && /^yayra-wa-[a-z0-9-]{1,80}$/i.test(payload.requestId)
+    ? payload.requestId
+    : null;
+  const rpId = typeof payload.rpId === 'string' && payload.rpId.length <= 253
+    && /^[a-z0-9.-]+$/i.test(payload.rpId)
+    ? payload.rpId.toLowerCase()
+    : null;
+  if (!phase || !action || !requestId || !rpId) return;
+  let pageHost = '';
+  try { pageHost = String(location.hostname || '').toLowerCase(); } catch { return; }
+  if (!pageHost || (rpId !== pageHost && !pageHost.endsWith(`.${rpId}`))) return;
+
+  const attachment = payload.attachment === 'platform' || payload.attachment === 'cross-platform'
+    ? payload.attachment
+    : 'any';
+  let lifecycle = { action, rpId, conditional: Boolean(payload.conditional), attachment };
+  if (phase === 'started') {
+    if (activeSitePasskeyRequests.has(requestId) || activeSitePasskeyRequests.size >= 8) return;
+    // This map belongs to the document's isolated world and disappears on
+    // navigation. Do not age out a real ceremony while Chromium is still
+    // waiting: doing so would drop its later settle event and strand chrome.
+    activeSitePasskeyRequests.set(requestId, lifecycle);
+  } else {
+    lifecycle = activeSitePasskeyRequests.get(requestId);
+    if (!lifecycle) return;
+    activeSitePasskeyRequests.delete(requestId);
+  }
+
+  const errorName = typeof payload.errorName === 'string' && /^[A-Za-z]+Error$/.test(payload.errorName)
+    ? payload.errorName.slice(0, 64)
+    : '';
+  try {
+    ipcRenderer.send(SITE_PASSKEY_REQUEST_CHANNEL, {
+      phase,
+      ...lifecycle,
+      requestId,
+      success: phase === 'settled' ? Boolean(payload.success) : undefined,
+      errorName
+    });
+  } catch { /* view detached during navigation */ }
+}, true);
+
+// Install the request observer in the page's MAIN world at document start.
+// Waiting for `dom-ready` can miss a site's early conditional WebAuthn call;
+// executeInMainWorld runs before page scripts while keeping the preload itself
+// isolated. The fuller dom-ready watchdog subscribes to this observer later to
+// add guidance/fallback UI without wrapping navigator.credentials twice.
+if (contextBridge && typeof contextBridge.executeInMainWorld === 'function') {
+  try {
+    contextBridge.executeInMainWorld({
+      func: () => {
+        try {
+          if (window.__yayraSitePasskeyObserver?.version === 1) return;
+          if (!window.PublicKeyCredential || !navigator.credentials) return;
+          const credentials = navigator.credentials;
+          const subscribers = [];
+          const active = new Map();
+          let sequence = 0;
+
+          const relyingPartyId = (options) => {
+            let candidate = '';
+            try {
+              candidate = options?.publicKey?.rpId || options?.publicKey?.rp?.id || window.location?.hostname || '';
+            } catch { candidate = ''; }
+            candidate = String(candidate || '').trim().toLowerCase();
+            if (candidate && candidate.length <= 253 && /^[a-z0-9.-]+$/.test(candidate)) return candidate;
+            const fallback = String(window.location?.hostname || '').trim().toLowerCase();
+            return fallback && fallback.length <= 253 && /^[a-z0-9.-]+$/.test(fallback) ? fallback : '';
+          };
+          const publish = (payload) => {
+            try { window.postMessage(payload, '*'); } catch { /* isolated preload remains the source of truth */ }
+            for (const subscriber of subscribers.slice()) {
+              try { subscriber({ ...payload }); } catch { /* helper UI is best-effort */ }
+            }
+          };
+          const requestMetadata = (action, options) => {
+            const selection = options?.publicKey?.authenticatorSelection;
+            const attachment = selection?.authenticatorAttachment;
+            return {
+              source: 'yayra-site-passkey',
+              version: 1,
+              phase: 'started',
+              requestId: `yayra-wa-${Date.now().toString(36)}-${++sequence}`,
+              action,
+              rpId: relyingPartyId(options),
+              conditional: options?.mediation === 'conditional',
+              attachment: attachment === 'platform' || attachment === 'cross-platform' ? attachment : 'any'
+            };
+          };
+          const wrap = (name, action) => {
+            const original = credentials[name];
+            if (typeof original !== 'function') return true;
+            const wrapped = function (options) {
+              if (!options?.publicKey) return original.apply(credentials, arguments);
+              const metadata = requestMetadata(action, options);
+              publish(metadata);
+              let result;
+              try {
+                result = original.apply(credentials, arguments);
+              } catch (error) {
+                publish({ ...metadata, phase: 'settled', success: false, errorName: String(error?.name || '') });
+                throw error;
+              }
+              if (!result || typeof result.then !== 'function') {
+                publish({ ...metadata, phase: 'settled', success: false, errorName: 'InvalidStateError' });
+                return result;
+              }
+              active.set(metadata.requestId, metadata);
+              result.then(
+                () => {
+                  active.delete(metadata.requestId);
+                  publish({ ...metadata, phase: 'settled', success: true, errorName: '' });
+                },
+                (error) => {
+                  active.delete(metadata.requestId);
+                  publish({ ...metadata, phase: 'settled', success: false, errorName: String(error?.name || '') });
+                }
+              );
+              return result;
+            };
+            try {
+              Object.defineProperty(credentials, name, { configurable: true, writable: true, value: wrapped });
+            } catch {
+              try { credentials[name] = wrapped; } catch { /* frozen by the embedder */ }
+            }
+            return credentials[name] === wrapped;
+          };
+
+          const methods = Object.freeze({
+            get: wrap('get', 'get'),
+            create: wrap('create', 'create')
+          });
+          const observer = Object.freeze({
+            version: 1,
+            methods,
+            subscribe(listener) {
+              if (typeof listener !== 'function') return () => {};
+              subscribers.push(listener);
+              for (const metadata of active.values()) {
+                try { listener({ ...metadata }); } catch { /* subscriber owns its failure */ }
+              }
+              return () => {
+                const index = subscribers.indexOf(listener);
+                if (index >= 0) subscribers.splice(index, 1);
+              };
+            }
+          });
+          try {
+            Object.defineProperty(window, '__yayraSitePasskeyObserver', {
+              configurable: false,
+              enumerable: false,
+              writable: false,
+              value: observer
+            });
+          } catch { window.__yayraSitePasskeyObserver = observer; }
+        } catch { /* Chromium WebAuthn remains untouched if early observation is unavailable */ }
+      }
+    });
+  } catch { /* older Electron: the dom-ready watchdog below remains the fallback */ }
+}
 
 const USERNAME_SELECTOR = [
   'input[type="email"]',

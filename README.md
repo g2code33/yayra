@@ -27,6 +27,10 @@ Yayra provides a floating glassmorphism bubble and a draggable, resizable browse
   * **Android**: `android.webkit.WebView` (Chromium Blink) with GeckoView alternative abstraction.
   * **Windows**: Microsoft Edge WebView2 Evergreen runtime.
   * **Linux**: WebKitGTK 4.1 / 6.0 (`libwebkit2gtk-4.1-0`).
+* **Standards-Based Website Passkeys (Electron desktop)**:
+  * Recognizes real WebAuthn create/sign-in requests at document start and keeps Chromium, the OS authenticator, or the user's FIDO security key in control.
+  * Native discoverable-account selection, a live omnibox indicator, and an honest system-browser fallback for browser-owned phone/synced-passkey flows.
+  * Ceremony secrets never enter Yayra's renderer, and Yayra's separate vault-unlock key is never presented as a website credential.
 * **Local-First & Privacy First**:
   * 100% offline functionality. Zero mandatory cloud backend, user account, or subscription fees.
   * Encrypted/indexed history, bookmark trees, session recovery, and user settings stored locally.

@@ -350,6 +350,64 @@ test('Autofill: detected login form gets saved credentials filled through the na
   }
 });
 
+test('Website passkeys: a genuine native lifecycle request gets an immediate omnibox indicator and deterministic cleanup', async () => {
+  const fakeBridge = installFakeWebviewBridge();
+  try {
+    const container = document.createElement('div');
+    const storage = new MemoryAdapter();
+    const pm = new PasswordManager({ storageAdapter: storage });
+    const shell = new BrowserShell({ container, isMobile: false, passwordManager: pm, storageAdapter: storage });
+    await shell.initialize();
+    shell.render(container);
+    const tab = shell.getActiveTab();
+    tab.url = 'https://login.github.com/security';
+
+    shell.handleNativeWebviewEvent({
+      tabId: tab.id,
+      type: 'webauthn-request',
+      phase: 'started',
+      requestId: 'yayra-wa-shell-1',
+      action: 'create',
+      rpId: 'github.com',
+      conditional: false,
+      attachment: 'platform'
+    });
+    shell.render(container);
+    const indicator = container.querySelector('.fb-site-passkey-indicator');
+    assert.ok(indicator, 'active site ceremony is visible in browser chrome without a fallback delay');
+    assert.match(indicator.textContent, /Creating passkey/i);
+    assert.match(indicator.getAttribute('title'), /github\.com/);
+
+    shell.handleNativeWebviewEvent({
+      tabId: tab.id,
+      type: 'webauthn-request',
+      phase: 'settled',
+      requestId: 'yayra-wa-shell-1',
+      action: 'create',
+      rpId: 'github.com',
+      success: false,
+      errorName: 'AbortError'
+    });
+    shell.render(container);
+    assert.equal(container.querySelector('.fb-site-passkey-indicator'), null, 'cancel/settle always clears the active indicator');
+    assert.equal(tab.sitePasskeyRequest, undefined);
+
+    shell.handleNativeWebviewEvent({
+      tabId: tab.id,
+      type: 'webauthn-request',
+      phase: 'started',
+      requestId: 'yayra-wa-conditional-1',
+      action: 'get',
+      rpId: 'github.com',
+      conditional: true
+    });
+    shell.render(container);
+    assert.equal(container.querySelector('.fb-site-passkey-indicator'), null, 'passive conditional mediation remains quiet until account interaction');
+  } finally {
+    fakeBridge.uninstall();
+  }
+});
+
 test('Passkey gate: vault reveal requires a successful ceremony when enabled', async () => {
   const container = document.createElement('div');
   const storage = new MemoryAdapter();
@@ -388,7 +446,9 @@ test('Passkey gate: vault reveal requires a successful ceremony when enabled', a
   assert.equal(await shell2.unlockVaultIfNeeded(), false, 'declined ceremony keeps secrets hidden');
 });
 
-test('Vault page: Passwords and Keys sections render with counts and passkey card', async () => {
+test('Vault page: Passwords and Keys sections render with counts, vault-unlock passkey, and separate website-passkey status', async (t) => {
+  const fakeBridge = installFakeWebviewBridge();
+  t.after(() => fakeBridge.uninstall());
   const container = document.createElement('div');
   const storage = new MemoryAdapter();
   const pm = new PasswordManager({ storageAdapter: storage });
@@ -400,7 +460,12 @@ test('Vault page: Passwords and Keys sections render with counts and passkey car
   shell.render(container);
   shell.navigateActiveTab('yayra://passwords');
 
-  assert.ok(container.querySelector('.fb-vault-security-card'), 'passkey card renders');
+  assert.ok(container.querySelector('.fb-vault-security-card'), 'Yayra vault-unlock passkey card renders');
+  const sitePasskeys = container.querySelector('.fb-site-passkeys-card');
+  assert.ok(sitePasskeys, 'website WebAuthn support is explained separately from vault unlock');
+  assert.match(sitePasskeys.textContent, /Website passkeys/);
+  assert.match(sitePasskeys.textContent, /Always active/);
+  assert.match(sitePasskeys.textContent, /system-browser fallback/);
   const tabs = container.querySelectorAll('.fb-vault-tab');
   assert.equal(tabs.length, 2);
   assert.ok(container.querySelector('.fb-pwd-row'), 'password row renders');

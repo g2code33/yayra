@@ -62,6 +62,37 @@ this list is the reality check.
   that Google permits OAuth sign-in there; do not work around a provider
   restriction by copying cookies or spoofing browser identity.
 
+## 1b. Website passkeys / WebAuthn on physical authenticators
+
+- [ ] On an HTTPS WebAuthn test site, start both registration
+  (`navigator.credentials.create`) and authentication
+  (`navigator.credentials.get`). Confirm the omnibox passkey indicator appears
+  as soon as each call begins, the site's genuine Chromium/OS ceremony remains
+  in control, success clears the indicator, and cancel/navigation clears it
+  without a stale spinner.
+- [ ] **Windows 10/11:** create and use a credential with Windows Hello; then
+  repeat with a USB/NFC FIDO2 key. Verify discoverable credentials show the
+  native account chooser and selecting or canceling completes exactly once.
+- [ ] **macOS with a signed desktop build:** verify `codesign -d
+  --entitlements :- <app>` contains a dedicated group ending in `.webauthn`.
+  Confirm startup logs say Touch ID website passkeys are enabled, then create
+  and use a device-bound Touch ID credential. An unsigned/unentitled build must
+  report Touch ID unavailable rather than claiming support.
+- [ ] **Linux:** test a security key that does not require Electron to collect
+  a PIN. If a PIN/hybrid phone/synced-passkey flow cannot be completed by
+  Electron, confirm the helper remains truthful and **Use system browser**
+  opens the exact HTTPS page. Do not hide or rewrite a site's own “partial
+  passkey support” warning.
+- [ ] Start a conditional-mediation request and leave it idle. Confirm no
+  unsolicited stuck-request banner appears; selecting an account should still
+  complete normally.
+- [ ] Inspect Electron renderer/main IPC while testing. Only lifecycle metadata
+  may cross into Yayra chrome—never challenge bytes, user handles, credential
+  IDs, attestation, authenticator data, or signatures.
+- [ ] Enable Yayra's separate vault-unlock passkey from the Passwords page and
+  confirm it gates Yayra secrets only. It must never be offered to a website as
+  an RP-bound WebAuthn credential.
+
 ## 2. Update pipeline — live (per docs/RELEASE-PIPELINE.md)
 
 - [ ] Publish a real tagged release end-to-end (`release.yml`):

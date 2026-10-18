@@ -1059,6 +1059,7 @@ html {
 
 .fb-omnibox-input {
   flex: 1;
+  min-width: 0;
   background: transparent;
   border: none;
   color: var(--fb-text-primary);
@@ -1069,6 +1070,74 @@ html {
 
 .fb-omnibox-input::placeholder {
   color: var(--fb-text-muted);
+}
+
+.fb-site-passkey-indicator {
+  flex: 0 0 auto;
+  max-width: 150px;
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid rgba(52, 211, 153, 0.42);
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  box-sizing: border-box;
+  color: #a7f3d0;
+  background: rgba(5, 150, 105, 0.16);
+  font-size: 0.7rem;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  animation: fb-site-passkey-pulse 1.8s ease-in-out infinite;
+}
+
+.fb-site-passkey-indicator svg {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.fb-site-passkey-indicator span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+[data-theme="light"] .fb-site-passkey-indicator {
+  color: #047857;
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(5, 150, 105, 0.34);
+}
+
+.fb-site-passkeys-ready {
+  flex: 0 0 auto;
+  padding: 4px 9px;
+  border-radius: 999px;
+  color: #a7f3d0;
+  background: rgba(5, 150, 105, 0.18);
+  border: 1px solid rgba(52, 211, 153, 0.34);
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+[data-theme="light"] .fb-site-passkeys-ready {
+  color: #047857;
+  background: rgba(16, 185, 129, 0.12);
+}
+
+@keyframes fb-site-passkey-pulse {
+  0%, 100% { opacity: 0.78; }
+  50% { opacity: 1; }
+}
+
+@media (max-width: 820px) {
+  .fb-site-passkey-indicator span { display: none; }
+  .fb-site-passkey-indicator { width: 26px; padding: 0 5px; }
 }
 
 .fb-omnibox-star {
