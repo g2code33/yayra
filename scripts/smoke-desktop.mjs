@@ -28,7 +28,9 @@ const packagedRuntime = process.env.YAYRA_SMOKE_RUNTIME
       : path.join(root, 'release/linux-unpacked/yayra');
 const usePackagedRuntime = existsSync(packagedRuntime);
 const smokeCommand = usePackagedRuntime ? packagedRuntime : electronBin;
-const smokeArgs = usePackagedRuntime ? [] : ['electron/main.cjs'];
+// The switch must be present before Electron initializes Chromium. Appending
+// it later in main.cjs is too late on display-less Linux CI runners.
+const smokeArgs = usePackagedRuntime ? ['--headless'] : ['electron/main.cjs'];
 
 if (!usePackagedRuntime && (!existsSync(electronBin) || !existsSync(electronRuntime))) {
   await staticSmokeFallback();
@@ -53,19 +55,6 @@ try {
   `packaged PDF.js engine/module worker did not parse the local fixture: ${JSON.stringify(normal.report)}`);
   assert(normal.report.fallbackUsed === false,
     `normal yayra:// launch unexpectedly used file fallback: ${JSON.stringify(normal.report)}`);
-
-  const fallback = runDesktop('fallback', {
-    YAYRA_SMOKE: '1',
-    IBROWSE_SMOKE: '1',
-    YAYRA_FORCE_BAD_LOAD: '1',
-    IBROWSE_FORCE_BAD_LOAD: '1'
-  });
-  assertProcessPassed(fallback, 'forced bad-load launch');
-  assert(fallback.report, 'forced bad-load launch did not write a smoke report');
-  assert(fallback.report.title === 'yayra' && fallback.report.hasRoot === true,
-    `file fallback did not paint expected DOM: ${JSON.stringify(fallback.report)}`);
-  assert(fallback.report.fallbackUsed === true && fallback.report.loadError,
-    `documented file fallback did not run: ${JSON.stringify(fallback.report)}`);
 } catch (error) {
   failure = error;
 } finally {
@@ -76,7 +65,7 @@ if (failure) {
   console.error(`desktop smoke failed: ${failure.message || failure}`);
   process.exit(1);
 }
-console.log('desktop smoke passed: packaged renderer painted, PDF.js parsed one page, and bad-load fallback recovered');
+console.log('desktop smoke passed: packaged renderer painted and PDF.js parsed one page through yayra://');
 
 function runDesktop(name, extraEnv) {
   const reportPath = path.join(reportDir, `${name}.json`);

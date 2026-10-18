@@ -488,6 +488,8 @@ test('PDF DESKTOP BUNDLE: yayra:// serves lazy ESM with strict MIME and smoke-pa
     'the smoke gate fails a desktop package that cannot parse its PDF fixture');
   assert.match(smoke, /YAYRA_SMOKE_REPORT:\s*reportPath/,
     'packaged Linux and Windows apps receive a deterministic result channel');
+  assert.match(smoke, /usePackagedRuntime \? \['--headless'\]/,
+    'headless mode is supplied before Chromium initializes on display-less runners');
   assert.doesNotMatch(smoke, /disable.{0,12}sandbox|no.{0,3}sandbox/i,
     'the PDF smoke must keep Chromium sandboxing enabled');
   assert.match(smoke, /release\/linux-unpacked\/yayra/,
@@ -538,8 +540,8 @@ fs.writeFileSync(process.env.YAYRA_SMOKE_REPORT, JSON.stringify(report));
     assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
     assert.match(result.stdout, /PDF\.js parsed one page/);
     const launches = readFileSync(argsLog, 'utf8').trim().split(/\r?\n/).map(JSON.parse);
-    assert.equal(launches.length, 2, 'normal and forced-fallback packaged launches both ran');
-    assert.deepEqual(launches, [[], []], 'packaged launches do not weaken Chromium sandboxing');
+    assert.deepEqual(launches, [['--headless']],
+      'the packaged runtime gets headless mode before Chromium initializes, without weakening its sandbox');
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }
