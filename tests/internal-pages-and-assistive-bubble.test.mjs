@@ -221,6 +221,13 @@ test('In-Tab Internal Pages: Redesigned yayra://newtab with search box and focus
   assert.ok(searchbox.querySelector('.fb-newtab-mic-btn'), 'voice-search control renders');
   assert.ok(searchbox.querySelector('.fb-newtab-lens-btn'), 'Google Lens control renders');
   assert.ok(searchbox.querySelector('.fb-newtab-google-ai-btn'), 'Google AI Mode control renders inside the pill');
+  const newTabCss = readFileSync(new URL('../packages/shared-ui/src/theme/design-system.css', import.meta.url), 'utf8');
+  const searchboxRuleStart = newTabCss.indexOf('.fb-newtab-searchbox {');
+  const searchboxRule = searchboxRuleStart >= 0
+    ? newTabCss.slice(searchboxRuleStart, newTabCss.indexOf('}', searchboxRuleStart))
+    : '';
+  assert.ok(searchboxRule.includes('max-width: 1080px;'), 'desktop Google search pill has the requested wider footprint');
+  assert.ok(searchboxRule.includes('height: 76px;'), 'desktop Google search pill has the requested larger height');
   assert.equal(searchbox.querySelector('.fb-newtab-ai-chip'), null, 'Yayra AI is not presented as a Google search control');
   assert.match(container.querySelector('.fb-newtab-ai-chip')?.textContent || '', /Ask Yayra AI/,
     'Yayra AI returns as its own entry below the Google search pill');
@@ -712,6 +719,11 @@ test('Requirement 5 & 7: New Tab Developer Ad Badges Showcase above Logo without
   assert.ok(container.querySelectorAll('.fb-dev-ad-label').length >= 4, 'Developer ad links should show as a horizontal labelled row');
 
   const designSystem = readFileSync(new URL('../packages/shared-ui/src/theme/design-system.css', import.meta.url), 'utf8');
+  const compactCardStart = designSystem.indexOf('.fb-dev-ad-card {');
+  const compactCardRule = compactCardStart >= 0 ? designSystem.slice(compactCardStart, designSystem.indexOf('}', compactCardStart)) : '';
+  assert.ok(compactCardRule.includes('width: 88px;'), 'sponsor shortcuts match the compact frequently-used-site scale');
+  assert.ok(compactCardRule.includes('min-height: 88px;'));
+  assert.ok(compactCardRule.includes('flex-direction: column;'), 'sponsor shortcuts use compact vertical tiles');
   const lightCardStart = designSystem.indexOf('[data-theme="light"] .fb-dev-ad-card.fb-sponsored-card {');
   const lightCardRule = lightCardStart >= 0 ? designSystem.slice(lightCardStart, designSystem.indexOf('}', lightCardStart)) : '';
   assert.ok(lightCardRule, 'light-theme sponsor cards have a targeted rule');

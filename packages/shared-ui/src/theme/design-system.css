@@ -1317,14 +1317,14 @@ html {
 
 .fb-newtab-searchbox {
   width: 100%;
-  max-width: 920px;
-  height: 68px;
+  max-width: 1080px;
+  height: 76px;
   box-sizing: border-box;
   position: relative;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 0 12px 0 14px;
+  gap: 10px;
+  padding: 0 14px 0 16px;
   margin-bottom: 32px;
   border: 1px solid rgba(60, 64, 67, 0.16);
   border-radius: 999px;
@@ -1362,9 +1362,9 @@ html {
 }
 
 .fb-newtab-search-action {
-  width: 42px;
-  height: 42px;
-  flex: 0 0 42px;
+  width: 48px;
+  height: 48px;
+  flex: 0 0 48px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1389,8 +1389,8 @@ html {
 }
 
 .fb-newtab-search-action svg {
-  width: 21px;
-  height: 21px;
+  width: 24px;
+  height: 24px;
 }
 
 .fb-newtab-search-tools-menu {
@@ -1535,10 +1535,10 @@ html {
   flex: 1;
   min-width: 0;
   height: 100%;
-  padding: 0 4px;
+  padding: 0 6px;
   background: transparent;
   border: none;
-  font-size: 1rem;
+  font-size: 1.1rem;
   color: #202124;
   caret-color: #202124;
   outline: none;
@@ -1924,22 +1924,22 @@ html {
 
 @media (max-width: 700px) {
   .fb-newtab-searchbox {
-    height: 60px;
+    height: 64px;
     padding-right: 9px;
     padding-left: 9px;
     gap: 4px;
   }
 
   .fb-newtab-search-action {
-    width: 38px;
-    height: 38px;
-    flex-basis: 38px;
+    width: 42px;
+    height: 42px;
+    flex-basis: 42px;
   }
 
   .fb-newtab-searchbox .fb-newtab-google-ai-btn {
-    width: 40px;
-    min-width: 40px;
-    height: 40px;
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
     padding: 0;
   }
 
@@ -4318,23 +4318,24 @@ html {
   font-size: 0.8rem;
 }
 
-/* Developer Advertisement Links Badge Showcase (Sleek & Non-Overshadowing) */
-/* Developer Sponsor cards: prominent glass cards (icon tile + name +
-   domain). Sized for readability + touch on web, PWA and Android. */
+/* Developer Sponsor shortcuts: intentionally compact so they sit at the
+   same visual scale as the Frequently Used Sites tiles instead of taking
+   over the new-tab page. Full names remain available through each link's
+   title and hover tooltip. */
 .fb-dev-ad-showcase {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 12px;
-  width: min(100%, 880px);
-  margin: 0 auto 22px auto;
+  gap: 8px;
+  width: min(100%, 680px);
+  margin: 0 auto 14px;
 }
 
 .fb-dev-ad-heading {
   margin: 0;
-  font-size: 0.78rem;
+  font-size: 0.68rem;
   font-weight: 800;
-  letter-spacing: 0.16em;
+  letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--fb-text-muted);
 }
@@ -4349,21 +4350,26 @@ html {
 }
 
 .fb-dev-ad-card {
+  position: relative;
+  width: 88px;
+  min-height: 88px;
+  box-sizing: border-box;
   display: inline-flex;
-  flex: 0 1 auto;
+  flex: 0 0 88px;
+  flex-direction: column;
   align-items: center;
-  gap: 12px;
-  min-height: 62px;
-  padding: 10px 18px 10px 12px;
-  border-radius: 18px;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 6px;
+  border-radius: 12px;
   background: rgba(255, 255, 255, 0.06);
   border: 1px solid rgba(255, 255, 255, 0.12);
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
-  cursor: pointer;
-  position: relative;
-  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  color: var(--fb-text-primary);
   text-decoration: none;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .fb-dev-ad-card:hover,
@@ -4371,78 +4377,62 @@ html {
   transform: translateY(-2px);
   background: rgba(255, 255, 255, 0.12);
   border-color: rgba(6, 182, 212, 0.6);
-  box-shadow: 0 8px 24px rgba(6, 182, 212, 0.3);
+  box-shadow: 0 6px 18px rgba(6, 182, 212, 0.24);
   outline: none;
 }
 
-/* Sponsor logo: free-standing (no tile/sub-card around it) and large
-   enough to be instantly recognizable. */
 .fb-dev-ad-icon {
-  width: 42px;
-  height: 42px;
-  flex: 0 0 42px;
-  border-radius: 10px;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 36px;
+  border-radius: 9px;
   object-fit: contain;
   background: transparent;
 }
 
 .fb-dev-ad-text {
-  display: flex;
+  width: 100%;
   min-width: 0;
+  display: flex;
   flex-direction: column;
-  gap: 2px;
-  text-align: left;
+  align-items: center;
+  text-align: center;
 }
 
 .fb-dev-ad-label {
-  max-width: 220px;
+  width: 100%;
   overflow: hidden;
   color: var(--fb-text-primary);
-  font-size: 0.95rem;
+  font-size: 0.7rem;
   font-weight: 700;
-  line-height: 1.2;
+  line-height: 1.15;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .fb-dev-ad-domain {
-  max-width: 220px;
-  overflow: hidden;
-  color: var(--fb-text-muted);
-  font-size: 0.74rem;
-  font-weight: 500;
-  line-height: 1.2;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: none;
 }
 
-/* Phones (Android/PWA): two generous touch-friendly columns; a trailing
-   odd card stretches across the full row. */
 @media (max-width: 600px) {
+  .fb-dev-ad-showcase {
+    width: 100%;
+  }
+
   .fb-dev-ad-row {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 10px;
   }
 
   .fb-dev-ad-card {
-    min-height: 68px;
-    padding: 10px 12px;
-  }
-
-  .fb-dev-ad-card:last-child:nth-child(odd) {
-    grid-column: 1 / -1;
+    width: 82px;
+    min-height: 82px;
+    flex-basis: 82px;
   }
 
   .fb-dev-ad-icon {
-    width: 48px;
-    height: 48px;
-    flex-basis: 48px;
-  }
-
-  .fb-dev-ad-label,
-  .fb-dev-ad-domain {
-    max-width: none;
+    width: 34px;
+    height: 34px;
+    flex-basis: 34px;
   }
 }
 
@@ -5873,12 +5863,11 @@ html {
   white-space: nowrap;
 }
 
-/* .fb-sponsored-* companions ride on the same elements as .fb-dev-ad-*
-   above — keep these rules non-conflicting so the larger card design in
-   section 2 stays authoritative. */
+/* .fb-sponsored-* companions ride on the same compact shortcut elements as
+   .fb-dev-ad-* above. Keep their shared container dimensions in lockstep. */
 .fb-sponsored-showcase {
-  width: min(100%, 880px);
-  margin: 0 auto 22px;
+  width: min(100%, 680px);
+  margin: 0 auto 14px;
 }
 
 .fb-sponsored-header {
@@ -6773,7 +6762,7 @@ html {
 
 .fb-mobile-safari-start-page .fb-newtab-searchbox {
   max-width: none;
-  height: 58px;
+  height: 64px;
   margin-bottom: 8px;
 }
 
@@ -7232,27 +7221,31 @@ html {
 }
 
 .fb-newtab-google-ai-btn {
-  min-width: 112px;
-  height: 44px;
+  min-width: 132px;
+  height: 52px;
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 7px;
+  gap: 8px;
   margin: 0;
-  padding: 0 16px;
+  padding: 0 20px;
   border: 0;
   border-radius: 999px;
   background: #f1f3f4;
   color: #202124;
-  font-size: 0.85rem;
+  font-size: 0.95rem;
   font-weight: 650;
   white-space: nowrap;
   cursor: pointer;
   transition: background 120ms ease, box-shadow 120ms ease, transform 120ms ease;
 }
 
-.fb-newtab-google-ai-btn svg,
+.fb-newtab-google-ai-btn svg {
+  width: 21px;
+  height: 21px;
+}
+
 .fb-newtab-ai-chip svg {
   width: 19px;
   height: 19px;
