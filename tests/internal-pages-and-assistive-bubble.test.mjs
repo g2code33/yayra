@@ -267,9 +267,9 @@ test('In-Tab Internal Pages: Redesigned yayra://newtab with search box and focus
     lensOverlay.querySelector('.fb-google-lens-upload-form')?.getAttribute('action').replaceAll('&amp;', '&')
   );
   assert.equal(lensUploadUrl.origin + lensUploadUrl.pathname, 'https://lens.google.com/v3/upload');
-  assert.equal(lensUploadUrl.searchParams.get('ep'), 'cntpubb', 'file upload uses Google Chromium’s Lens entrypoint');
-  assert.equal(lensUploadUrl.searchParams.get('re'), 'df');
-  assert.equal(lensUploadUrl.searchParams.get('s'), '4');
+  assert.equal(lensUploadUrl.searchParams.get('ep'), 'ccm', 'file upload uses Google’s current direct-search entrypoint');
+  assert.equal(lensUploadUrl.searchParams.get('vpw'), '1024');
+  assert.equal(lensUploadUrl.searchParams.get('vph'), '768');
   assert.equal(lensOverlay.querySelector('.fb-google-lens-file')?.getAttribute('name'), 'encoded_image');
   assert.equal(lensOverlay.querySelector('.fb-google-lens-upload-form')?.getAttribute('target'), null,
     'Lens never targets a new/external browser window');
@@ -280,9 +280,9 @@ test('In-Tab Internal Pages: Redesigned yayra://newtab with search box and focus
   assert.equal(lensUrl.origin + lensUrl.pathname, 'https://lens.google.com/uploadbyurl',
     'image links are handed directly to Google Lens');
   assert.equal(lensUrl.searchParams.get('url'), 'https://example.com/cat.png');
-  assert.equal(lensUrl.searchParams.get('ep'), 'cntpubu', 'URL upload uses Google Chromium’s Lens entrypoint');
-  assert.equal(lensUrl.searchParams.get('re'), 'df');
-  assert.equal(lensUrl.searchParams.get('s'), '4');
+  assert.equal(lensUrl.searchParams.get('ep'), 'ccm', 'URL upload uses Google’s current direct-search entrypoint');
+  assert.equal(lensUrl.searchParams.get('vpw'), '1024');
+  assert.equal(lensUrl.searchParams.get('vph'), '768');
 
   searchInput.value = 'compare browsers';
   searchbox.querySelector('.fb-newtab-google-ai-btn').click();
@@ -305,9 +305,21 @@ test('In-Tab Internal Pages: Redesigned yayra://newtab with search box and focus
 
   const previousSpeechRecognition = window.SpeechRecognition;
   const previousCapacitor = window.Capacitor;
+  const previousMediaDevices = navigator.mediaDevices;
   let activeRecognition = null;
   let voiceAbortCount = 0;
+  let microphonePermissionRequests = 0;
+  let temporaryTrackStops = 0;
   try {
+    navigator.mediaDevices = {
+      getUserMedia: async (constraints) => {
+        microphonePermissionRequests += 1;
+        assert.deepEqual(constraints, { audio: true }, 'voice preflight requests audio only');
+        return {
+          getTracks: () => [{ stop: () => { temporaryTrackStops += 1; } }]
+        };
+      }
+    };
     window.SpeechRecognition = class FakeSpeechRecognition {
       constructor() { activeRecognition = this; }
       start() { this.onstart?.(); }
@@ -317,14 +329,20 @@ test('In-Tab Internal Pages: Redesigned yayra://newtab with search box and focus
     searchbox.querySelector('.fb-newtab-mic-btn').click();
     const firstVoiceOverlay = container.querySelector('.fb-google-voice-overlay');
     assert.ok(firstVoiceOverlay, 'voice control opens the full Google-style voice surface');
-    assert.equal(firstVoiceOverlay.querySelector('.fb-google-voice-status').textContent, 'Waiting...',
-      'voice surface waits while browser microphone permission resolves');
+    assert.equal(firstVoiceOverlay.querySelector('.fb-google-voice-status').textContent, 'Requesting microphone permission…',
+      'recognition cannot begin before explicit microphone approval');
+    assert.match(firstVoiceOverlay.querySelector('.fb-google-voice-help').textContent, /Approve microphone access/);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(firstVoiceOverlay.querySelector('.fb-google-voice-status').textContent, 'Waiting...');
+    assert.equal(microphonePermissionRequests, 1);
+    assert.equal(temporaryTrackStops, 1, 'the permission-only stream is stopped before recognition');
     firstVoiceOverlay.querySelector('.fb-google-voice-close').click();
     assert.equal(container.querySelector('.fb-google-voice-overlay'), null, 'close dismisses the voice surface');
     assert.equal(voiceAbortCount, 1, 'close aborts the active microphone session');
 
     searchbox.querySelector('.fb-newtab-mic-btn').click();
     const voiceOverlay = container.querySelector('.fb-google-voice-overlay');
+    await new Promise((resolve) => setTimeout(resolve, 0));
     activeRecognition.onaudiostart?.();
     assert.equal(voiceOverlay.querySelector('.fb-google-voice-status').textContent, 'Listening...');
     const result = [{ transcript: 'weather tomorrow' }];
@@ -337,6 +355,7 @@ test('In-Tab Internal Pages: Redesigned yayra://newtab with search box and focus
     assert.equal(container.querySelector('.fb-google-voice-overlay'), null, 'voice surface closes after submission');
 
     searchbox.querySelector('.fb-newtab-mic-btn').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
     activeRecognition.onerror?.({ error: 'not-allowed' });
     const permissionOverlay = container.querySelector('.fb-google-voice-overlay');
     assert.equal(permissionOverlay.querySelector('.fb-google-voice-status').textContent, 'Microphone access is blocked');
@@ -378,6 +397,8 @@ test('In-Tab Internal Pages: Redesigned yayra://newtab with search box and focus
   } finally {
     if (previousSpeechRecognition === undefined) delete window.SpeechRecognition;
     else window.SpeechRecognition = previousSpeechRecognition;
+    if (previousMediaDevices === undefined) delete navigator.mediaDevices;
+    else navigator.mediaDevices = previousMediaDevices;
     if (previousCapacitor === undefined) delete window.Capacitor;
     else window.Capacitor = previousCapacitor;
   }

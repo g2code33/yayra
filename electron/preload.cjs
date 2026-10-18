@@ -204,10 +204,11 @@ const api = {
   // manager and real desktop shortcuts for "Create desktop shortcut...".
   system: {
     appMetrics: () => ipcRenderer.invoke('yayra:app-metrics'),
-    // Direct image bytes -> Google's official Lens endpoint. The image never
-    // passes through a Yayra server and the main process validates type/size.
-    googleLensUpload: ({ name, type, data, language, startedAt } = {}) => ipcRenderer.invoke('yayra:google-lens-upload', {
-      name, type, data, language, startedAt
+    // Direct image bytes/URL -> Google's official Lens endpoints. The image
+    // never passes through a Yayra server; main validates payload and result.
+    googleLensUpload: ({ name, type, data, imageUrl, language, startedAt, width, height, viewportWidth, viewportHeight, tabId, isPrivate, profileId } = {}) => ipcRenderer.invoke('yayra:google-lens-upload', {
+      name, type, data, imageUrl, language, startedAt, width, height, viewportWidth, viewportHeight,
+      tabId, isPrivate, profileId
     }),
     createShortcut: ({ url, title } = {}) => ipcRenderer.invoke('yayra:create-shortcut', { url, title }),
     // Chrome-style "Install page as app...": real launcher entries that

@@ -83,6 +83,40 @@ test('Media permissions: request/check handlers grant trusted audio and reject w
   assert.equal(await decide(page('https://example.com'), { mediaTypes: ['audio'] }), false);
 });
 
+
+test('Media permissions: desktop shell asks the user explicitly once before granting microphone access', async () => {
+  let requestHandler = null;
+  let promptCount = 0;
+  const responses = [1, 0];
+  const shell = page('yayra://app/index.html');
+  const owner = { id: 'window' };
+  configureTrustedMediaPermissions({
+    defaultSession: {
+      setPermissionRequestHandler: (handler) => { requestHandler = handler; },
+      setPermissionCheckHandler: () => {}
+    },
+    dialog: {
+      showMessageBox: async (dialogOwner, options) => {
+        assert.equal(dialogOwner, owner);
+        assert.match(options.message, /Allow Yayra to use your microphone/);
+        assert.deepEqual(options.buttons, ['Allow microphone', 'Not now']);
+        promptCount += 1;
+        return { response: responses.shift() };
+      }
+    },
+    getWindowForWebContents: () => owner,
+    platform: 'linux'
+  });
+
+  const decide = () => new Promise((resolve) => {
+    requestHandler(shell, 'media', resolve, { mediaTypes: ['audio'] });
+  });
+  assert.equal(await decide(), false, 'Not now denies the pending audio request');
+  assert.equal(await decide(), true, 'an explicit Allow grants the retry');
+  assert.equal(await decide(), true, 'the approved shell does not nag on every voice search');
+  assert.equal(promptCount, 2);
+});
+
 test('Media permissions: macOS still requires real OS microphone consent', async () => {
   let requestHandler = null;
   let checkHandler = null;

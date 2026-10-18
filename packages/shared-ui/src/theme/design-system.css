@@ -1881,6 +1881,60 @@ button.fb-site-passkey-indicator {
   border-color: #8ab4f8;
 }
 
+.fb-google-lens-dropzone.is-uploading,
+.fb-google-lens-url:disabled,
+.fb-google-lens-url-search:disabled {
+  cursor: wait;
+  opacity: 0.72;
+}
+
+.fb-google-lens-dropzone.is-uploading .fb-google-lens-art {
+  animation: fb-lens-upload-pulse 900ms ease-in-out infinite alternate;
+}
+
+.fb-google-lens-status[hidden],
+.fb-google-lens-retry[hidden] {
+  display: none;
+}
+
+.fb-google-lens-status {
+  margin: 16px 8px 0;
+  color: #bdc1c6;
+  font-size: 0.88rem;
+  line-height: 1.45;
+  text-align: center;
+}
+
+.fb-google-lens-status.is-error {
+  color: #f28b82;
+}
+
+.fb-google-lens-retry {
+  min-width: 104px;
+  height: 40px;
+  display: block;
+  margin: 12px auto 0;
+  padding: 0 20px;
+  border: 1px solid #8ab4f8;
+  border-radius: 999px;
+  background: transparent;
+  color: #8ab4f8;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.fb-google-lens-retry:hover,
+.fb-google-lens-retry:focus-visible {
+  outline: none;
+  background: rgba(138, 180, 248, 0.12);
+}
+
+@keyframes fb-lens-upload-pulse {
+  from { transform: scale(0.94); opacity: 0.7; }
+  to { transform: scale(1.04); opacity: 1; }
+}
+
 /* Full Google/Chrome-style voice-search surface. Permission is still owned
    by the browser/OS; this layer reflects waiting, listening, results, and
    actionable errors without pretending the microphone was granted. */

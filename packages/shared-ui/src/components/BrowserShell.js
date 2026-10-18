@@ -4598,18 +4598,21 @@ export class BrowserShell {
     return `https://www.google.com/search?${params.toString()}`;
   }
 
-  /** Google's current Chromium new-tab Lens contract. Keeping the entrypoint,
-   * rendering environment, and surface parameters makes file/URL handoffs
-   * behave like Chrome instead of relying on an incomplete upload URL. */
-  buildGoogleLensUrl(path, { entrypoint, imageUrl = '', startedAt = Date.now() } = {}) {
+  /** Build Google's current Lens upload/search contract. The `ccm`
+   * entrypoint plus viewport metadata mirrors current Chromium/Firefox Lens
+   * submissions; older incomplete contracts can redirect to the empty
+   * `www.google.com/?olud=` picker instead of processing the supplied image. */
+  buildGoogleLensUrl(path, { imageUrl = '', startedAt = Date.now() } = {}) {
     const language = typeof navigator !== 'undefined' && navigator.language ? navigator.language : 'en-US';
     const params = new URLSearchParams({
-      ep: entrypoint,
+      ep: 'ccm',
       hl: language,
-      st: String(startedAt),
-      re: 'df',
-      s: '4'
+      st: String(startedAt)
     });
+    const viewportWidth = typeof window !== 'undefined' ? Math.trunc(Number(window.innerWidth) || 0) : 0;
+    const viewportHeight = typeof window !== 'undefined' ? Math.trunc(Number(window.innerHeight) || 0) : 0;
+    if (viewportWidth > 0) params.set('vpw', String(viewportWidth));
+    if (viewportHeight > 0) params.set('vph', String(viewportHeight));
     if (imageUrl) params.set('url', imageUrl);
     return `https://lens.google.com${path}?${params.toString()}`;
   }
@@ -4620,6 +4623,25 @@ export class BrowserShell {
       const host = parsed.hostname.toLowerCase();
       return parsed.protocol === 'https:'
         && (host === 'google.com' || host.endsWith('.google.com'));
+    } catch {
+      return false;
+    }
+  }
+
+  isGoogleLensResultUrl(value) {
+    try {
+      const parsed = new URL(value);
+      const host = parsed.hostname.toLowerCase();
+      const path = parsed.pathname.replace(/\/+$/, '') || '/';
+      const emptyLensHome = host === 'lens.google.com'
+        && (path === '/' || path === '/v3/upload' || path === '/uploadbyurl');
+      const emptyGooglePicker = (host === 'google.com' || host === 'www.google.com')
+        && path === '/'
+        && (parsed.searchParams.has('olud') || parsed.searchParams.size === 0);
+      return this.isGoogleOwnedUrl(parsed.toString())
+        && host !== 'accounts.google.com'
+        && !emptyLensHome
+        && !emptyGooglePicker;
     } catch {
       return false;
     }
@@ -4653,18 +4675,83 @@ export class BrowserShell {
     return true;
   }
 
-  async uploadGoogleLensNatively(file, startedAt) {
-    const language = typeof navigator !== 'undefined' && navigator.language ? navigator.language : 'en-US';
-    const system = this.systemBridge;
-    if (system && typeof system.googleLensUpload === 'function' && typeof file?.arrayBuffer === 'function') {
+  googleLensViewport() {
+    return {
+      viewportWidth: typeof window !== 'undefined' ? Math.max(0, Math.trunc(Number(window.innerWidth) || 0)) : 0,
+      viewportHeight: typeof window !== 'undefined' ? Math.max(0, Math.trunc(Number(window.innerHeight) || 0)) : 0
+    };
+  }
+
+  async readGoogleLensImageDimensions(file) {
+    if (!file) return {};
+    if (typeof createImageBitmap === 'function') {
       try {
+        const bitmap = await createImageBitmap(file);
+        const dimensions = { width: Number(bitmap?.width) || 0, height: Number(bitmap?.height) || 0 };
+        try { bitmap?.close?.(); } catch { /* decoded image already released */ }
+        if (dimensions.width > 0 && dimensions.height > 0) return dimensions;
+      } catch { /* use the image-element fallback below */ }
+    }
+    if (typeof Image !== 'function' || typeof URL?.createObjectURL !== 'function') return {};
+    let objectUrl = '';
+    try {
+      objectUrl = URL.createObjectURL(file);
+      return await new Promise((resolve) => {
+        const image = new Image();
+        const finish = (value) => {
+          image.onload = null;
+          image.onerror = null;
+          resolve(value);
+        };
+        image.onload = () => finish({
+          width: Number(image.naturalWidth || image.width) || 0,
+          height: Number(image.naturalHeight || image.height) || 0
+        });
+        image.onerror = () => finish({});
+        image.src = objectUrl;
+      });
+    } catch {
+      return {};
+    } finally {
+      if (objectUrl) {
+        try { URL.revokeObjectURL(objectUrl); } catch { /* URL was already released */ }
+      }
+    }
+  }
+
+  hasNativeGoogleLensTransport({ file = null } = {}) {
+    const system = this.systemBridge;
+    if (system && typeof system.googleLensUpload === 'function'
+        && (!file || typeof file.arrayBuffer === 'function')) return true;
+    const android = this.capacitorOverlay;
+    return Boolean(android && typeof android.googleLensUpload === 'function'
+      && (!file || typeof FileReader === 'function'));
+  }
+
+  async uploadGoogleLensNatively({ file = null, imageUrl = '', startedAt, width, height } = {}) {
+    const language = typeof navigator !== 'undefined' && navigator.language ? navigator.language : 'en-US';
+    const activeTab = this.getActiveTab();
+    const common = {
+      language,
+      startedAt,
+      width,
+      height,
+      tabId: activeTab?.id || '',
+      isPrivate: Boolean(activeTab?.isPrivate),
+      profileId: this.profileService ? this.profileService.current().id : 'default',
+      ...this.googleLensViewport()
+    };
+    const system = this.systemBridge;
+    if (system && typeof system.googleLensUpload === 'function'
+        && (!file || typeof file.arrayBuffer === 'function')) {
+      try {
+        if (imageUrl) return await system.googleLensUpload({ ...common, imageUrl });
         const bytes = new Uint8Array(await file.arrayBuffer());
         return await system.googleLensUpload({
+          ...common,
           name: file.name || 'lens-upload',
           type: file.type,
-          data: bytes,
-          language,
-          startedAt
+          data: bytes
         });
       } catch (err) {
         return { ok: false, reason: String(err?.message || 'desktop-upload-failed') };
@@ -4672,8 +4759,10 @@ export class BrowserShell {
     }
 
     const android = this.capacitorOverlay;
-    if (android && typeof android.googleLensUpload === 'function' && typeof FileReader === 'function') {
+    if (android && typeof android.googleLensUpload === 'function'
+        && (!file || typeof FileReader === 'function')) {
       try {
+        if (imageUrl) return await android.googleLensUpload({ ...common, imageUrl });
         const dataUrl = await new Promise((resolve, reject) => {
           const reader = new FileReader();
           reader.onload = () => resolve(String(reader.result || ''));
@@ -4683,11 +4772,10 @@ export class BrowserShell {
         const comma = dataUrl.indexOf(',');
         if (comma < 0) return { ok: false, reason: 'file-read-failed' };
         return await android.googleLensUpload({
+          ...common,
           name: file.name || 'lens-upload',
           type: file.type,
-          data: dataUrl.slice(comma + 1),
-          language,
-          startedAt
+          data: dataUrl.slice(comma + 1)
         });
       } catch (err) {
         return { ok: false, reason: String(err?.message || 'android-upload-failed') };
@@ -4697,21 +4785,15 @@ export class BrowserShell {
   }
 
   /**
-   * Google Lens handoff shown over the new-tab page. Image URLs navigate to
-   * Google's public upload-by-URL route in the active Yayra tab. Local image
-   * files go straight to lens.google.com through a trusted native transport
-   * on Electron/Android (avoids renderer CORS and popup failures). Web/PWA
-   * keeps the chooser in place rather than opening an external browser, since
-   * Google forbids its result page from being embedded. No Yayra server sees
-   * the image.
+   * Google Lens handoff shown over the new-tab page. A selected file or URL
+   * is sent exactly once and only a completed Google result URL can replace
+   * the active Yayra tab. Failed uploads keep the original selection visible
+   * and retryable; they never fall through to Google's empty upload picker.
    */
   openGoogleLensSearch(viewport) {
     if (!viewport || typeof document === 'undefined') return;
     viewport.querySelector('.fb-google-lens-overlay')?.remove();
-    const initialUploadUrl = this.buildGoogleLensUrl('/v3/upload', {
-      entrypoint: 'cntpubb',
-      startedAt: Date.now()
-    });
+    const initialUploadUrl = this.buildGoogleLensUrl('/v3/upload', { startedAt: Date.now() });
 
     const overlay = document.createElement('div');
     overlay.className = 'fb-google-lens-overlay';
@@ -4737,19 +4819,87 @@ export class BrowserShell {
           <input type="url" class="fb-google-lens-url" inputmode="url" placeholder="Paste image link" aria-label="Image link" />
           <button type="button" class="fb-google-lens-url-search">Search</button>
         </div>
+        <div class="fb-google-lens-status" role="status" aria-live="polite" hidden></div>
+        <button type="button" class="fb-google-lens-retry" hidden>Try again</button>
       </section>
     `;
     viewport.appendChild(overlay);
 
-    const close = () => overlay.remove();
     const uploadForm = overlay.querySelector('.fb-google-lens-upload-form');
     const fileInput = overlay.querySelector('.fb-google-lens-file');
     const urlInput = overlay.querySelector('.fb-google-lens-url');
+    const urlButton = overlay.querySelector('.fb-google-lens-url-search');
+    const retryButton = overlay.querySelector('.fb-google-lens-retry');
+    const status = overlay.querySelector('.fb-google-lens-status');
+    const dropzone = overlay.querySelector('.fb-google-lens-dropzone');
+    let requestVersion = 0;
+    let retryAction = null;
+    let busy = false;
+
+    const setHidden = (element, hidden) => {
+      if (!element) return;
+      element.hidden = hidden;
+      if (hidden) element.setAttribute('hidden', '');
+      else element.removeAttribute('hidden');
+    };
+    const close = () => {
+      requestVersion += 1;
+      overlay.remove();
+    };
+    const setBusy = (nextBusy, message = '') => {
+      busy = nextBusy;
+      if (fileInput) fileInput.disabled = nextBusy;
+      if (urlInput) urlInput.disabled = nextBusy;
+      if (urlButton) urlButton.disabled = nextBusy;
+      if (retryButton) retryButton.disabled = nextBusy;
+      dropzone?.setAttribute('aria-busy', String(nextBusy));
+      dropzone?.classList.toggle('is-uploading', nextBusy);
+      if (message) {
+        status.textContent = message;
+        setHidden(status, false);
+      }
+      if (nextBusy) setHidden(retryButton, true);
+    };
+    const showError = (message, retry) => {
+      setBusy(false);
+      retryAction = typeof retry === 'function' ? retry : null;
+      status.textContent = message;
+      status.classList.add('is-error');
+      setHidden(status, false);
+      setHidden(retryButton, !retryAction);
+    };
+    const beginRequest = (message) => {
+      const version = ++requestVersion;
+      retryAction = null;
+      status.classList.remove('is-error');
+      setBusy(true, message);
+      return version;
+    };
+    const openCompletedResult = (result, version) => {
+      if (version !== requestVersion || !overlay.parentElement) return true;
+      const resultUrl = String(result?.url || '');
+      if (!result?.ok || !this.isGoogleLensResultUrl(resultUrl)) return false;
+      close();
+      return this.openGoogleFeatureInYayra('lens', resultUrl);
+    };
+    const lensFailureMessage = (reason) => {
+      if (reason === 'google-no-result') {
+        return 'Google Lens could not process that image. Your selection is still here—try again.';
+      }
+      if (reason === 'invalid-image-url') return 'That image link could not be used. Check it and try again.';
+      if (String(reason || '').includes('too-large')) return 'Google Lens accepts images up to 20 MB.';
+      if (String(reason || '').includes('unsupported')) {
+        return 'Google Lens supports BMP, JPEG, PNG, TIFF, WebP, and ICO images.';
+      }
+      return 'Could not reach Google Lens. Your image was kept here—check your connection and try again.';
+    };
+
     // Defense in depth: an Enter key or synthetic submit must never navigate
     // the shell document or create a new browsing context.
     uploadForm?.addEventListener('submit', (event) => event.preventDefault());
 
     const submitLocalImage = async () => {
+      if (busy) return;
       const file = fileInput?.files?.[0];
       if (!file) return;
       const supportedTypes = new Set([
@@ -4757,69 +4907,71 @@ export class BrowserShell {
       ]);
       const mimeType = String(file.type || '').toLowerCase();
       if (!supportedTypes.has(mimeType)) {
-        this.showTransientNotice('Google Lens supports BMP, JPEG, PNG, TIFF, WebP, and ICO images.');
+        showError('Google Lens supports BMP, JPEG, PNG, TIFF, WebP, and ICO images.', submitLocalImage);
         return;
       }
       if (Number(file.size) > 20 * 1024 * 1024) {
-        this.showTransientNotice('Google Lens accepts images up to 20 MB.');
+        showError('Google Lens accepts images up to 20 MB.', submitLocalImage);
+        return;
+      }
+      if (!this.hasNativeGoogleLensTransport({ file })) {
+        showError('Direct local-image search requires the Yayra desktop or mobile app. No external browser was opened.', submitLocalImage);
         return;
       }
 
-      const startedAt = Date.now();
-      const desktopLens = this.systemBridge;
-      const androidLens = this.capacitorOverlay;
-      const hasNativeLensTransport =
-        (desktopLens && typeof desktopLens.googleLensUpload === 'function' && typeof file?.arrayBuffer === 'function')
-        || (androidLens && typeof androidLens.googleLensUpload === 'function' && typeof FileReader === 'function');
-      if (hasNativeLensTransport) {
-        const nativeResult = await this.uploadGoogleLensNatively(file, startedAt);
-        let safeResultUrl = null;
-        try {
-          const parsed = new URL(nativeResult?.url || '');
-          if (parsed.protocol === 'https:'
-              && (parsed.hostname === 'lens.google.com' || parsed.hostname.endsWith('.google.com'))) {
-            safeResultUrl = parsed.toString();
-          }
-        } catch { /* malformed native result is rejected */ }
-        close();
-        if (nativeResult?.ok && safeResultUrl
-          && this.openGoogleFeatureInYayra('lens', safeResultUrl)) return;
-        this.openGoogleFeatureInYayra('lens');
-        this.showTransientNotice('Google Lens stayed in this Yayra tab. Choose the image again to continue.');
-        return;
-      }
-
-      // A browser/PWA cannot POST a local file into Google's frame-hostile
-      // Lens page without navigating the whole Yayra app or opening another
-      // browser tab. Neither is acceptable: keep the chooser in Yayra and be
-      // explicit. Desktop and Android use the native direct-to-Google upload
-      // transports above, so installed Yayra apps retain the complete flow.
-      this.showTransientNotice('To keep Lens inside Yayra, local image upload requires the Yayra desktop or mobile app. No external browser was opened.');
+      const version = beginRequest('Sending this image directly to Google Lens…');
+      const dimensions = await this.readGoogleLensImageDimensions(file);
+      if (version !== requestVersion || !overlay.parentElement) return;
+      const nativeResult = await this.uploadGoogleLensNatively({
+        file,
+        startedAt: Date.now(),
+        width: dimensions.width,
+        height: dimensions.height
+      });
+      if (openCompletedResult(nativeResult, version)) return;
+      if (version !== requestVersion || !overlay.parentElement) return;
+      showError(lensFailureMessage(nativeResult?.reason), submitLocalImage);
     };
 
-    const submitImageUrl = () => {
+    const submitImageUrl = async () => {
+      if (busy) return;
       const raw = String(urlInput?.value || '').trim();
       let imageUrl;
       try {
         imageUrl = new URL(raw);
       } catch {
-        this.showTransientNotice('Paste a valid image link first.');
+        showError('Paste a valid image link first.', submitImageUrl);
         urlInput?.focus();
         return;
       }
-      if (!/^https?:$/.test(imageUrl.protocol)) {
-        this.showTransientNotice('Google Lens accepts only http or https image links.');
+      if (!/^https?:$/.test(imageUrl.protocol) || imageUrl.username || imageUrl.password) {
+        showError('Google Lens accepts only public http or https image links.', submitImageUrl);
         urlInput?.focus();
         return;
       }
       if (encodeURI(imageUrl.href).length > 2000) {
-        this.showTransientNotice('That image link is too long for Google Lens.');
+        showError('That image link is too long for Google Lens.', submitImageUrl);
         urlInput?.focus();
         return;
       }
+
+      if (this.hasNativeGoogleLensTransport()) {
+        const version = beginRequest('Sending this image link directly to Google Lens…');
+        const nativeResult = await this.uploadGoogleLensNatively({
+          imageUrl: imageUrl.href,
+          startedAt: Date.now()
+        });
+        if (openCompletedResult(nativeResult, version)) return;
+        if (version !== requestVersion || !overlay.parentElement) return;
+        showError(lensFailureMessage(nativeResult?.reason), submitImageUrl);
+        return;
+      }
+
+      // Plain web/PWA has no privileged CORS-free transport. Its only valid
+      // in-tab option is Google's URL endpoint itself, carrying the supplied
+      // URL immediately (never the empty Lens home page).
       close();
       this.openGoogleFeatureInYayra('lens', this.buildGoogleLensUrl('/uploadbyurl', {
-        entrypoint: 'cntpubu',
         imageUrl: imageUrl.href,
         startedAt: Date.now()
       }));
@@ -4827,31 +4979,32 @@ export class BrowserShell {
 
     overlay.querySelector('.fb-google-lens-close')?.addEventListener('click', close);
     overlay.addEventListener('click', (event) => {
-      if (event.target === overlay) close();
+      if (event.target === overlay && !busy) close();
     });
     overlay.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape') close();
+      if (event.key === 'Escape' && !busy) close();
     });
-    const dropzone = overlay.querySelector('.fb-google-lens-dropzone');
     dropzone?.addEventListener('dragover', (event) => {
       event.preventDefault();
-      dropzone.classList.add('is-dragging');
+      if (!busy) dropzone.classList.add('is-dragging');
     });
     dropzone?.addEventListener('dragleave', () => dropzone.classList.remove('is-dragging'));
     dropzone?.addEventListener('drop', (event) => {
       event.preventDefault();
       dropzone.classList.remove('is-dragging');
+      if (busy) return;
       const files = event.dataTransfer?.files;
       if (!files?.length || !fileInput) return;
       try {
         fileInput.files = files;
         submitLocalImage();
       } catch {
-        this.showTransientNotice('Use “upload a file” to send this image to Google Lens.');
+        showError('Use “upload a file” to send this image to Google Lens.', null);
       }
     });
     fileInput?.addEventListener('change', submitLocalImage);
-    overlay.querySelector('.fb-google-lens-url-search')?.addEventListener('click', submitImageUrl);
+    urlButton?.addEventListener('click', submitImageUrl);
+    retryButton?.addEventListener('click', () => retryAction?.());
     urlInput?.addEventListener('keydown', (event) => {
       if (event.key === 'Enter') {
         event.preventDefault();
@@ -4862,9 +5015,10 @@ export class BrowserShell {
   }
 
   /**
-   * Chrome/Google-style full-page voice search. Starting recognition from the
-   * user's microphone click preserves the browser's native permission prompt;
-   * a final transcript is sent straight to Google Search, never Yayra AI.
+   * Chrome/Google-style full-page voice search. The user-initiated flow first
+   * obtains explicit browser/OS microphone approval with an audio-only media
+   * request, releases that temporary stream, and only then starts recognition.
+   * A final transcript goes straight to Google Search, never Yayra AI.
    */
   openGoogleVoiceSearch(viewport, searchInput) {
     if (!viewport || typeof document === 'undefined') return;
@@ -4908,6 +5062,8 @@ export class BrowserShell {
     let completed = false;
     let dismissed = false;
     let idleTimer = null;
+    let permissionAttempt = 0;
+    let permissionStream = null;
 
     const setHidden = (element, hidden) => {
       if (!element) return;
@@ -4933,9 +5089,16 @@ export class BrowserShell {
         micButton?.setAttribute('aria-pressed', 'false');
       }, 8000);
     };
+    const stopPermissionStream = () => {
+      const stream = permissionStream;
+      permissionStream = null;
+      try { stream?.getTracks?.().forEach((track) => track.stop?.()); } catch { /* stream already ended */ }
+    };
     const dismiss = ({ abort = true } = {}) => {
       if (dismissed) return;
       dismissed = true;
+      permissionAttempt += 1;
+      stopPermissionStream();
       clearIdleTimer();
       if (abort) {
         try { recognition?.abort?.(); } catch { /* already ended */ }
@@ -4949,6 +5112,7 @@ export class BrowserShell {
     const showError = (error) => {
       voiceState = 'error';
       clearIdleTimer();
+      if (micButton) micButton.disabled = false;
       micButton?.classList.remove('is-listening', 'is-receiving');
       micButton?.setAttribute('aria-label', 'Try voice search again');
       micButton?.setAttribute('aria-pressed', 'false');
@@ -4960,8 +5124,13 @@ export class BrowserShell {
           help.textContent = 'Allow microphone access, then tap the microphone to try again.';
           break;
         case 'audio-capture':
+        case 'not-found':
           status.textContent = 'No microphone found';
-          help.textContent = 'Connect a microphone and try again.';
+          help.textContent = 'Connect a microphone, approve access, and try again.';
+          break;
+        case 'permission-unavailable':
+          status.textContent = 'Microphone permission is unavailable';
+          help.textContent = 'This device cannot request microphone access for Yayra voice search.';
           break;
         case 'no-speech':
           status.textContent = 'Didn’t hear that';
@@ -4997,20 +5166,20 @@ export class BrowserShell {
       ? (window.SpeechRecognition || window.webkitSpeechRecognition)
       : null;
 
-    const startRecognition = () => {
+    const startRecognition = async () => {
       const androidVoice = this.capacitorOverlay;
       if (androidVoice && typeof androidVoice.googleVoiceSearch === 'function') {
         completed = false;
-        voiceState = 'listening';
-        status.textContent = 'Listening...';
+        voiceState = 'permission';
+        status.textContent = 'Requesting microphone permission…';
         transcript.textContent = '';
         help.textContent = '';
         setHidden(help, true);
         setHidden(googleButton, true);
-        micButton.disabled = false;
-        micButton.classList.add('is-listening');
-        micButton.setAttribute('aria-label', 'Listening for Google Search');
-        micButton.setAttribute('aria-pressed', 'true');
+        micButton.disabled = true;
+        micButton.classList.remove('is-listening', 'is-receiving');
+        micButton.setAttribute('aria-label', 'Requesting microphone permission');
+        micButton.setAttribute('aria-pressed', 'false');
         const language = typeof navigator !== 'undefined' && navigator.language ? navigator.language : 'en-US';
         Promise.resolve(androidVoice.googleVoiceSearch({ language }))
           .then((result) => {
@@ -5030,6 +5199,41 @@ export class BrowserShell {
         micButton.disabled = true;
         return;
       }
+
+      const mediaDevices = typeof navigator !== 'undefined' ? navigator.mediaDevices : null;
+      if (!mediaDevices || typeof mediaDevices.getUserMedia !== 'function') {
+        showError('permission-unavailable');
+        return;
+      }
+      const thisPermissionAttempt = ++permissionAttempt;
+      completed = false;
+      voiceState = 'permission';
+      status.textContent = 'Requesting microphone permission…';
+      transcript.textContent = '';
+      help.textContent = 'Approve microphone access to start Google Voice Search.';
+      setHidden(help, false);
+      setHidden(googleButton, true);
+      micButton.disabled = true;
+      micButton.classList.remove('is-listening', 'is-receiving');
+      micButton.setAttribute('aria-label', 'Requesting microphone permission');
+      micButton.setAttribute('aria-pressed', 'false');
+      try {
+        permissionStream = await mediaDevices.getUserMedia({ audio: true });
+      } catch (err) {
+        if (dismissed || thisPermissionAttempt !== permissionAttempt) return;
+        const name = String(err?.name || '').toLowerCase();
+        if (name === 'notallowederror' || name === 'securityerror' || name === 'permissiondeniederror') {
+          showError('not-allowed');
+        } else if (name === 'notfounderror' || name === 'devicesnotfounderror') {
+          showError('not-found');
+        } else {
+          showError('audio-capture');
+        }
+        return;
+      }
+      stopPermissionStream();
+      if (dismissed || thisPermissionAttempt !== permissionAttempt || !overlay.parentElement) return;
+
       const previousRecognition = recognition;
       if (previousRecognition) {
         previousRecognition.onend = null;
@@ -5142,6 +5346,7 @@ export class BrowserShell {
       if (event.key === 'Escape') dismiss();
     });
     micButton?.addEventListener('click', () => {
+      if (voiceState === 'permission') return;
       if (voiceState === 'waiting' || voiceState === 'listening' || voiceState === 'receiving') {
         status.textContent = 'Processing...';
         try { recognition?.stop?.(); } catch { showError('stop-failed'); }
@@ -13097,7 +13302,10 @@ export class BrowserShell {
     drawer.querySelector('.fb-dr-lens')?.addEventListener('click', () => {
       this.state.isSideDrawerOpen = false;
       const url = activeTab.url || 'https://yayra.app';
-      this.openGoogleFeatureInYayra('lens', `https://lens.google.com/uploadbyurl?url=${encodeURIComponent(url)}`);
+      this.openGoogleFeatureInYayra('lens', this.buildGoogleLensUrl('/uploadbyurl', {
+        imageUrl: url,
+        startedAt: Date.now()
+      }));
     });
 
     drawer.querySelector('.fb-dr-translate')?.addEventListener('click', () => {

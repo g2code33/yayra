@@ -22,7 +22,7 @@ const { createPasskeyBridge } = require('./passkeyBridge.cjs');
 const { configureWebsiteWebAuthn } = require('./websiteWebAuthn.cjs');
 const { createWebsitePasskeyProvider } = require('./websitePasskeyProvider.cjs');
 const { configureTrustedMediaPermissions } = require('./trustedMediaPermissions.cjs');
-const { uploadGoogleLensImage } = require('./googleFeatures.cjs');
+const { uploadGoogleLensImage, searchGoogleLensImageUrl } = require('./googleFeatures.cjs');
 const { createPhoneApproval } = require('./phoneApproval.cjs');
 const { createOverlayBridge } = require('./overlayWindow.cjs');
 const { createOverlayStore } = require('./overlayStore.cjs');
@@ -482,6 +482,8 @@ app.whenReady().then(async () => {
     systemPreferences,
     recorderPreloadPath: path.join(__dirname, 'recorderPreload.cjs'),
     platform: process.platform,
+    dialog,
+    getWindowForWebContents: (wc) => BrowserWindow.fromWebContents(wc),
     logger: console
   });
 
@@ -758,19 +760,45 @@ function registerIpcBridges() {
     return true;
   });
 
-  // Electron renderer fetches are CORS-constrained. Upload the user-selected
-  // image from the trusted main process straight to Google's official Lens
-  // endpoint and return only Google's final result URL. No Yayra backend or
-  // storage is involved, and googleFeatures.cjs enforces MIME/size limits.
+  // Electron renderer fetches are CORS-constrained. Send the user-selected
+  // file (or its public URL) from the trusted main process straight to
+  // Google's official Lens endpoints and return only a completed result URL.
+  // No Yayra backend/storage sees the image. Empty Google upload-picker
+  // redirects are rejected so the renderer can retain the selection + retry.
   ipcMain.handle('yayra:google-lens-upload', async (event, payload = {}) => {
     if (!senderWindow(event)) return { ok: false, reason: 'untrusted-sender' };
+    const tabId = String(payload.tabId || '');
+    if (payload.isPrivate && !/^[a-zA-Z0-9_-]{1,120}$/.test(tabId)) {
+      return { ok: false, reason: 'invalid-private-tab' };
+    }
+    const profileId = String(payload.profileId || 'default');
+    const partition = payload.isPrivate
+      ? `incognito-${tabId}`
+      : profileId === 'default'
+        ? 'persist:yayra-webview'
+        : `persist:yayra-profile-${profileId.replace(/[^a-zA-Z0-9_-]/g, '')}`;
+    // Use the same Chromium Session as the destination tab. Google cookies
+    // set while accepting the image are therefore present when the returned
+    // result URL is opened; main-process defaultSession cookies are not.
+    const tabSession = session.fromPartition(partition);
+    const common = {
+      netFetch: (url, options) => tabSession.fetch(url, options),
+      language: payload.language,
+      startedAt: payload.startedAt,
+      viewportWidth: payload.viewportWidth,
+      viewportHeight: payload.viewportHeight,
+      userAgent: buildBrowserUserAgent()
+    };
+    if (payload.imageUrl) {
+      return searchGoogleLensImageUrl({ ...common, imageUrl: payload.imageUrl });
+    }
     return uploadGoogleLensImage({
-      netFetch: (url, options) => net.fetch(url, options),
+      ...common,
       data: payload.data,
       name: payload.name,
       type: payload.type,
-      language: payload.language,
-      startedAt: payload.startedAt
+      width: payload.width,
+      height: payload.height
     });
   });
 

@@ -57,16 +57,70 @@ test('Voice Search fallback and results stay in the active Yayra tab without win
   }
 });
 
-test('Lens URL and failed native upload remain in Yayra; local web upload never submits a new window', async () => {
+
+test('Voice Search asks for audio-only permission before recognition and fails closed when denied', async () => {
+  const previousRecognition = window.SpeechRecognition;
+  const previousMediaDevices = navigator.mediaDevices;
+  const previousCapacitor = window.Capacitor;
+  let recognitionConstructions = 0;
+  let permissionRequests = 0;
+  delete window.Capacitor;
+  window.SpeechRecognition = class FakeRecognition {
+    constructor() { recognitionConstructions += 1; }
+    start() {}
+    abort() {}
+  };
+  navigator.mediaDevices = {
+    getUserMedia: async (constraints) => {
+      permissionRequests += 1;
+      assert.deepEqual(constraints, { audio: true });
+      const error = new Error('denied');
+      error.name = 'NotAllowedError';
+      throw error;
+    }
+  };
+
+  const { shell, container } = await makeShell();
+  try {
+    container.querySelector('.fb-newtab-mic-btn').click();
+    const voice = container.querySelector('.fb-google-voice-overlay');
+    assert.equal(voice.querySelector('.fb-google-voice-status').textContent, 'Requesting microphone permission…');
+    await flush();
+    assert.equal(permissionRequests, 1);
+    assert.equal(recognitionConstructions, 0, 'speech recognition is never created before permission is granted');
+    assert.equal(voice.querySelector('.fb-google-voice-status').textContent, 'Microphone access is blocked');
+    assert.match(voice.querySelector('.fb-google-voice-help').textContent, /Allow microphone access/);
+    assert.equal(shell.getActiveTab().url, 'yayra://newtab');
+  } finally {
+    shell.destroy();
+    if (previousRecognition === undefined) delete window.SpeechRecognition;
+    else window.SpeechRecognition = previousRecognition;
+    if (previousMediaDevices === undefined) delete navigator.mediaDevices;
+    else navigator.mediaDevices = previousMediaDevices;
+    if (previousCapacitor === undefined) delete window.Capacitor;
+    else window.Capacitor = previousCapacitor;
+  }
+});
+
+test('Lens processes each supplied file/URL directly and never falls back to an empty picker', async () => {
   const previousOpen = window.open;
   const previousYayra = window.yayra;
   const previousCapacitor = window.Capacitor;
   let externalOpens = 0;
+  let nativeMode = 'fail';
+  const nativeCalls = [];
   window.open = () => { externalOpens += 1; return {}; };
   delete window.Capacitor;
   window.yayra = {
     system: {
-      googleLensUpload: async () => ({ ok: false, reason: 'simulated-upload-failure' })
+      googleLensUpload: async (payload) => {
+        nativeCalls.push(payload);
+        if (nativeMode === 'fail') return { ok: false, reason: 'google-no-result' };
+        if (nativeMode === 'url-success') {
+          return { ok: true, url: 'https://www.google.com/search?vsrid=url-result' };
+        }
+        return { ok: true, url: 'https://lens.google.com/search?p=file-result' };
+      }
     }
   };
 
@@ -88,10 +142,23 @@ test('Lens URL and failed native upload remain in Yayra; local web upload never 
     fileInput.dispatchEvent({ type: 'change' });
     await flush();
 
-    assert.equal(shell.getActiveTab().url, 'https://lens.google.com/',
-      'native upload failure falls back to Lens in the same Yayra tab');
+    assert.equal(shell.getActiveTab().url, 'yayra://newtab',
+      'a failed direct upload never navigates to the empty Lens picker');
+    assert.ok(container.querySelector('.fb-google-lens-overlay'), 'the original chooser remains open');
+    assert.equal(fileInput.files[0], file, 'the chosen file is retained for retry');
+    assert.match(lens.querySelector('.fb-google-lens-status').textContent, /selection is still here/i);
+    assert.equal(lens.querySelector('.fb-google-lens-retry').hasAttribute('hidden'), false);
     assert.equal(externalOpens, 0);
+    assert.equal(shell._inAppOnlyGoogleTabs.has(shell.getActiveTab().id), false);
+
+    nativeMode = 'file-success';
+    lens.querySelector('.fb-google-lens-retry').click();
+    await flush();
+    assert.equal(shell.getActiveTab().url, 'https://lens.google.com/search?p=file-result',
+      'retry opens the completed result directly in the active Yayra tab');
     assert.equal(shell._inAppOnlyGoogleTabs.has(shell.getActiveTab().id), true);
+    assert.equal(nativeCalls[0].name, 'cat.png');
+    assert.equal(nativeCalls[0].tabId, shell.getActiveTab().id);
 
     shell.navigateActiveTab('yayra://newtab');
     delete window.yayra;
@@ -107,13 +174,32 @@ test('Lens URL and failed native upload remain in Yayra; local web upload never 
     assert.equal(externalOpens, 0);
 
     lens.querySelector('.fb-google-lens-close').click();
+    let urlAttempts = 0;
+    window.yayra = {
+      system: {
+        googleLensUpload: async (payload) => {
+          nativeCalls.push(payload);
+          urlAttempts += 1;
+          return urlAttempts === 1
+            ? { ok: false, reason: 'google-no-result' }
+            : { ok: true, url: 'https://www.google.com/search?vsrid=url-result' };
+        }
+      }
+    };
     container.querySelector('.fb-newtab-lens-btn').click();
     lens = container.querySelector('.fb-google-lens-overlay');
-    lens.querySelector('.fb-google-lens-url').value = 'https://example.com/image.jpg';
+    const imageUrlInput = lens.querySelector('.fb-google-lens-url');
+    imageUrlInput.value = 'https://example.com/image.jpg';
     lens.querySelector('.fb-google-lens-url-search').click();
-    const result = new URL(shell.getActiveTab().url);
-    assert.equal(result.origin + result.pathname, 'https://lens.google.com/uploadbyurl');
-    assert.equal(result.searchParams.get('url'), 'https://example.com/image.jpg');
+    await flush();
+    assert.equal(shell.getActiveTab().url, 'yayra://newtab',
+      'a rejected image URL does not navigate to Google’s empty picker');
+    assert.equal(imageUrlInput.value, 'https://example.com/image.jpg', 'the supplied URL remains available for retry');
+    lens.querySelector('.fb-google-lens-retry').click();
+    await flush();
+    assert.equal(shell.getActiveTab().url, 'https://www.google.com/search?vsrid=url-result');
+    assert.equal(nativeCalls.at(-1).imageUrl, 'https://example.com/image.jpg',
+      'the retained URL is resent through the native direct-result transport');
     assert.equal(externalOpens, 0, 'Lens URL search never launches another browser');
   } finally {
     shell.destroy();

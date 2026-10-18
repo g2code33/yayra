@@ -50,6 +50,8 @@ function configureTrustedMediaPermissions({
   systemPreferences,
   recorderPreloadPath = '',
   platform = process.platform,
+  dialog = null,
+  getWindowForWebContents = null,
   logger = console
 } = {}) {
   if (!defaultSession
@@ -57,6 +59,44 @@ function configureTrustedMediaPermissions({
       || typeof defaultSession.setPermissionCheckHandler !== 'function') {
     return false;
   }
+
+  // Electron delegates media decisions to the host application and otherwise
+  // has no browser permission bubble. Keep one explicit user decision per
+  // shell WebContents and coalesce simultaneous getUserMedia requests so a
+  // first Voice Search always asks, but retries do not stack dialogs.
+  const approvedShellAudio = new WeakSet();
+  const pendingShellAudio = new WeakMap();
+
+  const askForShellAudioConsent = (webContents) => {
+    if (approvedShellAudio.has(webContents)) return Promise.resolve(true);
+    const pending = pendingShellAudio.get(webContents);
+    if (pending) return pending;
+    if (!dialog || typeof dialog.showMessageBox !== 'function') return Promise.resolve(true);
+
+    let owner = null;
+    try { owner = getWindowForWebContents?.(webContents) || null; } catch { /* use an app-modal dialog */ }
+    const options = {
+      type: 'question',
+      title: 'Microphone permission',
+      message: 'Allow Yayra to use your microphone?',
+      detail: 'Voice Search uses the microphone only while listening, then searches the final transcript in your active Yayra tab.',
+      buttons: ['Allow microphone', 'Not now'],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true
+    };
+    const request = Promise.resolve(owner
+      ? dialog.showMessageBox(owner, options)
+      : dialog.showMessageBox(options))
+      .then((result) => Number(result?.response) === 0)
+      .catch((err) => {
+        logger?.warn?.('[yayra] microphone consent dialog failed', err?.message || err);
+        return false;
+      })
+      .finally(() => pendingShellAudio.delete(webContents));
+    pendingShellAudio.set(webContents, request);
+    return request;
+  };
 
   defaultSession.setPermissionCheckHandler((webContents, permission, _requestingOrigin, details = {}) => {
     const request = classifyTrustedMediaRequest(webContents, permission, details, { recorderPreloadPath });
@@ -82,18 +122,30 @@ function configureTrustedMediaPermissions({
       return;
     }
 
-    if (platform === 'darwin' && request.kind === 'shell-audio'
-        && typeof systemPreferences?.askForMediaAccess === 'function') {
-      Promise.resolve(systemPreferences.askForMediaAccess('microphone'))
-        .then((allowed) => finish(allowed))
-        .catch((err) => {
-          logger?.warn?.('[yayra] microphone permission request failed', err?.message || err);
-          finish(false);
-        });
+    if (request.kind !== 'shell-audio') {
+      finish(true);
       return;
     }
 
-    finish(true);
+    askForShellAudioConsent(webContents).then((userApproved) => {
+      if (!userApproved) {
+        finish(false);
+        return;
+      }
+      if (platform === 'darwin' && typeof systemPreferences?.askForMediaAccess === 'function') {
+        return Promise.resolve(systemPreferences.askForMediaAccess('microphone'))
+          .then((osApproved) => {
+            if (osApproved) approvedShellAudio.add(webContents);
+            finish(osApproved);
+          });
+      }
+      approvedShellAudio.add(webContents);
+      finish(true);
+      return undefined;
+    }).catch((err) => {
+      logger?.warn?.('[yayra] microphone permission request failed', err?.message || err);
+      finish(false);
+    });
   });
 
   return true;
