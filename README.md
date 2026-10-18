@@ -29,6 +29,7 @@ Yayra provides a floating glassmorphism bubble and a draggable, resizable browse
   * **Linux**: WebKitGTK 4.1 / 6.0 (`libwebkit2gtk-4.1-0`).
 * **Standards-Based Website Passkeys (Electron desktop)**:
   * Recognizes real WebAuthn create/sign-in requests at document start and keeps Chromium, the OS authenticator, or the user's FIDO security key in control.
+  * On supported Linux sessions, an encrypted local CTAP2 platform authenticator starts the site's untouched native request only after an explicit address-bar confirmation and PolicyKit verification.
   * Native discoverable-account selection, a live omnibox indicator, and an honest system-browser fallback for browser-owned phone/synced-passkey flows.
   * Ceremony secrets never enter Yayra's renderer, and Yayra's separate vault-unlock key is never presented as a website credential.
 * **Local-First & Privacy First**:

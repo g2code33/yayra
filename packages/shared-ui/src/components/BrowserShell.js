@@ -3719,8 +3719,11 @@ export class BrowserShell {
           setTimeout(() => {
             if (tab.sitePasskeyRequest?.requestId !== request.requestId
                 || request.providerState !== 'approved') return;
-            request.providerState = '';
-            this.showTransientNotice('The site is still waiting. Click “Confirm passkey” to approve again, or use the in-page system-browser option.');
+            // Chromium cannot replay a virtual-CTAP command that has already
+            // missed presence. Do not offer a misleading second confirmation;
+            // the safe recovery is a fresh site request or the system browser.
+            request.providerState = 'declined';
+            this.showTransientNotice('The site did not finish the passkey request. Retry it on the site, or click “Use system browser” to continue another way.');
             if (tab.id === this.state.activeTabId) this.requestRender();
           }, expiresInMs + 250);
         }

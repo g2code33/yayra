@@ -199,11 +199,16 @@ test('main-world observer and isolated preload share one versioned, metadata-onl
 test('isolated preload installs the main-world observer at document start and forwards an early real request', async () => {
   const preload = readFileSync(new URL('../electron/autofillPreload.cjs', import.meta.url), 'utf8');
   const windowListeners = new Map();
+  const ipcListeners = new Map();
   const sends = [];
   let resolveCreate;
+  let nativeCreateCalls = 0;
   const credentials = {
     get: () => Promise.resolve(null),
-    create: () => new Promise((resolve) => { resolveCreate = resolve; })
+    create: () => {
+      nativeCreateCalls += 1;
+      return new Promise((resolve) => { resolveCreate = resolve; });
+    }
   };
   const pageWindow = {
     PublicKeyCredential: function PublicKeyCredential() {},
@@ -233,7 +238,7 @@ test('isolated preload installs the main-world observer at document start and fo
   };
   const ipcRenderer = {
     send: (channel, payload) => sends.push({ channel, payload }),
-    on() {}
+    on: (channel, listener) => ipcListeners.set(channel, listener)
   };
   const contextBridge = {
     executeInMainWorld({ func, args = [] }) { return func(...args); }
@@ -254,6 +259,7 @@ test('isolated preload installs the main-world observer at document start and fo
     clearTimeout,
     setInterval: () => 1,
     clearInterval: () => {},
+    crypto: globalThis.crypto,
     console
   };
   vm.createContext(sandbox);
@@ -275,8 +281,25 @@ test('isolated preload installs the main-world observer at document start and fo
   assert.equal(started.payload.phase, 'started');
   assert.equal(started.payload.rpId, 'github.com');
   assert.equal(started.payload.attachment, 'platform');
+  assert.equal(started.payload.controlled, true, 'main can distinguish the secure pre-invocation gate from an old fallback observer');
   assert.equal(JSON.stringify(started).includes('private@example.com'), false);
   assert.equal(JSON.stringify(started).includes('challenge'), false);
+  assert.equal(nativeCreateCalls, 0, 'native CTAP does not start before trusted browser approval');
+
+  assert.equal(
+    pageWindow.__yayraSitePasskeyObserver.control(
+      { requestId: started.payload.requestId, command: 'release' },
+      '0'.repeat(64)
+    ),
+    false,
+    'page JavaScript cannot release its own ceremony without the isolated-world capability'
+  );
+  assert.equal(nativeCreateCalls, 0);
+  ipcListeners.get('yayra:site-passkey-control')({}, {
+    requestId: started.payload.requestId,
+    command: 'release'
+  });
+  assert.equal(nativeCreateCalls, 1, 'trusted main-process release starts the untouched native WebAuthn request');
 
   resolveCreate({ id: 'credential' });
   await request;
@@ -286,6 +309,17 @@ test('isolated preload installs the main-world observer at document start and fo
   assert.equal(lifecycle[1].payload.phase, 'settled');
   assert.equal(lifecycle[1].payload.success, true);
   assert.equal(lifecycle[1].payload.requestId, lifecycle[0].payload.requestId);
+
+  const controller = new AbortController();
+  const cancelled = credentials.create({
+    publicKey: { challenge: new Uint8Array([3]), rp: { id: 'github.com' } },
+    signal: controller.signal
+  });
+  controller.abort();
+  await assert.rejects(cancelled, { name: 'AbortError' });
+  assert.equal(nativeCreateCalls, 1, 'aborting a held request never enters native WebAuthn');
+  assert.equal(sends.at(-1).payload.phase, 'settled');
+  assert.equal(sends.at(-1).payload.errorName, 'AbortError');
 });
 
 test('decodeOpenExternalRequest is a security gate: only http(s) targets pass', () => {
@@ -301,7 +335,7 @@ test('decodeOpenExternalRequest is a security gate: only http(s) targets pass', 
 /* Bridge integration: injection on dom-ready + sentinel interception  */
 /* ------------------------------------------------------------------ */
 
-function makeBridgeHarness({ websitePasskeyProvider = null } = {}) {
+function makeBridgeHarness({ websitePasskeyProvider = null, webauthnSession = null, dialog = null } = {}) {
   const handlers = new Map();
   const listeners = new Map();
   const ipcMain = {
@@ -317,12 +351,16 @@ function makeBridgeHarness({ websitePasskeyProvider = null } = {}) {
   const externalCalls = [];
   const shell = { openExternal: async (url) => { externalCalls.push(url); } };
   const views = [];
+  const pageMessages = [];
   const WebContentsView = function FakeWebContentsView() {
     const listeners = new Map();
     let windowOpenHandler = null;
     const webContents = {
       executedScripts: [],
       loadedUrls: [],
+      session: webauthnSession,
+      mainFrame: null,
+      focus: () => {},
       loadURL: async (url) => { webContents.loadedUrls.push(url); },
       isDestroyed: () => false,
       setUserAgent: () => {},
@@ -333,7 +371,7 @@ function makeBridgeHarness({ websitePasskeyProvider = null } = {}) {
         listeners.get(event).push(fn);
       },
       emit: (event, ...args) => { for (const fn of listeners.get(event) || []) fn(...args); },
-      send: () => {},
+      send: (channel, payload) => pageMessages.push({ channel, payload }),
       _simulateWindowOpen: (details) => windowOpenHandler(details)
     };
     const view = { webContents, setBounds: () => {} };
@@ -346,9 +384,10 @@ function makeBridgeHarness({ websitePasskeyProvider = null } = {}) {
     shell,
     getMainWindow: () => fakeWin,
     websitePasskeyProvider,
+    dialog,
     logger: { error: () => {}, warn: () => {} }
   });
-  return { handlers, listeners, views, externalCalls, sentEvents };
+  return { handlers, listeners, views, externalCalls, sentEvents, pageMessages };
 }
 
 test('bridge injects the watchdog into the page main world on every dom-ready', async () => {
@@ -419,7 +458,7 @@ test('bridge turns a Linux site passkey request into an explicit secure continua
     settle: (details) => { calls.settle.push(details); },
     detach: () => {}
   };
-  const { handlers, listeners, views, sentEvents } = makeBridgeHarness({ websitePasskeyProvider: provider });
+  const { handlers, listeners, views, sentEvents, pageMessages } = makeBridgeHarness({ websitePasskeyProvider: provider });
   await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-passkey', url: 'https://github.com/settings/security' });
   await Promise.resolve();
   assert.equal(calls.attach.length, 1, 'provider is attached before the page can request WebAuthn');
@@ -430,11 +469,16 @@ test('bridge turns a Linux site passkey request into an explicit secure continua
     action: 'create',
     rpId: 'github.com',
     conditional: false,
-    attachment: 'platform'
+    attachment: 'platform',
+    controlled: true
   });
   const started = sentEvents.find((event) => event.payload.type === 'webauthn-request');
   assert.equal(started.payload.provider.mode, 'local');
   assert.equal(calls.confirm.length, 0, 'a site cannot trigger the system-password prompt without the user clicking browser chrome');
+  assert.deepEqual(pageMessages.at(-1), {
+    channel: 'yayra:site-passkey-control',
+    payload: { requestId: 'yayra-wa-linux-1', command: 'hold' }
+  }, 'GitHub create() is held before entering Chromium CTAP');
 
   const continued = await handlers.get('yayra:webview-continue-passkey')(null, {
     tabId: 'tab-passkey',
@@ -444,6 +488,10 @@ test('bridge turns a Linux site passkey request into an explicit secure continua
   assert.equal(calls.confirm.length, 1);
   assert.equal(calls.confirm[0].rpId, 'github.com');
   assert.equal(calls.confirm[0].isStillActive(), true);
+  assert.deepEqual(pageMessages.at(-1), {
+    channel: 'yayra:site-passkey-control',
+    payload: { requestId: 'yayra-wa-linux-1', command: 'release' }
+  }, 'verified presence is armed before the exact native create() call is released');
   assert.ok(sentEvents.some((event) => event.payload.type === 'webauthn-provider-state'
     && event.payload.state === 'prompting'));
   assert.ok(sentEvents.some((event) => event.payload.type === 'webauthn-provider-state'
@@ -457,6 +505,99 @@ test('bridge turns a Linux site passkey request into an explicit secure continua
     success: true
   });
   assert.equal(calls.settle.at(-1).requestId, 'yayra-wa-linux-1');
+});
+
+test('bridge fails an old ungated observer closed instead of attempting a late virtual touch', async () => {
+  let confirmations = 0;
+  const provider = {
+    describe: () => ({ mode: 'local', available: true, reason: '' }),
+    attach: async () => ({ ok: true }),
+    confirm: async () => { confirmations += 1; return { ok: true }; },
+    settle: () => {},
+    detach: () => {}
+  };
+  const { handlers, listeners, views, sentEvents, externalCalls } = makeBridgeHarness({ websitePasskeyProvider: provider });
+  const url = 'https://github.com/settings/security';
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-legacy-gate', url });
+  listeners.get('yayra:site-passkey-request')({ sender: views[0].webContents }, {
+    phase: 'started',
+    requestId: 'yayra-wa-legacy-ungated',
+    action: 'create',
+    rpId: 'github.com',
+    conditional: false,
+    controlled: false
+  });
+  const started = sentEvents.find((event) => event.payload?.type === 'webauthn-request');
+  assert.deepEqual(started.payload.provider, {
+    mode: 'external',
+    available: false,
+    reason: 'request-gate-unavailable'
+  });
+  const result = await handlers.get('yayra:webview-continue-passkey')(null, {
+    tabId: 'tab-legacy-gate',
+    requestId: 'yayra-wa-legacy-ungated'
+  });
+  assert.deepEqual(result, { ok: true, handedOff: true });
+  assert.equal(confirmations, 0, 'PolicyKit cannot claim success for an already-pending CTAP command');
+  assert.deepEqual(externalCalls, [url]);
+});
+
+test('bridge defers a conditional account callback until local user verification is armed', async () => {
+  const sessionListeners = new Map();
+  const session = { on: (event, listener) => sessionListeners.set(event, listener) };
+  const order = [];
+  const provider = {
+    describe: () => ({ mode: 'local', available: true, reason: '' }),
+    attach: async () => ({ ok: true }),
+    confirm: async () => { order.push('verified'); return { ok: true, prompted: true }; },
+    settle: () => {},
+    detach: () => {}
+  };
+  const dialog = {
+    showMessageBox: async () => ({ response: 0 })
+  };
+  const { handlers, listeners, views, pageMessages } = makeBridgeHarness({
+    websitePasskeyProvider: provider,
+    webauthnSession: session,
+    dialog
+  });
+  await handlers.get('yayra:webview-ensure')(null, {
+    tabId: 'tab-conditional',
+    url: 'https://github.com/login'
+  });
+  const frame = {};
+  views[0].webContents.mainFrame = frame;
+  listeners.get('yayra:site-passkey-request')({ sender: views[0].webContents }, {
+    phase: 'started',
+    requestId: 'yayra-wa-conditional-local-1',
+    action: 'get',
+    rpId: 'github.com',
+    conditional: true,
+    attachment: 'platform',
+    controlled: true
+  });
+  assert.equal(pageMessages.at(-1).payload.command, 'release', 'conditional discovery starts immediately');
+
+  const selected = [];
+  sessionListeners.get('select-webauthn-account')({}, {
+    relyingPartyId: 'github.com',
+    frame,
+    accounts: [{ credentialId: 'AQID', name: 'ada@example.com', displayName: 'Ada' }]
+  }, (credentialId) => {
+    order.push('account-callback');
+    selected.push(credentialId);
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(selected, [], 'choosing an account does not enter CTAP before verification');
+
+  const result = await handlers.get('yayra:webview-continue-passkey')(null, {
+    tabId: 'tab-conditional',
+    requestId: 'yayra-wa-conditional-local-1'
+  });
+  assert.deepEqual(result, { ok: true, prompted: true });
+  assert.deepEqual(selected, ['AQID']);
+  assert.deepEqual(order, ['verified', 'account-callback'], 'presence is armed before Chromium receives the selected credential');
 });
 
 test('bridge passkey action opens the exact HTTPS page externally when secure local storage is unavailable', async () => {

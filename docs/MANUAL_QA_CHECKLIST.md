@@ -78,11 +78,19 @@ this list is the reality check.
   Confirm startup logs say Touch ID website passkeys are enabled, then create
   and use a device-bound Touch ID credential. An unsigned/unentitled build must
   report Touch ID unavailable rather than claiming support.
-- [ ] **Linux:** test a security key that does not require Electron to collect
-  a PIN. If a PIN/hybrid phone/synced-passkey flow cannot be completed by
-  Electron, confirm the helper remains truthful and **Use system browser**
-  opens the exact HTTPS page. Do not hide or rewrite a site's own “partial
-  passkey support” warning.
+- [ ] **Linux local provider:** with a supported keyring backend and PolicyKit,
+  keep DevTools closed and register a platform passkey on GitHub. Before the
+  address-bar **Confirm passkey** action, confirm the site's native
+  `navigator.credentials.create()` has not entered CTAP. Approve the system
+  prompt and verify the same request completes, GitHub reports success, and
+  the credential still signs in after restarting Yayra. Repeat cancellation
+  and confirm it never releases virtual presence.
+- [ ] **Linux fallback:** open DevTools (which displaces the provider's single
+  CDP session), use a security key that needs unsupported Electron PIN UI, or
+  test without strong keyring/PolicyKit support. Confirm Yayra fails closed and
+  **Use system browser** opens the exact HTTPS page. A
+  `collector.github.com/github/collect` refusal is GitHub telemetry and must
+  not be reported as the WebAuthn failure.
 - [ ] Start a conditional-mediation request and leave it idle. Confirm no
   unsolicited stuck-request banner appears; selecting an account should still
   complete normally.

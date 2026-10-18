@@ -10,8 +10,9 @@
 //      Passwords fill only on explicit autofill; email addresses appear in a
 //      browser-owned picker when an email field is focused.
 //
-// Nothing here is exposed to the page: no contextBridge API is published,
-// listeners run in the isolated preload world only.
+// No privileged Electron API is exposed to the page. The document-start
+// WebAuthn observer publishes bounded lifecycle metadata only; its native-call
+// control requires a random capability supplied only by the isolated preload.
 
 const { ipcRenderer, contextBridge } = require('electron');
 
@@ -22,6 +23,22 @@ const EMAIL_FIELD_FOCUSED_CHANNEL = 'yayra:email-field-focused';
 const EMAIL_ADDRESS_CAPTURED_CHANNEL = 'yayra:email-address-captured';
 const EMAIL_SUGGESTIONS_CHANNEL = 'yayra:email-suggestions';
 const SITE_PASSKEY_REQUEST_CHANNEL = 'yayra:site-passkey-request';
+const SITE_PASSKEY_CONTROL_CHANNEL = 'yayra:site-passkey-control';
+
+function createSitePasskeyControlToken() {
+  try {
+    const bytes = new Uint8Array(32);
+    globalThis.crypto.getRandomValues(bytes);
+    return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
+  } catch {
+    // Do not install a page-callable release gate without an unguessable
+    // capability. Current Electron/Chromium always exposes Web Crypto here;
+    // an unusual older host safely falls back to ordinary native WebAuthn.
+    return '';
+  }
+}
+
+const sitePasskeyControlToken = createSitePasskeyControlToken();
 
 // The WebAuthn observer runs in the page's MAIN world because that is where
 // sites call navigator.credentials. It posts metadata-only lifecycle events;
@@ -51,7 +68,13 @@ window.addEventListener('message', (event) => {
   const attachment = payload.attachment === 'platform' || payload.attachment === 'cross-platform'
     ? payload.attachment
     : 'any';
-  let lifecycle = { action, rpId, conditional: Boolean(payload.conditional), attachment };
+  let lifecycle = {
+    action,
+    rpId,
+    conditional: Boolean(payload.conditional),
+    attachment,
+    controlled: payload.controlled === true
+  };
   if (phase === 'started') {
     if (activeSitePasskeyRequests.has(requestId) || activeSitePasskeyRequests.size >= 8) return;
     // This map belongs to the document's isolated world and disappears on
@@ -86,13 +109,21 @@ window.addEventListener('message', (event) => {
 if (contextBridge && typeof contextBridge.executeInMainWorld === 'function') {
   try {
     contextBridge.executeInMainWorld({
-      func: () => {
+      func: (controlToken) => {
         try {
           if (window.__yayraSitePasskeyObserver?.version === 1) return;
           if (!window.PublicKeyCredential || !navigator.credentials) return;
           const credentials = navigator.credentials;
+          const postToWindow = typeof window.postMessage === 'function'
+            ? window.postMessage.bind(window)
+            : null;
           const subscribers = [];
           const active = new Map();
+          const controlled = typeof controlToken === 'string' && /^[a-f0-9]{64}$/.test(controlToken);
+          // webContents.send reaches every preload frame. A per-document
+          // namespace prevents two same-origin frames from ever sharing an ID
+          // and being released by one trusted command.
+          const requestNamespace = controlled ? controlToken.slice(0, 16) : '';
           let sequence = 0;
 
           const relyingPartyId = (options) => {
@@ -106,7 +137,7 @@ if (contextBridge && typeof contextBridge.executeInMainWorld === 'function') {
             return fallback && fallback.length <= 253 && /^[a-z0-9.-]+$/.test(fallback) ? fallback : '';
           };
           const publish = (payload) => {
-            try { window.postMessage(payload, '*'); } catch { /* isolated preload remains the source of truth */ }
+            try { postToWindow?.(payload, '*'); } catch { /* isolated preload remains the source of truth */ }
             for (const subscriber of subscribers.slice()) {
               try { subscriber({ ...payload }); } catch { /* helper UI is best-effort */ }
             }
@@ -118,23 +149,113 @@ if (contextBridge && typeof contextBridge.executeInMainWorld === 'function') {
               source: 'yayra-site-passkey',
               version: 1,
               phase: 'started',
-              requestId: `yayra-wa-${Date.now().toString(36)}-${++sequence}`,
+              requestId: `yayra-wa-${Date.now().toString(36)}-${++sequence}${requestNamespace ? `-${requestNamespace}` : ''}`,
               action,
               rpId: relyingPartyId(options),
               conditional: options?.mediation === 'conditional',
-              attachment: attachment === 'platform' || attachment === 'cross-platform' ? attachment : 'any'
+              attachment: attachment === 'platform' || attachment === 'cross-platform' ? attachment : 'any',
+              controlled
             };
+          };
+          const abortError = () => {
+            try { return new window.DOMException('The passkey request was cancelled.', 'AbortError'); } catch {
+              const error = new Error('The passkey request was cancelled.');
+              try { error.name = 'AbortError'; } catch { /* Error name is writable in Chromium */ }
+              return error;
+            }
           };
           const wrap = (name, action) => {
             const original = credentials[name];
             if (typeof original !== 'function') return true;
             const wrapped = function (options) {
               if (!options?.publicKey) return original.apply(credentials, arguments);
+              const args = Array.from(arguments);
               const metadata = requestMetadata(action, options);
+
+              // A false virtual touch leaves Chromium's CTAP transaction
+              // pending; changing the touch flag later does not replay that
+              // command. Keep the native call behind this gate so Yayra can
+              // arm verified presence first, then start the exact untouched
+              // WebAuthn request. Non-local/native paths are released by main
+              // immediately. The random capability prevents page JavaScript
+              // from self-approving its own request.
+              if (controlled) {
+                let resolveOuter;
+                let rejectOuter;
+                let invoked = false;
+                let settled = false;
+                let abortSignal = null;
+                let abortListener = null;
+                const outer = new Promise((resolve, reject) => {
+                  resolveOuter = resolve;
+                  rejectOuter = reject;
+                });
+                const cleanup = () => {
+                  active.delete(metadata.requestId);
+                  if (abortSignal && abortListener) {
+                    try { abortSignal.removeEventListener('abort', abortListener); } catch { /* nonstandard signal */ }
+                  }
+                };
+                const settle = (success, value) => {
+                  if (settled) return;
+                  settled = true;
+                  cleanup();
+                  publish({
+                    ...metadata,
+                    phase: 'settled',
+                    success,
+                    errorName: success ? '' : String(value?.name || '')
+                  });
+                  if (success) resolveOuter(value);
+                  else rejectOuter(value);
+                };
+                const release = () => {
+                  if (invoked || settled) return;
+                  invoked = true;
+                  let nativeResult;
+                  try {
+                    nativeResult = original.apply(credentials, args);
+                  } catch (error) {
+                    settle(false, error);
+                    return;
+                  }
+                  if (!nativeResult || typeof nativeResult.then !== 'function') {
+                    const error = new Error('WebAuthn did not return a promise.');
+                    try { error.name = 'InvalidStateError'; } catch { /* best effort */ }
+                    settle(false, error);
+                    return;
+                  }
+                  nativeResult.then(
+                    (value) => settle(true, value),
+                    (error) => settle(false, error)
+                  );
+                };
+                const cancel = (reason) => {
+                  if (invoked || settled) return;
+                  settle(false, reason || abortError());
+                };
+                active.set(metadata.requestId, { metadata, release, cancel });
+
+                try { abortSignal = options?.signal || null; } catch { abortSignal = null; }
+                if (abortSignal?.aborted) {
+                  cancel(abortSignal.reason || abortError());
+                  return outer;
+                }
+                if (abortSignal && typeof abortSignal.addEventListener === 'function') {
+                  abortListener = () => cancel(abortSignal.reason || abortError());
+                  try { abortSignal.addEventListener('abort', abortListener, { once: true }); } catch { /* nonstandard signal */ }
+                }
+                publish(metadata);
+                return outer;
+              }
+
+              // Fail open only when this old/unusual renderer has no secure
+              // random capability. Main marks such requests as non-local, so
+              // the software provider can never rely on a late virtual touch.
               publish(metadata);
               let result;
               try {
-                result = original.apply(credentials, arguments);
+                result = original.apply(credentials, args);
               } catch (error) {
                 publish({ ...metadata, phase: 'settled', success: false, errorName: String(error?.name || '') });
                 throw error;
@@ -143,7 +264,8 @@ if (contextBridge && typeof contextBridge.executeInMainWorld === 'function') {
                 publish({ ...metadata, phase: 'settled', success: false, errorName: 'InvalidStateError' });
                 return result;
               }
-              active.set(metadata.requestId, metadata);
+              const record = { metadata };
+              active.set(metadata.requestId, record);
               result.then(
                 () => {
                   active.delete(metadata.requestId);
@@ -174,13 +296,24 @@ if (contextBridge && typeof contextBridge.executeInMainWorld === 'function') {
             subscribe(listener) {
               if (typeof listener !== 'function') return () => {};
               subscribers.push(listener);
-              for (const metadata of active.values()) {
-                try { listener({ ...metadata }); } catch { /* subscriber owns its failure */ }
+              for (const record of active.values()) {
+                try { listener({ ...record.metadata }); } catch { /* subscriber owns its failure */ }
               }
               return () => {
                 const index = subscribers.indexOf(listener);
                 if (index >= 0) subscribers.splice(index, 1);
               };
+            },
+            control(message, presentedToken) {
+              if (!controlled || presentedToken !== controlToken || !message || typeof message !== 'object') return false;
+              const requestId = typeof message.requestId === 'string' ? message.requestId : '';
+              if (!/^yayra-wa-[a-z0-9-]{1,80}$/i.test(requestId)) return false;
+              const record = active.get(requestId);
+              if (!record || typeof record.release !== 'function') return false;
+              if (message.command === 'hold') return true;
+              if (message.command === 'release') { record.release(); return true; }
+              if (message.command === 'cancel') { record.cancel?.(abortError()); return true; }
+              return false;
             }
           });
           try {
@@ -192,10 +325,34 @@ if (contextBridge && typeof contextBridge.executeInMainWorld === 'function') {
             });
           } catch { window.__yayraSitePasskeyObserver = observer; }
         } catch { /* Chromium WebAuthn remains untouched if early observation is unavailable */ }
-      }
+      },
+      args: [sitePasskeyControlToken]
     });
   } catch { /* older Electron: the dom-ready watchdog below remains the fallback */ }
 }
+
+// Only the isolated preload receives this command from Electron main. It
+// crosses into the page world with the per-document random capability that
+// was captured by the frozen observer closure above. A website can discover
+// the control function, but cannot guess the capability needed to use it.
+ipcRenderer.on(SITE_PASSKEY_CONTROL_CHANNEL, (_event, payload = {}) => {
+  const requestId = typeof payload.requestId === 'string' && /^yayra-wa-[a-z0-9-]{1,80}$/i.test(payload.requestId)
+    ? payload.requestId
+    : '';
+  const command = payload.command === 'hold' || payload.command === 'release' || payload.command === 'cancel'
+    ? payload.command
+    : '';
+  if (!sitePasskeyControlToken || !requestId || !command
+      || !contextBridge || typeof contextBridge.executeInMainWorld !== 'function') return;
+  try {
+    contextBridge.executeInMainWorld({
+      func: (message, controlToken) => {
+        try { window.__yayraSitePasskeyObserver?.control?.(message, controlToken); } catch { /* document navigated */ }
+      },
+      args: [{ requestId, command }, sitePasskeyControlToken]
+    });
+  } catch { /* document navigated or the renderer is shutting down */ }
+});
 
 const USERNAME_SELECTOR = [
   'input[type="email"]',
