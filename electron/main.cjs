@@ -25,6 +25,7 @@ const { createOverlayStore } = require('./overlayStore.cjs');
 const { createScreenRecorder } = require('./screenRecorder.cjs');
 const { createTrayController } = require('./tray.cjs');
 const { applyVaapiPolicy } = require('./vaapiProbe.cjs');
+const { createWindowDragController } = require('./windowDrag.cjs');
 
 const CUSTOM_SCHEME = 'yayra';
 const DIST_DIR = path.join(__dirname, '..', 'dist');
@@ -37,6 +38,7 @@ let overlayBridge = null;
 let webviewBridge = null;
 let globalHotkeys = null;
 let trayController = null;
+let windowDragController = null;
 let lastLoadError = null;
 
 // Boot launches (login items / XDG autostart) pass --yayra-autostart:
@@ -641,6 +643,8 @@ app.whenReady().then(async () => {
 
 app.on('will-quit', () => {
   try { globalHotkeys?.detach(); } catch { /* exiting */ }
+  try { windowDragController?.destroy(); } catch { /* exiting */ }
+  windowDragController = null;
   try { globalShortcut.unregisterAll(); } catch { /* exiting */ }
 });
 
@@ -676,6 +680,15 @@ app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) creat
 
 function registerIpcBridges() {
   registerDesktopUpdateHandlers({ getWindow: () => mainWindow });
+
+  // Keep every pixel of the custom top chrome renderer-interactive. Native
+  // CSS drag regions can hold a compositor input grab (most visibly on
+  // Linux), leaving tabs and caption buttons looking frozen. The dedicated
+  // dotted handle now streams pointer coordinates through this coalesced
+  // manual drag controller instead.
+  if (!windowDragController) {
+    windowDragController = createWindowDragController({ ipcMain, BrowserWindow });
+  }
 
   // Window controls for the frameless main window (the OS title bar and
   // menu block are gone - see createWindow()). Resolved per-sender so the
@@ -1084,6 +1097,75 @@ function registerIpcBridges() {
 }
 
 /**
+ * Website pages live in separate WebContentsViews. A stalled shell renderer
+ * therefore freezes only tabs/address/caption controls while the page below
+ * can keep moving - the exact split-freeze this guard repairs. It applies to
+ * both the primary shell and every independent profile window.
+ */
+function installShellFreezeRecovery(win, label = 'shell') {
+  const contents = win.webContents;
+  let crashWindowStarted = 0;
+  let crashReloads = 0;
+  let unresponsiveTimer = null;
+  let recoveryWindowStarted = 0;
+  let recoveryReloads = 0;
+  const clearUnresponsiveTimer = () => {
+    if (unresponsiveTimer) clearTimeout(unresponsiveTimer);
+    unresponsiveTimer = null;
+  };
+  const onRenderGone = (_event, details) => {
+    const reason = details && details.reason;
+    if (reason !== 'crashed' && reason !== 'oom' && reason !== 'killed') return;
+    const now = Date.now();
+    if (now - crashWindowStarted > 60000) {
+      crashWindowStarted = now;
+      crashReloads = 0;
+    }
+    crashReloads += 1;
+    console.error(`[yayra] ${label} renderer gone (${reason}) - reload #${crashReloads}`);
+    if (crashReloads > 5) {
+      console.error(`[yayra] ${label} renderer is crash-looping - not reloading again automatically`);
+      return;
+    }
+    try { if (!win.isDestroyed()) win.webContents.reload(); } catch { /* already closing */ }
+  };
+  const onUnresponsive = () => {
+    console.warn(`[yayra] ${label} renderer reported unresponsive; recovery grace period started`);
+    if (unresponsiveTimer) return;
+    unresponsiveTimer = setTimeout(() => {
+      unresponsiveTimer = null;
+      if (win.isDestroyed() || win.webContents.isDestroyed?.()) return;
+      const now = Date.now();
+      if (now - recoveryWindowStarted > 60000) {
+        recoveryWindowStarted = now;
+        recoveryReloads = 0;
+      }
+      recoveryReloads += 1;
+      if (recoveryReloads > 3) {
+        console.error(`[yayra] ${label} renderer remains unresponsive but recovery is rate-limited`);
+        return;
+      }
+      console.error(`[yayra] ${label} renderer stayed unresponsive; reloading chrome (${recoveryReloads}/3)`);
+      try { win.webContents.reload(); } catch { /* window raced shutdown */ }
+    }, 6000);
+    unresponsiveTimer?.unref?.();
+  };
+  const onResponsive = () => {
+    clearUnresponsiveTimer();
+    console.log(`[yayra] ${label} renderer responsive again`);
+  };
+  contents.on('render-process-gone', onRenderGone);
+  contents.on('unresponsive', onUnresponsive);
+  contents.on('responsive', onResponsive);
+  return () => {
+    clearUnresponsiveTimer();
+    try { contents.removeListener?.('render-process-gone', onRenderGone); } catch { /* destroyed */ }
+    try { contents.removeListener?.('unresponsive', onUnresponsive); } catch { /* destroyed */ }
+    try { contents.removeListener?.('responsive', onResponsive); } catch { /* destroyed */ }
+  };
+}
+
+/**
  * A SECOND, independent shell window bound to a specific browser profile
  * (Chrome's "open this profile in its own window" model). The existing
  * window keeps its profile and tabs; this one boots with ?profile=<id>
@@ -1100,10 +1182,14 @@ function createProfileWindow(profileId) {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: true,
+      // This renderer owns only browser chrome. Never freeze its timers/rAF
+      // while a native page surface remains active in a separate renderer.
+      backgroundThrottling: false
     }
   });
   profileWindows.add(win);
+  const clearShellRecovery = installShellFreezeRecovery(win, 'profile shell');
   win.webContents.on('context-menu', (_event, params) => {
     if (win.isDestroyed()) return;
     const template = buildContextMenuTemplate({ params, wc: win.webContents, tabId: null, send: () => {}, clipboard });
@@ -1111,6 +1197,7 @@ function createProfileWindow(profileId) {
   });
   const winContents = win.webContents;
   win.on('closed', () => {
+    clearShellRecovery();
     if (webviewBridge) webviewBridge.destroyForWebContents(winContents);
     profileWindows.delete(win);
   });
@@ -1128,11 +1215,11 @@ function createWindow() {
     width: 1200,
     height: 800,
     // No OS title bar ("yayra" text) and no File/Edit/View/Window menu
-    // block: Yayra draws its OWN top chrome, with a dedicated window-drag
-    // handle and real minimize/maximize/close buttons via the windowControls
-    // IPC bridge (see registerIpcBridges + BrowserShell.renderDesktopLayout).
-    // The rest of the tab strip stays interactive instead of behaving like
-    // a native title bar. On macOS the native traffic lights are kept, inset.
+    // block: Yayra draws its OWN top chrome, with a renderer-owned manual
+    // drag handle and real minimize/maximize/close buttons via the
+    // windowControls IPC bridge (see registerIpcBridges + BrowserShell).
+    // No part of the tab strip enters a native input-grab region. On macOS
+    // the native traffic lights are kept, inset.
     ...(process.platform === 'darwin' ? { titleBarStyle: 'hiddenInset' } : { frame: false }),
     // Dark surface behind EVERYTHING. Electron's default window background
     // is white, and every time the native page view hides/moves (menu
@@ -1146,7 +1233,11 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: true,
+      // Native pages run in their own WebContentsViews; the shell renderer
+      // is the tabs/address/window-control UI and must never be timer-frozen
+      // while those pages continue painting underneath it.
+      backgroundThrottling: false
     }
   });
 
@@ -1175,33 +1266,9 @@ function createWindow() {
     Menu.buildFromTemplate(template).popup({ window: win });
   });
 
-  // PRODUCTION FREEZE GUARDS: a renderer crash must never leave a dead
-  // white window that looks like a frozen app - reload it automatically,
-  // rate-limited so a genuine crash-loop can never spin the CPU.
-  let rendererReloads = 0;
-  let rendererReloadWindowStarted = 0;
-  win.webContents.on('render-process-gone', (_event, details) => {
-    const reason = details && details.reason;
-    if (reason !== 'crashed' && reason !== 'oom' && reason !== 'killed') return;
-    const now = Date.now();
-    if (now - rendererReloadWindowStarted > 60000) {
-      rendererReloadWindowStarted = now;
-      rendererReloads = 0;
-    }
-    rendererReloads += 1;
-    console.error(`[yayra] renderer gone (${reason}) - reload #${rendererReloads}`);
-    if (rendererReloads > 5) {
-      console.error('[yayra] renderer is crash-looping - not reloading again automatically');
-      return;
-    }
-    try { if (!win.isDestroyed()) win.webContents.reload(); } catch { /* already closing */ }
-  });
-  win.webContents.on('unresponsive', () => {
-    console.warn('[yayra] renderer reported unresponsive (busy page) - window stays alive');
-  });
-  win.webContents.on('responsive', () => {
-    console.log('[yayra] renderer responsive again');
-  });
+  // PRODUCTION FREEZE GUARDS: a crash or genuinely stuck chrome renderer
+  // must not leave a dead title/tab strip over still-live website content.
+  const clearShellRecovery = installShellFreezeRecovery(win, 'main shell');
 
   // Closing the main window only tears down ITS tab views; the floating
   // bubble/mini window (and their views) stay alive independently. The
@@ -1209,6 +1276,7 @@ function createWindow() {
   // refuses property access after destruction.
   const winContents = win.webContents;
   win.on('closed', () => {
+    clearShellRecovery();
     if (webviewBridge) webviewBridge.destroyForWebContents(winContents);
     if (mainWindow === win) mainWindow = null;
   });

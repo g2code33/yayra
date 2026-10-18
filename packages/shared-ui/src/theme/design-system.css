@@ -536,11 +536,9 @@ html {
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   user-select: none;
   z-index: 20;
-  /* The strip is custom chrome, but not a window-manager title bar: tabs,
-     buttons, and blank space all remain renderer-interactive. A small
-     explicit handle below is the only native drag region. This prevents
-     double-clicking anywhere on the tab strip from unexpectedly restoring
-     or minimizing the whole window. */
+  /* The complete strip stays renderer-owned. Native Electron drag regions
+     can retain a Linux compositor input grab and make tabs/buttons appear
+     frozen; the dotted handle below uses pointer events + IPC instead. */
   -webkit-app-region: no-drag;
 }
 
@@ -553,11 +551,17 @@ html {
   color: var(--fb-text-muted);
   opacity: 0.58;
   cursor: move;
+  touch-action: none;
   background-image: radial-gradient(circle, currentColor 1px, transparent 1.2px);
   background-size: 4px 4px;
   background-position: center;
   background-repeat: repeat;
-  -webkit-app-region: drag;
+  -webkit-app-region: no-drag;
+}
+
+.fb-tabstrip-drag-handle.is-dragging {
+  cursor: move;
+  opacity: 0.9;
 }
 
 .fb-chrome-tabstrip .fb-tab-item,
@@ -3226,6 +3230,28 @@ html {
   min-width: 76px;
   overflow: hidden;
   box-sizing: border-box;
+  /* Keep tab reordering inside Chromium's pointer-event path. Native HTML
+     drag/drop is intentionally disabled because a lost Linux drag-end can
+     leave this whole row input-grabbed. */
+  -webkit-user-drag: none;
+  user-drag: none;
+  touch-action: pan-x;
+}
+
+.fb-tab-item *,
+.fb-tab-item img,
+.fb-tab-item svg {
+  -webkit-user-drag: none;
+  user-drag: none;
+}
+
+.fb-tab-item.fb-tab-pointer-dragging {
+  opacity: 0.72;
+  cursor: move;
+}
+
+.fb-tab-item.fb-tab-pointer-target {
+  box-shadow: inset 3px 0 0 var(--fb-accent-primary), 0 4px 14px var(--fb-accent-glow);
 }
 
 .fb-tab-item .fb-tab-favicon,

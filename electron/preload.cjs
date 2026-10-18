@@ -15,6 +15,11 @@ const api = {
     toggleMaximize: () => ipcRenderer.invoke('yayra:window-maximize-toggle'),
     isMaximized: () => ipcRenderer.invoke('yayra:window-is-maximized'),
     close: () => ipcRenderer.invoke('yayra:window-close'),
+    // Manual dragging keeps the complete tab strip out of Electron's native
+    // app-region path, which can swallow input and leave Linux chrome stuck.
+    dragStart: (point) => ipcRenderer.send('yayra:window-drag-start', point),
+    dragMove: (point) => ipcRenderer.send('yayra:window-drag-move', point),
+    dragEnd: () => ipcRenderer.send('yayra:window-drag-end'),
     // Explicit menu > Exit: unlike close(), this quits the whole app and
     // its floating bubble/tray process, not only this BrowserWindow.
     quit: () => ipcRenderer.invoke('yayra:app-quit')

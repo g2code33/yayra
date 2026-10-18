@@ -20,13 +20,16 @@ import { BrowserShell } from '../packages/shared-ui/src/components/BrowserShell.
  */
 
 function installFakeWindowControls() {
-  const calls = { minimize: 0, toggleMaximize: 0, close: 0 };
+  const calls = { minimize: 0, toggleMaximize: 0, close: 0, dragStart: [], dragMove: [], dragEnd: 0 };
   globalThis.window.yayra = {
     windowControls: {
       minimize: () => { calls.minimize += 1; return Promise.resolve(); },
       toggleMaximize: () => { calls.toggleMaximize += 1; return Promise.resolve(true); },
       isMaximized: () => Promise.resolve(false),
-      close: () => { calls.close += 1; return Promise.resolve(); }
+      close: () => { calls.close += 1; return Promise.resolve(); },
+      dragStart: (point) => { calls.dragStart.push(point); },
+      dragMove: (point) => { calls.dragMove.push(point); },
+      dragEnd: () => { calls.dragEnd += 1; }
     }
   };
   return { calls, uninstall: () => { delete globalThis.window.yayra; } };
@@ -56,18 +59,63 @@ test('web/PWA (no bridge): no window-control buttons - the browser owns the wind
 
   assert.equal(shell.windowControls, null);
   assert.equal(el.querySelector('.fb-window-controls'), null);
-  assert.equal(el.querySelector('.fb-tabstrip-drag-handle'), null, 'web/PWA has no native window drag handle');
+  assert.equal(el.querySelector('.fb-tabstrip-drag-handle'), null, 'web/PWA has no desktop window drag handle');
 });
 
-test('frameless tab strip limits native dragging to its dedicated handle', () => {
+test('frameless top chrome has ZERO native drag regions, including the dedicated handle', () => {
   const css = readFileSync(new URL('../packages/shared-ui/src/theme/design-system.css', import.meta.url), 'utf8');
   const tabStripRule = css.match(/\.fb-chrome-tabstrip\s*\{([\s\S]*?)\}/)?.[1] || '';
   const dragHandleRule = css.match(/\.fb-tabstrip-drag-handle\s*\{([\s\S]*?)\}/)?.[1] || '';
   const tabListRule = css.match(/\.fb-chrome-tabstrip \.fb-tab-item,[\s\S]*?\{([\s\S]*?)\}/)?.[1] || '';
 
-  assert.match(tabStripRule, /-webkit-app-region:\s*no-drag/, 'the tab strip no longer acts as a whole-window titlebar');
-  assert.match(dragHandleRule, /-webkit-app-region:\s*drag/, 'window movement remains available through the explicit handle');
+  assert.match(tabStripRule, /-webkit-app-region:\s*no-drag/, 'the tab strip stays renderer-interactive');
+  assert.match(dragHandleRule, /-webkit-app-region:\s*no-drag/, 'the handle uses pointer IPC, never a native input grab');
+  assert.doesNotMatch(dragHandleRule, /-webkit-app-region:\s*drag(?:\s|;)/, 'no native drag region survives on the handle');
+  assert.match(dragHandleRule, /touch-action:\s*none/, 'the manual handle owns its pointer stream');
   assert.match(tabListRule, /-webkit-app-region:\s*no-drag/, 'tab items and their scroll area remain clickable');
+});
+
+test('manual window handle starts only after movement and always ends the IPC drag', async () => {
+  const { calls, uninstall } = installFakeWindowControls();
+  try {
+    const container = document.createElement('div');
+    const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+    await shell.initialize();
+    const handle = shell.render(container).querySelector('.fb-tabstrip-drag-handle');
+    const event = (type, x, y) => ({
+      type, target: handle, pointerType: 'mouse', button: 0, pointerId: 7,
+      screenX: x, screenY: y, preventDefault() {}, stopPropagation() {}
+    });
+
+    handle.dispatchEvent(event('pointerdown', 100, 200));
+    handle.dispatchEvent(event('pointermove', 102, 202));
+    assert.equal(calls.dragStart.length, 0, 'a normal click/tiny jitter never moves the window');
+    handle.dispatchEvent(event('pointermove', 120, 214));
+    handle.dispatchEvent(event('pointerup', 120, 214));
+
+    assert.deepEqual(calls.dragStart, [{ x: 100, y: 200 }]);
+    assert.deepEqual(calls.dragMove.at(-1), { x: 120, y: 214 });
+    assert.equal(calls.dragEnd, 1, 'pointerup releases the main-process drag state');
+
+    handle.dispatchEvent(event('pointerdown', 120, 214));
+    handle.dispatchEvent(event('pointerup', 120, 214));
+    handle.dispatchEvent(event('pointerdown', 120, 214));
+    handle.dispatchEvent(event('pointerup', 120, 214));
+    assert.equal(calls.toggleMaximize, 1, 'double-click behavior is preserved without native titlebar input');
+    shell.destroy();
+  } finally {
+    uninstall();
+  }
+});
+
+test('manual drag IPC is wired through preload and one lifecycle-owned main controller', () => {
+  const preload = readFileSync(new URL('../electron/preload.cjs', import.meta.url), 'utf8');
+  const main = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
+  assert.match(preload, /dragStart:[\s\S]{0,100}ipcRenderer\.send\('yayra:window-drag-start'/);
+  assert.match(preload, /dragMove:[\s\S]{0,100}ipcRenderer\.send\('yayra:window-drag-move'/);
+  assert.match(preload, /dragEnd:[\s\S]{0,100}ipcRenderer\.send\('yayra:window-drag-end'/);
+  assert.match(main, /createWindowDragController\(\{ ipcMain, BrowserWindow \}\)/);
+  assert.match(main, /windowDragController\?\.destroy\(\)/, 'app shutdown unregisters listeners and clears sessions');
 });
 
 test('Exit bridge quits the whole Electron app separately from closing only the current window', () => {

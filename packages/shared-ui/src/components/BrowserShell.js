@@ -614,8 +614,8 @@ export class BrowserShell {
   // maximize/close for the frameless Electron main window. The OS title
   // bar (which just said "yayra") and the File/Edit/View/Window menu block
   // are removed - Yayra renders its own tab strip and window controls, with
-  // a small dedicated drag handle. Absent on web/PWA, where the browser
-  // provides the window chrome.
+  // a small renderer-owned pointer/IPC drag handle (never a native app drag
+  // region). Absent on web/PWA, where the browser provides window chrome.
   get windowControls() {
     if (typeof window === 'undefined') return null;
     const bridge = (window.yayra && window.yayra.windowControls) || (window.ibrowse && window.ibrowse.windowControls) || null;
@@ -1672,6 +1672,223 @@ export class BrowserShell {
     }
   }
 
+  /**
+   * Frameless-window movement without `-webkit-app-region: drag`.
+   * Native drag regions own the mouse before Chromium and have repeatedly
+   * wedged the Linux tab strip. Pointer capture + fire-and-forget IPC keeps
+   * clicks, double-clicks, tabs and window controls in the renderer.
+   */
+  bindManualWindowDrag(handle, controls) {
+    if (!handle || !controls || typeof controls.dragStart !== 'function'
+      || typeof controls.dragMove !== 'function' || typeof controls.dragEnd !== 'function') return;
+    let pressed = null;
+    let dragging = false;
+    let globalsBound = false;
+    let lastMoveEvent = null;
+    let lastTapAt = 0;
+    const pointerPoint = (event) => {
+      const x = Number(event?.screenX);
+      const y = Number(event?.screenY);
+      return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+    };
+    const samePointer = (event) => !pressed || pressed.pointerId == null || event?.pointerId == null
+      || pressed.pointerId === event.pointerId;
+    const removeGlobals = () => {
+      if (!globalsBound || typeof window === 'undefined') return;
+      globalsBound = false;
+      window.removeEventListener?.('pointermove', move, true);
+      window.removeEventListener?.('pointerup', end, true);
+      window.removeEventListener?.('pointercancel', cancel, true);
+      window.removeEventListener?.('blur', cancel, true);
+    };
+    const end = (event = null) => {
+      if (!pressed || !samePointer(event)) return;
+      const pointerId = pressed.pointerId;
+      const wasDragging = dragging;
+      pressed = null;
+      dragging = false;
+      removeGlobals();
+      this._activePointerCleanups?.delete(cancel);
+      handle.classList?.remove('is-dragging');
+      if (wasDragging) {
+        try { controls.dragEnd(); } catch { /* window raced shutdown */ }
+        event?.preventDefault?.();
+      } else if (event?.type === 'pointerup') {
+        // pointerdown is prevented to eliminate text/image native drags, so
+        // implement titlebar-style double-click explicitly and exactly once.
+        const now = Date.now();
+        if (lastTapAt && now - lastTapAt <= 400) {
+          lastTapAt = 0;
+          Promise.resolve(controls.toggleMaximize?.()).catch(() => {});
+        } else lastTapAt = now;
+      }
+      try { handle.releasePointerCapture?.(pointerId); } catch { /* capture already released */ }
+    };
+    const cancel = (event = null) => end(event);
+    const move = (event) => {
+      if (!pressed || !samePointer(event) || event === lastMoveEvent) return;
+      lastMoveEvent = event;
+      if (event?.pointerType === 'mouse' && event?.buttons != null && Number(event.buttons) === 0) {
+        cancel(event);
+        return;
+      }
+      const current = pointerPoint(event);
+      if (!current) { cancel(event); return; }
+      if (!dragging) {
+        if (Math.abs(current.x - pressed.x) < 4 && Math.abs(current.y - pressed.y) < 4) return;
+        dragging = true;
+        lastTapAt = 0;
+        handle.classList?.add('is-dragging');
+        try { controls.dragStart({ x: pressed.x, y: pressed.y }); } catch { cancel(event); return; }
+      }
+      try { controls.dragMove(current); } catch { cancel(event); }
+      event?.preventDefault?.();
+    };
+    handle.addEventListener('pointerdown', (event) => {
+      if (event?.isPrimary === false) return;
+      if (event?.pointerType === 'mouse' && event?.button != null && Number(event.button) !== 0) return;
+      const start = pointerPoint(event);
+      if (!start) return;
+      if (pressed) cancel();
+      pressed = { ...start, pointerId: event?.pointerId };
+      dragging = false;
+      lastMoveEvent = null;
+      this._activePointerCleanups ||= new Set();
+      this._activePointerCleanups.add(cancel);
+      if (typeof window !== 'undefined') {
+        globalsBound = true;
+        // Capture-phase window fallbacks survive a render replacing `handle`
+        // mid-gesture and also cover embedders without pointer-capture APIs.
+        window.addEventListener?.('pointermove', move, true);
+        window.addEventListener?.('pointerup', end, true);
+        window.addEventListener?.('pointercancel', cancel, true);
+        window.addEventListener?.('blur', cancel, true);
+      }
+      try { handle.setPointerCapture?.(event.pointerId); } catch { /* optional */ }
+      event?.preventDefault?.();
+    });
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', end);
+    handle.addEventListener('pointercancel', cancel);
+    handle.addEventListener('lostpointercapture', cancel);
+  }
+
+  /**
+   * Reorder tabs with normal pointer events only. HTML5 drag/drop enters a
+   * native drag loop; when a Linux compositor loses its drop/end event the
+   * row remains input-grabbed and appears frozen. This implementation keeps
+   * the pointer captured by the source tab and commits once on pointerup.
+   */
+  bindPointerTabReorder(tabEl, fromIndex, tabsScroll) {
+    if (!tabEl || !tabsScroll) return;
+    let pressed = null;
+    let dragging = false;
+    let globalsBound = false;
+    let lastMoveEvent = null;
+    let targetIndex = fromIndex;
+    const clientPoint = (event) => {
+      const x = Number(event?.clientX);
+      const y = Number(event?.clientY);
+      return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+    };
+    const samePointer = (event) => !pressed || pressed.pointerId == null || event?.pointerId == null
+      || pressed.pointerId === event.pointerId;
+    const clearMarkers = () => {
+      tabEl.classList?.remove('fb-tab-pointer-dragging');
+      for (const item of tabsScroll.querySelectorAll?.('.fb-tab-item') || []) {
+        item.classList?.remove('fb-tab-pointer-target');
+      }
+    };
+    const nearestIndex = (clientX) => {
+      const tabs = Array.from(tabsScroll.querySelectorAll?.('.fb-tab-item') || []);
+      if (!tabs.length) return fromIndex;
+      let winner = fromIndex;
+      let distance = Infinity;
+      tabs.forEach((item, index) => {
+        const rect = item.getBoundingClientRect?.();
+        const center = rect && Number.isFinite(rect.left) && Number.isFinite(rect.width)
+          ? rect.left + rect.width / 2
+          : index;
+        const nextDistance = Math.abs((Number(clientX) || 0) - center);
+        if (nextDistance < distance) { distance = nextDistance; winner = index; }
+      });
+      return winner;
+    };
+    const removeGlobals = () => {
+      if (!globalsBound || typeof window === 'undefined') return;
+      globalsBound = false;
+      window.removeEventListener?.('pointermove', move, true);
+      window.removeEventListener?.('pointerup', commit, true);
+      window.removeEventListener?.('pointercancel', cancel, true);
+      window.removeEventListener?.('blur', cancel, true);
+    };
+    const finish = (event, shouldCommit) => {
+      if (!pressed || !samePointer(event)) return;
+      const pointerId = pressed.pointerId;
+      const wasDragging = dragging;
+      pressed = null;
+      dragging = false;
+      removeGlobals();
+      this._activePointerCleanups?.delete(cancel);
+      clearMarkers();
+      try { tabEl.releasePointerCapture?.(pointerId); } catch { /* optional */ }
+      if (!wasDragging) return;
+      tabEl._yayraSuppressClick = true;
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      if (shouldCommit && targetIndex !== fromIndex) this.reorderTabs(fromIndex, targetIndex);
+    };
+    const commit = (event) => finish(event, true);
+    const cancel = (event = null) => finish(event, false);
+    const move = (event) => {
+      if (!pressed || !samePointer(event) || event === lastMoveEvent) return;
+      lastMoveEvent = event;
+      if (event?.pointerType === 'mouse' && event?.buttons != null && Number(event.buttons) === 0) {
+        cancel(event);
+        return;
+      }
+      const current = clientPoint(event);
+      if (!current) { cancel(event); return; }
+      const { x, y } = current;
+      if (!dragging) {
+        if (Math.abs(x - pressed.x) < 6 && Math.abs(y - pressed.y) < 6) return;
+        dragging = true;
+        tabEl.classList?.add('fb-tab-pointer-dragging');
+      }
+      targetIndex = nearestIndex(x);
+      const tabs = Array.from(tabsScroll.querySelectorAll?.('.fb-tab-item') || []);
+      tabs.forEach((item, index) => item.classList?.toggle('fb-tab-pointer-target', index === targetIndex && index !== fromIndex));
+      event?.preventDefault?.();
+    };
+    tabEl.addEventListener('pointerdown', (event) => {
+      if (event?.isPrimary === false) return;
+      if (event?.pointerType === 'mouse' && event?.button != null && Number(event.button) !== 0) return;
+      if (event?.target?.closest?.('.fb-tab-close-btn')) return;
+      const start = clientPoint(event);
+      if (!start) return;
+      if (pressed) cancel();
+      pressed = { ...start, pointerId: event?.pointerId };
+      targetIndex = fromIndex;
+      lastMoveEvent = null;
+      this._activePointerCleanups ||= new Set();
+      this._activePointerCleanups.add(cancel);
+      if (typeof window !== 'undefined') {
+        globalsBound = true;
+        // Keep the gesture alive if a native navigation update re-renders
+        // and replaces this tab before the user releases the pointer.
+        window.addEventListener?.('pointermove', move, true);
+        window.addEventListener?.('pointerup', commit, true);
+        window.addEventListener?.('pointercancel', cancel, true);
+        window.addEventListener?.('blur', cancel, true);
+      }
+      try { tabEl.setPointerCapture?.(event.pointerId); } catch { /* optional */ }
+    });
+    tabEl.addEventListener('pointermove', move);
+    tabEl.addEventListener('pointerup', commit);
+    tabEl.addEventListener('pointercancel', cancel);
+    tabEl.addEventListener('lostpointercapture', cancel);
+  }
+
   /* -------------------------------------------------------------
    * DESKTOP LAYOUT (COMPACT TABS, OMNIBOX, BRANDING, NO-BLUR DRAWER)
    * ----------------------------------------------------------- */
@@ -1690,17 +1907,19 @@ export class BrowserShell {
     tabstripBrand.setAttribute('aria-hidden', 'true');
     tabStrip.appendChild(tabstripBrand);
 
-    // Do not make the entire tab strip an OS title bar: Electron's native
-    // drag region can consume clicks and applies the desktop's double-click
-    // title-bar action (often restore/minimize) to otherwise ordinary tab
-    // interactions. Keep window movement on one small, explicit handle.
+    // ZERO native app-region pixels. Electron/OS drag regions consume input
+    // before Chromium dispatches it and can leave Linux's custom chrome in a
+    // compositor-owned grab (tabs/window buttons look frozen while the page
+    // below keeps working). The dotted handle is renderer-owned and streams
+    // pointer coordinates through the preload bridge instead.
     const winControls = this.options?.isMiniShell ? null : this.windowControls;
     if (winControls) {
       const dragHandle = document.createElement('span');
       dragHandle.className = 'fb-tabstrip-drag-handle';
       dragHandle.setAttribute('aria-hidden', 'true');
-      dragHandle.setAttribute('title', 'Drag window');
+      dragHandle.setAttribute('title', 'Drag window · double-click to maximize or restore');
       tabStrip.appendChild(dragHandle);
+      this.bindManualWindowDrag(dragHandle, winControls);
     }
 
     const tabsScroll = document.createElement('div');
@@ -1712,7 +1931,11 @@ export class BrowserShell {
       tabEl.className = `fb-tab-item ${isActive ? 'active' : ''} ${tab.isPrivate ? 'fb-tab-incognito' : ''} ${!isActive && this.state.settings.dimInactiveTabs !== false ? 'fb-tab-inactive-dim' : ''}`;
       tabEl.setAttribute('role', 'tab');
       tabEl.setAttribute('aria-selected', isActive ? 'true' : 'false');
-      tabEl.setAttribute('draggable', 'true');
+      // Never enter Chromium's native HTML drag-and-drop loop here. On
+      // Linux/Wayland a tiny accidental tab drag can retain the input grab
+      // and make the complete strip appear frozen. Reordering uses ordinary
+      // pointer events below, so clicks always remain renderer-owned.
+      tabEl.draggable = false;
       tabEl.dataset.tabId = tab.id;
 
       if (this.state.settings.tabHoverCards !== false) {
@@ -1791,6 +2014,10 @@ export class BrowserShell {
       tabEl.appendChild(closeBtn);
 
       tabEl.addEventListener('click', () => {
+        if (tabEl._yayraSuppressClick) {
+          tabEl._yayraSuppressClick = false;
+          return;
+        }
         this.selectTab(tab.id);
       });
 
@@ -1809,20 +2036,12 @@ export class BrowserShell {
         this.renderTabContextMenu(e.clientX, e.clientY, tab);
       });
 
-      // Tab drag reordering
-      tabEl.addEventListener('dragstart', (e) => {
-        if (e.dataTransfer) {
-          e.dataTransfer.setData('text/plain', String(index));
-        }
-      });
-      tabEl.addEventListener('dragover', (e) => e.preventDefault());
-      tabEl.addEventListener('drop', (e) => {
-        e.preventDefault();
-        const fromIdx = Number(e.dataTransfer?.getData('text/plain'));
-        if (!isNaN(fromIdx) && fromIdx !== index) {
-          this.reorderTabs(fromIdx, index);
-        }
-      });
+      // Pointer-only tab reordering: unlike HTML5 drag/drop this never asks
+      // the compositor/window manager for a native drag session, so a lost
+      // drop cannot lock the strip. The listener is installed before append;
+      // it reads the completed row only when a real pointer move occurs.
+      tabEl.addEventListener('dragstart', (e) => e.preventDefault());
+      this.bindPointerTabReorder(tabEl, index, tabsScroll);
 
       tabsScroll.appendChild(tabEl);
     });
@@ -1853,12 +2072,11 @@ export class BrowserShell {
       });
     }
 
-    // REAL window controls for the frameless Electron window. The tab strip
-    // uses only the small explicit drag handle as a native draggable region;
-    // tab clicks and double-clicks stay in the renderer instead of invoking
-    // the desktop's title-bar restore/minimize action. These controls still
-    // minimize/maximize/close via IPC. Web/PWA builds omit the whole cluster;
-    // the frameless mini window keeps its own expand/hide title bar.
+    // REAL window controls for the frameless Electron window. Every part of
+    // the strip, including the manual drag handle, stays in the renderer;
+    // no native app-region can swallow tab/control input. These controls
+    // minimize/maximize/close via IPC. Web/PWA builds omit the cluster; the
+    // frameless mini window keeps its own expand/hide title bar.
     if (winControls) {
       const controls = document.createElement('div');
       controls.className = 'fb-window-controls';
@@ -15658,10 +15876,31 @@ export class BrowserShell {
     }
     if (this._renderFramePending) return;
     this._renderFramePending = true;
-    window.requestAnimationFrame(() => {
+    const flush = () => {
+      if (!this._renderFramePending) return;
       this._renderFramePending = false;
+      if (this._renderFallbackTimer) clearTimeout(this._renderFallbackTimer);
+      this._renderFallbackTimer = null;
+      this._renderFrameHandle = null;
       this.render();
-    });
+    };
+    // Arm the independent deadline BEFORE asking for a frame: even an
+    // embedder whose rAF implementation throws or (incorrectly) invokes the
+    // callback synchronously cannot strand the pending latch.
+    this._renderFrameHandle = null;
+    this._renderFallbackTimer = setTimeout(flush, 120);
+    this._renderFallbackTimer?.unref?.();
+    try {
+      const frameHandle = window.requestAnimationFrame(flush);
+      if (this._renderFramePending) this._renderFrameHandle = frameHandle;
+    } catch {
+      flush();
+    }
+    // A suspended/missed rAF used to leave _renderFramePending=true forever,
+    // so all future native navigation updates were ignored and the top
+    // chrome looked frozen. The shell is backgroundThrottling:false on
+    // desktop, but this deadline guarantees the invariant in every embedder.
+    // The guard in flush keeps it exactly-once.
   }
 
   /**
@@ -15868,6 +16107,13 @@ export class BrowserShell {
   }
 
   destroy() {
+    // A shell may be torn down after its source tab/handle was replaced but
+    // before pointerup. End every renderer-only gesture and release its IPC
+    // session/global fallback listeners synchronously.
+    for (const cancelPointerGesture of [...(this._activePointerCleanups || [])]) {
+      try { cancelPointerGesture(); } catch { /* gesture already ended */ }
+    }
+    this._activePointerCleanups?.clear?.();
     if (typeof window !== 'undefined') {
       window.removeEventListener('resize', this.boundResizeHandler);
       window.removeEventListener('keydown', this.boundKeyHandler);
@@ -15881,6 +16127,15 @@ export class BrowserShell {
     }
     this.stopBackgroundUpdateChecks();
     this.stopBackgroundRefresh();
+    if (this._renderFallbackTimer) {
+      clearTimeout(this._renderFallbackTimer);
+      this._renderFallbackTimer = null;
+    }
+    if (this._renderFrameHandle && typeof window !== 'undefined' && typeof window.cancelAnimationFrame === 'function') {
+      try { window.cancelAnimationFrame(this._renderFrameHandle); } catch { /* already fired */ }
+    }
+    this._renderFrameHandle = null;
+    this._renderFramePending = false;
     if (this._loadingWatchdogTimer && typeof window !== 'undefined' && typeof window.clearInterval === 'function') {
       window.clearInterval(this._loadingWatchdogTimer);
       this._loadingWatchdogTimer = null;
