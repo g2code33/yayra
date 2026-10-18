@@ -70,16 +70,24 @@ if (existsSync(path.join(root, 'dist'))) {
   }
 }
 
-const unpacked = path.join(root, 'release/linux-unpacked');
-if (existsSync(unpacked)) {
-  assert(existsSync(path.join(unpacked, 'resources/app.asar')), 'linux-unpacked app.asar missing');
-  const asar = spawnSync(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['asar', 'list', path.join(unpacked, 'resources/app.asar')], { cwd: root, encoding: 'utf8' });
-  assert(asar.status === 0, `asar listing failed: ${asar.stderr || asar.stdout}`);
-  assert(asar.stdout.includes('/dist/index.html'), 'asar listing did not include dist/index.html');
-  assert(asar.stdout.includes('/dist/packages/shared-ui/src/vendor/pdfjs/pdf.mjs'), 'asar listing did not include the PDF.js engine');
-  assert(asar.stdout.includes('/dist/packages/shared-ui/src/vendor/pdfjs/pdf.worker.mjs'), 'asar listing did not include the PDF.js worker');
+// Inspect every unpacked desktop target that is present. Runtime GUI smoke is
+// useful diagnostics but can depend on the CI display/console environment;
+// app.asar contents are deterministic and therefore remain the release gate.
+const packagedAsars = [
+  ['linux-unpacked', path.join(root, 'release/linux-unpacked/resources/app.asar')],
+  ['win-unpacked', path.join(root, 'release/win-unpacked/resources/app.asar')],
+  ['mac', path.join(root, 'release/mac/yayra.app/Contents/Resources/app.asar')]
+].filter(([, asarPath]) => existsSync(asarPath));
+if (packagedAsars.length) {
+  for (const [target, asarPath] of packagedAsars) {
+    const asar = spawnSync(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['asar', 'list', asarPath], { cwd: root, encoding: 'utf8' });
+    assert(asar.status === 0, `${target} app.asar listing failed: ${asar.stderr || asar.stdout}`);
+    assert(asar.stdout.includes('/dist/index.html'), `${target} app.asar did not include dist/index.html`);
+    assert(asar.stdout.includes('/dist/packages/shared-ui/src/vendor/pdfjs/pdf.mjs'), `${target} app.asar did not include the PDF.js engine`);
+    assert(asar.stdout.includes('/dist/packages/shared-ui/src/vendor/pdfjs/pdf.worker.mjs'), `${target} app.asar did not include the PDF.js worker`);
+  }
 } else {
-  console.log('packaging layout note: release/linux-unpacked not present; run npm run package:linux:dir to inspect real asar contents');
+  console.log('packaging layout note: no unpacked desktop app is present; package a desktop target to inspect its real app.asar contents');
 }
 
 const builtExe = await findBuiltExe(path.join(root, 'release'));
@@ -99,7 +107,7 @@ if (failures.length) {
   for (const failure of failures) console.error(` - ${failure}`);
   process.exit(1);
 }
-console.log('packaging verification passed: NSIS/Linux config, hook syntax, desktop/icon mapping, and version lockstep are valid');
+console.log('packaging verification passed: desktop config, PDF.js app.asar assets, hook syntax, icons, and version lockstep are valid');
 
 function assert(condition, message) { if (!condition) failures.push(message); }
 function parseDesktop(text) {

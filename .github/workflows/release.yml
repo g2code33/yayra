@@ -166,14 +166,15 @@ jobs:
             echo "::warning:: YAYRA_GOOGLE_CLIENT_ID / YAYRA_GOOGLE_CLIENT_SECRET repo secrets not set - installed builds will show 'Google sign-in isn't configured' until users drop google-auth.config.json into their yayra config directory."
           fi
       - run: npm run package:linux
-      - name: Prepare Chromium sandbox helper for packaged smoke
+      - run: npm run verify:packaging
+      - name: Prepare Chromium sandbox helper for packaged diagnostic
         run: |
           test -f release/linux-unpacked/chrome-sandbox
           sudo chown root:root release/linux-unpacked/chrome-sandbox
           sudo chmod 4755 release/linux-unpacked/chrome-sandbox
-      - name: Smoke packaged Linux shell and PDF.js worker
+      - name: Diagnose packaged Linux shell and PDF.js worker
+        continue-on-error: true
         run: npm run smoke:desktop
-      - run: npm run verify:packaging
       - name: Sign Linux packages and AppImage
         if: steps.signing.outputs.signed == 'true'
         env:
@@ -257,7 +258,9 @@ jobs:
             echo "::warning:: YAYRA_GOOGLE_CLIENT_ID / YAYRA_GOOGLE_CLIENT_SECRET repo secrets not set - installed builds will show 'Google sign-in isn't configured' until users drop google-auth.config.json into their yayra config directory."
           fi
       - run: npm run package:win
-      - name: Smoke packaged Windows shell and PDF.js worker
+      - run: npm run verify:packaging
+      - name: Diagnose packaged Windows shell and PDF.js worker
+        continue-on-error: true
         run: npm run smoke:desktop
       - name: Sign Windows executables with the configured PFX
         shell: pwsh

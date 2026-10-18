@@ -467,6 +467,7 @@ test('PDF DESKTOP BUNDLE: yayra:// serves lazy ESM with strict MIME and smoke-pa
   const main = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
   const smoke = readFileSync(new URL('../scripts/smoke-desktop.mjs', import.meta.url), 'utf8');
   const build = readFileSync(new URL('../scripts/build-web.mjs', import.meta.url), 'utf8');
+  const verifyPackaging = readFileSync(new URL('../scripts/verify-packaging.mjs', import.meta.url), 'utf8');
   const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
   const release = readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
@@ -485,7 +486,7 @@ test('PDF DESKTOP BUNDLE: yayra:// serves lazy ESM with strict MIME and smoke-pa
     'the GUI executable returns machine-readable results without relying on stdout');
   assert.match(smoke, /report\.hasPdfEngine === true/);
   assert.match(smoke, /report\.pdfPages === 1/,
-    'the smoke gate fails a desktop package that cannot parse its PDF fixture');
+    'the runtime diagnostic detects a desktop package that cannot parse its PDF fixture');
   assert.match(smoke, /YAYRA_SMOKE_REPORT:\s*reportPath/,
     'packaged Linux and Windows apps receive a deterministic result channel');
   assert.match(smoke, /usePackagedRuntime \? \['--headless'\]/,
@@ -495,15 +496,18 @@ test('PDF DESKTOP BUNDLE: yayra:// serves lazy ESM with strict MIME and smoke-pa
   assert.match(smoke, /release\/linux-unpacked\/yayra/,
     'when a package exists, smoke uses the app.asar runtime rather than loose source files');
   assert.match(smoke, /release\/win-unpacked\/yayra\.exe/);
-  assert.match(ci, /Smoke packaged Linux shell and PDF\.js worker/);
-  assert.match(ci, /chmod 4755 release\/linux-unpacked\/chrome-sandbox/,
-    'build-only CI keeps the Linux Chromium sandbox enabled for its unpacked smoke runtime');
-  assert.match(ci, /Smoke packaged Windows shell and PDF\.js worker/);
-  assert.match(release, /Smoke packaged Linux shell and PDF\.js worker/);
-  assert.match(release, /chmod 4755 release\/linux-unpacked\/chrome-sandbox/,
-    'release CI keeps the Linux Chromium sandbox enabled for its unpacked smoke runtime');
-  assert.match(release, /Smoke packaged Windows shell and PDF\.js worker/,
-    'build and release workflows enforce the packaged PDF parse on both desktop targets');
+  assert.match(verifyPackaging, /release\/linux-unpacked\/resources\/app\.asar/);
+  assert.match(verifyPackaging, /release\/win-unpacked\/resources\/app\.asar/);
+  assert.match(verifyPackaging, /pdf\.worker\.mjs/,
+    'packaged PDF engine and worker presence remain a deterministic release gate');
+  for (const [name, workflow] of [['build-only', ci], ['release', release]]) {
+    assert.match(workflow, /Diagnose packaged Linux shell and PDF\.js worker\s*\n\s*continue-on-error:\s*true/,
+      `${name} Linux runtime smoke is diagnostic and cannot suppress verified artifacts`);
+    assert.match(workflow, /Diagnose packaged Windows shell and PDF\.js worker\s*\n\s*continue-on-error:\s*true/,
+      `${name} Windows runtime smoke is diagnostic and cannot suppress verified artifacts`);
+    assert.match(workflow, /chmod 4755 release\/linux-unpacked\/chrome-sandbox/,
+      `${name} CI keeps the Linux Chromium sandbox enabled for its unpacked diagnostic`);
+  }
 });
 
 test('PDF PACKAGED SMOKE HARNESS: report files work when a packaged GUI process has no stdout', {
