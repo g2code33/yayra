@@ -20,6 +20,8 @@ const { createDownloadsStore } = require('./downloadsStore.cjs');
 const { createDownloadsBridge } = require('./downloadsBridge.cjs');
 const { createPasskeyBridge } = require('./passkeyBridge.cjs');
 const { configureWebsiteWebAuthn } = require('./websiteWebAuthn.cjs');
+const { configureTrustedMediaPermissions } = require('./trustedMediaPermissions.cjs');
+const { GOOGLE_FEATURE_URLS, uploadGoogleLensImage } = require('./googleFeatures.cjs');
 const { createPhoneApproval } = require('./phoneApproval.cjs');
 const { createOverlayBridge } = require('./overlayWindow.cjs');
 const { createOverlayStore } = require('./overlayStore.cjs');
@@ -471,6 +473,17 @@ app.whenReady().then(async () => {
   // the signed app entitlements (the helper refuses invented/default groups).
   configureWebsiteWebAuthn({ app });
 
+  // The internal voice-search surface may request AUDIO only. Keep arbitrary
+  // website origins denied and preserve the app-generated recorder window;
+  // macOS still owns and displays its OS-level microphone consent prompt.
+  configureTrustedMediaPermissions({
+    defaultSession: session.defaultSession,
+    systemPreferences,
+    recorderPreloadPath: path.join(__dirname, 'recorderPreload.cjs'),
+    platform: process.platform,
+    logger: console
+  });
+
   // One glance at the terminal must answer "which backend is this
   // instance on?" - it decides whether the bubble can move and overlay.
   if (process.platform === 'linux') {
@@ -724,6 +737,42 @@ function registerIpcBridges() {
     if (!senderWindow(event)) return false;
     app.quit();
     return true;
+  });
+
+  // Google-owned feature escape hatch. Desktop Electron does not ship
+  // Chrome's proprietary remote speech-recognition service, so Google voice
+  // search must continue in the user's full system browser when Chromium's
+  // local/on-device recognizer is unavailable. The enum prevents a
+  // compromised renderer from turning this into an arbitrary URL launcher.
+  ipcMain.handle('yayra:open-google-feature', async (event, payload = {}) => {
+    if (!senderWindow(event)) return { ok: false, reason: 'untrusted-sender' };
+    const key = String(payload?.feature || '');
+    const url = Object.prototype.hasOwnProperty.call(GOOGLE_FEATURE_URLS, key)
+      ? GOOGLE_FEATURE_URLS[key]
+      : null;
+    if (!url) return { ok: false, reason: 'unknown-feature' };
+    try {
+      await shell.openExternal(url);
+      return { ok: true, url };
+    } catch (err) {
+      return { ok: false, reason: String(err?.message || 'open-failed') };
+    }
+  });
+
+  // Electron renderer fetches are CORS-constrained. Upload the user-selected
+  // image from the trusted main process straight to Google's official Lens
+  // endpoint and return only Google's final result URL. No Yayra backend or
+  // storage is involved, and googleFeatures.cjs enforces MIME/size limits.
+  ipcMain.handle('yayra:google-lens-upload', async (event, payload = {}) => {
+    if (!senderWindow(event)) return { ok: false, reason: 'untrusted-sender' };
+    return uploadGoogleLensImage({
+      netFetch: (url, options) => net.fetch(url, options),
+      data: payload.data,
+      name: payload.name,
+      type: payload.type,
+      language: payload.language,
+      startedAt: payload.startedAt
+    });
   });
 
   // Menu > More tools > Performance / Task manager: REAL process metrics

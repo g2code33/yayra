@@ -158,9 +158,10 @@ async function installAndroidOverlayNative() {
     <!-- ${OVERLAY_MARKER}: injected by scripts/ensure-capacitor-platform.mjs.
          SYSTEM_ALERT_WINDOW = draw the bubble over every other app (the user
          grants it on the system "Display over other apps" page, reached via
-         YayraOverlay.requestPermission()). The FGS + notification permissions
-         keep the user-controlled bubble service alive and visible per
-         Android 13-15 policy. -->
+         YayraOverlay.requestPermission()). RECORD_AUDIO supports Google voice
+         search; the FGS + notification permissions keep the user-controlled
+         bubble service alive and visible per Android 13-15 policy. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
@@ -184,6 +185,16 @@ async function installAndroidOverlayNative() {
       manifest = manifest.replace(/(\n\s*<\/application>)/, `\n${service}$1`);
       await writeFile(manifestPath, manifest);
       console.log('injected floating-bubble permissions + service into AndroidManifest.xml');
+    }
+    // Existing generated projects already contain OVERLAY_MARKER, so new
+    // voice-search builds must backfill RECORD_AUDIO independently.
+    if (!manifest.includes('android.permission.RECORD_AUDIO')) {
+      manifest = manifest.replace(
+        /(\n\s*<application)/,
+        '\n    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n$1'
+      );
+      await writeFile(manifestPath, manifest);
+      console.log('injected Google voice-search audio permission into AndroidManifest.xml');
     }
   }
 

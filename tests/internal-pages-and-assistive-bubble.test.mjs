@@ -263,7 +263,13 @@ test('In-Tab Internal Pages: Redesigned yayra://newtab with search box and focus
   searchbox.querySelector('.fb-newtab-lens-btn').click();
   const lensOverlay = container.querySelector('.fb-google-lens-overlay');
   assert.ok(lensOverlay, 'Lens icon opens the same Google image upload surface');
-  assert.equal(lensOverlay.querySelector('.fb-google-lens-upload-form')?.getAttribute('action'), 'https://lens.google.com/v3/upload');
+  const lensUploadUrl = new URL(
+    lensOverlay.querySelector('.fb-google-lens-upload-form')?.getAttribute('action').replaceAll('&amp;', '&')
+  );
+  assert.equal(lensUploadUrl.origin + lensUploadUrl.pathname, 'https://lens.google.com/v3/upload');
+  assert.equal(lensUploadUrl.searchParams.get('ep'), 'cntpubb', 'file upload uses Google Chromium’s Lens entrypoint');
+  assert.equal(lensUploadUrl.searchParams.get('re'), 'df');
+  assert.equal(lensUploadUrl.searchParams.get('s'), '4');
   assert.equal(lensOverlay.querySelector('.fb-google-lens-file')?.getAttribute('name'), 'encoded_image');
   lensOverlay.querySelector('.fb-google-lens-url').value = 'https://example.com/cat.png';
   lensOverlay.querySelector('.fb-google-lens-url-search').click();
@@ -271,6 +277,9 @@ test('In-Tab Internal Pages: Redesigned yayra://newtab with search box and focus
   assert.equal(lensUrl.origin + lensUrl.pathname, 'https://lens.google.com/uploadbyurl',
     'image links are handed directly to Google Lens');
   assert.equal(lensUrl.searchParams.get('url'), 'https://example.com/cat.png');
+  assert.equal(lensUrl.searchParams.get('ep'), 'cntpubu', 'URL upload uses Google Chromium’s Lens entrypoint');
+  assert.equal(lensUrl.searchParams.get('re'), 'df');
+  assert.equal(lensUrl.searchParams.get('s'), '4');
 
   searchInput.value = 'compare browsers';
   searchbox.querySelector('.fb-newtab-google-ai-btn').click();
@@ -292,6 +301,7 @@ test('In-Tab Internal Pages: Redesigned yayra://newtab with search box and focus
   assert.equal(shortcutModal, 'edit-shortcut', 'Add shortcut remains functional');
 
   const previousSpeechRecognition = window.SpeechRecognition;
+  const previousCapacitor = window.Capacitor;
   let activeRecognition = null;
   let voiceAbortCount = 0;
   try {
@@ -333,13 +343,42 @@ test('In-Tab Internal Pages: Redesigned yayra://newtab with search box and focus
     delete window.SpeechRecognition;
     searchbox.querySelector('.fb-newtab-mic-btn').click();
     const fallbackOverlay = container.querySelector('.fb-google-voice-overlay');
-    assert.equal(fallbackOverlay.querySelector('.fb-google-voice-status').textContent, 'Voice search is unavailable');
+    assert.equal(fallbackOverlay.querySelector('.fb-google-voice-status').textContent, 'Voice search is unavailable here');
     assert.equal(fallbackOverlay.querySelector('.fb-google-voice-google-btn').hasAttribute('hidden'), false,
       'unsupported sessions provide an explicit Google fallback');
-    fallbackOverlay.querySelector('.fb-google-voice-close').click();
+    const fallbackButton = fallbackOverlay.querySelector('.fb-google-voice-google-btn');
+    assert.match(fallbackButton.textContent, /Google Voice Search/);
+    let googleVoiceHandoff = null;
+    shell.openGoogleFeatureExternally = async (feature) => {
+      googleVoiceHandoff = feature;
+      return true;
+    };
+    fallbackButton.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(googleVoiceHandoff, 'voice', 'fallback hands control to Google’s own voice-search surface');
+    assert.equal(container.querySelector('.fb-google-voice-overlay'), null);
+
+    window.Capacitor = {
+      isNativePlatform: () => true,
+      Plugins: {
+        YayraOverlay: {
+          show: async () => {},
+          googleVoiceSearch: async () => ({ ok: true, transcript: 'native android weather' })
+        }
+      }
+    };
+    searchbox.querySelector('.fb-newtab-mic-btn').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const nativeVoiceUrl = new URL(lensTarget);
+    assert.equal(nativeVoiceUrl.origin + nativeVoiceUrl.pathname, 'https://www.google.com/search');
+    assert.equal(nativeVoiceUrl.searchParams.get('q'), 'native android weather',
+      'Android native speech recognition hands its transcript directly to Google Search');
+    assert.equal(container.querySelector('.fb-google-voice-overlay'), null);
   } finally {
     if (previousSpeechRecognition === undefined) delete window.SpeechRecognition;
     else window.SpeechRecognition = previousSpeechRecognition;
+    if (previousCapacitor === undefined) delete window.Capacitor;
+    else window.Capacitor = previousCapacitor;
   }
   // Fresh install / brand-new profile: NO invented "frequently used"
   // tiles (they used to be a hardcoded DuckDuckGo/Wikipedia/GitHub list).

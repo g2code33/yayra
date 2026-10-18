@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { buildContentSecurityPolicy, DESKTOP_CUSTOM_SCHEME } from '../src/security/csp.js';
 import { isJavaScriptMime, mimeTypeFor, normalizeAssetPath } from '../src/security/localAssets.js';
 
@@ -14,6 +15,13 @@ test('CSP is pinned to self, exact hosts, and desktop custom scheme', () => {
   assert.match(csp, /form-action 'self' https:\/\/lens\.google\.com/,
     'local image files can post directly to Google Lens without passing through Yayra');
   assert.equal(DESKTOP_CUSTOM_SCHEME, 'yayra');
+});
+
+test('web/PWA deployment explicitly allows user-initiated same-origin microphone access', () => {
+  const headers = readFileSync(new URL('../public/_headers', import.meta.url), 'utf8');
+  const devServer = readFileSync(new URL('../scripts/dev-server.mjs', import.meta.url), 'utf8');
+  assert.match(headers, /Permissions-Policy:\s*microphone=\(self\)/);
+  assert.match(devServer, /setHeader\('Permissions-Policy', 'microphone=\(self\)'\)/);
 });
 
 test('local asset serving refuses traversal and preserves JS MIME type', () => {

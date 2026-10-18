@@ -1,16 +1,29 @@
 package com.yayra.floating.android
 
+import android.app.Activity
 import android.content.Intent
 import android.content.pm.ShortcutInfo
 import android.content.pm.ShortcutManager
 import android.graphics.drawable.Icon
 import android.net.Uri
 import android.os.Build
+import android.speech.RecognizerIntent
+import android.util.Base64
+import android.webkit.WebSettings
+import androidx.activity.result.ActivityResult
 import com.getcapacitor.JSObject
 import com.getcapacitor.Plugin
 import com.getcapacitor.PluginCall
 import com.getcapacitor.PluginMethod
+import com.getcapacitor.annotation.ActivityCallback
 import com.getcapacitor.annotation.CapacitorPlugin
+import java.io.BufferedOutputStream
+import java.io.DataOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import java.util.Locale
+import java.util.UUID
 
 /**
  * Capacitor bridge for Yayra's REAL system-wide floating bubble on Android.
@@ -42,6 +55,11 @@ import com.getcapacitor.annotation.CapacitorPlugin
  */
 @CapacitorPlugin(name = "YayraOverlay")
 class YayraOverlayPlugin : Plugin() {
+
+    private fun googleLanguage(value: String?): String {
+        val requested = (value ?: Locale.getDefault().toLanguageTag()).trim()
+        return if (Regex("^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$").matches(requested)) requested else "en-US"
+    }
 
     // In-app native tab webview engine (see YayraTabWebviewManager): real
     // WebViews layered inside Yayra's own window so frame-hostile sites
@@ -169,6 +187,144 @@ class YayraOverlayPlugin : Plugin() {
         if (id.isNullOrBlank()) { call.reject("id-required"); return }
         tabWeb()?.remove(id)
         call.resolve(JSObject().put("ok", true))
+    }
+
+    /**
+     * Android WebView does not reliably expose Chromium's Web Speech API.
+     * Launch Android's real speech-recognizer activity (Google Speech
+     * Services on standard Android devices), return only the transcript,
+     * and let the JS shell hand that text directly to Google Search.
+     */
+    @PluginMethod
+    fun googleVoiceSearch(call: PluginCall) {
+        val language = googleLanguage(call.getString("language"))
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_WEB_SEARCH)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, language)
+            putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak now")
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+        }
+        if (intent.resolveActivity(context.packageManager) == null) {
+            call.resolve(JSObject().put("ok", false).put("reason", "recognizer-unavailable"))
+            return
+        }
+        startActivityForResult(call, intent, "googleVoiceSearchResult")
+    }
+
+    @ActivityCallback
+    private fun googleVoiceSearchResult(call: PluginCall?, result: ActivityResult) {
+        if (call == null) return
+        if (result.resultCode != Activity.RESULT_OK) {
+            call.resolve(JSObject().put("ok", false).put("canceled", true))
+            return
+        }
+        val matches = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+        val transcript = matches?.firstOrNull()?.trim().orEmpty()
+        if (transcript.isEmpty()) {
+            call.resolve(JSObject().put("ok", false).put("reason", "no-speech"))
+            return
+        }
+        call.resolve(JSObject().put("ok", true).put("transcript", transcript))
+    }
+
+    /**
+     * Direct Android -> Google Lens multipart upload. This avoids WebView
+     * popup/CORS limitations and does not involve any Yayra server.
+     */
+    @PluginMethod
+    fun googleLensUpload(call: PluginCall) {
+        val encoded = call.getString("data")
+        val mimeType = (call.getString("type") ?: "").lowercase(Locale.US)
+        val supportedTypes = setOf(
+            "image/bmp", "image/jpeg", "image/png", "image/tiff", "image/webp", "image/x-icon"
+        )
+        if (encoded.isNullOrBlank()) {
+            call.resolve(JSObject().put("ok", false).put("reason", "empty-file"))
+            return
+        }
+        // A 20 MB binary payload is at most 27,962,028 Base64 characters.
+        // Reject before decoding so a compromised renderer cannot force a
+        // much larger temporary allocation in the native process.
+        if (encoded.length > 27_962_028) {
+            call.resolve(JSObject().put("ok", false).put("reason", "file-too-large"))
+            return
+        }
+        if (!supportedTypes.contains(mimeType)) {
+            call.resolve(JSObject().put("ok", false).put("reason", "unsupported-file-type"))
+            return
+        }
+        val language = googleLanguage(call.getString("language"))
+        val rawName = (call.getString("name") ?: "lens-upload").take(120)
+        val safeName = rawName.replace(Regex("[\\\\/:*?\"<>|\\p{Cntrl}]+"), "-").ifBlank { "lens-upload" }
+        val userAgent = try {
+            WebSettings.getDefaultUserAgent(context)
+        } catch (_: Exception) {
+            "Mozilla/5.0 (Linux; Android) AppleWebKit/537.36 Chrome Mobile Safari/537.36"
+        }
+        val hostActivity = activity
+        if (hostActivity == null) {
+            call.resolve(JSObject().put("ok", false).put("reason", "activity-unavailable"))
+            return
+        }
+
+        Thread {
+            var connection: HttpURLConnection? = null
+            try {
+                val bytes = Base64.decode(encoded, Base64.DEFAULT)
+                if (bytes.isEmpty() || bytes.size > 20 * 1024 * 1024) {
+                    hostActivity.runOnUiThread {
+                        call.resolve(JSObject().put("ok", false).put("reason", "file-too-large"))
+                    }
+                    return@Thread
+                }
+                val startedAt = (call.getLong("startedAt") ?: System.currentTimeMillis()).toString()
+                val query = "ep=cntpubb&hl=${URLEncoder.encode(language, "UTF-8")}" +
+                    "&st=${URLEncoder.encode(startedAt, "UTF-8")}&re=df&s=4"
+                val endpoint = URL("https://lens.google.com/v3/upload?$query")
+                val boundary = "----YayraLens${UUID.randomUUID().toString().replace("-", "")}"
+                connection = (endpoint.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    doOutput = true
+                    instanceFollowRedirects = true
+                    connectTimeout = 20_000
+                    readTimeout = 30_000
+                    setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+                    setRequestProperty("Accept", "text/html,application/xhtml+xml")
+                    setRequestProperty("Accept-Language", language)
+                    setRequestProperty("User-Agent", userAgent)
+                }
+                DataOutputStream(BufferedOutputStream(connection.outputStream)).use { output ->
+                    output.writeBytes("--$boundary\r\n")
+                    output.writeBytes("Content-Disposition: form-data; name=\"encoded_image\"; filename=\"$safeName\"\r\n")
+                    output.writeBytes("Content-Type: $mimeType\r\n\r\n")
+                    output.write(bytes)
+                    output.writeBytes("\r\n--$boundary--\r\n")
+                    output.flush()
+                }
+                val status = connection.responseCode
+                val location = connection.getHeaderField("Location")
+                val resultUrl = if (!location.isNullOrBlank()) URL(endpoint, location).toString() else connection.url.toString()
+                val googleResult = try {
+                    val host = Uri.parse(resultUrl).host.orEmpty().lowercase(Locale.US)
+                    resultUrl.startsWith("https://") && (host == "lens.google.com" || host.endsWith(".google.com"))
+                } catch (_: Exception) {
+                    false
+                }
+                hostActivity.runOnUiThread {
+                    if (status in 200..399 && googleResult) {
+                        call.resolve(JSObject().put("ok", true).put("url", resultUrl))
+                    } else {
+                        call.resolve(JSObject().put("ok", false).put("reason", "google-http-$status"))
+                    }
+                }
+            } catch (err: Exception) {
+                hostActivity.runOnUiThread {
+                    call.resolve(JSObject().put("ok", false).put("reason", "upload-failed: ${err.message}"))
+                }
+            } finally {
+                connection?.disconnect()
+            }
+        }.start()
     }
 
     @PluginMethod

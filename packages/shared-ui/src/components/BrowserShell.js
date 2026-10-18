@@ -4374,15 +4374,100 @@ export class BrowserShell {
     return `https://www.google.com/search?${params.toString()}`;
   }
 
+  /** Google's current Chromium new-tab Lens contract. Keeping the entrypoint,
+   * rendering environment, and surface parameters makes file/URL handoffs
+   * behave like Chrome instead of relying on an incomplete upload URL. */
+  buildGoogleLensUrl(path, { entrypoint, imageUrl = '', startedAt = Date.now() } = {}) {
+    const language = typeof navigator !== 'undefined' && navigator.language ? navigator.language : 'en-US';
+    const params = new URLSearchParams({
+      ep: entrypoint,
+      hl: language,
+      st: String(startedAt),
+      re: 'df',
+      s: '4'
+    });
+    if (imageUrl) params.set('url', imageUrl);
+    return `https://lens.google.com${path}?${params.toString()}`;
+  }
+
+  async openGoogleFeatureExternally(feature) {
+    const urls = {
+      voice: 'https://www.google.com/',
+      lens: 'https://lens.google.com/'
+    };
+    if (!Object.prototype.hasOwnProperty.call(urls, feature)) return false;
+    const bridge = this.systemBridge;
+    if (bridge && typeof bridge.openGoogleFeature === 'function') {
+      try {
+        const result = await bridge.openGoogleFeature(feature);
+        if (result?.ok) return true;
+      } catch { /* fall through to the platform browser */ }
+    }
+    try {
+      await this.openExternally(urls[feature]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async uploadGoogleLensNatively(file, startedAt) {
+    const language = typeof navigator !== 'undefined' && navigator.language ? navigator.language : 'en-US';
+    const system = this.systemBridge;
+    if (system && typeof system.googleLensUpload === 'function' && typeof file?.arrayBuffer === 'function') {
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        return await system.googleLensUpload({
+          name: file.name || 'lens-upload',
+          type: file.type,
+          data: bytes,
+          language,
+          startedAt
+        });
+      } catch (err) {
+        return { ok: false, reason: String(err?.message || 'desktop-upload-failed') };
+      }
+    }
+
+    const android = this.capacitorOverlay;
+    if (android && typeof android.googleLensUpload === 'function' && typeof FileReader === 'function') {
+      try {
+        const dataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result || ''));
+          reader.onerror = () => reject(new Error('file-read-failed'));
+          reader.readAsDataURL(file);
+        });
+        const comma = dataUrl.indexOf(',');
+        if (comma < 0) return { ok: false, reason: 'file-read-failed' };
+        return await android.googleLensUpload({
+          name: file.name || 'lens-upload',
+          type: file.type,
+          data: dataUrl.slice(comma + 1),
+          language,
+          startedAt
+        });
+      } catch (err) {
+        return { ok: false, reason: String(err?.message || 'android-upload-failed') };
+      }
+    }
+    return null;
+  }
+
   /**
    * Google Lens handoff shown over the new-tab page. Image URLs navigate to
    * Google's public upload-by-URL route in the active Yayra tab. Local image
-   * files are POSTed straight to lens.google.com in a Google result tab;
-   * Yayra never stores, proxies, or reads their contents.
+   * files go straight to lens.google.com: through a trusted native transport
+   * on Electron/Android (avoids renderer CORS and popup failures), or through
+   * Google's own multipart form on web/PWA. No Yayra server sees the image.
    */
   openGoogleLensSearch(viewport) {
     if (!viewport || typeof document === 'undefined') return;
     viewport.querySelector('.fb-google-lens-overlay')?.remove();
+    const initialUploadUrl = this.buildGoogleLensUrl('/v3/upload', {
+      entrypoint: 'cntpubb',
+      startedAt: Date.now()
+    });
 
     const overlay = document.createElement('div');
     overlay.className = 'fb-google-lens-overlay';
@@ -4396,12 +4481,11 @@ export class BrowserShell {
           <h2 id="fb-google-lens-title">Search any image with Lens</h2>
           <button type="button" class="fb-google-lens-close" aria-label="Close Google Lens">${Icons.close}</button>
         </header>
-        <form class="fb-google-lens-upload-form" action="https://lens.google.com/v3/upload" method="post" enctype="multipart/form-data" target="_blank" rel="noopener">
+        <form class="fb-google-lens-upload-form" action="${escapeAttr(initialUploadUrl)}" method="post" enctype="multipart/form-data" target="_blank" rel="noopener">
           <label class="fb-google-lens-dropzone">
             <span class="fb-google-lens-art" aria-hidden="true">${Icons.lens}</span>
             <span>Drag an image here or <span class="fb-google-lens-upload-link">upload a file</span></span>
-            <input class="fb-google-lens-file" type="file" name="encoded_image" accept="image/*" />
-            <input type="hidden" name="processed_image_dimensions" value="0,0" />
+            <input class="fb-google-lens-file" type="file" name="encoded_image" accept="image/bmp,image/jpeg,image/png,image/tiff,image/webp,image/x-icon" />
           </label>
         </form>
         <div class="fb-google-lens-divider"><span>OR</span></div>
@@ -4418,29 +4502,67 @@ export class BrowserShell {
     const fileInput = overlay.querySelector('.fb-google-lens-file');
     const urlInput = overlay.querySelector('.fb-google-lens-url');
 
-    const submitLocalImage = () => {
+    const submitLocalImage = async () => {
       const file = fileInput?.files?.[0];
       if (!file) return;
-      if (file.type && !String(file.type).toLowerCase().startsWith('image/')) {
-        this.showTransientNotice('Choose an image file for Google Lens.');
+      const supportedTypes = new Set([
+        'image/bmp', 'image/jpeg', 'image/png', 'image/tiff', 'image/webp', 'image/x-icon'
+      ]);
+      const mimeType = String(file.type || '').toLowerCase();
+      if (!supportedTypes.has(mimeType)) {
+        this.showTransientNotice('Google Lens supports BMP, JPEG, PNG, TIFF, WebP, and ICO images.');
         return;
       }
-      // The public Lens multipart endpoint returns the visual-search result.
-      // A noopener result tab keeps the Yayra shell alive while Google gets
-      // the original File object directly from the browser form.
-      uploadForm.action = `https://lens.google.com/v3/upload?stcs=${Date.now()}`;
+      if (Number(file.size) > 20 * 1024 * 1024) {
+        this.showTransientNotice('Google Lens accepts images up to 20 MB.');
+        return;
+      }
+
+      const startedAt = Date.now();
+      const desktopLens = this.systemBridge;
+      const androidLens = this.capacitorOverlay;
+      const hasNativeLensTransport =
+        (desktopLens && typeof desktopLens.googleLensUpload === 'function' && typeof file?.arrayBuffer === 'function')
+        || (androidLens && typeof androidLens.googleLensUpload === 'function' && typeof FileReader === 'function');
+      if (hasNativeLensTransport) {
+        const nativeResult = await this.uploadGoogleLensNatively(file, startedAt);
+        let safeResultUrl = null;
+        try {
+          const parsed = new URL(nativeResult?.url || '');
+          if (parsed.protocol === 'https:'
+              && (parsed.hostname === 'lens.google.com' || parsed.hostname.endsWith('.google.com'))) {
+            safeResultUrl = parsed.toString();
+          }
+        } catch { /* malformed native result is rejected */ }
+        close();
+        if (nativeResult?.ok && safeResultUrl) {
+          this.navigateActiveTab(safeResultUrl);
+          return;
+        }
+        await this.openGoogleFeatureExternally('lens');
+        this.showTransientNotice('Google Lens opened directly. Choose the image again to continue.');
+        return;
+      }
+
+      // Web/PWA: use the same multipart contract as Chromium's new-tab Lens
+      // form. `submit()` is intentional (Chrome does the same) so no local
+      // validation handler can intercept the Google navigation.
+      uploadForm.action = this.buildGoogleLensUrl('/v3/upload', {
+        entrypoint: 'cntpubb',
+        startedAt
+      });
       uploadForm.target = '_blank';
       uploadForm.rel = 'noopener';
       try {
-        if (typeof uploadForm.requestSubmit === 'function') uploadForm.requestSubmit();
-        else if (typeof uploadForm.submit === 'function') uploadForm.submit();
+        if (typeof uploadForm.submit === 'function') uploadForm.submit();
+        else if (typeof uploadForm.requestSubmit === 'function') uploadForm.requestSubmit();
         else throw new Error('form-submit-unavailable');
         this.showTransientNotice('Opening your image directly in Google Lens...');
         setTimeout(close, 0);
       } catch {
         close();
-        this.navigateActiveTab('https://lens.google.com/');
-        this.showTransientNotice('Google Lens opened. Choose the image again to continue.');
+        await this.openGoogleFeatureExternally('lens');
+        this.showTransientNotice('Google Lens opened directly. Choose the image again to continue.');
       }
     };
 
@@ -4459,8 +4581,17 @@ export class BrowserShell {
         urlInput?.focus();
         return;
       }
+      if (encodeURI(imageUrl.href).length > 2000) {
+        this.showTransientNotice('That image link is too long for Google Lens.');
+        urlInput?.focus();
+        return;
+      }
       close();
-      this.navigateActiveTab(`https://lens.google.com/uploadbyurl?url=${encodeURIComponent(imageUrl.href)}`);
+      this.navigateActiveTab(this.buildGoogleLensUrl('/uploadbyurl', {
+        entrypoint: 'cntpubu',
+        imageUrl: imageUrl.href,
+        startedAt: Date.now()
+      }));
     };
 
     overlay.querySelector('.fb-google-lens-close')?.addEventListener('click', close);
@@ -4525,7 +4656,7 @@ export class BrowserShell {
           <div id="fb-google-voice-status" class="fb-google-voice-status">Waiting...</div>
           <div class="fb-google-voice-transcript"></div>
           <div class="fb-google-voice-help" hidden></div>
-          <button type="button" class="fb-google-voice-google-btn" hidden>Continue on Google</button>
+          <button type="button" class="fb-google-voice-google-btn" hidden>Open Google Voice Search</button>
         </div>
         <div class="fb-google-voice-mic-container">
           <div class="fb-google-voice-volume">
@@ -4611,11 +4742,24 @@ export class BrowserShell {
           setHidden(googleButton, false);
           break;
         default:
-          status.textContent = 'Voice search is unavailable';
-          help.textContent = 'Continue on Google to use Google’s own voice controls.';
+          status.textContent = 'Voice search is unavailable here';
+          help.textContent = 'Open Google Voice Search in your full browser to use Google’s own microphone service.';
           setHidden(googleButton, false);
           break;
       }
+    };
+
+    const submitTranscript = (value) => {
+      const finalText = String(value || '').trim();
+      if (!finalText || completed || dismissed) return false;
+      completed = true;
+      clearIdleTimer();
+      transcript.textContent = finalText;
+      status.textContent = 'Searching...';
+      if (searchInput) searchInput.value = finalText;
+      dismiss({ abort: false });
+      this.navigateActiveTab(`https://www.google.com/search?q=${encodeURIComponent(finalText)}`);
+      return true;
     };
 
     const Recognition = typeof window !== 'undefined'
@@ -4623,6 +4767,33 @@ export class BrowserShell {
       : null;
 
     const startRecognition = () => {
+      const androidVoice = this.capacitorOverlay;
+      if (androidVoice && typeof androidVoice.googleVoiceSearch === 'function') {
+        completed = false;
+        voiceState = 'listening';
+        status.textContent = 'Listening...';
+        transcript.textContent = '';
+        help.textContent = '';
+        setHidden(help, true);
+        setHidden(googleButton, true);
+        micButton.disabled = false;
+        micButton.classList.add('is-listening');
+        micButton.setAttribute('aria-label', 'Listening for Google Search');
+        micButton.setAttribute('aria-pressed', 'true');
+        const language = typeof navigator !== 'undefined' && navigator.language ? navigator.language : 'en-US';
+        Promise.resolve(androidVoice.googleVoiceSearch({ language }))
+          .then((result) => {
+            if (dismissed) return;
+            const nativeTranscript = String(result?.transcript || '').trim();
+            if (result?.ok && nativeTranscript) submitTranscript(nativeTranscript);
+            else showError(result?.canceled ? 'no-speech' : (result?.reason || 'native-failed'));
+          })
+          .catch((err) => {
+            if (!dismissed) showError(String(err?.message || 'native-failed'));
+          });
+        return;
+      }
+
       if (typeof Recognition !== 'function') {
         showError('unsupported');
         micButton.disabled = true;
@@ -4688,12 +4859,9 @@ export class BrowserShell {
         micButton.classList.add('is-listening', 'is-receiving');
         armIdleTimer();
         if (!finalText || completed) return;
-        completed = true;
-        clearIdleTimer();
-        if (searchInput) searchInput.value = finalText;
-        try { currentRecognition.stop(); } catch { /* browser already stopped */ }
-        dismiss({ abort: false });
-        this.navigateActiveTab(`https://www.google.com/search?q=${encodeURIComponent(finalText)}`);
+        if (submitTranscript(finalText)) {
+          try { currentRecognition.stop(); } catch { /* browser already stopped */ }
+        }
       };
       currentRecognition.onerror = (event) => {
         if (dismissed || event?.error === 'aborted') return;
@@ -4710,11 +4878,31 @@ export class BrowserShell {
         micButton.setAttribute('aria-label', 'Try voice search again');
         micButton.setAttribute('aria-pressed', 'false');
       };
-      try {
-        currentRecognition.start();
-      } catch {
-        if (this._newTabSpeechRecognition === currentRecognition) this._newTabSpeechRecognition = null;
-        showError('start-failed');
+      const beginRecognition = () => {
+        if (dismissed || recognition !== currentRecognition) return;
+        try {
+          currentRecognition.start();
+        } catch {
+          if (this._newTabSpeechRecognition === currentRecognition) this._newTabSpeechRecognition = null;
+          showError('start-failed');
+        }
+      };
+
+      // New Chromium builds can use an installed on-device speech pack. It
+      // avoids Electron's missing proprietary remote recognizer while
+      // remaining a progressive enhancement: if no pack/API exists, use the
+      // normal browser service and retain the explicit Google fallback.
+      if ('processLocally' in currentRecognition && typeof Recognition.available === 'function') {
+        status.textContent = 'Preparing voice search...';
+        Promise.resolve(Recognition.available({
+          langs: [currentRecognition.lang],
+          processLocally: true
+        })).then((availability) => {
+          if (availability === 'available') currentRecognition.processLocally = true;
+          beginRecognition();
+        }).catch(beginRecognition);
+      } else {
+        beginRecognition();
       }
     };
 
@@ -4730,9 +4918,10 @@ export class BrowserShell {
       }
       startRecognition();
     });
-    googleButton?.addEventListener('click', () => {
+    googleButton?.addEventListener('click', async () => {
       dismiss();
-      this.navigateActiveTab('https://www.google.com/');
+      const opened = await this.openGoogleFeatureExternally('voice');
+      if (!opened) this.navigateActiveTab('https://www.google.com/');
     });
 
     overlay.focus?.();
