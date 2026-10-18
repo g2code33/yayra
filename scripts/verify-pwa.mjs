@@ -14,6 +14,18 @@ const expected = (await listFiles(dist))
 if (JSON.stringify(precache) !== JSON.stringify(expected)) {
   fail(`precache mismatch\nexpected=${JSON.stringify(expected, null, 2)}\nactual=${JSON.stringify(precache, null, 2)}`);
 }
+// The integrated document reader is a lazy ESM graph. Pin its two entry
+// modules explicitly so a copy/filter change cannot ship a shell whose PDF
+// button always lands on the startup error screen (and so PWA use is truly
+// offline after installation).
+for (const asset of [
+  './packages/shared-ui/src/vendor/pdfjs/pdf.mjs',
+  './packages/shared-ui/src/vendor/pdfjs/pdf.worker.mjs'
+]) {
+  if (!precache.includes(asset)) fail(`PDF reader asset missing from build/precache: ${asset}`);
+  const info = await stat(path.join(dist, asset.slice(2)));
+  if (info.size < 100_000) fail(`PDF reader asset is unexpectedly small: ${asset} (${info.size} bytes)`);
+}
 const html = await readFile(path.join(dist, 'index.html'), 'utf8');
 const refs = [...html.matchAll(/(?:src|href)="([^"]+)"/g)].map((match) => match[1]);
 for (const ref of refs) {

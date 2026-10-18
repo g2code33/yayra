@@ -5325,7 +5325,10 @@ export class BrowserShell {
         row.querySelector('.fb-google-recent-tab-fallback')?.removeAttribute('hidden');
       });
       row.querySelector('.fb-google-recent-tab-title').textContent = item.title;
-      row.title = item.url;
+      // Keep the URL available to screen readers without a native `title`
+      // tooltip: Chromium's large hover bubble covered the rest of this
+      // compact menu and made the Google actions underneath unusable.
+      row.setAttribute('aria-label', `${item.title} — ${item.url}`);
       row.addEventListener('click', () => {
         const selected = !selectedGoogleContexts.has(item.url);
         if (selected) selectedGoogleContexts.set(item.url, item);
@@ -16861,7 +16864,11 @@ export class BrowserShell {
             .then(() => { if (isCurrent()) session.sync?.(); })
             .catch(() => {});
         }
-      } catch {
+      } catch (error) {
+        // Keep the UI concise, but retain the real startup reason in desktop
+        // logs/DevTools so a missing or rejected packaged module is never
+        // reduced to an undiagnosable generic screen again.
+        console.error?.('[yayra:pdf] reader startup failed', error);
         if (!isCurrent()) return;
         Object.assign(session.state, {
           status: 'error',

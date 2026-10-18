@@ -51,12 +51,33 @@ assert(nativeIos.includes(`<string>${pkg.version}</string>`), 'iOS CFBundleShort
 assert(webManifest.version === pkg.version && webManifest.cacheVersion === pkg.version, 'web manifest version/cacheVersion mismatch package.json');
 assert(JSON.parse(await readFile(path.join(root, 'electron/app-version.json'), 'utf8')).version === pkg.version, 'electron app-version mismatch package.json');
 
+// PDF.js is loaded lazily at runtime, so ordinary static imports cannot save
+// it from an over-aggressive packaging filter. Verify both the builder input
+// and the custom protocol's strict .mjs MIME handling.
+assert(build.files?.includes('dist/**/*'), 'Electron builder must include the complete dist tree (including lazy PDF.js modules)');
+const electronMain = await readFile(path.join(root, 'electron/main.cjs'), 'utf8');
+assert(electronMain.includes("lower.endsWith('.mjs')"), 'yayra:// MIME map must recognize .mjs');
+assert(electronMain.includes("headers.set('content-type', type)"), 'yayra:// responses must set deterministic asset Content-Type headers');
+const builtPdfAssets = [
+  'dist/packages/shared-ui/src/vendor/pdfjs/pdf.mjs',
+  'dist/packages/shared-ui/src/vendor/pdfjs/pdf.worker.mjs'
+];
+if (existsSync(path.join(root, 'dist'))) {
+  for (const asset of builtPdfAssets) {
+    const absolute = path.join(root, asset);
+    assert(existsSync(absolute), `${asset} missing from built desktop input`);
+    if (existsSync(absolute)) assert((await stat(absolute)).size > 100_000, `${asset} is unexpectedly truncated`);
+  }
+}
+
 const unpacked = path.join(root, 'release/linux-unpacked');
 if (existsSync(unpacked)) {
   assert(existsSync(path.join(unpacked, 'resources/app.asar')), 'linux-unpacked app.asar missing');
   const asar = spawnSync(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['asar', 'list', path.join(unpacked, 'resources/app.asar')], { cwd: root, encoding: 'utf8' });
   assert(asar.status === 0, `asar listing failed: ${asar.stderr || asar.stdout}`);
   assert(asar.stdout.includes('/dist/index.html'), 'asar listing did not include dist/index.html');
+  assert(asar.stdout.includes('/dist/packages/shared-ui/src/vendor/pdfjs/pdf.mjs'), 'asar listing did not include the PDF.js engine');
+  assert(asar.stdout.includes('/dist/packages/shared-ui/src/vendor/pdfjs/pdf.worker.mjs'), 'asar listing did not include the PDF.js worker');
 } else {
   console.log('packaging layout note: release/linux-unpacked not present; run npm run package:linux:dir to inspect real asar contents');
 }

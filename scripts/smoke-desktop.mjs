@@ -15,11 +15,20 @@ const electronRuntime = process.platform === 'win32'
   : process.platform === 'darwin'
     ? path.join(root, 'node_modules/electron/dist/Electron.app/Contents/MacOS/Electron')
     : path.join(root, 'node_modules/electron/dist/electron');
-if (!existsSync(electronBin) || !existsSync(electronRuntime)) {
+const packagedRuntime = process.platform === 'win32'
+  ? path.join(root, 'release/win-unpacked/yayra.exe')
+  : process.platform === 'darwin'
+    ? path.join(root, 'release/mac/yayra.app/Contents/MacOS/yayra')
+    : path.join(root, 'release/linux-unpacked/yayra');
+const usePackagedRuntime = existsSync(packagedRuntime);
+const smokeCommand = usePackagedRuntime ? packagedRuntime : electronBin;
+const smokeArgs = usePackagedRuntime ? [] : ['electron/main.cjs'];
+if (!usePackagedRuntime && (!existsSync(electronBin) || !existsSync(electronRuntime))) {
   await staticSmokeFallback();
   process.exit(0);
 }
-const smoke = spawnSync(electronBin, ['electron/main.cjs'], {
+console.log(`desktop smoke runtime: ${usePackagedRuntime ? 'packaged application (app.asar)' : 'development Electron'}`);
+const smoke = spawnSync(smokeCommand, smokeArgs, {
   cwd: root,
   env: { ...process.env, YAYRA_SMOKE: '1', IBROWSE_SMOKE: '1' },
   encoding: 'utf8',
@@ -32,7 +41,11 @@ if (!smoke.stdout.includes('[yayra-smoke]') || !smoke.stdout.includes('"title":"
   console.error('desktop smoke failed: renderer did not paint expected DOM');
   process.exit(1);
 }
-const fallback = spawnSync(electronBin, ['electron/main.cjs'], {
+if (!smoke.stdout.includes('"hasPdfEngine":true') || !smoke.stdout.includes('"pdfPages":1') || !smoke.stdout.includes('"pdfError":null')) {
+  console.error('desktop smoke failed: packaged PDF.js engine/module worker did not parse the local fixture');
+  process.exit(1);
+}
+const fallback = spawnSync(smokeCommand, smokeArgs, {
   cwd: root,
   env: { ...process.env, YAYRA_SMOKE: '1', YAYRA_FORCE_BAD_LOAD: '1', IBROWSE_SMOKE: '1', IBROWSE_FORCE_BAD_LOAD: '1' },
   encoding: 'utf8',
@@ -58,6 +71,15 @@ async function staticSmokeFallback() {
     console.error('desktop smoke fallback failed: documented fallback log line missing from Electron main process');
     process.exit(1);
   }
-  console.log('[yayra-smoke] {"title":"yayra","hasRoot":true,"mode":"static-fallback","reason":"Electron runtime was not installed in this sandbox"}');
-  console.log('desktop smoke fallback passed: built DOM and retry ladder log are present; actual binary smoke runs in CI when Electron runtime is available');
+  const pdfRoot = path.join(root, 'dist/packages/shared-ui/src/vendor/pdfjs');
+  if (!existsSync(path.join(pdfRoot, 'pdf.mjs')) || !existsSync(path.join(pdfRoot, 'pdf.worker.mjs'))) {
+    console.error('desktop smoke fallback failed: built PDF.js engine/worker assets are missing');
+    process.exit(1);
+  }
+  if (!main.includes("headers.set('content-type', type)") || !main.includes("lower.endsWith('.mjs')")) {
+    console.error('desktop smoke fallback failed: yayra:// does not pin JavaScript module MIME types');
+    process.exit(1);
+  }
+  console.log('[yayra-smoke] {"title":"yayra","hasRoot":true,"pdfAssets":true,"pdfModuleMime":true,"mode":"static-fallback","reason":"Electron runtime was not installed in this sandbox"}');
+  console.log('desktop smoke fallback passed: built DOM, PDF.js assets, module MIME handling, and retry ladder are present; actual binary PDF parse runs in CI when Electron runtime is available');
 }

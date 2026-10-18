@@ -460,6 +460,37 @@ test('PDF OFFLINE: local document bytes and the vendored PDF.js engine do not re
   assert.doesNotMatch(shell, /https?:\/\/(?:cdn\.)?mozilla\.github\.io\/pdf\.js/, 'the viewer never depends on a PDF.js CDN');
 });
 
+test('PDF DESKTOP BUNDLE: yayra:// serves lazy ESM with strict MIME and smoke-parses the packaged worker', () => {
+  const main = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
+  const smoke = readFileSync(new URL('../scripts/smoke-desktop.mjs', import.meta.url), 'utf8');
+  const build = readFileSync(new URL('../scripts/build-web.mjs', import.meta.url), 'utf8');
+  const ci = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  const release = readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+
+  assert.match(build, /cp\(path\.join\(root, 'packages', packageName\)/,
+    'the web/desktop input recursively copies shared-ui and its vendored PDF assets');
+  assert.ok(pkg.build.files.includes('dist/**/*'), 'Electron packages the complete built tree');
+  assert.match(main, /lower\.endsWith\('\.js'\) \|\| lower\.endsWith\('\.mjs'\)/,
+    'the custom protocol recognizes JavaScript modules on every host OS');
+  assert.match(main, /headers\.set\('content-type', type\)/,
+    'the custom protocol explicitly supplies the strict module MIME header');
+  assert.match(main, /hasPdfEngine:\s*false/);
+  assert.match(main, /output\.pdfPages = pdf\?\.numPages \|\| 0/,
+    'desktop smoke opens a real local fixture through the PDF.js worker');
+  assert.match(smoke, /"hasPdfEngine":true/);
+  assert.match(smoke, /"pdfPages":1/,
+    'the smoke gate fails a desktop package that cannot parse its PDF fixture');
+  assert.match(smoke, /release\/linux-unpacked\/yayra/,
+    'when a package exists, smoke uses the app.asar runtime rather than loose source files');
+  assert.match(smoke, /release\/win-unpacked\/yayra\.exe/);
+  assert.match(ci, /Smoke packaged Linux shell and PDF\.js worker/);
+  assert.match(ci, /Smoke packaged Windows shell and PDF\.js worker/);
+  assert.match(release, /Smoke packaged Linux shell and PDF\.js worker/);
+  assert.match(release, /Smoke packaged Windows shell and PDF\.js worker/,
+    'build and release workflows enforce the packaged PDF parse on both desktop targets');
+});
+
 test('PDF.js REAL ENGINE: a local PDF opens quickly and its text is searchable offline', async () => {
   const { shell } = await bootShell();
   try {

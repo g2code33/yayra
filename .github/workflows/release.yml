@@ -166,6 +166,8 @@ jobs:
             echo "::warning:: YAYRA_GOOGLE_CLIENT_ID / YAYRA_GOOGLE_CLIENT_SECRET repo secrets not set - installed builds will show 'Google sign-in isn't configured' until users drop google-auth.config.json into their yayra config directory."
           fi
       - run: npm run package:linux
+      - name: Smoke packaged Linux shell and PDF.js worker
+        run: npm run smoke:desktop
       - run: npm run verify:packaging
       - name: Sign Linux packages and AppImage
         if: steps.signing.outputs.signed == 'true'
@@ -250,6 +252,8 @@ jobs:
             echo "::warning:: YAYRA_GOOGLE_CLIENT_ID / YAYRA_GOOGLE_CLIENT_SECRET repo secrets not set - installed builds will show 'Google sign-in isn't configured' until users drop google-auth.config.json into their yayra config directory."
           fi
       - run: npm run package:win
+      - name: Smoke packaged Windows shell and PDF.js worker
+        run: npm run smoke:desktop
       - name: Sign Windows executables with the configured PFX
         shell: pwsh
         env:

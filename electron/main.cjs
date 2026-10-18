@@ -514,7 +514,25 @@ app.whenReady().then(async () => {
     if (!file.startsWith(DIST_DIR) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) return new Response('not found', { status: 404 });
     const type = mimeType(file);
     if (/\.m?js$/.test(file) && !/javascript/.test(type)) return new Response('refused wrong MIME type', { status: 415 });
-    return net.fetch(pathToFileURL(file).toString());
+
+    // Do not leave module MIME types up to the host OS's file association
+    // database. In particular, Linux installations can return .mjs files as
+    // application/octet-stream through net.fetch(file://…), and Chromium's
+    // strict module loader then rejects the lazily imported PDF.js engine.
+    // Preserve net.fetch's streaming body/status while making every bundled
+    // asset's Content-Type deterministic under yayra:// (including the
+    // module worker used by PDF.js).
+    const assetResponse = await net.fetch(pathToFileURL(file).toString());
+    const headers = new Headers(assetResponse.headers);
+    headers.set('content-type', type);
+    headers.set('x-content-type-options', 'nosniff');
+    return new Response(assetResponse.body, {
+      // net.fetch(file:) normally reports 200; guard the Fetch API's
+      // internal status 0 as Response() only accepts 200–599.
+      status: assetResponse.status >= 200 && assetResponse.status <= 599 ? assetResponse.status : 200,
+      statusText: assetResponse.status >= 200 ? assetResponse.statusText : '',
+      headers
+    });
   });
 
   // ALL IPC surfaces are registered exactly once here (never inside
@@ -1343,7 +1361,35 @@ function createWindow() {
   win.loadURL(loadTarget);
   if (process.env.YAYRA_SMOKE === '1' || process.env.IBROWSE_SMOKE === '1') {
     winContents.once('did-finish-load', async () => {
-      const result = await winContents.executeJavaScript('({ title: document.title, hasRoot: Boolean(document.getElementById("app")), headerControl: Boolean(document.getElementById("update-button") || document.getElementById("top-header")) })');
+      // Exercise the lazy PDF.js ESM + module worker through the exact
+      // yayra:// protocol used by installed apps. A DOM-only smoke could
+      // pass while .mjs was served as octet-stream and every PDF failed.
+      const result = await winContents.executeJavaScript(`(async () => {
+        const output = {
+          title: document.title,
+          hasRoot: Boolean(document.getElementById('app')),
+          headerControl: Boolean(document.getElementById('update-button') || document.getElementById('top-header')),
+          hasPdfEngine: false,
+          pdfPages: 0,
+          pdfError: null
+        };
+        try {
+          const engine = await window.__yayraShell?._pdfjsModule?.();
+          output.hasPdfEngine = typeof engine?.getDocument === 'function';
+          if (output.hasPdfEngine) {
+            const encoded = 'JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCAzMDAgMTQ0XSAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSA0IDAgUiA+PiA+PiAvQ29udGVudHMgNSAwIFIgPj4KZW5kb2JqCjQgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iago1IDAgb2JqCjw8IC9MZW5ndGggNDUgPj4Kc3RyZWFtCkJUIC9GMSAxOCBUZiAzMCA3MCBUZCAoWWF5cmEgUERGIHNtb2tlKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCnhyZWYKMCA2CjAwMDAwMDAwMDAgNjU1MzUgZiAKMDAwMDAwMDAwOSAwMDAwMCBuIAowMDAwMDAwMDU4IDAwMDAwIG4gCjAwMDAwMDAxMTUgMDAwMDAgbiAKMDAwMDAwMDI0MSAwMDAwMCBuIAowMDAwMDAwMzExIDAwMDAwIG4gCnRyYWlsZXIKPDwgL1NpemUgNiAvUm9vdCAxIDAgUiA+PgpzdGFydHhyZWYKNDA2CiUlRU9GCg==';
+            const raw = atob(encoded);
+            const data = Uint8Array.from(raw, (char) => char.charCodeAt(0));
+            const task = engine.getDocument({ data });
+            const pdf = await task.promise;
+            output.pdfPages = pdf?.numPages || 0;
+            await pdf?.destroy?.();
+          }
+        } catch (error) {
+          output.pdfError = String(error?.message || error);
+        }
+        return output;
+      })()`);
       console.log(`[yayra-smoke] ${JSON.stringify(result)}`);
       app.quit();
     });
@@ -1373,12 +1419,24 @@ function safeAssetPath(rawPath) {
 }
 
 function mimeType(file) {
-  if (file.endsWith('.html')) return 'text/html';
-  if (file.endsWith('.js') || file.endsWith('.mjs')) return 'text/javascript';
-  if (file.endsWith('.css')) return 'text/css';
-  if (file.endsWith('.json')) return 'application/json';
-  if (file.endsWith('.webmanifest')) return 'application/manifest+json';
-  if (file.endsWith('.png')) return 'image/png';
-  if (file.endsWith('.ico')) return 'image/x-icon';
+  const lower = String(file || '').toLowerCase();
+  if (lower.endsWith('.html')) return 'text/html; charset=utf-8';
+  if (lower.endsWith('.js') || lower.endsWith('.mjs')) return 'text/javascript; charset=utf-8';
+  if (lower.endsWith('.css')) return 'text/css; charset=utf-8';
+  if (lower.endsWith('.json') || lower.endsWith('.map')) return 'application/json; charset=utf-8';
+  if (lower.endsWith('.webmanifest')) return 'application/manifest+json; charset=utf-8';
+  if (lower.endsWith('.svg')) return 'image/svg+xml';
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  if (lower.endsWith('.gif')) return 'image/gif';
+  if (lower.endsWith('.ico')) return 'image/x-icon';
+  if (lower.endsWith('.woff2')) return 'font/woff2';
+  if (lower.endsWith('.woff')) return 'font/woff';
+  if (lower.endsWith('.ttf')) return 'font/ttf';
+  if (lower.endsWith('.otf')) return 'font/otf';
+  if (lower.endsWith('.pfb')) return 'application/x-font-type1';
+  if (lower.endsWith('.pdf')) return 'application/pdf';
+  if (lower.endsWith('.wasm')) return 'application/wasm';
   return 'application/octet-stream';
 }

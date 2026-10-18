@@ -11,6 +11,14 @@ const css = readFileSync(
   new URL('../packages/shared-ui/src/theme/design-system.css', import.meta.url),
   'utf8'
 );
+const publicCss = readFileSync(
+  new URL('../public/styles.css', import.meta.url),
+  'utf8'
+);
+const devServer = readFileSync(
+  new URL('../scripts/dev-server.mjs', import.meta.url),
+  'utf8'
+);
 
 const ruleBody = (selector) => {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -79,4 +87,51 @@ test('tab-group text prompts use an upper-left, opaque, light/dark-safe surface'
   assert.match(dialog, /color:\s*#f8fafc/);
   assert.match(lightDialog, /background:\s*#ffffff/);
   assert.match(lightDialog, /color:\s*#0f172a/);
+});
+
+test('Google + menu sections are isolated from legacy page cards and recent rows never create native URL tooltips', async () => {
+  const reset = publicCss.match(/:where\(#app \.fb-browser-shell\) section\s*\{([^}]*)\}/)?.[1] || '';
+  assert.ok(reset, 'the production stylesheet has a low-specificity BrowserShell section reset');
+  assert.match(reset, /margin:\s*0/);
+  assert.match(reset, /padding:\s*0/);
+  assert.match(reset, /background:\s*transparent/);
+  assert.match(reset, /border:\s*0/);
+  assert.match(reset, /border-radius:\s*0/);
+  assert.ok(
+    publicCss.indexOf(':where(#app .fb-browser-shell) section') > publicCss.indexOf('@media (prefers-color-scheme: dark)'),
+    'the reset follows both the light and dark legacy section-card declarations'
+  );
+  assert.ok(
+    devServer.indexOf('/styles.css?dev=') > -1
+      && devServer.indexOf('/styles.css?dev=') < devServer.indexOf('/packages/shared-ui/src/theme/design-system.css?dev='),
+    'the dev preview reproduces the production stylesheet cascade instead of hiding this regression'
+  );
+
+  delete globalThis.window.yayra;
+  const container = document.createElement('div');
+  const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+  await shell.initialize();
+  try {
+    shell.state.closedTabsHistory = [{
+      id: 'closed-menu-regression',
+      title: 'Account security',
+      url: 'https://github.com/example/security'
+    }];
+    const el = shell.render(container);
+    const row = el.querySelector('.fb-google-recent-tab');
+    assert.ok(row, 'a real recent page appears in the Google context menu');
+    assert.equal(row.getAttribute('title'), null,
+      'no native title bubble can cover the compact menu');
+    assert.match(row.getAttribute('aria-label') || '', /Account security/);
+    assert.match(row.getAttribute('aria-label') || '', /github\.com\/example\/security/,
+      'the URL remains available to assistive technology');
+
+    row.click();
+    assert.equal(row.getAttribute('aria-checked'), 'true', 'recent-tab context selection still works');
+    for (const selector of ['.fb-google-add-images', '.fb-google-add-files', '.fb-google-create-images', '.fb-google-canvas']) {
+      assert.ok(el.querySelector(selector), `${selector} remains present and actionable`);
+    }
+  } finally {
+    shell.destroy();
+  }
 });

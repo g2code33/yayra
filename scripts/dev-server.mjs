@@ -212,6 +212,9 @@ function serveBrowserApp(res) {
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" type="image/png" sizes="1024x1024" href="/assets/brand/logomain1-transparent.png">
   <link rel="icon" type="image/jpeg" sizes="1024x1024" href="/assets/brand/logomain1.jpg">
+  <!-- Match public/index.html's production cascade so legacy-style leaks
+       into BrowserShell popovers are visible (and testable) in dev too. -->
+  <link rel="stylesheet" href="/styles.css?dev=${devToken}">
   <link rel="stylesheet" href="/packages/shared-ui/src/theme/design-system.css?dev=${devToken}">
   <link rel="stylesheet" href="/packages/shared-ui/src/glassmorphism.css?dev=${devToken}">
   <style>

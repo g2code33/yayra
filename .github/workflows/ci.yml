@@ -67,6 +67,8 @@ jobs:
             echo "Linux PR build-only artifacts are unsigned; release.yml records this in artifact names."
           } >> "$GITHUB_STEP_SUMMARY"
       - run: npm run package:linux
+      - name: Smoke packaged Linux shell and PDF.js worker
+        run: npm run smoke:desktop
       - run: npm run verify:packaging
 
   desktop-win:
@@ -98,6 +100,8 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
       - run: npm run package:win
+      - name: Smoke packaged Windows shell and PDF.js worker
+        run: npm run smoke:desktop
       - name: Verify Windows executables
         shell: pwsh
         run: |
