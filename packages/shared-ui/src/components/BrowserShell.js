@@ -16644,13 +16644,20 @@ export class BrowserShell {
         // viewer makes carries them without the viewer knowing.
         const stdFontUrl = new URL('../vendor/pdfjs/standard_fonts/', import.meta.url).toString();
         const cMapUrl = new URL('../vendor/pdfjs/cmaps/', import.meta.url).toString();
-        const wrapped = Object.create(lib);
-        wrapped.getDocument = (params = {}) => lib.getDocument({
-          standardFontDataUrl: stdFontUrl,
-          cMapUrl,
-          cMapPacked: true,
-          ...params
-        });
+        // Browser ESM namespace objects are immutable exotic objects. Using
+        // one as a prototype and assigning an exported name can throw in
+        // Chromium ("Cannot assign to property 'getDocument' of [object
+        // Module]"). Copy the exports into an ordinary object and define the
+        // configured entry point in the same object literal instead.
+        const wrapped = {
+          ...lib,
+          getDocument: (params = {}) => lib.getDocument({
+            standardFontDataUrl: stdFontUrl,
+            cMapUrl,
+            cMapPacked: true,
+            ...params
+          })
+        };
         this._pdfjsLib = wrapped;
         return wrapped;
       }).catch((error) => {
@@ -16686,6 +16693,13 @@ export class BrowserShell {
       b.addEventListener('click', fn);
       return b;
     };
+    // The toolbar is painted before the asynchronous PDF engine is ready.
+    // Every interaction must therefore tolerate a session whose controller
+    // is still null (and must never act on another tab's controller).
+    const activeViewer = () => {
+      const session = this._activeDocViewer;
+      return session && session.tabId === tab.id ? session.viewer : null;
+    };
 
     // ---- Row A: identity + the big actions -----------------------------
     const bar = document.createElement('div');
@@ -16719,7 +16733,7 @@ export class BrowserShell {
     bar2.className = 'fb-doc-toolbar fb-doc-toolbar2';
     bar2.style.cssText = 'flex:none; display:flex; align-items:center; gap:6px; padding:5px 10px; background:var(--fb-bg-surface,#11141d); border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.78rem; color:var(--fb-text-primary,#dfe4ee); flex-wrap:wrap;';
 
-    bar2.appendChild(mkBtn('\u2039', 'Previous page (Left)', () => this._activeDocViewer?.viewer.prevPage()));
+    bar2.appendChild(mkBtn('\u2039', 'Previous page (Left)', () => activeViewer()?.prevPage?.()));
     const pageInput = document.createElement('input');
     pageInput.type = 'number';
     pageInput.className = 'fb-doc-page-input';
@@ -16732,25 +16746,25 @@ export class BrowserShell {
     pageLabel.textContent = '/ -';
     const gotoPage = () => {
       const n = parseInt(pageInput.value, 10);
-      if (Number.isFinite(n)) this._activeDocViewer?.viewer.setPage(n);
+      if (Number.isFinite(n)) activeViewer()?.setPage?.(n);
     };
     pageInput.addEventListener('change', gotoPage);
     pageInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { gotoPage(); wrap.focus?.(); } });
     bar2.appendChild(pageInput);
     bar2.appendChild(pageLabel);
-    bar2.appendChild(mkBtn('\u203a', 'Next page (Right)', () => this._activeDocViewer?.viewer.nextPage()));
+    bar2.appendChild(mkBtn('\u203a', 'Next page (Right)', () => activeViewer()?.nextPage?.()));
 
-    bar2.appendChild(mkBtn('\u2212', 'Zoom out (-)', () => this._activeDocViewer?.viewer.setZoom((tab.docState?.zoom || 1.25) - 0.25)));
+    bar2.appendChild(mkBtn('\u2212', 'Zoom out (-)', () => activeViewer()?.setZoom?.((tab.docState?.zoom || 1.25) - 0.25)));
     const zoomLabel = document.createElement('span');
     zoomLabel.className = 'fb-doc-zoom-label';
     zoomLabel.style.cssText = 'min-width:40px; text-align:center; color:var(--fb-text-secondary,#9aa3b2);';
     bar2.appendChild(zoomLabel);
-    bar2.appendChild(mkBtn('+', 'Zoom in (+)', () => this._activeDocViewer?.viewer.setZoom((tab.docState?.zoom || 1.25) + 0.25)));
+    bar2.appendChild(mkBtn('+', 'Zoom in (+)', () => activeViewer()?.setZoom?.((tab.docState?.zoom || 1.25) + 0.25)));
 
-    bar2.appendChild(mkBtn('\u2194 Fit', 'Fit the page to the window width (F)', () => this._activeDocViewer?.viewer.fitToWidth(), 'fb-doc-btn-fitw'));
-    bar2.appendChild(mkBtn('\u29c9 Page', 'Show the whole page at once', () => this._activeDocViewer?.viewer.fitToPage(), 'fb-doc-btn-fitp'));
-    bar2.appendChild(mkBtn('\u21bb', 'Rotate 90\u00b0 (R)', () => this._activeDocViewer?.viewer.rotate(90), 'fb-doc-btn-rotate'));
-    bar2.appendChild(mkBtn('\u263d', 'Night reading mode - invert colors (N)', () => { this._activeDocViewer?.viewer.setNight(!tab.docState?.night); }, 'fb-doc-btn-night'));
+    bar2.appendChild(mkBtn('\u2194 Fit', 'Fit the page to the window width (F)', () => activeViewer()?.fitToWidth?.(), 'fb-doc-btn-fitw'));
+    bar2.appendChild(mkBtn('\u29c9 Page', 'Show the whole page at once', () => activeViewer()?.fitToPage?.(), 'fb-doc-btn-fitp'));
+    bar2.appendChild(mkBtn('\u21bb', 'Rotate 90\u00b0 (R)', () => activeViewer()?.rotate?.(90), 'fb-doc-btn-rotate'));
+    bar2.appendChild(mkBtn('\u263d', 'Night reading mode - invert colors (N)', () => { activeViewer()?.setNight?.(!tab.docState?.night); }, 'fb-doc-btn-night'));
     bar2.appendChild(mkBtn('\u2630', 'Outline and page thumbnails', () => {
       tab.docState.sidebarOpen = !tab.docState.sidebarOpen;
       if (this._activeDocViewer && this._activeDocViewer.tabId === tab.id) this._activeDocViewer.rerenderSidebar?.();
@@ -16766,7 +16780,7 @@ export class BrowserShell {
     let searchTimer = null;
     searchInput.addEventListener('input', () => {
       if (searchTimer) clearTimeout(searchTimer);
-      searchTimer = setTimeout(() => { this._activeDocViewer?.viewer.search(searchInput.value); }, 350);
+      searchTimer = setTimeout(() => { activeViewer()?.search?.(searchInput.value); }, 350);
     });
     bar2.appendChild(searchInput);
     const matchLabel = document.createElement('span');
@@ -16883,7 +16897,7 @@ export class BrowserShell {
             label.textContent = String(p);
             label.style.cssText = 'padding:2px 0; color:var(--fb-text-secondary,#9aa3b2); font-size:0.7rem;';
             thumb.appendChild(label);
-            thumb.addEventListener('click', () => this._activeDocViewer?.viewer.setPage(p));
+            thumb.addEventListener('click', () => activeViewer()?.setPage?.(p));
             sidebarBody.appendChild(thumb);
           }
           return;
@@ -16898,7 +16912,7 @@ export class BrowserShell {
           row.textContent = item.title;
           if (item.page) {
             row.title = `Go to page ${item.page}`;
-            row.addEventListener('click', () => this._activeDocViewer?.viewer.setPage(item.page));
+            row.addEventListener('click', () => activeViewer()?.setPage?.(item.page));
           }
           row.style.cssText = `padding:6px 8px; margin-bottom:2px; border-radius:6px; cursor:${item.page ? 'pointer' : 'default'}; background:${item.page ? 'rgba(255,255,255,0.04)' : 'transparent'}; color:${item.page ? 'var(--fb-text-primary,#dfe4ee)' : 'var(--fb-text-secondary,#9aa3b2)'}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-left:${(item.depth || 0) * 12}px;`;
           sidebarBody.appendChild(row);
@@ -16953,7 +16967,7 @@ export class BrowserShell {
             snippet.textContent = ` \u2014 ${String(m.snippet || '').slice(0, 90)}`;
             row.appendChild(pageNumber);
             row.appendChild(snippet);
-            row.addEventListener('click', () => { this._activeDocViewer?.viewer.setPage(m.page); });
+            row.addEventListener('click', () => { activeViewer()?.setPage?.(m.page); });
             matchPanel.appendChild(row);
           });
         } else {
@@ -16969,9 +16983,9 @@ export class BrowserShell {
 
     // Keyboard: page/zoom/rotate/night/fit + Ctrl+F focus search.
     wrap.addEventListener('keydown', (e) => {
-      const active = this._activeDocViewer;
-      if (!active || active.tabId !== tab.id) return;
-      const action = active.viewer.handleKeydown(e);
+      const viewer = activeViewer();
+      if (!viewer || typeof viewer.handleKeydown !== 'function') return;
+      const action = viewer.handleKeydown(e);
       if (action === 'focus-search') {
         if (typeof e.preventDefault === 'function') e.preventDefault();
         searchInput.focus?.();

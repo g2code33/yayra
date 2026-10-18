@@ -147,6 +147,55 @@ test('VIEWER: load -> ready with page count; navigation is clamped to the docume
   viewer.destroy();
 });
 
+test('VIEWER: paints the first PDF page to a live canvas and repaints on zoom', async () => {
+  const state = createDocumentViewerState();
+  const container = document.createElement('div');
+  let renders = 0;
+  let lastViewport = null;
+  container.ownerDocument = {
+    createElement(tagName) {
+      const element = document.createElement(tagName);
+      if (String(tagName).toLowerCase() === 'canvas') {
+        element.getContext = () => ({ canvas: element });
+      }
+      return element;
+    }
+  };
+  const pdfjs = {
+    getDocument: () => ({
+      promise: Promise.resolve({
+        numPages: 1,
+        getPage: async () => ({
+          rotate: 0,
+          getViewport: ({ scale = 1 } = {}) => ({ width: 400 * scale, height: 600 * scale, scale }),
+          render: ({ canvasContext, viewport }) => {
+            assert.ok(canvasContext, 'a real 2D context is supplied');
+            renders += 1;
+            lastViewport = viewport;
+            return { promise: Promise.resolve() };
+          }
+        }),
+        destroy: () => {}
+      })
+    })
+  };
+  const viewer = createPdfViewer({ pdfjs, container, state });
+  try {
+    await viewer.load(new Uint8Array([1, 2, 3]));
+    assert.equal(state.status, 'ready');
+    assert.equal(renders, 1, 'the first page paints as part of opening the document');
+    assert.equal(lastViewport.scale, 1.25);
+    assert.ok(container.querySelector('.fb-doc-canvas'), 'the painted page is attached to the visible PDF host');
+
+    await viewer.setZoom(2);
+    assert.equal(renders, 2, 'zoom repaints the current page');
+    assert.equal(lastViewport.scale, 2);
+    assert.equal(container.querySelectorAll('.fb-doc-canvas').length, 1, 'the old canvas is replaced, not stacked');
+  } finally {
+    viewer.destroy();
+  }
+});
+
 test('VIEWER: zoom is clamped to a sane range', async () => {
   const state = { status: 'idle', numPages: 0, page: 1, zoom: 1.25, query: '', matches: [], matchIndex: -1, error: null };
   const viewer = createPdfViewer({ pdfjs: fakePdfjs(), container: null, state });
@@ -320,6 +369,20 @@ test('TAB INTEGRATION: PDF.js startup failures are shown with a working retry, n
     assert.equal(tab.docState.status, 'error');
     assert.match(status.textContent, /could not start the PDF reader/i);
     assert.equal(retry.style.display, 'inline-flex');
+
+    // The toolbar and focused viewer exist before (and after a failed)
+    // asynchronous engine startup, while the controller is still null. Every
+    // action must no-op rather than throwing `handleKeydown`/method errors.
+    const viewerSurface = container.querySelector('.fb-doc-viewer');
+    assert.doesNotThrow(() => viewerSurface.dispatchEvent({
+      type: 'keydown',
+      key: 'ArrowRight',
+      preventDefault() {}
+    }));
+    for (const button of viewerSurface.querySelector('.fb-doc-toolbar2').querySelectorAll('.fb-doc-btn')) {
+      assert.doesNotThrow(() => button.click(), `${button.title || button.textContent} is safe while the engine is unavailable`);
+    }
+
     retry.click();
     await new Promise((resolve) => setTimeout(resolve, 10));
     assert.equal(attempts, 2, 'Retry starts a fresh module load attempt');
@@ -555,6 +618,9 @@ test('PDF.js REAL ENGINE: a local PDF opens quickly and its text is searchable o
   const { shell } = await bootShell();
   try {
     const engine = await shell._pdfjsModule();
+    assert.equal(Object.getPrototypeOf(engine), Object.prototype,
+      'the browser receives an ordinary adapter, never an immutable ESM namespace prototype');
+    assert.equal(Object.hasOwn(engine, 'getDocument'), true);
     const pdfjs = await import('../packages/shared-ui/src/vendor/pdfjs/pdf.mjs');
     // Node's PDF.js factory reads native filesystem paths; the app itself
     // uses same-origin fetch URLs in the browser/Electron renderer.
@@ -600,6 +666,10 @@ test('PDF FONTS: standard-14 font data and CJK cmaps are vendored and wired into
   assert.match(src, /standardFontDataUrl: stdFontUrl/, 'standardFontDataUrl is passed');
   assert.match(src, /cMapUrl,/, 'cMapUrl is passed');
   assert.match(src, /cMapPacked: true/, 'cmaps are packed (bcmap)');
+  assert.doesNotMatch(src, /Object\.create\(lib\)/,
+    'Chromium cannot shadow exports through an immutable ESM namespace prototype');
+  assert.match(src, /const wrapped = \{[\s\S]*\.\.\.lib,[\s\S]*getDocument:/,
+    'the PDF.js adapter is an ordinary object with its own configured getDocument');
   // The wrapped module keeps the worker assignment and the engine surface.
   assert.match(src, /GlobalWorkerOptions\.workerSrc = new URL\('\.\.\/vendor\/pdfjs\/pdf\.worker\.mjs'/, 'worker still set on the real module');
 }
