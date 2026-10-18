@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
 
 const require = createRequire(import.meta.url);
@@ -8,6 +9,7 @@ const {
   GOOGLE_LENS_MAX_BYTES,
   buildGoogleLensUploadUrl,
   isGoogleLensPickerUrl,
+  requestGoogleLensWithElectronNet,
   searchGoogleLensImageUrl,
   uploadGoogleLensImage
 } = require('../electron/googleFeatures.cjs');
@@ -17,6 +19,52 @@ const resultResponse = (url, status = 200) => ({
   status,
   url,
   headers: { get: () => null }
+});
+
+test('Google Lens: Electron captures the exact redirect instead of relying on net.fetch Response.url', async () => {
+  let requestOptions = null;
+  let requestBody = null;
+  let followed = false;
+  class FakeClientRequest extends EventEmitter {
+    end(body) {
+      requestBody = body;
+      queueMicrotask(() => this.emit(
+        'redirect',
+        303,
+        'GET',
+        'https://lens.google.com/search?p=real-result',
+        { location: ['https://lens.google.com/search?p=real-result'] }
+      ));
+    }
+    followRedirect() { followed = true; }
+    abort() {}
+  }
+
+  const result = await uploadGoogleLensImage({
+    requestTransport: (url, options) => requestGoogleLensWithElectronNet({
+      createRequest: (nextOptions) => {
+        requestOptions = nextOptions;
+        return new FakeClientRequest();
+      },
+      url,
+      options,
+      timeoutMs: 2_000
+    }),
+    data: new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+    name: 'camera.png',
+    type: 'image/png',
+    width: 640,
+    height: 480
+  });
+
+  assert.deepEqual(result, { ok: true, url: 'https://lens.google.com/search?p=real-result' });
+  assert.equal(requestOptions.redirect, 'manual');
+  assert.equal(requestOptions.credentials, 'include');
+  assert.match(requestOptions.headers['Content-Type'], /^multipart\/form-data; boundary=/);
+  assert.equal(Buffer.isBuffer(requestBody), true);
+  assert.match(requestBody.toString('latin1'), /name="encoded_image"; filename="camera.png"/);
+  assert.match(requestBody.toString('latin1'), /name="processed_image_dimensions"[\s\S]*640,480/);
+  assert.equal(followed, false, 'the hidden request must not download the Lens result page');
 });
 
 test('Google Lens: native uploads use the current direct-search contract and completed result URL', async () => {
@@ -137,6 +185,12 @@ test('Desktop Google features: Lens upload is connected but external Voice/Lens 
   assert.match(main, /searchGoogleLensImageUrl/);
   assert.match(main, /session\.fromPartition\(partition\)/,
     'Lens uses the destination tab session so Google result cookies are retained');
+  assert.match(main, /requestGoogleLensWithElectronNet/,
+    'desktop Lens captures ClientRequest redirect events');
+  assert.match(main, /net\.request\(\{ \.\.\.requestOptions, session: tabSession \}\)/,
+    'Lens requests use the destination tab Chromium session');
+  assert.doesNotMatch(main, /tabSession\.fetch\(/,
+    'Lens must not rely on Electron’s documented-incorrect fetch Response.url');
   assert.match(preload, /googleLensUpload:[\s\S]*yayra:google-lens-upload/);
   assert.doesNotMatch(main, /yayra:open-google-feature/,
     'main process cannot launch Voice or Lens in the system browser');

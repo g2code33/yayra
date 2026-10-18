@@ -22,7 +22,7 @@ const { createPasskeyBridge } = require('./passkeyBridge.cjs');
 const { configureWebsiteWebAuthn } = require('./websiteWebAuthn.cjs');
 const { createWebsitePasskeyProvider } = require('./websitePasskeyProvider.cjs');
 const { configureTrustedMediaPermissions } = require('./trustedMediaPermissions.cjs');
-const { uploadGoogleLensImage, searchGoogleLensImageUrl } = require('./googleFeatures.cjs');
+const { uploadGoogleLensImage, searchGoogleLensImageUrl, requestGoogleLensWithElectronNet } = require('./googleFeatures.cjs');
 const { createPhoneApproval } = require('./phoneApproval.cjs');
 const { createOverlayBridge } = require('./overlayWindow.cjs');
 const { createOverlayStore } = require('./overlayStore.cjs');
@@ -782,7 +782,14 @@ function registerIpcBridges() {
     // result URL is opened; main-process defaultSession cookies are not.
     const tabSession = session.fromPartition(partition);
     const common = {
-      netFetch: (url, options) => tabSession.fetch(url, options),
+      // ClientRequest exposes Google's exact redirect destination. Electron
+      // documents net.fetch Response.url as incorrect, so it cannot reliably
+      // identify the completed Lens result after following that redirect.
+      requestTransport: (url, options) => requestGoogleLensWithElectronNet({
+        createRequest: (requestOptions) => net.request({ ...requestOptions, session: tabSession }),
+        url,
+        options
+      }),
       language: payload.language,
       startedAt: payload.startedAt,
       viewportWidth: payload.viewportWidth,

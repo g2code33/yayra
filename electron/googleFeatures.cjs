@@ -143,13 +143,127 @@ function googleRedirectUrl(response, requestUrl) {
   return String(response?.url || '').trim();
 }
 
-async function requestGoogleLensResult(netFetch, requestUrl, options) {
+function headerValue(headers, name) {
+  if (!headers || typeof headers !== 'object') return '';
+  const wanted = String(name || '').toLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    if (String(key).toLowerCase() !== wanted) continue;
+    return Array.isArray(value) ? String(value[0] || '') : String(value || '');
+  }
+  return '';
+}
+
+function headersAdapter(headers) {
+  return {
+    get(name) {
+      return headerValue(headers, name) || null;
+    }
+  };
+}
+
+async function serializeElectronRequestBody(url, body, headers) {
+  if (typeof FormData === 'function' && body instanceof FormData) {
+    // ClientRequest accepts bytes rather than WHATWG FormData. Let Node's
+    // standards implementation generate the multipart boundary/body once,
+    // then send those exact bytes with Chromium's network stack.
+    const encoded = new Request(url, { method: 'POST', body });
+    const contentType = encoded.headers.get('content-type');
+    if (contentType && !headerValue(headers, 'content-type')) headers['Content-Type'] = contentType;
+    return Buffer.from(await encoded.arrayBuffer());
+  }
+  if (body == null) return null;
+  if (Buffer.isBuffer(body)) return body;
+  if (body instanceof ArrayBuffer) return Buffer.from(body);
+  if (ArrayBuffer.isView(body)) return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+  return Buffer.from(String(body));
+}
+
+/**
+ * Issue a Lens request with Electron ClientRequest and stop at Google's first
+ * redirect. Electron documents that the Response.url returned by net.fetch is
+ * incorrect, so following a redirect and then reading response.url cannot
+ * reliably recover the Lens result. ClientRequest's redirect event contains
+ * the exact destination URL before any result page is downloaded.
+ */
+async function requestGoogleLensWithElectronNet({
+  createRequest,
+  url,
+  options = {},
+  timeoutMs = 45_000
+} = {}) {
+  if (typeof createRequest !== 'function') throw new Error('lens-transport-unavailable');
+  const requestUrl = String(url || '');
+  const headers = { ...(options.headers || {}) };
+  const body = await serializeElectronRequestBody(requestUrl, options.body, headers);
+
+  return new Promise((resolve, reject) => {
+    let request;
+    let settled = false;
+    let timer = null;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      callback(value);
+    };
+
+    try {
+      request = createRequest({
+        url: requestUrl,
+        method: String(options.method || 'GET').toUpperCase(),
+        headers,
+        redirect: 'manual',
+        credentials: 'include'
+      });
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    request.on('redirect', (statusCode, _method, redirectUrl, responseHeaders) => {
+      // Deliberately do not call followRedirect(): the active Yayra tab will
+      // perform that navigation only after the destination passes validation.
+      finish(resolve, {
+        status: Number(statusCode) || 0,
+        url: String(redirectUrl || ''),
+        headers: headersAdapter(responseHeaders)
+      });
+    });
+    request.on('response', (response) => {
+      // A non-redirect response is still returned for useful diagnostics. The
+      // original upload endpoint is classified as an empty picker, never as a
+      // completed Lens result.
+      response.on('data', () => {});
+      response.on('error', () => {});
+      const location = headerValue(response.headers, 'location');
+      let responseUrl = requestUrl;
+      if (location) {
+        try { responseUrl = new URL(location, requestUrl).toString(); } catch { responseUrl = ''; }
+      }
+      finish(resolve, {
+        status: Number(response.statusCode) || 0,
+        url: responseUrl,
+        headers: headersAdapter(response.headers)
+      });
+    });
+    request.on('error', (error) => finish(reject, error));
+    timer = setTimeout(() => {
+      try { request.abort(); } catch { /* request already closed */ }
+      finish(reject, new Error('google-lens-timeout'));
+    }, Math.max(1_000, Math.min(Number(timeoutMs) || 45_000, 120_000)));
+
+    try {
+      if (body) request.end(body);
+      else request.end();
+    } catch (error) {
+      finish(reject, error);
+    }
+  });
+}
+
+async function requestGoogleLensResult(requestTransport, requestUrl, options) {
   try {
-    // Electron's Chromium-backed fetch currently cancels `redirect: manual`.
-    // Follow Google's redirect in the destination tab's own Session (the same
-    // proven contract used by Firefox), then validate the final URL before
-    // allowing the active Yayra tab to navigate to it.
-    const response = await netFetch(requestUrl, {
+    const response = await requestTransport(requestUrl, {
       ...options,
       redirect: 'follow',
       credentials: 'include'
@@ -172,10 +286,11 @@ async function requestGoogleLensResult(netFetch, requestUrl, options) {
 
 /**
  * Send image bytes straight from the Electron main process to Google's
- * official Lens endpoint. `net.fetch` is used here because renderer fetches
- * are CORS-constrained; no Yayra server, proxy, or storage sees the image.
+ * official Lens endpoint. A Chromium ClientRequest is used because renderer
+ * fetches are CORS-constrained; no Yayra server, proxy, or storage sees the image.
  */
 async function uploadGoogleLensImage({
+  requestTransport,
   netFetch,
   data,
   name,
@@ -188,7 +303,8 @@ async function uploadGoogleLensImage({
   viewportHeight,
   userAgent
 } = {}) {
-  if (typeof netFetch !== 'function') return { ok: false, reason: 'transport-unavailable' };
+  const transport = requestTransport || netFetch;
+  if (typeof transport !== 'function') return { ok: false, reason: 'transport-unavailable' };
   const bytes = normalizeBytes(data);
   if (!bytes || bytes.length === 0) return { ok: false, reason: 'empty-file' };
   if (bytes.length > GOOGLE_LENS_MAX_BYTES) return { ok: false, reason: 'file-too-large' };
@@ -208,7 +324,7 @@ async function uploadGoogleLensImage({
     viewportWidth,
     viewportHeight
   });
-  return requestGoogleLensResult(netFetch, requestUrl, {
+  return requestGoogleLensResult(transport, requestUrl, {
     method: 'POST',
     body,
     headers: googleRequestHeaders(language, userAgent)
@@ -221,6 +337,7 @@ async function uploadGoogleLensImage({
  * is treated as failure, so the original URL stays in Yayra for a retry.
  */
 async function searchGoogleLensImageUrl({
+  requestTransport,
   netFetch,
   imageUrl,
   language,
@@ -229,7 +346,8 @@ async function searchGoogleLensImageUrl({
   viewportHeight,
   userAgent
 } = {}) {
-  if (typeof netFetch !== 'function') return { ok: false, reason: 'transport-unavailable' };
+  const transport = requestTransport || netFetch;
+  if (typeof transport !== 'function') return { ok: false, reason: 'transport-unavailable' };
   const requestUrl = buildGoogleLensImageUrl({
     imageUrl,
     language,
@@ -238,7 +356,7 @@ async function searchGoogleLensImageUrl({
     viewportHeight
   });
   if (!requestUrl) return { ok: false, reason: 'invalid-image-url' };
-  return requestGoogleLensResult(netFetch, requestUrl, {
+  return requestGoogleLensResult(transport, requestUrl, {
     method: 'GET',
     headers: googleRequestHeaders(language, userAgent)
   });
@@ -252,6 +370,7 @@ module.exports = {
   buildGoogleLensImageUrl,
   isGoogleLensPickerUrl,
   isGoogleLensResultUrl,
+  requestGoogleLensWithElectronNet,
   uploadGoogleLensImage,
   searchGoogleLensImageUrl
 };
