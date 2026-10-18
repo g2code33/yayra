@@ -7,8 +7,8 @@
   "display": "standalone",
   "background_color": "#172554",
   "theme_color": "#172554",
-  "version": "1.0.59",
-  "cacheVersion": "1.0.59",
+  "version": "1.0.60",
+  "cacheVersion": "1.0.60",
   "icons": [
     {
       "src": "assets/brand/logomain1-transparent.png",
