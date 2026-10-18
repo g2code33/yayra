@@ -2282,26 +2282,41 @@ export class BrowserShell {
     const toolbarActions = document.createElement('div');
     toolbarActions.className = 'fb-toolbar-actions';
 
-    // Persistent "Update available" chip: background update checks (see
-    // startBackgroundUpdateChecks) can discover a release at any time, and
-    // the one-per-session confirm dialog is easy to dismiss - this chip
-    // stays visible until the update is actually applied.
-    if (this.state.updateState.status === 'ready' || this.state.updateState.status === 'staged') {
+    // Persistent update chip: background checks can discover a release at
+    // any time. It remains visible not only before/after the download, but
+    // DURING it too, so every website has a live view of update progress
+    // without opening Settings or refreshing the page.
+    if (['ready', 'downloading', 'staged'].includes(this.state.updateState.status)) {
       const staged = this.state.updateState.status === 'staged';
+      const downloading = this.state.updateState.status === 'downloading';
       const updateChip = document.createElement('button');
-      updateChip.className = 'fb-update-chip';
+      updateChip.className = `fb-update-chip ${downloading ? 'fb-update-chip-downloading' : ''}`;
+      const downloadDetail = this.formatUpdateDownloadProgress(this.state.updateState);
       updateChip.setAttribute(
         'title',
         staged
           ? `Yayra v${this.state.updateState.availableVersion || 'latest'} is downloaded & verified - click to install`
-          : `Update Yayra to v${this.state.updateState.availableVersion || 'latest'} - click to download & install`
+          : downloading
+            ? `Downloading Yayra v${this.state.updateState.availableVersion || 'latest'} - ${downloadDetail}. Click for update details.`
+            : `Update Yayra to v${this.state.updateState.availableVersion || 'latest'} - click to download & install`
       );
-      updateChip.setAttribute('aria-label', staged ? 'Install downloaded update' : 'Download and install available update');
-      // Downloaded & verified -> the remaining action is INSTALL, and the
-      // chip says exactly that (never "Download and install" again).
-      updateChip.innerHTML = `${Icons.download}<span class="fb-update-chip-label">${staged ? 'Install' : 'Update'}</span>`;
+      updateChip.setAttribute(
+        'aria-label',
+        staged ? 'Install downloaded update' : downloading ? `Downloading Yayra update, ${downloadDetail}` : 'Download and install available update'
+      );
+      // Downloaded & verified -> Install. Active download -> a compact live
+      // percentage/byte count. Available -> Update.
+      updateChip.innerHTML = downloading
+        ? `${Icons.download}<span class="fb-update-chip-label fb-update-progress-label fb-update-progress-toolbar" data-update-progress-context="toolbar" aria-live="polite" aria-atomic="true">${this.formatUpdateDownloadLabel('toolbar')}</span>`
+        : `${Icons.download}<span class="fb-update-chip-label">${staged ? 'Install' : 'Update'}</span>`;
       updateChip.addEventListener('click', (e) => {
         e.stopPropagation();
+        if (downloading) {
+          this.state.settingsActiveCategory = 'updates';
+          this.state.activeSettingsCategory = 'updates';
+          this.openInternalPage('yayra://settings');
+          return;
+        }
         this.applyUpdate();
       });
       toolbarActions.appendChild(updateChip);
@@ -11609,7 +11624,15 @@ export class BrowserShell {
   }
 
   async checkForUpdates(manual = false) {
-    if (this.state.updateState.status === 'checking') return;
+    // Never let a periodic/manual check overwrite an active download or
+    // installer state. Doing so removed the live progress targets while
+    // bytes were still arriving and made the UI appear frozen until reload.
+    if (['checking', 'downloading', 'installing'].includes(this.state.updateState.status)) {
+      if (manual && this.state.updateState.status === 'downloading') {
+        this.showTransientNotice(`Update download is already in progress (${this.formatUpdateDownloadProgress()}).`);
+      }
+      return;
+    }
     this.state.updateState = { ...this.state.updateState, status: 'checking' };
     this.render();
 
@@ -11882,6 +11905,25 @@ export class BrowserShell {
     try { return JSON.parse(localStorage.getItem('yayra:pending-update-install') || 'null'); } catch { return null; }
   }
 
+  /** Human-readable live download progress shared by Settings, the toolbar
+   * chip, and the Yayra menu. Keeping one formatter means a later render
+   * can never jump back to stale text after an in-place progress update. */
+  formatUpdateDownloadProgress(updateState = this.state.updateState || {}) {
+    if (typeof updateState.progressPercent === 'number' && Number.isFinite(updateState.progressPercent)) {
+      return `${Math.max(0, Math.min(100, Math.round(updateState.progressPercent)))}%`;
+    }
+    const received = Number(updateState.progressReceivedBytes) || 0;
+    if (received > 0) return `${(received / (1024 * 1024)).toFixed(1)} MB`;
+    return 'Starting…';
+  }
+
+  formatUpdateDownloadLabel(context = 'compact', updateState = this.state.updateState || {}) {
+    const detail = this.formatUpdateDownloadProgress(updateState);
+    if (context === 'settings') return `Downloading v${updateState.availableVersion || 'latest'}… ${detail}`;
+    if (context === 'toolbar') return `Update ${detail}`;
+    return `Downloading update… ${detail}`;
+  }
+
   /**
    * Settings -> "Yayra Updates": the full manual home of the update
    * pipeline. Everything the prompts offer lives here too - check,
@@ -11895,9 +11937,14 @@ export class BrowserShell {
     const configured = Number(this.updateService?.config?.checkIntervalMinutes);
     const intervalMin = Math.max(15, Number.isFinite(configured) && configured > 0 ? configured : 720);
     const intervalLabel = intervalMin % 60 === 0 ? `${intervalMin / 60} hour${intervalMin === 60 ? '' : 's'}` : `${intervalMin} minutes`;
+    const isDownloading = u.status === 'downloading';
+    const progressPercent = typeof u.progressPercent === 'number' && Number.isFinite(u.progressPercent)
+      ? Math.max(0, Math.min(100, Math.round(u.progressPercent)))
+      : null;
+    const progressDetail = this.formatUpdateDownloadProgress(u);
 
     const statusLabel = u.status === 'checking' ? 'Checking for updates…'
-      : u.status === 'downloading' ? `Downloading v${u.availableVersion || ''}… ${typeof u.progressPercent === 'number' ? `${u.progressPercent}%` : ''}`
+      : isDownloading ? this.formatUpdateDownloadLabel('settings', u)
       : u.status === 'staged' ? `v${u.availableVersion || ''} downloaded & verified - ready to install`
       : u.status === 'ready' ? `v${u.availableVersion || ''} is available`
       : u.status === 'installing' ? 'Installer running…'
@@ -11907,12 +11954,16 @@ export class BrowserShell {
     return `
       <div class="fb-updates-settings">
         <div class="fb-updates-status-row">
-          <span class="fb-status-orb ${u.status === 'error' ? '' : u.status === 'checking' || u.status === 'downloading' ? 'pulse' : 'green'}" ${u.status === 'error' ? 'style="background:#ef4444;"' : ''}></span>
-          <div>
-            <strong>${statusLabel}</strong>
+          <span class="fb-status-orb ${u.status === 'error' ? '' : u.status === 'checking' || isDownloading ? 'pulse' : 'green'}" ${u.status === 'error' ? 'style="background:#ef4444;"' : ''}></span>
+          <div class="fb-updates-status-copy">
+            <strong class="${isDownloading ? 'fb-update-progress-label fb-update-progress-settings' : ''}" ${isDownloading ? 'data-update-progress-context="settings" aria-live="polite" aria-atomic="true"' : ''}>${statusLabel}</strong>
             <p style="margin:2px 0 0; font-size:0.78rem; color:var(--fb-text-muted);">Installed: v${u.installedVersion || 'unknown'} &#183; Auto-checks every ${intervalLabel} while Yayra is open.</p>
           </div>
         </div>
+        ${isDownloading ? `
+          <div class="fb-update-live-progress ${progressPercent == null ? 'is-indeterminate' : ''}" role="progressbar" aria-label="Yayra update download" aria-valuemin="0" aria-valuemax="100" ${progressPercent == null ? '' : `aria-valuenow="${progressPercent}"`} aria-valuetext="${progressDetail}">
+            <span class="fb-update-live-progress-fill" style="width:${progressPercent == null ? 30 : progressPercent}%;"></span>
+          </div>` : ''}
         ${scheduled ? `
           <div class="fb-updates-scheduled-row">
             <span>${Icons.hourglass}</span>
@@ -11920,7 +11971,7 @@ export class BrowserShell {
             <button class="fb-btn fb-btn-secondary fb-up-cancel-scheduled">Cancel</button>
           </div>` : ''}
         <div class="fb-updates-actions">
-          <button class="fb-btn fb-btn-secondary fb-up-check">Check for updates now</button>
+          <button class="fb-btn fb-btn-secondary fb-up-check" ${['checking', 'downloading', 'installing'].includes(u.status) ? 'disabled' : ''}>${isDownloading ? 'Download in progress' : u.status === 'checking' ? 'Checking…' : u.status === 'installing' ? 'Installer running…' : 'Check for updates now'}</button>
           ${u.status === 'ready' ? `<button class="fb-btn fb-btn-primary fb-up-download">${desktopPipeline && u.download?.url ? `Download v${u.availableVersion || 'update'} (verified)` : `Update now to v${u.availableVersion || 'latest'}`}</button>` : ''}
           ${u.status === 'staged' ? `
             <button class="fb-btn fb-btn-primary fb-up-install-now">Install &amp; restart now</button>
@@ -11986,7 +12037,13 @@ export class BrowserShell {
     if (!bridge || !download?.url) return;
     if (this.state.updateState.status === 'downloading') return;
 
-    this.state.updateState = { ...this.state.updateState, status: 'downloading', progressPercent: 0 };
+    this.state.updateState = {
+      ...this.state.updateState,
+      status: 'downloading',
+      progressPercent: 0,
+      progressReceivedBytes: 0,
+      progressTotalBytes: Number(download.bytes) || null
+    };
     this.render();
     this.showTransientNotice(`Downloading Yayra v${availableVersion || ''}…`);
 
@@ -12159,24 +12216,60 @@ export class BrowserShell {
   }
 
   /**
-   * Live progress events from electron/desktopUpdater.cjs. Updates the
-   * drawer progress label in place (no full re-render per chunk - that
-   * would tear down input focus dozens of times per second).
+   * Paint one update-progress event into EVERY currently visible surface:
+   * Settings, the global toolbar chip, and the Yayra menu. This is a
+   * surgical DOM update rather than a full render per network chunk, so
+   * websites, focused inputs, and scroll positions stay live while the
+   * number and progress bar advance without a manual refresh.
    */
+  syncDesktopUpdateProgressUi() {
+    if (typeof document === 'undefined') return;
+    const root = this.rootElement || document;
+    const detail = this.formatUpdateDownloadProgress(this.state.updateState);
+    for (const label of root.querySelectorAll('.fb-update-progress-label')) {
+      const context = label.getAttribute('data-update-progress-context') || 'compact';
+      label.textContent = this.formatUpdateDownloadLabel(context, this.state.updateState);
+    }
+    for (const progress of root.querySelectorAll('.fb-update-live-progress')) {
+      const rawPercent = this.state.updateState.progressPercent;
+      const percent = typeof rawPercent === 'number' && Number.isFinite(rawPercent)
+        ? Math.max(0, Math.min(100, Math.round(rawPercent)))
+        : null;
+      progress.setAttribute('aria-valuetext', detail);
+      if (percent == null) {
+        progress.removeAttribute('aria-valuenow');
+        progress.classList.add('is-indeterminate');
+      } else {
+        progress.setAttribute('aria-valuenow', String(percent));
+        progress.classList.remove('is-indeterminate');
+      }
+      const fill = progress.querySelector('.fb-update-live-progress-fill');
+      if (fill) fill.style.width = `${percent == null ? 30 : percent}%`;
+    }
+    for (const chip of root.querySelectorAll('.fb-update-chip-downloading')) {
+      chip.setAttribute('aria-label', `Downloading Yayra update, ${detail}`);
+      chip.setAttribute('title', `Downloading Yayra v${this.state.updateState.availableVersion || 'latest'} - ${detail}. Click for update details.`);
+    }
+  }
+
   handleDesktopUpdateEvent(evt) {
-    if (!evt || typeof document === 'undefined') return;
+    if (!evt) return;
     if (evt.type === 'download-progress') {
-      if (typeof evt.percent === 'number') {
-        this.state.updateState.progressPercent = evt.percent;
-      }
-      const label = document.querySelector('.fb-update-progress-label');
-      if (label) {
-        const received = Number(evt.received) || 0;
-        const mb = (received / (1024 * 1024)).toFixed(1);
-        label.textContent = typeof evt.percent === 'number'
-          ? `Downloading update… ${evt.percent}%`
-          : `Downloading update… ${mb} MB`;
-      }
+      // Ignore a late queued chunk after the verified/staged or install
+      // transition; progress must never move the state machine backwards.
+      if (this.state.updateState.status === 'staged' || this.state.updateState.status === 'installing') return;
+      const percent = typeof evt.percent === 'number' && Number.isFinite(evt.percent)
+        ? Math.max(0, Math.min(100, Math.round(evt.percent)))
+        : null;
+      this.state.updateState = {
+        ...this.state.updateState,
+        status: 'downloading',
+        availableVersion: this.state.updateState.availableVersion || evt.version || null,
+        progressPercent: percent,
+        progressReceivedBytes: Math.max(0, Number(evt.received) || 0),
+        progressTotalBytes: Math.max(0, Number(evt.total) || 0) || null
+      };
+      this.syncDesktopUpdateProgressUi();
     } else if (evt.type === 'download-failed') {
       this.state.updateState = { ...this.state.updateState, status: 'error', notes: evt.reason || 'download failed' };
       this.requestRender();
@@ -12245,7 +12338,7 @@ export class BrowserShell {
             <div class="fb-drawer-update-status-row">
               <div class="fb-update-status-left">
                 <span class="fb-status-orb pulse"></span>
-                <span class="fb-update-status-text fb-update-progress-label">Downloading update… ${typeof this.state.updateState.progressPercent === 'number' ? `${this.state.updateState.progressPercent}%` : ''}</span>
+                <span class="fb-update-status-text fb-update-progress-label fb-update-progress-compact" data-update-progress-context="compact" aria-live="polite" aria-atomic="true">${this.formatUpdateDownloadLabel('compact')}</span>
               </div>
             </div>
           ` : this.state.updateState.status === 'staged' ? `
@@ -17065,6 +17158,10 @@ export class BrowserShell {
     if (this._unsubscribeAuthBridge) {
       this._unsubscribeAuthBridge();
       this._unsubscribeAuthBridge = null;
+    }
+    if (this._unsubscribeUpdatesBridge) {
+      this._unsubscribeUpdatesBridge();
+      this._unsubscribeUpdatesBridge = null;
     }
     for (const tabId of Array.from(this._nativeWebviewTabIds || [])) {
       this.destroyNativeWebview(tabId);

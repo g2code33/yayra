@@ -1273,6 +1273,21 @@ button.fb-site-passkey-indicator {
   filter: brightness(1.12);
 }
 
+.fb-update-chip-downloading {
+  background: linear-gradient(135deg, #0284c7, #2563eb);
+  min-width: 82px;
+  justify-content: center;
+}
+
+.fb-update-chip-downloading svg {
+  animation: fb-update-download-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes fb-update-download-pulse {
+  0%, 100% { transform: translateY(-1px); opacity: 0.72; }
+  50% { transform: translateY(2px); opacity: 1; }
+}
+
 @keyframes fb-update-chip-pop {
   from { transform: scale(0.85); opacity: 0; }
   to { transform: scale(1); opacity: 1; }
@@ -4987,6 +5002,37 @@ button.fb-site-passkey-indicator {
   display: flex;
   align-items: flex-start;
   gap: 10px;
+}
+
+.fb-updates-status-copy {
+  flex: 1;
+  min-width: 0;
+}
+
+.fb-update-live-progress {
+  position: relative;
+  width: 100%;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(56, 189, 248, 0.18);
+}
+
+.fb-update-live-progress-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #06b6d4, #2563eb);
+  transition: width 0.2s ease;
+}
+
+.fb-update-live-progress.is-indeterminate .fb-update-live-progress-fill {
+  animation: fb-update-progress-indeterminate 1.1s ease-in-out infinite;
+}
+
+@keyframes fb-update-progress-indeterminate {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(340%); }
 }
 
 .fb-updates-scheduled-row {
