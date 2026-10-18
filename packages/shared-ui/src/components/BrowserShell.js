@@ -2624,6 +2624,10 @@ export class BrowserShell {
    * VIEWPORT CONTENT ROUTER (IN-TAB INTERNAL PAGES OR WEBVIEW)
    * ----------------------------------------------------------- */
   renderViewportContent(viewport, activeTab) {
+    // A re-render removes the new-tab voice surface. End its microphone
+    // session at the same time so recognition cannot continue off-screen.
+    try { this._closeGoogleVoiceSearch?.(); } catch { /* already closed */ }
+
     // Assume no external pooled frame is on screen until the external
     // branch below proves otherwise - internal pages must hide the layer.
     this.activeWebFrameSlot = null;
@@ -4354,6 +4358,387 @@ export class BrowserShell {
     }, 4000);
   }
 
+  /** Build a first-party Google AI Mode URL, optionally carrying real tabs
+   * the user selected as context from the new-tab + menu. */
+  buildGoogleAiModeUrl(query = '', contextTabs = []) {
+    const cleanQuery = String(query || '').trim();
+    const contexts = (Array.isArray(contextTabs) ? contextTabs : [])
+      .filter((tab) => /^https?:\/\//i.test(String(tab?.url || '')))
+      .slice(0, 4)
+      .map((tab) => `- ${String(tab.title || tab.url).trim()}: ${tab.url}`);
+    const prompt = contexts.length
+      ? `${cleanQuery || 'Help me with these pages'}\n\nPages from my Yayra tabs:\n${contexts.join('\n')}`
+      : cleanQuery;
+    const params = new URLSearchParams({ udm: '50' });
+    if (prompt) params.set('q', prompt);
+    return `https://www.google.com/search?${params.toString()}`;
+  }
+
+  /**
+   * Google Lens handoff shown over the new-tab page. Image URLs navigate to
+   * Google's public upload-by-URL route in the active Yayra tab. Local image
+   * files are POSTed straight to lens.google.com in a Google result tab;
+   * Yayra never stores, proxies, or reads their contents.
+   */
+  openGoogleLensSearch(viewport) {
+    if (!viewport || typeof document === 'undefined') return;
+    viewport.querySelector('.fb-google-lens-overlay')?.remove();
+
+    const overlay = document.createElement('div');
+    overlay.className = 'fb-google-lens-overlay';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-labelledby', 'fb-google-lens-title');
+    overlay.setAttribute('tabindex', '-1');
+    overlay.innerHTML = `
+      <section class="fb-google-lens-panel">
+        <header class="fb-google-lens-header">
+          <h2 id="fb-google-lens-title">Search any image with Lens</h2>
+          <button type="button" class="fb-google-lens-close" aria-label="Close Google Lens">${Icons.close}</button>
+        </header>
+        <form class="fb-google-lens-upload-form" action="https://lens.google.com/v3/upload" method="post" enctype="multipart/form-data" target="_blank" rel="noopener">
+          <label class="fb-google-lens-dropzone">
+            <span class="fb-google-lens-art" aria-hidden="true">${Icons.lens}</span>
+            <span>Drag an image here or <span class="fb-google-lens-upload-link">upload a file</span></span>
+            <input class="fb-google-lens-file" type="file" name="encoded_image" accept="image/*" />
+            <input type="hidden" name="processed_image_dimensions" value="0,0" />
+          </label>
+        </form>
+        <div class="fb-google-lens-divider"><span>OR</span></div>
+        <div class="fb-google-lens-url-row">
+          <input type="url" class="fb-google-lens-url" inputmode="url" placeholder="Paste image link" aria-label="Image link" />
+          <button type="button" class="fb-google-lens-url-search">Search</button>
+        </div>
+      </section>
+    `;
+    viewport.appendChild(overlay);
+
+    const close = () => overlay.remove();
+    const uploadForm = overlay.querySelector('.fb-google-lens-upload-form');
+    const fileInput = overlay.querySelector('.fb-google-lens-file');
+    const urlInput = overlay.querySelector('.fb-google-lens-url');
+
+    const submitLocalImage = () => {
+      const file = fileInput?.files?.[0];
+      if (!file) return;
+      if (file.type && !String(file.type).toLowerCase().startsWith('image/')) {
+        this.showTransientNotice('Choose an image file for Google Lens.');
+        return;
+      }
+      // The public Lens multipart endpoint returns the visual-search result.
+      // A noopener result tab keeps the Yayra shell alive while Google gets
+      // the original File object directly from the browser form.
+      uploadForm.action = `https://lens.google.com/v3/upload?stcs=${Date.now()}`;
+      uploadForm.target = '_blank';
+      uploadForm.rel = 'noopener';
+      try {
+        if (typeof uploadForm.requestSubmit === 'function') uploadForm.requestSubmit();
+        else if (typeof uploadForm.submit === 'function') uploadForm.submit();
+        else throw new Error('form-submit-unavailable');
+        this.showTransientNotice('Opening your image directly in Google Lens...');
+        setTimeout(close, 0);
+      } catch {
+        close();
+        this.navigateActiveTab('https://lens.google.com/');
+        this.showTransientNotice('Google Lens opened. Choose the image again to continue.');
+      }
+    };
+
+    const submitImageUrl = () => {
+      const raw = String(urlInput?.value || '').trim();
+      let imageUrl;
+      try {
+        imageUrl = new URL(raw);
+      } catch {
+        this.showTransientNotice('Paste a valid image link first.');
+        urlInput?.focus();
+        return;
+      }
+      if (!/^https?:$/.test(imageUrl.protocol)) {
+        this.showTransientNotice('Google Lens accepts only http or https image links.');
+        urlInput?.focus();
+        return;
+      }
+      close();
+      this.navigateActiveTab(`https://lens.google.com/uploadbyurl?url=${encodeURIComponent(imageUrl.href)}`);
+    };
+
+    overlay.querySelector('.fb-google-lens-close')?.addEventListener('click', close);
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay) close();
+    });
+    overlay.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') close();
+    });
+    const dropzone = overlay.querySelector('.fb-google-lens-dropzone');
+    dropzone?.addEventListener('dragover', (event) => {
+      event.preventDefault();
+      dropzone.classList.add('is-dragging');
+    });
+    dropzone?.addEventListener('dragleave', () => dropzone.classList.remove('is-dragging'));
+    dropzone?.addEventListener('drop', (event) => {
+      event.preventDefault();
+      dropzone.classList.remove('is-dragging');
+      const files = event.dataTransfer?.files;
+      if (!files?.length || !fileInput) return;
+      try {
+        fileInput.files = files;
+        submitLocalImage();
+      } catch {
+        this.showTransientNotice('Use “upload a file” to send this image to Google Lens.');
+      }
+    });
+    fileInput?.addEventListener('change', submitLocalImage);
+    overlay.querySelector('.fb-google-lens-url-search')?.addEventListener('click', submitImageUrl);
+    urlInput?.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        submitImageUrl();
+      }
+    });
+    overlay.focus?.();
+  }
+
+  /**
+   * Chrome/Google-style full-page voice search. Starting recognition from the
+   * user's microphone click preserves the browser's native permission prompt;
+   * a final transcript is sent straight to Google Search, never Yayra AI.
+   */
+  openGoogleVoiceSearch(viewport, searchInput) {
+    if (!viewport || typeof document === 'undefined') return;
+    try { this._closeGoogleVoiceSearch?.(); } catch { /* already closed */ }
+    this._closeGoogleVoiceSearch = null;
+    viewport.querySelector('.fb-google-voice-overlay')?.remove();
+    try { this._newTabSpeechRecognition?.abort?.(); } catch { /* already stopped */ }
+
+    const overlay = document.createElement('div');
+    overlay.className = 'fb-google-voice-overlay';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-labelledby', 'fb-google-voice-status');
+    overlay.setAttribute('tabindex', '-1');
+    overlay.innerHTML = `
+      <button type="button" class="fb-google-voice-close" aria-label="Close voice search">${Icons.close}</button>
+      <span class="fb-google-voice-brand" aria-hidden="true">${Icons.google}</span>
+      <div class="fb-google-voice-content">
+        <div class="fb-google-voice-texts" aria-live="polite" aria-atomic="true">
+          <div id="fb-google-voice-status" class="fb-google-voice-status">Waiting...</div>
+          <div class="fb-google-voice-transcript"></div>
+          <div class="fb-google-voice-help" hidden></div>
+          <button type="button" class="fb-google-voice-google-btn" hidden>Continue on Google</button>
+        </div>
+        <div class="fb-google-voice-mic-container">
+          <div class="fb-google-voice-volume">
+            <button type="button" class="fb-google-voice-mic" aria-label="Stop listening" aria-pressed="true">${Icons.microphoneFilled}</button>
+          </div>
+        </div>
+      </div>
+    `;
+    viewport.appendChild(overlay);
+
+    const status = overlay.querySelector('.fb-google-voice-status');
+    const transcript = overlay.querySelector('.fb-google-voice-transcript');
+    const help = overlay.querySelector('.fb-google-voice-help');
+    const googleButton = overlay.querySelector('.fb-google-voice-google-btn');
+    const micButton = overlay.querySelector('.fb-google-voice-mic');
+    let recognition = null;
+    let voiceState = 'idle';
+    let completed = false;
+    let dismissed = false;
+    let idleTimer = null;
+
+    const setHidden = (element, hidden) => {
+      if (!element) return;
+      element.hidden = hidden;
+      if (hidden) element.setAttribute('hidden', '');
+      else element.removeAttribute('hidden');
+    };
+    const clearIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = null;
+    };
+    const armIdleTimer = () => {
+      clearIdleTimer();
+      idleTimer = setTimeout(() => {
+        if (completed || dismissed || !overlay.parentElement) return;
+        try { recognition?.stop?.(); } catch { /* already ended */ }
+        voiceState = 'idle';
+        status.textContent = 'Didn’t hear that';
+        help.textContent = 'Tap the microphone to try again.';
+        setHidden(help, false);
+        micButton?.classList.remove('is-listening', 'is-receiving');
+        micButton?.setAttribute('aria-label', 'Try voice search again');
+        micButton?.setAttribute('aria-pressed', 'false');
+      }, 8000);
+    };
+    const dismiss = ({ abort = true } = {}) => {
+      if (dismissed) return;
+      dismissed = true;
+      clearIdleTimer();
+      if (abort) {
+        try { recognition?.abort?.(); } catch { /* already ended */ }
+      }
+      if (this._newTabSpeechRecognition === recognition) this._newTabSpeechRecognition = null;
+      if (this._closeGoogleVoiceSearch === dismiss) this._closeGoogleVoiceSearch = null;
+      overlay.remove();
+    };
+    this._closeGoogleVoiceSearch = dismiss;
+
+    const showError = (error) => {
+      voiceState = 'error';
+      clearIdleTimer();
+      micButton?.classList.remove('is-listening', 'is-receiving');
+      micButton?.setAttribute('aria-label', 'Try voice search again');
+      micButton?.setAttribute('aria-pressed', 'false');
+      setHidden(help, false);
+      switch (error) {
+        case 'not-allowed':
+        case 'service-not-allowed':
+          status.textContent = 'Microphone access is blocked';
+          help.textContent = 'Allow microphone access, then tap the microphone to try again.';
+          break;
+        case 'audio-capture':
+          status.textContent = 'No microphone found';
+          help.textContent = 'Connect a microphone and try again.';
+          break;
+        case 'no-speech':
+          status.textContent = 'Didn’t hear that';
+          help.textContent = 'Tap the microphone to try again.';
+          break;
+        case 'language-not-supported':
+          status.textContent = 'This language isn’t supported';
+          help.textContent = 'Continue on Google to choose another input method.';
+          setHidden(googleButton, false);
+          break;
+        default:
+          status.textContent = 'Voice search is unavailable';
+          help.textContent = 'Continue on Google to use Google’s own voice controls.';
+          setHidden(googleButton, false);
+          break;
+      }
+    };
+
+    const Recognition = typeof window !== 'undefined'
+      ? (window.SpeechRecognition || window.webkitSpeechRecognition)
+      : null;
+
+    const startRecognition = () => {
+      if (typeof Recognition !== 'function') {
+        showError('unsupported');
+        micButton.disabled = true;
+        return;
+      }
+      const previousRecognition = recognition;
+      if (previousRecognition) {
+        previousRecognition.onend = null;
+        previousRecognition.onerror = null;
+        try { previousRecognition.abort?.(); } catch { /* previous attempt ended */ }
+      }
+      completed = false;
+      voiceState = 'waiting';
+      status.textContent = 'Waiting...';
+      transcript.textContent = '';
+      help.textContent = '';
+      setHidden(help, true);
+      setHidden(googleButton, true);
+      micButton.disabled = false;
+      micButton.classList.remove('is-listening', 'is-receiving');
+      micButton.setAttribute('aria-label', 'Stop listening');
+      micButton.setAttribute('aria-pressed', 'true');
+
+      let currentRecognition;
+      try {
+        currentRecognition = new Recognition();
+      } catch {
+        showError('start-failed');
+        return;
+      }
+      recognition = currentRecognition;
+      this._newTabSpeechRecognition = currentRecognition;
+      currentRecognition.lang = typeof navigator !== 'undefined' && navigator.language ? navigator.language : 'en-US';
+      currentRecognition.continuous = false;
+      currentRecognition.interimResults = true;
+      currentRecognition.maxAlternatives = 1;
+      currentRecognition.onstart = armIdleTimer;
+      currentRecognition.onaudiostart = () => {
+        voiceState = 'listening';
+        status.textContent = 'Listening...';
+        micButton.classList.add('is-listening');
+      };
+      currentRecognition.onspeechstart = () => {
+        voiceState = 'receiving';
+        status.textContent = 'Listening...';
+        micButton.classList.add('is-listening', 'is-receiving');
+        armIdleTimer();
+      };
+      currentRecognition.onresult = (event) => {
+        const finalParts = [];
+        const interimParts = [];
+        for (let index = 0; index < event.results.length; index += 1) {
+          const result = event.results[index];
+          const value = String(result?.[0]?.transcript || '').trim();
+          if (!value) continue;
+          if (result.isFinal) finalParts.push(value);
+          else interimParts.push(value);
+        }
+        const finalText = finalParts.join(' ').trim();
+        const visibleText = [...finalParts, ...interimParts].join(' ').trim();
+        if (visibleText) transcript.textContent = visibleText;
+        status.textContent = finalText ? 'Searching...' : 'Listening...';
+        micButton.classList.add('is-listening', 'is-receiving');
+        armIdleTimer();
+        if (!finalText || completed) return;
+        completed = true;
+        clearIdleTimer();
+        if (searchInput) searchInput.value = finalText;
+        try { currentRecognition.stop(); } catch { /* browser already stopped */ }
+        dismiss({ abort: false });
+        this.navigateActiveTab(`https://www.google.com/search?q=${encodeURIComponent(finalText)}`);
+      };
+      currentRecognition.onerror = (event) => {
+        if (dismissed || event?.error === 'aborted') return;
+        if (this._newTabSpeechRecognition === currentRecognition) this._newTabSpeechRecognition = null;
+        showError(event?.error || 'unknown');
+      };
+      currentRecognition.onend = () => {
+        if (this._newTabSpeechRecognition === currentRecognition) this._newTabSpeechRecognition = null;
+        if (dismissed || completed || voiceState === 'error' || recognition !== currentRecognition) return;
+        voiceState = 'idle';
+        clearIdleTimer();
+        status.textContent = 'Tap the microphone to try again';
+        micButton.classList.remove('is-listening', 'is-receiving');
+        micButton.setAttribute('aria-label', 'Try voice search again');
+        micButton.setAttribute('aria-pressed', 'false');
+      };
+      try {
+        currentRecognition.start();
+      } catch {
+        if (this._newTabSpeechRecognition === currentRecognition) this._newTabSpeechRecognition = null;
+        showError('start-failed');
+      }
+    };
+
+    overlay.querySelector('.fb-google-voice-close')?.addEventListener('click', () => dismiss());
+    overlay.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') dismiss();
+    });
+    micButton?.addEventListener('click', () => {
+      if (voiceState === 'waiting' || voiceState === 'listening' || voiceState === 'receiving') {
+        status.textContent = 'Processing...';
+        try { recognition?.stop?.(); } catch { showError('stop-failed'); }
+        return;
+      }
+      startRecognition();
+    });
+    googleButton?.addEventListener('click', () => {
+      dismiss();
+      this.navigateActiveTab('https://www.google.com/');
+    });
+
+    overlay.focus?.();
+    startRecognition();
+  }
+
   /* -------------------------------------------------------------
    * 1. NEW TAB PAGE (PHASE 7, REQ 6 & REQ 7)
    * ----------------------------------------------------------- */
@@ -4434,25 +4819,171 @@ export class BrowserShell {
 
     const searchEngine = this.state.settings.searchEngine || 'google';
     const engineCap = searchEngine.charAt(0).toUpperCase() + searchEngine.slice(1);
+    const searchPlaceholder = activeTab.isPrivate
+      ? 'Search securely in Incognito'
+      : (searchEngine === 'google' ? 'Ask Google' : `Search with ${engineCap} or type a URL`);
     searchForm.innerHTML = `
-      <span class="fb-newtab-search-icon">${Icons.search}</span>
-      <input type="text" placeholder="${activeTab.isPrivate ? 'Search securely in Incognito' : `Search with ${engineCap} or type a URL`}" class="fb-newtab-input fb-newtab-search-input" autofocus />
+      <div class="fb-newtab-search-tools">
+        <button type="button" class="fb-newtab-search-action fb-newtab-add-btn" aria-label="Add tabs, images, files, or Google tools" aria-haspopup="menu" aria-expanded="false" title="Add to Google search">${Icons.plus}</button>
+        <div class="fb-newtab-search-tools-menu" role="menu" aria-label="Google search tools" hidden>
+          <section class="fb-google-tools-section fb-google-tools-recent-section">
+            <h3>Add recent tabs</h3>
+            <div class="fb-google-recent-tabs"></div>
+          </section>
+          <div class="fb-google-tools-separator"></div>
+          <button type="button" class="fb-newtab-tool-option fb-google-add-images" role="menuitem">${Icons.lens}<span>Add images</span></button>
+          <button type="button" class="fb-newtab-tool-option fb-google-add-files" role="menuitem">${Icons.document}<span>Add files</span></button>
+          <div class="fb-google-tools-separator"></div>
+          <section class="fb-google-tools-section">
+            <h3>Tools</h3>
+            <button type="button" class="fb-newtab-tool-option fb-google-create-images" role="menuitem">${Icons.sparkles}<span>Create images</span></button>
+            <button type="button" class="fb-newtab-tool-option fb-google-canvas" role="menuitem">${Icons.edit}<span>Canvas</span></button>
+          </section>
+        </div>
+      </div>
+      <input type="text" placeholder="${escapeAttr(searchPlaceholder)}" aria-label="${escapeAttr(searchPlaceholder)}" class="fb-newtab-input fb-newtab-search-input" autocomplete="off" spellcheck="false" autofocus />
+      <div class="fb-newtab-search-actions">
+        <button type="button" class="fb-newtab-search-action fb-newtab-mic-btn" aria-label="Search Google by voice" title="Search by voice">${Icons.microphone}</button>
+        <button type="button" class="fb-newtab-search-action fb-newtab-lens-btn" aria-label="Search with Google Lens" title="Search with Google Lens">${Icons.lens}</button>
+        <button type="button" class="fb-newtab-google-ai-btn" aria-label="Open Google AI Mode" title="Google AI Mode">${Icons.sparkles}<span>AI Mode</span></button>
+      </div>
     `;
     newTabPage.appendChild(searchForm);
-    this.bindSearchSuggestions(searchForm.querySelector('.fb-newtab-search-input'));
+    const newTabSearchInput = searchForm.querySelector('.fb-newtab-search-input');
+    // Yayra AI intentionally stays OUTSIDE this Google-owned pill. The
+    // omnibox keeps its optional Yayra row, while this widget's suggestions
+    // and controls all remain Google search features.
+    this.bindSearchSuggestions(newTabSearchInput, { includeYayraAi: false });
 
-    // Chrome-style AI entry point right under the search box: asks the
-    // typed query (or just opens the yayra://ai chat when empty).
-    if (this.state.aiConfig?.enabled) {
-      const aiChip = document.createElement('button');
-      aiChip.type = 'button';
-      aiChip.className = 'fb-newtab-ai-chip';
-      aiChip.innerHTML = `${Icons.sparkles} <span>Ask Yayra AI</span>`;
-      aiChip.addEventListener('click', () => {
-        const typed = searchForm.querySelector('.fb-newtab-search-input')?.value?.trim() || '';
-        this.openAiPage(typed);
+    const toolsButton = searchForm.querySelector('.fb-newtab-add-btn');
+    const toolsMenu = searchForm.querySelector('.fb-newtab-search-tools-menu');
+    const setToolsOpen = (open) => {
+      if (!toolsButton || !toolsMenu) return;
+      toolsMenu.hidden = !open;
+      if (open) toolsMenu.removeAttribute('hidden');
+      else toolsMenu.setAttribute('hidden', '');
+      toolsButton.setAttribute('aria-expanded', String(open));
+      toolsButton.classList.toggle('active', open);
+    };
+
+    // Real recent/open pages only: never invent Google demo rows. Selecting
+    // one adds its title and URL as context when Google AI Mode is opened.
+    const selectedGoogleContexts = new Map();
+    const recentContextItems = [];
+    const seenContextUrls = new Set();
+    const collectContextItem = (item) => {
+      const url = String(item?.url || '').trim();
+      if (!/^https?:\/\//i.test(url) || seenContextUrls.has(url)) return;
+      seenContextUrls.add(url);
+      recentContextItems.push({
+        id: String(item?.id || `recent-${recentContextItems.length}`),
+        title: String(item?.title || url).trim(),
+        url
       });
-      newTabPage.appendChild(aiChip);
+    };
+    (this.state.tabs || [])
+      .filter((tab) => tab.id !== activeTab.id && Boolean(tab.isPrivate) === Boolean(activeTab.isPrivate))
+      .forEach(collectContextItem);
+    if (!activeTab.isPrivate) {
+      (this.state.closedTabsHistory || []).forEach(collectContextItem);
+      (this.state.historyItems || []).forEach(collectContextItem);
+    }
+    const recentTabsHost = searchForm.querySelector('.fb-google-recent-tabs');
+    recentContextItems.slice(0, 2).forEach((item) => {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'fb-google-recent-tab';
+      row.setAttribute('role', 'menuitemcheckbox');
+      row.setAttribute('aria-checked', 'false');
+      let contextHost = '';
+      try { contextHost = new URL(item.url).hostname; } catch { /* filtered above */ }
+      const contextIcon = contextHost
+        ? `<img class="fb-google-recent-tab-favicon" src="https://icons.duckduckgo.com/ip3/${encodeURIComponent(contextHost)}.ico" alt="" /><span class="fb-google-recent-tab-fallback" hidden>${Icons.history}</span>`
+        : `<span class="fb-google-recent-tab-fallback">${Icons.history}</span>`;
+      row.innerHTML = `<span class="fb-google-recent-tab-icon">${contextIcon}</span><span class="fb-google-recent-tab-title"></span><span class="fb-google-recent-tab-toggle">${Icons.plus}</span>`;
+      row.querySelector('.fb-google-recent-tab-favicon')?.addEventListener('error', (event) => {
+        event.target.remove();
+        row.querySelector('.fb-google-recent-tab-fallback')?.removeAttribute('hidden');
+      });
+      row.querySelector('.fb-google-recent-tab-title').textContent = item.title;
+      row.title = item.url;
+      row.addEventListener('click', () => {
+        const selected = !selectedGoogleContexts.has(item.url);
+        if (selected) selectedGoogleContexts.set(item.url, item);
+        else selectedGoogleContexts.delete(item.url);
+        row.classList.toggle('is-selected', selected);
+        row.setAttribute('aria-checked', String(selected));
+        row.querySelector('.fb-google-recent-tab-toggle').innerHTML = selected ? Icons.check : Icons.plus;
+      });
+      recentTabsHost?.appendChild(row);
+    });
+    if (recentTabsHost && recentTabsHost.children.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'fb-google-recent-tabs-empty';
+      empty.textContent = 'No recent tabs yet';
+      recentTabsHost.appendChild(empty);
+    }
+
+    toolsButton?.addEventListener('click', () => setToolsOpen(toolsMenu?.hasAttribute('hidden') || toolsMenu?.hidden === true));
+    toolsMenu?.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      setToolsOpen(false);
+      toolsButton?.focus();
+    });
+    searchForm.addEventListener('focusout', () => {
+      setTimeout(() => {
+        if (typeof searchForm.contains !== 'function' || !searchForm.contains(document.activeElement)) setToolsOpen(false);
+      }, 0);
+    });
+    newTabSearchInput?.addEventListener('focus', () => setToolsOpen(false));
+
+    const openLens = () => {
+      setToolsOpen(false);
+      this.openGoogleLensSearch(viewport);
+    };
+    searchForm.querySelector('.fb-newtab-lens-btn')?.addEventListener('click', openLens);
+    searchForm.querySelector('.fb-google-add-images')?.addEventListener('click', openLens);
+    searchForm.querySelector('.fb-google-add-files')?.addEventListener('click', () => {
+      setToolsOpen(false);
+      this.navigateActiveTab(this.buildGoogleAiModeUrl(newTabSearchInput?.value || ''));
+      this.showTransientNotice('Google AI Mode opened. Use its + button to upload a file directly to Google.');
+    });
+    searchForm.querySelector('.fb-google-create-images')?.addEventListener('click', () => {
+      setToolsOpen(false);
+      this.navigateActiveTab('https://labs.google/fx/tools/image-fx');
+    });
+    searchForm.querySelector('.fb-google-canvas')?.addEventListener('click', () => {
+      setToolsOpen(false);
+      this.navigateActiveTab('https://gemini.google.com/app');
+    });
+
+    const openGoogleAiMode = () => {
+      setToolsOpen(false);
+      this.navigateActiveTab(this.buildGoogleAiModeUrl(
+        newTabSearchInput?.value || '',
+        [...selectedGoogleContexts.values()]
+      ));
+    };
+    searchForm.querySelector('.fb-newtab-google-ai-btn')?.addEventListener('click', openGoogleAiMode);
+
+    searchForm.querySelector('.fb-newtab-mic-btn')?.addEventListener('click', () => {
+      setToolsOpen(false);
+      this.openGoogleVoiceSearch(viewport, newTabSearchInput);
+    });
+
+    // Yayra's assistant remains a distinct Yayra feature below Google's
+    // search control, exactly like the original start-page layout.
+    if (this.state.aiConfig?.enabled) {
+      searchForm.classList.add('has-yayra-ai-below');
+      const yayraAiChip = document.createElement('button');
+      yayraAiChip.type = 'button';
+      yayraAiChip.className = 'fb-newtab-ai-chip';
+      yayraAiChip.innerHTML = `${Icons.sparkles}<span>Ask Yayra AI</span>`;
+      yayraAiChip.addEventListener('click', () => {
+        this.openAiPage(newTabSearchInput?.value?.trim() || '');
+      });
+      newTabPage.appendChild(yayraAiChip);
     }
 
     if (this.state.isMobile && !activeTab.isPrivate) {
@@ -6764,8 +7295,8 @@ export class BrowserShell {
    * YAYRA AI - yayra://ai (Chrome-style "AI options on every search")
    * -----------------------------------------------------------
    * The in-tab AI page: a conversation with Yayra AI, reachable from the
-   * omnibox "Ask Yayra AI" suggestion row, the new-tab chip, and directly
-   * via yayra://ai. Opening yayra://ai?q=<query> asks the query
+   * omnibox "Ask Yayra AI" suggestion row, the separate new-tab Yayra
+   * button, and directly via yayra://ai. Opening yayra://ai?q=<query> asks the query
    * immediately (that is how omnibox searches hand over to AI).
    * Providers live in services/aiService.js - no provider, no fake
    * answers: the page says exactly what to configure instead.
@@ -6936,7 +7467,7 @@ export class BrowserShell {
   /**
    * Ask Yayra AI and append both sides to the ACTIVE chat, creating it on
    * demand. With { newChat: true } (every search-engine handoff: omnibox
-   * "Ask Yayra AI", new-tab chip, yayra://ai?q=...) the question starts a
+   * "Ask Yayra AI", new-tab Yayra button, yayra://ai?q=...) the question starts a
    * brand-new chat instead of continuing the current one - ChatGPT-style.
    * Errors become honest assistant-side notices (never fake answers).
    */
@@ -13131,9 +13662,9 @@ export class BrowserShell {
       const suggestions = await this.getGoogleSearchSuggestions(query);
       if (currentRequest !== requestId || input.value.trim() !== query) return;
       list.innerHTML = '';
-      // Chrome-style AI entry: every search also offers "Ask Yayra AI"
-      // as the first row, opening yayra://ai with the query pre-asked.
-      if (this.state.aiConfig?.enabled && this.state.aiConfig?.suggestInOmnibox) {
+      // Optional Yayra entry for the browser omnibox. The Google-owned
+      // new-tab pill opts out and keeps its separate Ask Yayra AI button.
+      if (options.includeYayraAi !== false && this.state.aiConfig?.enabled && this.state.aiConfig?.suggestInOmnibox) {
         const aiItem = document.createElement('button');
         aiItem.type = 'button';
         aiItem.className = 'fb-search-suggestion fb-ai-suggestion';

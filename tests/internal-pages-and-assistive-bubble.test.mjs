@@ -211,7 +211,129 @@ test('In-Tab Internal Pages: Redesigned yayra://newtab with search box and focus
   assert.equal(shell.getActiveTab().title, 'New Tab');
 
   assert.ok(container.querySelector('.fb-newtab-hero'), 'New tab hero header must render');
-  assert.ok(container.querySelector('.fb-newtab-search-input'), 'New tab main search box must render');
+  assert.ok(container.querySelector('.fb-official-brand-orb'), 'Yayra orb remains above the search experience');
+  assert.ok(container.querySelector('.fb-official-brand-wordmark'), 'Yayra wordmark remains above the search experience');
+  const searchbox = container.querySelector('.fb-newtab-searchbox');
+  const searchInput = container.querySelector('.fb-newtab-search-input');
+  assert.ok(searchInput, 'New tab main search box must render');
+  assert.equal(searchInput.getAttribute('placeholder'), 'Ask Google', 'default Google search uses the familiar Chrome wording');
+  assert.ok(searchbox.querySelector('.fb-newtab-add-btn'), 'Google-style plus control renders');
+  assert.ok(searchbox.querySelector('.fb-newtab-mic-btn'), 'voice-search control renders');
+  assert.ok(searchbox.querySelector('.fb-newtab-lens-btn'), 'Google Lens control renders');
+  assert.ok(searchbox.querySelector('.fb-newtab-google-ai-btn'), 'Google AI Mode control renders inside the pill');
+  assert.equal(searchbox.querySelector('.fb-newtab-ai-chip'), null, 'Yayra AI is not presented as a Google search control');
+  assert.match(container.querySelector('.fb-newtab-ai-chip')?.textContent || '', /Ask Yayra AI/,
+    'Yayra AI returns as its own entry below the Google search pill');
+  shell.getGoogleSearchSuggestions = async () => ['compare browsers'];
+  searchInput.value = 'compare';
+  searchInput.dispatchEvent(new Event('input'));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(searchbox.querySelector('.fb-ai-suggestion'), null,
+    'Google-owned new-tab suggestions do not inject Yayra AI back into the pill');
+
+  const toolsMenu = searchbox.querySelector('.fb-newtab-search-tools-menu');
+  assert.equal(toolsMenu.hasAttribute('hidden'), true, 'extra search tools start closed');
+  searchbox.querySelector('.fb-newtab-add-btn').click();
+  assert.equal(toolsMenu.hasAttribute('hidden'), false, 'plus control opens real search tools rather than being decorative');
+  assert.match(toolsMenu.textContent, /Add recent tabs/);
+  assert.match(toolsMenu.textContent, /Add images/);
+  assert.match(toolsMenu.textContent, /Add files/);
+  assert.match(toolsMenu.textContent, /Create images/);
+  assert.match(toolsMenu.textContent, /Canvas/);
+
+  let lensTarget = null;
+  shell.navigateActiveTab = (url) => { lensTarget = url; };
+  shell.showTransientNotice = () => {};
+  toolsMenu.querySelector('.fb-google-add-files').click();
+  assert.equal(new URL(lensTarget).searchParams.get('udm'), '50', 'Add files hands off to Google AI Mode');
+  toolsMenu.querySelector('.fb-google-create-images').click();
+  assert.equal(lensTarget, 'https://labs.google/fx/tools/image-fx', 'Create images opens Google ImageFX');
+  toolsMenu.querySelector('.fb-google-canvas').click();
+  assert.equal(lensTarget, 'https://gemini.google.com/app', 'Canvas opens Google Gemini');
+  toolsMenu.querySelector('.fb-google-add-images').click();
+  assert.ok(container.querySelector('.fb-google-lens-overlay'), 'Add images opens the Google Lens upload surface');
+  container.querySelector('.fb-google-lens-close').click();
+  searchbox.querySelector('.fb-newtab-lens-btn').click();
+  const lensOverlay = container.querySelector('.fb-google-lens-overlay');
+  assert.ok(lensOverlay, 'Lens icon opens the same Google image upload surface');
+  assert.equal(lensOverlay.querySelector('.fb-google-lens-upload-form')?.getAttribute('action'), 'https://lens.google.com/v3/upload');
+  assert.equal(lensOverlay.querySelector('.fb-google-lens-file')?.getAttribute('name'), 'encoded_image');
+  lensOverlay.querySelector('.fb-google-lens-url').value = 'https://example.com/cat.png';
+  lensOverlay.querySelector('.fb-google-lens-url-search').click();
+  const lensUrl = new URL(lensTarget);
+  assert.equal(lensUrl.origin + lensUrl.pathname, 'https://lens.google.com/uploadbyurl',
+    'image links are handed directly to Google Lens');
+  assert.equal(lensUrl.searchParams.get('url'), 'https://example.com/cat.png');
+
+  searchInput.value = 'compare browsers';
+  searchbox.querySelector('.fb-newtab-google-ai-btn').click();
+  const googleAiUrl = new URL(lensTarget);
+  assert.equal(googleAiUrl.origin, 'https://www.google.com');
+  assert.equal(googleAiUrl.searchParams.get('udm'), '50', 'AI Mode is Google AI Mode');
+  assert.equal(googleAiUrl.searchParams.get('q'), 'compare browsers');
+
+  let yayraQuery = null;
+  shell.openAiPage = (query) => { yayraQuery = query; };
+  container.querySelector('.fb-newtab-ai-chip').click();
+  assert.equal(yayraQuery, 'compare browsers', 'separate Yayra entry still receives the typed question');
+
+  let shortcutModal = null;
+  shell.openModal = (type) => { shortcutModal = type; };
+  const addShortcut = container.querySelector('.fb-add-shortcut-card');
+  assert.ok(addShortcut, 'Add shortcut remains present below the Yayra AI entry');
+  addShortcut.click();
+  assert.equal(shortcutModal, 'edit-shortcut', 'Add shortcut remains functional');
+
+  const previousSpeechRecognition = window.SpeechRecognition;
+  let activeRecognition = null;
+  let voiceAbortCount = 0;
+  try {
+    window.SpeechRecognition = class FakeSpeechRecognition {
+      constructor() { activeRecognition = this; }
+      start() { this.onstart?.(); }
+      stop() { this.onend?.(); }
+      abort() { voiceAbortCount += 1; this.onend?.(); }
+    };
+    searchbox.querySelector('.fb-newtab-mic-btn').click();
+    const firstVoiceOverlay = container.querySelector('.fb-google-voice-overlay');
+    assert.ok(firstVoiceOverlay, 'voice control opens the full Google-style voice surface');
+    assert.equal(firstVoiceOverlay.querySelector('.fb-google-voice-status').textContent, 'Waiting...',
+      'voice surface waits while browser microphone permission resolves');
+    firstVoiceOverlay.querySelector('.fb-google-voice-close').click();
+    assert.equal(container.querySelector('.fb-google-voice-overlay'), null, 'close dismisses the voice surface');
+    assert.equal(voiceAbortCount, 1, 'close aborts the active microphone session');
+
+    searchbox.querySelector('.fb-newtab-mic-btn').click();
+    const voiceOverlay = container.querySelector('.fb-google-voice-overlay');
+    activeRecognition.onaudiostart?.();
+    assert.equal(voiceOverlay.querySelector('.fb-google-voice-status').textContent, 'Listening...');
+    const result = [{ transcript: 'weather tomorrow' }];
+    result.isFinal = true;
+    activeRecognition.onresult?.({ resultIndex: 0, results: [result] });
+    const voiceSearchUrl = new URL(lensTarget);
+    assert.equal(voiceSearchUrl.origin + voiceSearchUrl.pathname, 'https://www.google.com/search');
+    assert.equal(voiceSearchUrl.searchParams.get('q'), 'weather tomorrow',
+      'a final voice transcript is sent directly to Google Search');
+    assert.equal(container.querySelector('.fb-google-voice-overlay'), null, 'voice surface closes after submission');
+
+    searchbox.querySelector('.fb-newtab-mic-btn').click();
+    activeRecognition.onerror?.({ error: 'not-allowed' });
+    const permissionOverlay = container.querySelector('.fb-google-voice-overlay');
+    assert.equal(permissionOverlay.querySelector('.fb-google-voice-status').textContent, 'Microphone access is blocked');
+    assert.match(permissionOverlay.querySelector('.fb-google-voice-help').textContent, /Allow microphone access/);
+    permissionOverlay.querySelector('.fb-google-voice-close').click();
+
+    delete window.SpeechRecognition;
+    searchbox.querySelector('.fb-newtab-mic-btn').click();
+    const fallbackOverlay = container.querySelector('.fb-google-voice-overlay');
+    assert.equal(fallbackOverlay.querySelector('.fb-google-voice-status').textContent, 'Voice search is unavailable');
+    assert.equal(fallbackOverlay.querySelector('.fb-google-voice-google-btn').hasAttribute('hidden'), false,
+      'unsupported sessions provide an explicit Google fallback');
+    fallbackOverlay.querySelector('.fb-google-voice-close').click();
+  } finally {
+    if (previousSpeechRecognition === undefined) delete window.SpeechRecognition;
+    else window.SpeechRecognition = previousSpeechRecognition;
+  }
   // Fresh install / brand-new profile: NO invented "frequently used"
   // tiles (they used to be a hardcoded DuckDuckGo/Wikipedia/GitHub list).
   assert.equal(container.querySelectorAll('.fb-newtab-shortcut').length, 0, 'no fabricated frequent sites on a fresh profile');
@@ -248,6 +370,18 @@ test('In-Tab Internal Pages: frequent sites are built from REAL visits, most-vis
     ['https://a.com', 'https://b.com', 'https://c.com', 'https://d.com', 'https://e.com'],
     'ordered by real visit count; internal yayra:// pages excluded');
   assert.ok(container.querySelectorAll('.fb-newtab-shortcut').length > 0, 'tiles render once there is real browsing');
+  assert.ok(container.querySelector('.fb-newtab-history'), 'Recent history remains visible when real visits exist');
+  let reopenedUrl = null;
+  shell.navigateActiveTab = (url) => { reopenedUrl = url; };
+  const recentContext = container.querySelector('.fb-google-recent-tab');
+  recentContext.click();
+  container.querySelector('.fb-newtab-search-input').value = 'summarize';
+  container.querySelector('.fb-newtab-google-ai-btn').click();
+  const contextualAiUrl = new URL(reopenedUrl);
+  assert.match(contextualAiUrl.searchParams.get('q') || '', /https:\/\/a\.com/,
+    'a real recent tab can be added as context for Google AI Mode');
+  container.querySelector('.fb-history-quick-item').click();
+  assert.equal(reopenedUrl, 'https://a.com', 'Recent history rows remain functional');
 });
 
 test('Live pages: background sync pulls fresh history/bookmarks into state and repaints visible data pages (Chrome-style)', async () => {

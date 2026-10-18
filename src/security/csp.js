@@ -28,6 +28,9 @@ export function buildContentSecurityPolicy() {
     // sandboxed webview. frame-ancestors is an HTTP-response directive and is
     // ignored when this policy is delivered through the index meta tag.
     `frame-src http: https: ${scheme}`,
+    // Local-image Lens searches use a native multipart form so the File goes
+    // straight from the user's browser to Google; no Yayra server can see it.
+    `form-action 'self' https://lens.google.com`,
     `object-src 'none'`,
     `base-uri 'self'`
   ].join('; ');
