@@ -67,6 +67,11 @@ jobs:
             echo "Linux PR build-only artifacts are unsigned; release.yml records this in artifact names."
           } >> "$GITHUB_STEP_SUMMARY"
       - run: npm run package:linux
+      - name: Prepare Chromium sandbox helper for packaged smoke
+        run: |
+          test -f release/linux-unpacked/chrome-sandbox
+          sudo chown root:root release/linux-unpacked/chrome-sandbox
+          sudo chmod 4755 release/linux-unpacked/chrome-sandbox
       - name: Smoke packaged Linux shell and PDF.js worker
         run: npm run smoke:desktop
       - run: npm run verify:packaging

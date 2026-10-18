@@ -1373,32 +1373,65 @@ function createWindow() {
           pdfPages: 0,
           pdfError: null
         };
-        try {
-          const engine = await window.__yayraShell?._pdfjsModule?.();
-          output.hasPdfEngine = typeof engine?.getDocument === 'function';
-          if (output.hasPdfEngine) {
-            const encoded = 'JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCAzMDAgMTQ0XSAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSA0IDAgUiA+PiA+PiAvQ29udGVudHMgNSAwIFIgPj4KZW5kb2JqCjQgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iago1IDAgb2JqCjw8IC9MZW5ndGggNDUgPj4Kc3RyZWFtCkJUIC9GMSAxOCBUZiAzMCA3MCBUZCAoWWF5cmEgUERGIHNtb2tlKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCnhyZWYKMCA2CjAwMDAwMDAwMDAgNjU1MzUgZiAKMDAwMDAwMDAwOSAwMDAwMCBuIAowMDAwMDAwMDU4IDAwMDAwIG4gCjAwMDAwMDAxMTUgMDAwMDAgbiAKMDAwMDAwMDI0MSAwMDAwMCBuIAowMDAwMDAwMzExIDAwMDAwIG4gCnRyYWlsZXIKPDwgL1NpemUgNiAvUm9vdCAxIDAgUiA+PgpzdGFydHhyZWYKNDA2CiUlRU9GCg==';
-            const raw = atob(encoded);
-            const data = Uint8Array.from(raw, (char) => char.charCodeAt(0));
-            const task = engine.getDocument({ data });
-            const pdf = await task.promise;
-            output.pdfPages = pdf?.numPages || 0;
-            await pdf?.destroy?.();
+        // The second smoke launch deliberately forces a bad shell URL and
+        // only verifies file:// recovery. Parse the PDF once, on the normal
+        // yayra:// launch, so fallback behavior cannot mask module health.
+        if (${isBadLoad ? 'false' : 'true'}) {
+          try {
+            const engine = await window.__yayraShell?._pdfjsModule?.();
+            output.hasPdfEngine = typeof engine?.getDocument === 'function';
+            if (output.hasPdfEngine) {
+              const encoded = 'JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCAzMDAgMTQ0XSAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSA0IDAgUiA+PiA+PiAvQ29udGVudHMgNSAwIFIgPj4KZW5kb2JqCjQgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iago1IDAgb2JqCjw8IC9MZW5ndGggNDUgPj4Kc3RyZWFtCkJUIC9GMSAxOCBUZiAzMCA3MCBUZCAoWWF5cmEgUERGIHNtb2tlKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCnhyZWYKMCA2CjAwMDAwMDAwMDAgNjU1MzUgZiAKMDAwMDAwMDAwOSAwMDAwMCBuIAowMDAwMDAwMDU4IDAwMDAwIG4gCjAwMDAwMDAxMTUgMDAwMDAgbiAKMDAwMDAwMDI0MSAwMDAwMCBuIAowMDAwMDAwMzExIDAwMDAwIG4gCnRyYWlsZXIKPDwgL1NpemUgNiAvUm9vdCAxIDAgUiA+PgpzdGFydHhyZWYKNDA2CiUlRU9GCg==';
+              const raw = atob(encoded);
+              const data = Uint8Array.from(raw, (char) => char.charCodeAt(0));
+              const task = engine.getDocument({ data });
+              const pdf = await task.promise;
+              output.pdfPages = pdf?.numPages || 0;
+              await pdf?.destroy?.();
+            }
+          } catch (error) {
+            output.pdfError = String(error?.message || error);
           }
-        } catch (error) {
-          output.pdfError = String(error?.message || error);
         }
         return output;
       })()`);
-      console.log(`[yayra-smoke] ${JSON.stringify(result)}`);
+      const smokeResult = {
+        ...result,
+        fallbackUsed: Boolean(lastLoadError),
+        loadError: lastLoadError
+      };
+      writeSmokeReport(smokeResult);
+      console.log(`[yayra-smoke] ${JSON.stringify(smokeResult)}`);
       app.quit();
     });
     setTimeout(() => {
+      const timeoutResult = {
+        timeout: true,
+        fallbackUsed: Boolean(lastLoadError),
+        loadError: lastLoadError
+      };
+      writeSmokeReport(timeoutResult);
       console.error('[yayra-smoke] timeout waiting for renderer paint');
       app.exit(1);
     }, 15000).unref();
   }
   return mainWindow;
+}
+
+/**
+ * GUI-subsystem Windows executables are not guaranteed to expose stdout to
+ * their parent. Write an explicit machine-readable result as well as logging
+ * it so the packaged smoke gate measures the renderer/PDF result, not console
+ * plumbing.
+ */
+function writeSmokeReport(payload) {
+  const reportPath = String(process.env.YAYRA_SMOKE_REPORT || '').trim();
+  if (!reportPath) return;
+  try {
+    fs.writeFileSync(reportPath, `${JSON.stringify(payload)}\n`, { encoding: 'utf8', mode: 0o600 });
+  } catch (error) {
+    console.error(`[yayra-smoke] could not write report: ${error?.message || error}`);
+  }
 }
 
 function safeAssetPath(rawPath) {

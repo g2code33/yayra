@@ -166,6 +166,11 @@ jobs:
             echo "::warning:: YAYRA_GOOGLE_CLIENT_ID / YAYRA_GOOGLE_CLIENT_SECRET repo secrets not set - installed builds will show 'Google sign-in isn't configured' until users drop google-auth.config.json into their yayra config directory."
           fi
       - run: npm run package:linux
+      - name: Prepare Chromium sandbox helper for packaged smoke
+        run: |
+          test -f release/linux-unpacked/chrome-sandbox
+          sudo chown root:root release/linux-unpacked/chrome-sandbox
+          sudo chmod 4755 release/linux-unpacked/chrome-sandbox
       - name: Smoke packaged Linux shell and PDF.js worker
         run: npm run smoke:desktop
       - run: npm run verify:packaging

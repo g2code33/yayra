@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setupDomShim } from './dom-shim.mjs';
 
@@ -478,17 +481,68 @@ test('PDF DESKTOP BUNDLE: yayra:// serves lazy ESM with strict MIME and smoke-pa
   assert.match(main, /hasPdfEngine:\s*false/);
   assert.match(main, /output\.pdfPages = pdf\?\.numPages \|\| 0/,
     'desktop smoke opens a real local fixture through the PDF.js worker');
-  assert.match(smoke, /"hasPdfEngine":true/);
-  assert.match(smoke, /"pdfPages":1/,
+  assert.match(main, /writeSmokeReport\(smokeResult\)/,
+    'the GUI executable returns machine-readable results without relying on stdout');
+  assert.match(smoke, /report\.hasPdfEngine === true/);
+  assert.match(smoke, /report\.pdfPages === 1/,
     'the smoke gate fails a desktop package that cannot parse its PDF fixture');
+  assert.match(smoke, /YAYRA_SMOKE_REPORT:\s*reportPath/,
+    'packaged Linux and Windows apps receive a deterministic result channel');
+  assert.doesNotMatch(smoke, /disable.{0,12}sandbox|no.{0,3}sandbox/i,
+    'the PDF smoke must keep Chromium sandboxing enabled');
   assert.match(smoke, /release\/linux-unpacked\/yayra/,
     'when a package exists, smoke uses the app.asar runtime rather than loose source files');
   assert.match(smoke, /release\/win-unpacked\/yayra\.exe/);
   assert.match(ci, /Smoke packaged Linux shell and PDF\.js worker/);
+  assert.match(ci, /chmod 4755 release\/linux-unpacked\/chrome-sandbox/,
+    'build-only CI keeps the Linux Chromium sandbox enabled for its unpacked smoke runtime');
   assert.match(ci, /Smoke packaged Windows shell and PDF\.js worker/);
   assert.match(release, /Smoke packaged Linux shell and PDF\.js worker/);
+  assert.match(release, /chmod 4755 release\/linux-unpacked\/chrome-sandbox/,
+    'release CI keeps the Linux Chromium sandbox enabled for its unpacked smoke runtime');
   assert.match(release, /Smoke packaged Windows shell and PDF\.js worker/,
     'build and release workflows enforce the packaged PDF parse on both desktop targets');
+});
+
+test('PDF PACKAGED SMOKE HARNESS: report files work when a packaged GUI process has no stdout', {
+  skip: process.platform !== 'linux'
+}, () => {
+  const fixture = mkdtempSync(join(tmpdir(), 'yayra-smoke-harness-'));
+  const fakeRuntime = join(fixture, 'fake-packaged-electron.cjs');
+  const argsLog = join(fixture, 'args.log');
+  mkdirSync(join(fixture, 'dist'), { recursive: true });
+  writeFileSync(join(fixture, 'dist/index.html'), '<title>yayra</title><main id="app"></main>');
+  writeFileSync(fakeRuntime, `#!/usr/bin/env node
+const fs = require('node:fs');
+const fallback = process.env.YAYRA_FORCE_BAD_LOAD === '1';
+const report = fallback
+  ? { title: 'yayra', hasRoot: true, hasPdfEngine: false, pdfPages: 0, pdfError: null, fallbackUsed: true, loadError: { code: -6, description: 'forced smoke fallback' } }
+  : { title: 'yayra', hasRoot: true, hasPdfEngine: true, pdfPages: 1, pdfError: null, fallbackUsed: false, loadError: null };
+fs.appendFileSync(process.env.YAYRA_SMOKE_ARGS_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');
+fs.writeFileSync(process.env.YAYRA_SMOKE_REPORT, JSON.stringify(report));
+`);
+  chmodSync(fakeRuntime, 0o755);
+
+  try {
+    const smokeScript = fileURLToPath(new URL('../scripts/smoke-desktop.mjs', import.meta.url));
+    const result = spawnSync(process.execPath, [smokeScript], {
+      cwd: fixture,
+      env: {
+        ...process.env,
+        YAYRA_SMOKE_RUNTIME: fakeRuntime,
+        YAYRA_SMOKE_ARGS_LOG: argsLog
+      },
+      encoding: 'utf8',
+      timeout: 15_000
+    });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /PDF\.js parsed one page/);
+    const launches = readFileSync(argsLog, 'utf8').trim().split(/\r?\n/).map(JSON.parse);
+    assert.equal(launches.length, 2, 'normal and forced-fallback packaged launches both ran');
+    assert.deepEqual(launches, [[], []], 'packaged launches do not weaken Chromium sandboxing');
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
 });
 
 test('PDF.js REAL ENGINE: a local PDF opens quickly and its text is searchable offline', async () => {
