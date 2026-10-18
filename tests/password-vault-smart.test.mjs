@@ -224,6 +224,7 @@ test('PasskeyService: honest failure reasons (decline, unsupported, nothing regi
 
 function installFakeWebviewBridge() {
   const fills = [];
+  const passkeyContinuations = [];
   window.yayra = window.yayra || {};
   window.yayra.webview = {
     ensure: async () => ({}),
@@ -234,11 +235,16 @@ function installFakeWebviewBridge() {
     reload: async () => ({}),
     stop: async () => ({}),
     destroy: async () => ({}),
+    continuePasskey: async (tabId, requestId, external) => {
+      passkeyContinuations.push({ tabId, requestId, external });
+      return { ok: true, prompted: !external, handedOff: Boolean(external) };
+    },
     fillCredentials: async (tabId, creds) => { fills.push({ tabId, ...creds }); return { filled: true }; },
     onEvent: () => () => {}
   };
   return {
     fills,
+    passkeyContinuations,
     uninstall: () => { delete window.yayra.webview; }
   };
 }
@@ -396,6 +402,71 @@ test('Website passkeys: a genuine native lifecycle request gets an immediate omn
       tabId: tab.id,
       type: 'webauthn-request',
       phase: 'started',
+      requestId: 'yayra-wa-linux-local-1',
+      action: 'create',
+      rpId: 'github.com',
+      conditional: false,
+      attachment: 'platform',
+      provider: { mode: 'local', available: true, reason: '' }
+    });
+    assert.equal(tab.sitePasskeyRequest?.requestId, 'yayra-wa-linux-local-1', 'local request is retained on its tab');
+    shell.render(container);
+    const confirm = container.querySelector('.fb-site-passkey-indicator');
+    assert.ok(confirm, 'Linux local provider turns the dead status chip into an explicit confirmation control');
+    assert.equal(confirm.tagName, 'BUTTON');
+    assert.match(confirm.textContent, /Confirm passkey/i);
+    confirm.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(fakeBridge.passkeyContinuations.at(-1), {
+      tabId: tab.id,
+      requestId: 'yayra-wa-linux-local-1',
+      external: false
+    });
+    assert.equal(tab.sitePasskeyRequest.providerState, 'approved');
+
+    shell.handleNativeWebviewEvent({
+      tabId: tab.id,
+      type: 'webauthn-request',
+      phase: 'settled',
+      requestId: 'yayra-wa-linux-local-1',
+      action: 'create',
+      rpId: 'github.com',
+      success: true
+    });
+    shell.handleNativeWebviewEvent({
+      tabId: tab.id,
+      type: 'webauthn-request',
+      phase: 'started',
+      requestId: 'yayra-wa-linux-external-1',
+      action: 'create',
+      rpId: 'github.com',
+      conditional: false,
+      provider: { mode: 'external', available: false, reason: 'secure-storage-unavailable' }
+    });
+    shell.render(container);
+    const external = container.querySelector('.fb-site-passkey-indicator');
+    assert.match(external.textContent, /Use system browser/i);
+    external.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(fakeBridge.passkeyContinuations.at(-1).external, true,
+      'unsupported sessions hand the exact ceremony page to a browser with a real passkey provider');
+    assert.equal(tab.sitePasskeyRequest.providerState, 'handed-off');
+    assert.match(container.querySelector('.fb-site-passkey-indicator')?.textContent || '', /Opened in system browser/i);
+
+    shell.handleNativeWebviewEvent({
+      tabId: tab.id,
+      type: 'webauthn-request',
+      phase: 'settled',
+      requestId: 'yayra-wa-linux-external-1',
+      action: 'create',
+      rpId: 'github.com',
+      success: false,
+      errorName: 'AbortError'
+    });
+    shell.handleNativeWebviewEvent({
+      tabId: tab.id,
+      type: 'webauthn-request',
+      phase: 'started',
       requestId: 'yayra-wa-conditional-1',
       action: 'get',
       rpId: 'github.com',
@@ -403,6 +474,16 @@ test('Website passkeys: a genuine native lifecycle request gets an immediate omn
     });
     shell.render(container);
     assert.equal(container.querySelector('.fb-site-passkey-indicator'), null, 'passive conditional mediation remains quiet until account interaction');
+    shell.handleNativeWebviewEvent({
+      tabId: tab.id,
+      type: 'webauthn-account-selection',
+      requestId: 'yayra-wa-conditional-1',
+      relyingPartyId: 'github.com',
+      accountCount: 1
+    });
+    shell.render(container);
+    assert.ok(container.querySelector('.fb-site-passkey-indicator'),
+      'account interaction promotes conditional mediation to a visible active ceremony');
   } finally {
     fakeBridge.uninstall();
   }

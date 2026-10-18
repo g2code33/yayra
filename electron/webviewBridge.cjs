@@ -358,6 +358,7 @@ function buildWebAuthnWatchdogScript() {
   var pending = Object.create(null);
   var sequence = 0;
   var platformAuthenticator = null;
+  var linuxSession = /Linux/i.test(String(navigator.userAgent || navigator.platform || ''));
 
   function requestCount() { return Object.keys(pending).length; }
   function safeRpId(options) {
@@ -417,7 +418,9 @@ function buildWebAuthnWatchdogScript() {
     }
     var text = site + ' is asking to ' + verb + '. The secure Chromium WebAuthn request is active in Yayra. ';
     if (platformAuthenticator === true) {
-      text += 'Complete the Windows Hello or Touch ID prompt, or use a security key.';
+      text += linuxSession
+        ? 'Click Confirm passkey in Yayra’s address bar, then approve the system-password prompt.'
+        : 'Complete the Windows Hello or Touch ID prompt, or use a security key.';
     } else if (platformAuthenticator === false) {
       text += 'A built-in device authenticator is not exposed in this session; a compatible USB/NFC security key can still work when no unsupported PIN prompt is needed. Phone and synced passkeys can be used by opening this page in your system browser.';
     } else {
@@ -917,6 +920,10 @@ function createWebviewBridge({
   // page view gets sandboxed password capture/fill and email suggestion hooks
   // (context-isolated, nothing exposed to the page). Optional for test hosts.
   autofillPreloadPath = null,
+  // Optional Linux software platform authenticator. It uses Chromium's real
+  // WebAuthn machinery, encrypted per-profile credentials, and an explicit
+  // browser-chrome confirmation before releasing user presence.
+  websitePasskeyProvider = null,
   logger = console,
   pageUnresponsiveReloadDelayMs = PAGE_UNRESPONSIVE_RELOAD_DELAY_MS,
   pageUnresponsiveReloadCooldownMs = PAGE_UNRESPONSIVE_RELOAD_COOLDOWN_MS
@@ -944,9 +951,33 @@ function createWebviewBridge({
     }
   }
 
+  function websitePasskeyInfo(entry) {
+    if (!websitePasskeyProvider || typeof websitePasskeyProvider.describe !== 'function') {
+      return { mode: 'native', available: false, reason: 'native-platform-authenticator' };
+    }
+    try {
+      const info = websitePasskeyProvider.describe({
+        webContents: entry?.view?.webContents,
+        profileId: entry?.profileId,
+        isPrivate: entry?.isPrivate
+      }) || {};
+      const mode = info.mode === 'local' || info.mode === 'external' ? info.mode : 'native';
+      return {
+        mode,
+        available: mode === 'local' && info.available === true,
+        reason: typeof info.reason === 'string' ? info.reason.slice(0, 120) : ''
+      };
+    } catch {
+      return { mode: 'external', available: false, reason: 'provider-unavailable' };
+    }
+  }
+
   function cancelSitePasskeyRequests(entry, errorName = 'AbortError') {
     if (!entry?.sitePasskeyRequests?.size) return;
     for (const [requestId, meta] of entry.sitePasskeyRequests) {
+      try {
+        websitePasskeyProvider?.settle?.({ webContents: entry.view?.webContents, requestId });
+      } catch { /* provider is already detached */ }
       sendTo(entry, 'webauthn-request', {
         phase: 'settled',
         requestId,
@@ -1034,7 +1065,22 @@ function createWebviewBridge({
       // Electron documents a null frame after navigation/destruction. Do not
       // attach an account chooser to an unrelated tab/window in that race.
       if (!entry) { finish(); return; }
-      sendTo(entry, 'webauthn-account-selection', { relyingPartyId, accountCount: accounts.length });
+      let requestId = '';
+      for (const [candidateId, meta] of entry.sitePasskeyRequests || []) {
+        if (meta?.action === 'get' && meta.conditional === true && meta.rpId === relyingPartyId) {
+          // Conditional mediation stays silent until Chromium asks the user to
+          // choose an account. From this point it is an active ceremony and
+          // the trusted toolbar may release presence after explicit approval.
+          meta.conditional = false;
+          requestId = candidateId;
+          break;
+        }
+      }
+      sendTo(entry, 'webauthn-account-selection', {
+        relyingPartyId,
+        accountCount: accounts.length,
+        ...(requestId ? { requestId } : {})
+      });
       const owner = entry.hostWin && !entry.hostWin.isDestroyed?.() ? entry.hostWin : getMainWindow();
 
       // Match a mainstream browser's account sheet. The WebAuthn operation
@@ -1448,6 +1494,7 @@ function createWebviewBridge({
       hostWin,
       isPrivate: Boolean(isPrivate),
       profileId: String(profileId || 'default'),
+      requestedUrl: null,
       pointerTheme: 'system',
       pointerSize: 'normal',
       pageUnresponsive: false,
@@ -1455,12 +1502,26 @@ function createWebviewBridge({
       lastPageUnresponsiveReloadAt: 0
     };
     views.set(key, entry);
+    if (websitePasskeyProvider && typeof websitePasskeyProvider.attach === 'function') {
+      try {
+        entry.websitePasskeyReady = Promise.resolve(websitePasskeyProvider.attach({
+          webContents: view.webContents,
+          profileId: entry.profileId,
+          isPrivate: entry.isPrivate
+        })).catch((error) => {
+          logger.warn?.(`[yayra:site-passkeys] provider attach failed: ${error?.message || error}`);
+          return { ok: false, reason: 'provider-unavailable' };
+        });
+      } catch (error) {
+        logger.warn?.(`[yayra:site-passkeys] provider attach failed: ${error?.message || error}`);
+      }
+    }
     installWebAuthnAccountChooser(view.webContents.session);
     attachListeners(key, entry);
     return entry;
   }
 
-  function ensureView(key, tabId, url, {
+  async function ensureView(key, tabId, url, {
     isPrivate = false,
     hostWc = null,
     hostWin = null,
@@ -1501,6 +1562,15 @@ function createWebviewBridge({
     entry.pointerTheme = nextPointerTheme;
     entry.pointerSize = nextPointerSize;
     if (pointerChanged && entry.lastUrl) applyPointerThemeToPage(entry);
+
+    // The virtual authenticator must exist before any page JavaScript runs.
+    // Loading first creates a race where an early navigator.credentials call
+    // enters Chromium's silent Linux path and remains stuck even though the
+    // provider finishes attaching a few milliseconds later. Keep only the
+    // newest URL when rapid navigation arrives while initialization waits.
+    entry.requestedUrl = url;
+    if (entry.websitePasskeyReady) await entry.websitePasskeyReady;
+    if (entry.requestedUrl !== url) return { handedOffToSystemBrowser: false };
 
     if (entry.lastUrl !== url) {
       entry.lastUrl = url;
@@ -1692,6 +1762,7 @@ function createWebviewBridge({
         logger.error(`[yayra:webview] failed to detach view for ${key}`, err);
       }
     }
+    try { websitePasskeyProvider?.detach?.(entry.view.webContents); } catch { /* view is closing */ }
     if (!entry.view.webContents.isDestroyed()) entry.view.webContents.close();
     views.delete(key);
   }
@@ -1717,6 +1788,55 @@ function createWebviewBridge({
   ipcMain.handle('yayra:webview-ensure', (event, { tabId, url, isPrivate, profileId, pointerTheme, pointerSize } = {}) => {
     const { hostWc, hostWin } = resolveHost(event);
     return ensureView(viewKey(event, tabId), tabId, url, { isPrivate, hostWc, hostWin, profileId, pointerTheme, pointerSize });
+  });
+  ipcMain.handle('yayra:webview-continue-passkey', async (event, { tabId, requestId, external = false } = {}) => {
+    const entry = views.get(viewKey(event, tabId));
+    const id = typeof requestId === 'string' && /^yayra-wa-[a-z0-9-]{1,80}$/i.test(requestId)
+      ? requestId
+      : null;
+    const request = id ? entry?.sitePasskeyRequests?.get(id) : null;
+    if (!entry || !request || request.conditional) return { ok: false, reason: 'request-ended' };
+
+    const provider = websitePasskeyInfo(entry);
+    if (external || provider.mode !== 'local') {
+      const currentUrl = String(entry.view?.webContents?.getURL?.() || entry.lastUrl || '');
+      if (!isHttpUrl(currentUrl)) return { ok: false, reason: 'invalid-url' };
+      try {
+        await shell.openExternal(currentUrl);
+        sendTo(entry, 'system-browser-handoff', { url: currentUrl, reason: 'passkey' });
+        return { ok: true, handedOff: true };
+      } catch (error) {
+        return { ok: false, reason: String(error?.message || 'open-failed').slice(0, 120) };
+      }
+    }
+
+    sendTo(entry, 'webauthn-provider-state', { requestId: id, state: 'prompting' });
+    let result;
+    try {
+      result = await websitePasskeyProvider.confirm({
+        webContents: entry.view.webContents,
+        requestId: id,
+        action: request.action,
+        rpId: request.rpId,
+        isStillActive: () => entry.sitePasskeyRequests?.has(id) === true
+      });
+    } catch (error) {
+      result = { ok: false, reason: String(error?.message || 'provider-unavailable').slice(0, 120) };
+    }
+    sendTo(entry, 'webauthn-provider-state', {
+      requestId: id,
+      state: result?.ok ? 'approved' : 'declined',
+      reason: result?.ok ? '' : String(result?.reason || 'provider-unavailable').slice(0, 120)
+    });
+    return result?.ok
+      ? {
+        ok: true,
+        prompted: Boolean(result.prompted),
+        ...(Number(result.presenceExpiresInMs) > 0
+          ? { presenceExpiresInMs: Math.min(60000, Number(result.presenceExpiresInMs)) }
+          : {})
+      }
+      : { ok: false, reason: result?.reason || 'provider-unavailable', canUseSystemBrowser: true };
   });
   ipcMain.handle('yayra:webview-set-background-throttling', (event, { enabled } = {}) => {
     const sender = event?.sender;
@@ -2045,11 +2165,15 @@ function createWebviewBridge({
       };
       if (phase === 'started') {
         if (entry.sitePasskeyRequests.size >= 8 || entry.sitePasskeyRequests.has(requestId)) return;
+        requestMeta.provider = websitePasskeyInfo(entry);
         entry.sitePasskeyRequests.set(requestId, requestMeta);
       } else {
         requestMeta = entry.sitePasskeyRequests.get(requestId);
         if (!requestMeta) return;
         entry.sitePasskeyRequests.delete(requestId);
+        try {
+          websitePasskeyProvider?.settle?.({ webContents: entry.view?.webContents, requestId });
+        } catch { /* provider is already detached */ }
       }
       sendTo(entry, 'webauthn-request', {
         phase,

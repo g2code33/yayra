@@ -996,6 +996,11 @@ test('website passkeys: valid lifecycle metadata reaches only the owning shell a
     rpId: 'github.com',
     conditional: false,
     attachment: 'platform',
+    provider: {
+      mode: 'native',
+      available: false,
+      reason: 'native-platform-authenticator'
+    },
     success: undefined,
     errorName: ''
   });
@@ -1045,12 +1050,20 @@ test('website passkeys: discoverable-account chooser is installed once per Sessi
       return { response: 1 };
     }
   };
-  const { handlers, sentEvents, views } = makeHarness({ webauthnSession, Dialog });
+  const { handlers, listeners, sentEvents, views, externalCalls } = makeHarness({ webauthnSession, Dialog });
   await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-account-1', url: 'https://github.com/login' });
   await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-account-2', url: 'https://github.com/settings' });
   const requestingFrame = {};
   views[0].webContents.mainFrame = requestingFrame;
   assert.equal(webauthnSession.listenerCount('select-webauthn-account'), 1, 'one listener serves every tab in the same Session');
+  listeners.get('yayra:site-passkey-request')({ sender: views[0].webContents }, {
+    phase: 'started',
+    requestId: 'yayra-wa-conditional-account-1',
+    action: 'get',
+    rpId: 'github.com',
+    conditional: true,
+    attachment: 'platform'
+  });
 
   const credentialA = 'AQID';
   const credentialB = 'BAUG';
@@ -1079,9 +1092,17 @@ test('website passkeys: discoverable-account chooser is installed once per Sessi
     tabId: 'tab-account-1',
     type: 'webauthn-account-selection',
     relyingPartyId: 'github.com',
-    accountCount: 2
+    accountCount: 2,
+    requestId: 'yayra-wa-conditional-account-1'
   });
   assert.equal(JSON.stringify(notice).includes('ada@example.com'), false, 'account identities stay in native chooser UI');
+  const activated = await handlers.get('yayra:webview-continue-passkey')(null, {
+    tabId: 'tab-account-1',
+    requestId: 'yayra-wa-conditional-account-1'
+  });
+  assert.deepEqual(activated, { ok: true, handedOff: true },
+    'account choice promotes conditional mediation into an actionable request');
+  assert.deepEqual(externalCalls, ['https://github.com/login']);
 
   const canceled = [];
   sessionListeners.get('select-webauthn-account')(

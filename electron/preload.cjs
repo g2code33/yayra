@@ -73,6 +73,12 @@ const api = {
     stop: (tabId) => ipcRenderer.invoke('yayra:webview-stop', { tabId }),
     isLoading: (tabId) => ipcRenderer.invoke('yayra:webview-is-loading', { tabId }),
     destroy: (tabId) => ipcRenderer.invoke('yayra:webview-destroy', { tabId }),
+    // Linux passkeys: an explicit toolbar click authorizes the pending real
+    // WebAuthn ceremony (PolicyKit) or hands the exact page to the system
+    // browser when no secure local provider is available.
+    continuePasskey: (tabId, requestId, external = false) => ipcRenderer.invoke('yayra:webview-continue-passkey', {
+      tabId, requestId, external: Boolean(external)
+    }),
     // Autofill saved credentials into the page's login form (Chrome-style).
     fillCredentials: (tabId, { username, password } = {}) => ipcRenderer.invoke('yayra:webview-fill-credentials', { tabId, username, password }),
     // Suggest this profile's saved email addresses in a focused email field.

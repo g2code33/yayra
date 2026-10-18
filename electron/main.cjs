@@ -20,6 +20,7 @@ const { createDownloadsStore } = require('./downloadsStore.cjs');
 const { createDownloadsBridge } = require('./downloadsBridge.cjs');
 const { createPasskeyBridge } = require('./passkeyBridge.cjs');
 const { configureWebsiteWebAuthn } = require('./websiteWebAuthn.cjs');
+const { createWebsitePasskeyProvider } = require('./websitePasskeyProvider.cjs');
 const { configureTrustedMediaPermissions } = require('./trustedMediaPermissions.cjs');
 const { GOOGLE_FEATURE_URLS, uploadGoogleLensImage } = require('./googleFeatures.cjs');
 const { createPhoneApproval } = require('./phoneApproval.cjs');
@@ -1015,6 +1016,20 @@ function registerIpcBridges() {
     }
   });
 
+  // Linux has no Chromium platform-passkey UI in Electron: website
+  // navigator.credentials.create/get calls otherwise wait silently for at
+  // least three minutes. Supply a local CTAP2 authenticator only when its
+  // private credentials can be strongly encrypted and PolicyKit can perform
+  // real system-password verification for every user-approved ceremony.
+  const websitePasskeyProvider = createWebsitePasskeyProvider({
+    fsImpl: fs,
+    pathImpl: path,
+    userDataDir: app.getPath('userData'),
+    safeStorageImpl: safeStorage,
+    platform: process.platform,
+    logger: console
+  });
+
   // Native website-rendering engine bridge (replaces <iframe>-based rendering
   // so real sites with X-Frame-Options/frame-ancestors - Google, GitHub,
   // etc. - actually load). See electron/webviewBridge.cjs for the full
@@ -1031,7 +1046,8 @@ function registerIpcBridges() {
     getWindowForWebContents: (wc) => BrowserWindow.fromWebContents(wc),
     // Chrome-style password capture/fill inside real pages (sandboxed
     // preload, nothing exposed to the page) - see autofillPreload.cjs.
-    autofillPreloadPath: path.join(__dirname, 'autofillPreload.cjs')
+    autofillPreloadPath: path.join(__dirname, 'autofillPreload.cjs'),
+    websitePasskeyProvider
   });
 
   // "Sign in with Google" for Yayra's own app-level identity. See

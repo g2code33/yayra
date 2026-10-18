@@ -301,9 +301,13 @@ test('decodeOpenExternalRequest is a security gate: only http(s) targets pass', 
 /* Bridge integration: injection on dom-ready + sentinel interception  */
 /* ------------------------------------------------------------------ */
 
-function makeBridgeHarness() {
+function makeBridgeHarness({ websitePasskeyProvider = null } = {}) {
   const handlers = new Map();
-  const ipcMain = { handle: (c, fn) => handlers.set(c, fn), on: () => {} };
+  const listeners = new Map();
+  const ipcMain = {
+    handle: (c, fn) => handlers.set(c, fn),
+    on: (c, fn) => listeners.set(c, fn)
+  };
   const sentEvents = [];
   const fakeWin = {
     isDestroyed: () => false,
@@ -318,7 +322,8 @@ function makeBridgeHarness() {
     let windowOpenHandler = null;
     const webContents = {
       executedScripts: [],
-      loadURL: async () => {},
+      loadedUrls: [],
+      loadURL: async (url) => { webContents.loadedUrls.push(url); },
       isDestroyed: () => false,
       setUserAgent: () => {},
       setWindowOpenHandler: (fn) => { windowOpenHandler = fn; },
@@ -340,9 +345,10 @@ function makeBridgeHarness() {
     ipcMain,
     shell,
     getMainWindow: () => fakeWin,
-    logger: { error: () => {} }
+    websitePasskeyProvider,
+    logger: { error: () => {}, warn: () => {} }
   });
-  return { handlers, views, externalCalls, sentEvents };
+  return { handlers, listeners, views, externalCalls, sentEvents };
 }
 
 test('bridge injects the watchdog into the page main world on every dom-ready', async () => {
@@ -381,4 +387,99 @@ test('bridge intercepts the open-external sentinel: opens the REAL url in the sy
   assert.notEqual(decodeOpenExternalRequest(`${OPEN_EXTERNAL_SCHEME}${encodeURIComponent('javascript:alert(1)')}`), 'javascript:alert(1)');
   assert.equal(externalCalls.length, 1, 'nothing extra opened externally');
   void evil;
+});
+
+
+test('bridge attaches the Linux authenticator before any page JavaScript can request a passkey', async () => {
+  let releaseAttach;
+  const provider = {
+    attach: () => new Promise((resolve) => { releaseAttach = resolve; }),
+    describe: () => ({ mode: 'local', available: true, reason: '' }),
+    detach: () => {}
+  };
+  const { handlers, views } = makeBridgeHarness({ websitePasskeyProvider: provider });
+  const ensure = handlers.get('yayra:webview-ensure')(null, {
+    tabId: 'tab-provider-order',
+    url: 'https://github.com/settings/security'
+  });
+  await Promise.resolve();
+  assert.equal(views.length, 1);
+  assert.deepEqual(views[0].webContents.loadedUrls, [], 'page load is gated on provider initialization');
+  releaseAttach({ ok: true });
+  await ensure;
+  assert.deepEqual(views[0].webContents.loadedUrls, ['https://github.com/settings/security']);
+});
+
+test('bridge turns a Linux site passkey request into an explicit secure continuation action', async () => {
+  const calls = { attach: [], confirm: [], settle: [] };
+  const provider = {
+    describe: () => ({ mode: 'local', available: true, reason: '' }),
+    attach: async (details) => { calls.attach.push(details); return { ok: true }; },
+    confirm: async (details) => { calls.confirm.push(details); return { ok: true, prompted: true }; },
+    settle: (details) => { calls.settle.push(details); },
+    detach: () => {}
+  };
+  const { handlers, listeners, views, sentEvents } = makeBridgeHarness({ websitePasskeyProvider: provider });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-passkey', url: 'https://github.com/settings/security' });
+  await Promise.resolve();
+  assert.equal(calls.attach.length, 1, 'provider is attached before the page can request WebAuthn');
+
+  listeners.get('yayra:site-passkey-request')({ sender: views[0].webContents }, {
+    phase: 'started',
+    requestId: 'yayra-wa-linux-1',
+    action: 'create',
+    rpId: 'github.com',
+    conditional: false,
+    attachment: 'platform'
+  });
+  const started = sentEvents.find((event) => event.payload.type === 'webauthn-request');
+  assert.equal(started.payload.provider.mode, 'local');
+  assert.equal(calls.confirm.length, 0, 'a site cannot trigger the system-password prompt without the user clicking browser chrome');
+
+  const continued = await handlers.get('yayra:webview-continue-passkey')(null, {
+    tabId: 'tab-passkey',
+    requestId: 'yayra-wa-linux-1'
+  });
+  assert.deepEqual(continued, { ok: true, prompted: true });
+  assert.equal(calls.confirm.length, 1);
+  assert.equal(calls.confirm[0].rpId, 'github.com');
+  assert.equal(calls.confirm[0].isStillActive(), true);
+  assert.ok(sentEvents.some((event) => event.payload.type === 'webauthn-provider-state'
+    && event.payload.state === 'prompting'));
+  assert.ok(sentEvents.some((event) => event.payload.type === 'webauthn-provider-state'
+    && event.payload.state === 'approved'));
+
+  listeners.get('yayra:site-passkey-request')({ sender: views[0].webContents }, {
+    phase: 'settled',
+    requestId: 'yayra-wa-linux-1',
+    action: 'create',
+    rpId: 'github.com',
+    success: true
+  });
+  assert.equal(calls.settle.at(-1).requestId, 'yayra-wa-linux-1');
+});
+
+test('bridge passkey action opens the exact HTTPS page externally when secure local storage is unavailable', async () => {
+  const provider = {
+    describe: () => ({ mode: 'external', available: false, reason: 'secure-storage-unavailable' }),
+    attach: async () => ({ ok: false }),
+    settle: () => {},
+    detach: () => {}
+  };
+  const { handlers, listeners, views, externalCalls } = makeBridgeHarness({ websitePasskeyProvider: provider });
+  const url = 'https://github.com/settings/security';
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-external', url });
+  listeners.get('yayra:site-passkey-request')({ sender: views[0].webContents }, {
+    phase: 'started',
+    requestId: 'yayra-wa-external-1',
+    action: 'create',
+    rpId: 'github.com',
+    conditional: false
+  });
+  const result = await handlers.get('yayra:webview-continue-passkey')(null, {
+    tabId: 'tab-external',
+    requestId: 'yayra-wa-external-1'
+  });
+  assert.deepEqual(result, { ok: true, handedOff: true });
+  assert.deepEqual(externalCalls, [url]);
 });

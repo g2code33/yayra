@@ -763,6 +763,12 @@ test('Requirement 5 & 7: New Tab Developer Ad Badges Showcase above Logo without
   assert.ok(compactCardRule.includes('width: 88px;'), 'sponsor shortcuts match the compact frequently-used-site scale');
   assert.ok(compactCardRule.includes('min-height: 88px;'));
   assert.ok(compactCardRule.includes('flex-direction: column;'), 'sponsor shortcuts use compact vertical tiles');
+  const showcaseStart = designSystem.indexOf('.fb-sponsored-showcase {');
+  const showcaseRule = showcaseStart >= 0 ? designSystem.slice(showcaseStart, designSystem.indexOf('}', showcaseStart)) : '';
+  assert.ok(showcaseRule.includes('background: transparent;'), 'the sponsor row has no black panel background');
+  assert.ok(showcaseRule.includes('border: 0;'));
+  assert.ok(showcaseRule.includes('box-shadow: none;'));
+  assert.ok(showcaseRule.includes('padding: 0;'), 'the transparent sponsor row does not retain panel padding');
   const lightCardStart = designSystem.indexOf('[data-theme="light"] .fb-dev-ad-card.fb-sponsored-card {');
   const lightCardRule = lightCardStart >= 0 ? designSystem.slice(lightCardStart, designSystem.indexOf('}', lightCardStart)) : '';
   assert.ok(lightCardRule, 'light-theme sponsor cards have a targeted rule');

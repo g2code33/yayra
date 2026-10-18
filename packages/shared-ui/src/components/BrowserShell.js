@@ -2223,17 +2223,47 @@ export class BrowserShell {
 
     // Standards-based site passkey ceremony indicator. This appears only
     // while a site has an active navigator.credentials create/get request;
-    // the actual secret/signature remains entirely inside Chromium + the OS
-    // authenticator/security key and never enters Yayra's renderer.
-    if (activeTab.sitePasskeyRequest) {
+    // secrets/signatures never enter Yayra's renderer or the website page;
+    // native platforms keep them in the OS authenticator, while Linux keeps
+    // local-provider keys in safeStorage-encrypted main-process storage.
+    if (activeTab.sitePasskeyRequest && !activeTab.sitePasskeyRequest.conditional) {
       const request = activeTab.sitePasskeyRequest;
-      const indicator = document.createElement('div');
-      indicator.className = 'fb-site-passkey-indicator';
-      indicator.setAttribute('role', 'status');
+      const providerMode = request.provider?.mode || 'native';
+      const actionable = providerMode === 'local' || providerMode === 'external';
+      const state = request.providerState || '';
+      const indicator = document.createElement(actionable ? 'button' : 'div');
+      if (actionable) indicator.type = 'button';
+      indicator.className = `fb-site-passkey-indicator ${actionable ? 'is-actionable' : ''} ${state ? `is-${state}` : ''}`.trim();
+      indicator.setAttribute('role', actionable ? 'button' : 'status');
       indicator.setAttribute('aria-live', 'polite');
-      indicator.setAttribute('title', `${request.rpId || 'This site'} is ${request.action === 'create' ? 'creating' : 'requesting'} a passkey. Complete the device or security-key prompt.`);
+
+      let label = request.action === 'create' ? 'Creating passkey' : 'Passkey active';
+      let title = `${request.rpId || 'This site'} is ${request.action === 'create' ? 'creating' : 'requesting'} a passkey. Complete the device or security-key prompt.`;
+      if (providerMode === 'local') {
+        label = state === 'prompting' ? 'Confirm system password'
+          : state === 'approved' ? 'Completing passkey'
+            : state === 'handed-off' ? 'Opened in system browser'
+              : state === 'declined' ? 'Use system browser'
+                : 'Confirm passkey';
+        title = state === 'handed-off'
+          ? 'This exact page is open in your system browser. Complete the passkey request there.'
+          : state === 'declined'
+            ? 'Local verification did not complete. Open this exact page in your system browser instead.'
+            : 'Click to confirm this passkey request with your Linux system password.';
+      } else if (providerMode === 'external') {
+        label = state === 'handed-off' ? 'Opened in system browser' : 'Use system browser';
+        title = state === 'handed-off'
+          ? 'This exact page is open in your system browser. Complete the passkey request there.'
+          : 'This Linux session has no secure local passkey provider. Open this exact page in your system browser.';
+      }
+      indicator.setAttribute('title', title);
+      indicator.setAttribute('aria-label', title);
       indicator.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="15" r="4"></circle><path d="m11 12 9-9m-4 4 3 3m-6 0 3 3"></path></svg>'
-        + `<span>${request.action === 'create' ? 'Creating passkey' : 'Passkey active'}</span>`;
+        + `<span>${label}</span>`;
+      if (actionable) {
+        indicator.disabled = state === 'prompting' || state === 'approved' || state === 'handed-off';
+        indicator.addEventListener('click', () => this.continueWebsitePasskey(activeTab, request));
+      }
       omnibox.appendChild(indicator);
     }
 
@@ -3545,6 +3575,44 @@ export class BrowserShell {
     }
   }
 
+  async continueWebsitePasskey(tab, request) {
+    if (!tab || !request || !this.nativeWebview?.continuePasskey) return;
+    const external = request.provider?.mode === 'external'
+      || request.providerState === 'declined';
+    request.providerState = external ? 'approved' : 'prompting';
+    if (tab.id === this.state.activeTabId) this.requestRender();
+    try {
+      const result = await this.nativeWebview.continuePasskey(tab.id, request.requestId, external);
+      if (result?.handedOff) {
+        request.providerState = 'handed-off';
+        this.showTransientNotice('The passkey page opened in your system browser. Complete it there using that browser’s passkey provider.');
+      } else if (result?.ok) {
+        request.providerState = 'approved';
+        this.showTransientNotice('System verification accepted. Completing the passkey request...');
+        const expiresInMs = Math.max(0, Math.min(60000, Number(result.presenceExpiresInMs) || 0));
+        if (expiresInMs > 0) {
+          setTimeout(() => {
+            if (tab.sitePasskeyRequest?.requestId !== request.requestId
+                || request.providerState !== 'approved') return;
+            request.providerState = '';
+            this.showTransientNotice('The site is still waiting. Click “Confirm passkey” to approve again, or use the in-page system-browser option.');
+            if (tab.id === this.state.activeTabId) this.requestRender();
+          }, expiresInMs + 250);
+        }
+      } else {
+        request.providerState = 'declined';
+        this.showTransientNotice(result?.reason === 'user-declined-or-timeout'
+          ? 'System verification was cancelled. Click “Use system browser” to continue another way.'
+          : 'The secure local passkey provider is unavailable. Click “Use system browser” to continue.');
+      }
+    } catch {
+      request.providerState = 'declined';
+      this.showTransientNotice('The secure local passkey provider is unavailable. Click “Use system browser” to continue.');
+    }
+    if (tab.sitePasskeyRequest?.requestId === request.requestId
+        && tab.id === this.state.activeTabId) this.requestRender();
+  }
+
   handleNativeWebviewEvent(evt) {
     if (!evt || !evt.tabId) return;
     const { tabId, type } = evt;
@@ -3693,15 +3761,23 @@ export class BrowserShell {
         // Conditional mediation is intentionally quiet until a user chooses
         // an account; those passive requests can remain pending for a page's
         // entire lifetime by design.
-        if (evt.phase === 'started' && !evt.conditional) {
+        if (evt.phase === 'started') {
           tab.sitePasskeyRequest = {
             requestId: evt.requestId,
             action: evt.action,
             rpId: evt.rpId,
             attachment: evt.attachment,
+            conditional: evt.conditional === true,
+            provider: evt.provider && ['local', 'external', 'native'].includes(evt.provider.mode)
+              ? {
+                  mode: evt.provider.mode,
+                  available: evt.provider.available === true,
+                  reason: String(evt.provider.reason || '').slice(0, 120)
+                }
+              : { mode: 'native', available: false, reason: '' },
             startedAt: Date.now()
           };
-          if (tabId === this.state.activeTabId) this.requestRender();
+          if (!tab.sitePasskeyRequest.conditional && tabId === this.state.activeTabId) this.requestRender();
         } else if (evt.phase === 'settled') {
           const current = tab.sitePasskeyRequest;
           if (current?.requestId === evt.requestId) {
@@ -3718,7 +3794,26 @@ export class BrowserShell {
         }
         break;
       }
+      case 'webauthn-provider-state': {
+        const request = tab.sitePasskeyRequest;
+        if (!request || request.requestId !== evt.requestId) break;
+        if (['prompting', 'approved', 'declined'].includes(evt.state)) {
+          request.providerState = evt.state;
+          if (evt.state === 'declined') request.provider = { ...request.provider, mode: 'local' };
+          if (tabId === this.state.activeTabId) this.requestRender();
+        }
+        break;
+      }
       case 'webauthn-account-selection':
+        // Conditional mediation is deliberately quiet until Chromium has an
+        // account to offer. A local Linux credential still needs the trusted
+        // toolbar click after account choice, so promote only the matching
+        // pending request to an active ceremony here.
+        if (tab.sitePasskeyRequest?.conditional
+            && (!evt.requestId || evt.requestId === tab.sitePasskeyRequest.requestId)) {
+          tab.sitePasskeyRequest.conditional = false;
+          if (tabId === this.state.activeTabId) this.requestRender();
+        }
         // The native chooser is already in front; this notice makes the
         // reason explicit if the OS/menu appears away from the page surface.
         if (tabId === this.state.activeTabId) {
@@ -7144,7 +7239,7 @@ export class BrowserShell {
             <div>
               <strong>Website passkeys</strong>
               <p>${this.nativeWebview
-                ? 'Always active. Yayra recognizes secure sites when they call WebAuthn to create or use a passkey, shows an active indicator, uses available OS/device prompts and compatible USB/NFC security keys, and provides a system-browser fallback for phone or synced passkeys.'
+                ? 'Always active. Yayra recognizes secure sites when they call WebAuthn. On Linux, a clickable address-bar confirmation uses your system password and a KWallet/libsecret-encrypted local passkey; Windows Hello, entitled macOS Touch ID builds, and compatible security keys remain native. A system-browser fallback handles unavailable, phone, or synced providers.'
                 : 'Handled automatically by your browser when a secure site asks to create or use a passkey.'}</p>
             </div>
             <span class="fb-site-passkeys-ready" role="status">Active</span>
