@@ -9966,7 +9966,12 @@ export class BrowserShell {
   }
 
   renderTabGroupsModal(modal) {
-    modal.className = 'fb-modal-card fb-tab-groups-modal';
+    // Tab groups is a compact toolbar popover, not a centered full-screen
+    // modal. The transparent click-away layer mirrors Connection is Secure.
+    modal.className = 'fb-modal-card fb-tab-groups-modal fb-tab-groups-popover';
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'false');
+    modal.setAttribute('aria-label', 'Tab groups');
     modal.innerHTML = `
       <div class="fb-modal-header">
         <h2 class="fb-modal-title">${Icons.tabGroup} Tab groups</h2>
@@ -13005,7 +13010,8 @@ export class BrowserShell {
     const backdrop = document.createElement('div');
     const isCompactTabSearch = this.state.activeModal === 'tab-switcher'
       && this.state.settings.tabSwitcherView === 'list';
-    backdrop.className = `fb-modal-backdrop ${this.state.activeModal === 'search-overlay' ? 'fb-search-backdrop' : ''} ${isCompactTabSearch ? 'fb-tab-search-list-backdrop' : ''}`;
+    const isTabGroupsPopover = this.state.activeModal === 'tab-groups';
+    backdrop.className = `fb-modal-backdrop ${this.state.activeModal === 'search-overlay' ? 'fb-search-backdrop' : ''} ${isCompactTabSearch ? 'fb-tab-search-list-backdrop' : ''} ${isTabGroupsPopover ? 'fb-tab-groups-popover-backdrop' : ''}`;
     backdrop.addEventListener('click', (e) => {
       if (e.target === backdrop) this.closeModal();
     });

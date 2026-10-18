@@ -321,6 +321,10 @@ test('TAB GROUPS: real create / group / ungroup with colour dots in the tab stri
     assert.ok(groupIcon, 'tab-group icon is present beside the site connection control');
     groupIcon.click();
     assert.equal(shell.state.activeModal, 'tab-groups', 'group icon opens the group picker');
+    assert.ok(container.querySelector('.fb-tab-groups-popover-backdrop'),
+      'tab groups uses a transparent click-away popover layer instead of the dimmed full-screen modal');
+    assert.ok(container.querySelector('.fb-tab-groups-popover'),
+      'tab groups renders as the compact top-left toolbar panel');
     const groupChoice = container.querySelector('.fb-tab-group-picker-item');
     assert.ok(groupChoice, 'the picker lists open groups');
     groupChoice.click();

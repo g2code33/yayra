@@ -831,6 +831,54 @@ html {
   min-height: 36px;
 }
 
+/* Tab groups belongs to the toolbar, like the Connection is Secure panel.
+   Keep only an invisible click-away layer: no dimmed full-screen treatment. */
+.fb-modal-backdrop.fb-tab-groups-popover-backdrop {
+  display: block;
+  padding: 44px 12px 12px;
+  box-sizing: border-box;
+  background: transparent;
+  animation: none;
+  z-index: 500001;
+}
+
+.fb-modal-card.fb-tab-groups-popover {
+  width: 360px;
+  max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 56px);
+  margin: 0;
+  border-radius: 12px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.52);
+  animation: fb-slide-up 0.15s ease;
+}
+
+.fb-tab-groups-popover .fb-modal-header {
+  padding: 12px 14px;
+}
+
+.fb-tab-groups-popover .fb-modal-title {
+  font-size: 1rem;
+}
+
+.fb-tab-groups-popover .fb-modal-body {
+  padding: 12px 14px 14px;
+}
+
+.fb-tab-groups-popover .fb-tab-groups-picker-list {
+  max-height: min(34vh, 280px);
+}
+
+.fb-tab-groups-popover .fb-tab-group-picker-item {
+  padding: 9px 10px;
+  border-radius: 9px;
+}
+
+.fb-tab-groups-popover .fb-tab-groups-modal-actions .fb-btn {
+  min-height: 32px;
+  padding: 7px 10px;
+  font-size: 0.78rem;
+}
+
 @media (max-width: 600px) {
   .fb-tab-group-settings-card {
     align-items: stretch;
