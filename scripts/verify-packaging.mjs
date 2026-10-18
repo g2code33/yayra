@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { execFileSync, spawnSync } from 'node:child_process';
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { dimensions } from './lib/png.mjs';
+import { findPackagedWindowsExecutable } from './lib/windows-package-layout.mjs';
 
 const root = process.cwd();
 const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
@@ -90,21 +91,37 @@ if (packagedAsars.length) {
   console.log('packaging layout note: no unpacked desktop app is present; package a desktop target to inspect its real app.asar contents');
 }
 
-const builtExe = await findBuiltExe(path.join(root, 'release'));
+// Version-check the configured application executable only. A Windows
+// electron-builder layout also contains helpers such as elevate.exe; selecting
+// the first recursive .exe makes their unrelated ProductVersion fail an
+// otherwise valid release after packaging has already succeeded.
+const builtExe = await findPackagedWindowsExecutable(path.join(root, 'release'), build.executableName);
 if (builtExe) {
   if (process.platform === 'win32') {
-    const out = execFileSync('powershell', ['-NoProfile', '-Command', `(Get-Item '${builtExe.replaceAll("'", "''")}').VersionInfo.ProductVersion`], { encoding: 'utf8' }).trim();
-    assert(out.startsWith(pkg.version), `built exe ProductVersion ${out} does not match package.json ${pkg.version}`);
+    try {
+      const out = execFileSync('powershell', ['-NoProfile', '-Command', `(Get-Item '${builtExe.replaceAll("'", "''")}').VersionInfo.ProductVersion`], { encoding: 'utf8' }).trim();
+      assert(out.startsWith(pkg.version), `packaged ${path.basename(builtExe)} ProductVersion ${out} does not match package.json ${pkg.version}`);
+    } catch (error) {
+      assert(false, `could not read packaged ${path.basename(builtExe)} ProductVersion: ${String(error?.message || error).slice(0, 300)}`);
+    }
   } else {
     console.log(`windows version resource check deferred on non-Windows host for ${path.relative(root, builtExe)}; CI Windows runs scripts/assert-windows-version.mjs`);
   }
 } else {
-  console.log('windows version resource check deferred: no built .exe present in release/');
+  console.log(`windows version resource check deferred: no unpacked ${build.executableName}.exe is present in release/`);
 }
 
 if (failures.length) {
   console.error('packaging verification failed:');
-  for (const failure of failures) console.error(` - ${failure}`);
+  for (const failure of failures) {
+    console.error(` - ${failure}`);
+    // Actions log archives can be inaccessible after a failed matrix job.
+    // Emit the actual verifier reason as a check annotation as well, so the
+    // next failure is diagnosable from GitHub's always-available job API.
+    if (process.env.GITHUB_ACTIONS === 'true') {
+      console.error(`::error title=Packaging verification::${escapeWorkflowCommand(failure)}`);
+    }
+  }
   process.exit(1);
 }
 console.log('packaging verification passed: desktop config, PDF.js app.asar assets, hook syntax, icons, and version lockstep are valid');
@@ -118,15 +135,6 @@ function parseDesktop(text) {
   }
   return out;
 }
-async function findBuiltExe(dir) {
-  if (!existsSync(dir)) return null;
-  for (const entry of await readdir(dir)) {
-    const absolute = path.join(dir, entry);
-    const info = await stat(absolute);
-    if (info.isDirectory()) {
-      const nested = await findBuiltExe(absolute);
-      if (nested) return nested;
-    } else if (/\.exe$/i.test(entry)) return absolute;
-  }
-  return null;
+function escapeWorkflowCommand(value) {
+  return String(value).replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
 }
