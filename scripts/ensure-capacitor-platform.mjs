@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { cp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
+import { updateIosProjectVersion } from './lib/ios-project.mjs';
 
 const platform = process.argv[2];
 if (!['android', 'ios'].includes(platform)) {
@@ -77,6 +78,16 @@ async function injectIosUrlScheme() {
   plist = plist.replace(closingDict, `\n${urlTypes}$1`);
   await writeFile(plistPath, plist);
   console.log('injected Google sign-in URL scheme into Info.plist');
+}
+
+async function syncIosVersion() {
+  const projectPath = path.join(root, 'ios/App/App.xcodeproj/project.pbxproj');
+  if (!existsSync(projectPath)) return;
+
+  const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
+  const result = updateIosProjectVersion(await readFile(projectPath, 'utf8'), pkg.version);
+  await writeFile(projectPath, result.project);
+  console.log(`synced iOS project version ${pkg.version} (${result.buildNumber})`);
 }
 
 // --- System-wide floating bubble (SYSTEM_ALERT_WINDOW overlay) -----------
@@ -249,6 +260,7 @@ if (platform === 'android') {
 }
 if (platform === 'ios') {
   await injectIosUrlScheme();
+  await syncIosVersion();
   const src = path.join(root, 'native-assets/ios/AppIcon.appiconset');
   const dest = path.join(root, 'ios/App/App/Assets.xcassets/AppIcon.appiconset');
   if (existsSync(src) && existsSync(path.join(root, 'ios'))) {

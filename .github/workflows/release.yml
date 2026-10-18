@@ -501,10 +501,10 @@ jobs:
           APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
         run: |
           if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
-            xcodebuild -workspace ios/App/App.xcworkspace -scheme App -configuration Release -destination generic/platform=iOS DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Automatic -allowProvisioningUpdates -authenticationKeyPath "$APPLE_AUTH_KEY_PATH" -authenticationKeyID "$APP_STORE_CONNECT_KEY_ID" -authenticationKeyIssuerID "$APP_STORE_CONNECT_ISSUER_ID" -archivePath build/yayra.xcarchive archive
+            xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Release -destination generic/platform=iOS DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Automatic -allowProvisioningUpdates -authenticationKeyPath "$APPLE_AUTH_KEY_PATH" -authenticationKeyID "$APP_STORE_CONNECT_KEY_ID" -authenticationKeyIssuerID "$APP_STORE_CONNECT_ISSUER_ID" -archivePath build/yayra.xcarchive archive
             xcodebuild -exportArchive -archivePath build/yayra.xcarchive -exportPath build/ios-export -exportOptionsPlist ios/exportOptions.plist -allowProvisioningUpdates -authenticationKeyPath "$APPLE_AUTH_KEY_PATH" -authenticationKeyID "$APP_STORE_CONNECT_KEY_ID" -authenticationKeyIssuerID "$APP_STORE_CONNECT_ISSUER_ID"
           else
-            xcodebuild -workspace ios/App/App.xcworkspace -scheme App -configuration Release -destination generic/platform=iOS CODE_SIGNING_ALLOWED=NO archive -archivePath build/yayra.xcarchive
+            xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Release -destination generic/platform=iOS CODE_SIGNING_ALLOWED=NO archive -archivePath build/yayra.xcarchive
           fi
       - id: artifact
         shell: bash
