@@ -265,3 +265,50 @@ export const buildPowerPointDeck = async (opts = {}) => {
 </p:notes>`);
   return zip.generateAsync({ type: 'uint8array' });
 };
+
+/**
+ * Realistic PowerPoint video placeholder: poster in p:blipFill plus either
+ * the legacy a:videoFile relationship or the PowerPoint 2010+ p14:media form.
+ * The tiny MP4 prefix is sufficient to verify byte-preserving local routing;
+ * browser codec playback itself remains native.
+ */
+export const buildPowerPointVideoDeck = async ({ modern = false, linked = false } = {}) => {
+  const zip = new JSZip();
+  const clipRelationship = modern ? 'media' : 'video';
+  const mediaMarker = modern
+    ? `<p:extLst><p:ext uri="{DAA4B4D4-6D71-4841-9C94-3DE7FCFB9230}"><p14:media xmlns:p14="http://schemas.microsoft.com/office/powerpoint/2010/main" r:embed="rId3"/></p:ext></p:extLst>`
+    : '<a:videoFile r:link="rId3"/>';
+
+  zip.file('ppt/presentation.xml', `<?xml version="1.0"?>
+<p:presentation xmlns:p="${P}" xmlns:a="${A}" xmlns:r="${R}">
+  <p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst>
+  <p:sldSz cx="9144000" cy="6858000"/>
+</p:presentation>`);
+  zip.file('ppt/_rels/presentation.xml.rels', `<Relationships xmlns="${REL_NS}">
+  <Relationship Id="rId1" Type="${REL('slide')}" Target="slides/slide1.xml"/>
+</Relationships>`);
+  zip.file('ppt/slides/slide1.xml', `<?xml version="1.0"?>
+<p:sld xmlns:p="${P}" xmlns:a="${A}" xmlns:r="${R}">
+  <p:cSld><p:spTree>
+    <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>
+    <p:pic>
+      <p:nvPicPr><p:cNvPr id="2" name="Training video"/><p:cNvPicPr/><p:nvPr>${mediaMarker}</p:nvPr></p:nvPicPr>
+      <p:blipFill><a:blip r:embed="rId2"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>
+      <p:spPr><a:xfrm><a:off x="914400" y="914400"/><a:ext cx="3657600" cy="2743200"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr>
+    </p:pic>
+  </p:spTree></p:cSld>
+</p:sld>`);
+  zip.file('ppt/slides/_rels/slide1.xml.rels', `<Relationships xmlns="${REL_NS}">
+  <Relationship Id="rId2" Type="${REL('image')}" Target="../media/poster1.png"/>
+  <Relationship Id="rId3" Type="${REL(clipRelationship)}" Target="${linked ? 'https://media.example/training.mp4' : '../media/clip1.mp4'}"${linked ? ' TargetMode="External"' : ''}/>
+</Relationships>`);
+  zip.file('ppt/media/poster1.png', PNG_BYTES);
+  if (!linked) {
+    zip.file('ppt/media/clip1.mp4', new Uint8Array([
+      0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70,
+      0x69, 0x73, 0x6f, 0x6d, 0x00, 0x00, 0x02, 0x00,
+      0x69, 0x73, 0x6f, 0x6d, 0x6d, 0x70, 0x34, 0x32,
+    ]));
+  }
+  return zip.generateAsync({ type: 'uint8array' });
+};

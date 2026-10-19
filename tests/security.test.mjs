@@ -11,6 +11,7 @@ test('CSP is pinned to self, exact hosts, and desktop custom scheme', () => {
   assert.match(csp, /worker-src 'self' blob: yayra:/, 'offline PDF.js workers work on both the app scheme and file fallback');
   assert.match(csp, /style-src 'self' 'unsafe-inline' yayra:/);
   assert.match(csp, /img-src 'self' data: blob: yayra: https:\/\/yayra\.pages\.dev https:\/\/icons\.duckduckgo\.com https:\/\/lh3\.googleusercontent\.com/);
+  assert.match(csp, /media-src 'self' blob: yayra:/, 'embedded PPTX video can play only from same-origin or local in-memory blobs');
   assert.match(csp, /connect-src 'self' yayra: https:\/\/yayra-updates-api\.g2code335\.workers\.dev/);
   assert.match(csp, /form-action 'self' https:\/\/lens\.google\.com/,
     'local image files can post directly to Google Lens without passing through Yayra');

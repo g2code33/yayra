@@ -32,6 +32,10 @@ const { applyVaapiPolicy } = require('./vaapiProbe.cjs');
 const { createWindowDragController } = require('./windowDrag.cjs');
 
 const CUSTOM_SCHEME = 'yayra';
+// Keep local-document IPC bounded before any file is read into memory. This
+// mirrors MAX_DOCUMENT_BYTES in the browser workspace (CommonJS cannot import
+// that browser ESM module during Electron startup).
+const MAX_DOCUMENT_BYTES = 300 * 1024 * 1024;
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 let mainWindow;
 let downloadsBridge = null;
@@ -348,7 +352,7 @@ const pendingPdfFiles = []; // legacy name: local documents queued until the ren
 function deliverPdfFile(filePath) {
   try {
     const stat = fs.statSync(filePath);
-    if (!stat.isFile() || stat.size > 150 * 1024 * 1024) return false;
+    if (!stat.isFile() || stat.size > MAX_DOCUMENT_BYTES) return false;
     const data = fs.readFileSync(filePath);
     const payload = { name: path.basename(filePath), size: stat.size, data };
     const rendererReady = mainWindow && !mainWindow.isDestroyed()
@@ -972,7 +976,7 @@ function registerIpcBridges() {
   // spreadsheets, images and text have bundled offline viewers; older/unknown
   // files receive an honest original-file fallback. The path never crosses
   // IPC, nothing else on disk is reachable, and every format shares the same
-  // 150 MB ceiling.
+  // 300 MB ceiling.
   ipcMain.handle('yayra:doc-open', async () => {
     try {
       const picked = await dialog.showOpenDialog({
@@ -991,7 +995,7 @@ function registerIpcBridges() {
       const filePath = picked.filePaths[0];
       const stat = await fs.promises.stat(filePath);
       if (!stat.isFile()) return { ok: false, reason: 'not-a-file' };
-      if (stat.size > 150 * 1024 * 1024) return { ok: false, reason: 'file-too-large' };
+      if (stat.size > MAX_DOCUMENT_BYTES) return { ok: false, reason: 'file-too-large' };
       const data = await fs.promises.readFile(filePath);
       return { ok: true, name: path.basename(filePath), size: stat.size, data };
     } catch (err) {
@@ -1012,7 +1016,7 @@ function registerIpcBridges() {
       fs.mkdirSync(dir, { recursive: true });
       const filePath = path.join(dir, `${Date.now().toString(36)}-${safeName}`);
       const bytes = data.byteLength !== undefined ? Buffer.from(data) : Buffer.from(new Uint8Array(0));
-      if (bytes.length === 0 || bytes.length > 150 * 1024 * 1024) return { ok: false, reason: 'bad-size' };
+      if (bytes.length === 0 || bytes.length > MAX_DOCUMENT_BYTES) return { ok: false, reason: 'bad-size' };
       fs.writeFileSync(filePath, bytes);
       const result = await shell.openPath(filePath);
       if (result !== '') return { ok: false, reason: String(result) };
@@ -1129,7 +1133,7 @@ function registerIpcBridges() {
       if (!item || !item.path) return { ok: false, reason: 'not-found' };
       const stat = await fs.promises.stat(item.path);
       if (!stat.isFile()) return { ok: false, reason: 'not-a-file' };
-      if (stat.size > 150 * 1024 * 1024) return { ok: false, reason: 'file-too-large' };
+      if (stat.size > MAX_DOCUMENT_BYTES) return { ok: false, reason: 'file-too-large' };
       const data = await fs.promises.readFile(item.path);
       return { ok: true, name: path.basename(item.path), size: stat.size, data };
     } catch (err) {

@@ -3545,6 +3545,13 @@ var require_dist = __commonJS({
 // scripts/vendor-src/pptxRenderer.ts
 var import_jszip = __toESM(require_jszip_min(), 1);
 var import_dingbat_to_unicode = __toESM(require_dist(), 1);
+/*!
+ * Adapted from g2code33/pharmaTRACK_PERFECT_new at
+ * 19edf65562e25d0827f655e0c799cfe83554abc6.
+ * Copyright (c) 2026 G2CODE33. Licensed under the MIT License.
+ * The generated browser module retains this notice and ships with
+ * packages/shared-ui/src/vendor/documents/PHARMATRACK-MIT-LICENSE.
+ */
 var EMU_PER_PX = 9525;
 var DEFAULT_SLIDE_CX = 12192e3;
 var DEFAULT_SLIDE_CY = 6858e3;
@@ -4027,6 +4034,36 @@ function resolveZipPath(fromDir, target) {
   }
   return parts.join("/");
 }
+function mediaMimeForPath(path) {
+  const extension = path.toLowerCase().split(/[?#]/, 1)[0].split(".").pop() || "";
+  const mimeByExtension = {
+    mp4: "video/mp4",
+    m4v: "video/mp4",
+    mov: "video/quicktime",
+    webm: "video/webm",
+    ogv: "video/ogg",
+    avi: "video/x-msvideo",
+    wmv: "video/x-ms-wmv",
+    mpg: "video/mpeg",
+    mpeg: "video/mpeg",
+    mp3: "audio/mpeg",
+    m4a: "audio/mp4",
+    aac: "audio/aac",
+    wav: "audio/wav",
+    oga: "audio/ogg",
+    ogg: "audio/ogg",
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    webp: "image/webp",
+    svg: "image/svg+xml",
+    bmp: "image/bmp",
+    tif: "image/tiff",
+    tiff: "image/tiff"
+  };
+  return mimeByExtension[extension] || "";
+}
 async function loadRelsFor(zip, partPath) {
   const idx = partPath.lastIndexOf("/");
   const dir = partPath.slice(0, idx);
@@ -4331,12 +4368,15 @@ function parsePic(pic, ctx) {
   const box = applyT(ctx.t, parseXfrm(spPr));
   const blipFill = child(pic, "p:blipFill");
   const blip = blipFill ? child(blipFill, "a:blip") : null;
-  const rid = blip?.getAttribute("r:embed");
+  const rid = blip?.getAttribute("r:embed") || blip?.getAttribute("r:link") || void 0;
   const url = rid ? ctx.imageUrls.get(rid) : void 0;
   if (url) ctx.imageList.push(url);
+  const videoEl = pic.getElementsByTagName("a:videoFile")[0] ?? pic.getElementsByTagName("p14:media")[0];
+  const videoRid = videoEl?.getAttribute("r:link") || videoEl?.getAttribute("r:embed") || void 0;
+  const videoUrl = videoRid ? ctx.videoUrls.get(videoRid) : void 0;
   const shape = {
     id: ctx.nextId(),
-    type: "image",
+    type: videoRid ? "video" : "image",
     x: box.x,
     y: box.y,
     w: Math.max(box.w, 0),
@@ -4345,6 +4385,8 @@ function parsePic(pic, ctx) {
     geom: child(spPr, "a:prstGeom")?.getAttribute("prst") || "rect",
     imageUrl: url,
     imageRid: rid || void 0,
+    videoUrl,
+    videoRid,
     textScale: 1,
     isTitle: false
   };
@@ -4475,6 +4517,7 @@ async function openPptxDeck(blob, opts) {
   const pathRefs = /* @__PURE__ */ new Map();
   const slideLoadedPaths = /* @__PURE__ */ new Map();
   const jobs = /* @__PURE__ */ new Map();
+  const loadedPreviewMedia = /* @__PURE__ */ new Set();
   const loadedMedia = /* @__PURE__ */ new Set();
   const inflight = /* @__PURE__ */ new Map();
   let alive = true;
@@ -4488,7 +4531,10 @@ async function openPptxDeck(blob, opts) {
     const media = zip.file(path);
     if (!media) return void 0;
     try {
-      const url = URL.createObjectURL(await media.async("blob"));
+      const rawBlob = await media.async("blob");
+      const mime = mediaMimeForPath(path);
+      const typedBlob = mime && rawBlob.type !== mime ? rawBlob.slice(0, rawBlob.size, mime) : rawBlob;
+      const url = URL.createObjectURL(typedBlob);
       if (!alive) {
         try {
           URL.revokeObjectURL(url);
@@ -4517,16 +4563,19 @@ async function openPptxDeck(blob, opts) {
     const doc = new DOMParser().parseFromString(content, "text/xml");
     const rels = await loadRelsCached(slidePath);
     const imageUrls = /* @__PURE__ */ new Map();
+    const videoUrls = /* @__PURE__ */ new Map();
     if (!lazyMedia) {
       for (const [rid, rel] of rels) {
-        if (!rel.type.endsWith("/image")) continue;
+        const isImage = rel.type.endsWith("/image");
+        const isClip = rel.type.endsWith("/video") || rel.type.endsWith("/audio") || rel.type.endsWith("/media");
+        if (!isImage && !isClip) continue;
         const path = resolveZipPath("ppt/slides", rel.target);
         const media = zip.file(path);
         if (!media) continue;
         try {
           const url = await urlFor(path, i + 1);
           if (url) {
-            imageUrls.set(rid, url);
+            (isImage ? imageUrls : videoUrls).set(rid, url);
             const list = slideLoadedPaths.get(i + 1) ?? [];
             if (!list.includes(path)) {
               list.push(path);
@@ -4567,6 +4616,7 @@ async function openPptxDeck(blob, opts) {
     const ctx = {
       t: IDENTITY,
       imageUrls,
+      videoUrls,
       layout,
       sw: slideWidth,
       sh: slideHeight,
@@ -4648,6 +4698,9 @@ async function openPptxDeck(blob, opts) {
   const slideInflight = /* @__PURE__ */ new Map();
   let allParsed = false;
   const revokeSlideMedia = (n) => {
+    loadedPreviewMedia.delete(n);
+    loadedMedia.delete(n);
+    inflight.delete(n);
     const paths = slideLoadedPaths.get(n);
     if (!paths) return;
     for (const path of paths) {
@@ -4701,15 +4754,21 @@ async function openPptxDeck(blob, opts) {
     slideInflight.set(n, run);
     return run;
   };
-  const ensureSlideMedia = (slideNumber) => {
-    if (!alive || loadedMedia.has(slideNumber)) return Promise.resolve();
+  const ensureSlideMedia = (slideNumber, options = {}) => {
+    const includeClips = options.includeClips !== false;
+    if (!alive || (includeClips ? loadedMedia.has(slideNumber) : loadedPreviewMedia.has(slideNumber))) {
+      return Promise.resolve();
+    }
     const pending = inflight.get(slideNumber);
-    if (pending) return pending;
+    if (pending) {
+      return pending.then(() => ensureSlideMedia(slideNumber, options));
+    }
     const run = (async () => {
       const job = jobs.get(slideNumber);
       const slide = parsedSlides.get(slideNumber);
       if (!job || !slide) {
-        loadedMedia.add(slideNumber);
+        loadedPreviewMedia.add(slideNumber);
+        if (includeClips) loadedMedia.add(slideNumber);
         return;
       }
       const note = (path) => {
@@ -4720,29 +4779,48 @@ async function openPptxDeck(blob, opts) {
           slideLoadedPaths.set(slideNumber, list);
         }
       };
-      if (job.slideBgPath) {
-        slide.backgroundImageUrl = await urlFor(job.slideBgPath, slideNumber) ?? slide.backgroundImageUrl;
-        note(job.slideBgPath);
-      } else if (job.layoutBgPath && !slide.backgroundImageUrl) {
-        const layoutUrl = await urlFor(job.layoutBgPath, slideNumber);
-        if (layoutUrl) {
-          note(job.layoutBgPath);
-          slide.backgroundImageUrl = layoutUrl;
+      if (!loadedPreviewMedia.has(slideNumber)) {
+        if (job.slideBgPath) {
+          slide.backgroundImageUrl = await urlFor(job.slideBgPath, slideNumber) ?? slide.backgroundImageUrl;
+          note(job.slideBgPath);
+        } else if (job.layoutBgPath && !slide.backgroundImageUrl) {
+          const layoutUrl = await urlFor(job.layoutBgPath, slideNumber);
+          if (layoutUrl) {
+            note(job.layoutBgPath);
+            slide.backgroundImageUrl = layoutUrl;
+          }
         }
+        for (const shape of slide.shapes) {
+          if (!shape.imageRid || shape.imageUrl) continue;
+          const rel = job.rels.get(shape.imageRid);
+          if (!rel || !rel.type.endsWith("/image")) continue;
+          const path = resolveZipPath("ppt/slides", rel.target);
+          const url = await urlFor(path, slideNumber);
+          if (!url) continue;
+          note(path);
+          shape.imageUrl = url;
+          if (!slide.images.includes(url)) slide.images.push(url);
+        }
+        loadedPreviewMedia.add(slideNumber);
       }
-      for (const shape of slide.shapes) {
-        if (!shape.imageRid || shape.imageUrl) continue;
-        const rel = job.rels.get(shape.imageRid);
-        if (!rel || !rel.type.endsWith("/image")) continue;
-        const path = resolveZipPath("ppt/slides", rel.target);
-        const url = await urlFor(path, slideNumber);
-        if (!url) continue;
-        note(path);
-        shape.imageUrl = url;
-        if (!slide.images.includes(url)) slide.images.push(url);
+      if (includeClips) {
+        for (const shape of slide.shapes) {
+          if (!shape.videoRid || shape.videoUrl) continue;
+          const videoRel = job.rels.get(shape.videoRid);
+          if (videoRel && (videoRel.type.endsWith("/video") || videoRel.type.endsWith("/audio") || videoRel.type.endsWith("/media"))) {
+            const videoPath = resolveZipPath("ppt/slides", videoRel.target);
+            const videoUrl = await urlFor(videoPath, slideNumber);
+            if (videoUrl) {
+              note(videoPath);
+              shape.videoUrl = videoUrl;
+            }
+          }
+        }
+        loadedMedia.add(slideNumber);
       }
-      loadedMedia.add(slideNumber);
-    })();
+    })().finally(() => {
+      inflight.delete(slideNumber);
+    });
     inflight.set(slideNumber, run);
     return run;
   };
@@ -4760,7 +4838,10 @@ async function openPptxDeck(blob, opts) {
       for (const s of slides) {
         parsedSlides.set(s.slideNumber, s);
       }
-      if (!lazyMedia) slides.forEach((s) => loadedMedia.add(s.slideNumber));
+      if (!lazyMedia) slides.forEach((s) => {
+        loadedPreviewMedia.add(s.slideNumber);
+        loadedMedia.add(s.slideNumber);
+      });
       allParsed = true;
     }
     return slides;
@@ -4813,6 +4894,7 @@ async function openPptxDeck(blob, opts) {
     relsCache.clear();
     layoutCache.clear();
     inflight.clear();
+    loadedPreviewMedia.clear();
     loadedMedia.clear();
     urlRevoke.forEach((u) => {
       try {

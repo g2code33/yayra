@@ -23,6 +23,9 @@ export function buildContentSecurityPolicy() {
     `worker-src 'self' blob: ${scheme}`,
     `style-src 'self' 'unsafe-inline' ${scheme}`,
     `img-src ${imgSources.join(' ')}`,
+    // PPTX clips are read from the selected local file and exposed only as
+    // in-memory blob: URLs. No document media origin is reachable here.
+    `media-src 'self' blob: ${scheme}`,
     `connect-src ${connectSources.join(' ')}`,
     // The browser shell intentionally hosts navigated HTTP(S) pages in its
     // sandboxed webview. frame-ancestors is an HTTP-response directive and is

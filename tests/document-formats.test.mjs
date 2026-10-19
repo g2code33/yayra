@@ -4,7 +4,7 @@ import JSZip from 'jszip';
 import * as FixtureXlsx from '@e965/xlsx';
 import { parseHTML } from 'linkedom';
 import { DOMParser as NamespaceDomParser, XMLSerializer } from '@xmldom/xmldom';
-import { buildPowerPointDeck } from './fixtures/pptx-powerpoint-fixture.mjs';
+import { buildPowerPointDeck, buildPowerPointVideoDeck } from './fixtures/pptx-powerpoint-fixture.mjs';
 
 // docx-preview needs namespace-aware XML localName values. linkedom provides
 // the live HTML tree while xmldom parses the OOXML package parts.
@@ -181,6 +181,83 @@ test('PPTX REAL ENGINE: PowerPoint geometry, themes, image crop, merged table, n
     assert.match(index[0].text, /Notes: Emphasise the beta blocker contraindication/);
   } finally {
     deck.dispose();
+  }
+});
+
+test('PPTX VIDEO ENGINE: legacy and p14 clips stay lazy, preserve posters, and receive a playable MIME', async () => {
+  for (const modern of [false, true]) {
+    const bytes = await buildPowerPointVideoDeck({ modern });
+    const deck = await pptxEngine.openPptxDeck(new Blob([bytes]), { lazyMedia: true });
+    try {
+      const slide = await deck.getSlide(1);
+      const video = slide.shapes.find((shape) => shape.type === 'video');
+      assert.ok(video, `${modern ? 'p14:media' : 'a:videoFile'} is recognised as a video shape`);
+      assert.equal(video.imageUrl, undefined, 'poster starts lazy');
+      assert.equal(video.videoUrl, undefined, 'clip starts lazy');
+
+      await deck.ensureSlideMedia(1, { includeClips: false });
+      assert.match(video.imageUrl, /^blob:/, 'thumbnail pass resolves the poster');
+      assert.equal(video.videoUrl, undefined, 'thumbnail pass never decompresses the movie');
+      assert.equal((await fetch(video.imageUrl)).headers.get('content-type'), 'image/png');
+
+      await deck.ensureSlideMedia(1);
+      assert.match(video.videoUrl, /^blob:/, 'opening the slide resolves the embedded clip locally');
+      assert.equal((await fetch(video.videoUrl)).headers.get('content-type'), 'video/mp4');
+      assert.equal(video.w, 384);
+      assert.equal(video.h, 288);
+    } finally {
+      deck.dispose();
+    }
+  }
+});
+
+test('PPTX VIDEO CONTROLLER: embedded clips use native controls, poster thumbnails, and media-owned keyboard input', async () => {
+  const host = mount();
+  const state = createDocumentViewerState('pptx');
+  const viewer = createPptxViewer({ container: host, state, fileName: 'video-training.pptx' });
+  try {
+    await viewer.load(await buildPowerPointVideoDeck());
+    assert.equal(state.status, 'ready');
+    const video = host.querySelector('video.fb-pptx-video');
+    assert.ok(video, 'the embedded movie is a real HTML video element');
+    assert.equal(video.hasAttribute('controls'), true);
+    assert.equal(video.hasAttribute('autoplay'), false, 'opening a deck never starts sound unexpectedly');
+    assert.equal(video.getAttribute('preload'), 'metadata');
+    assert.equal(video.hasAttribute('playsinline'), true);
+    assert.match(video.getAttribute('src'), /^blob:/);
+    assert.match(video.getAttribute('poster'), /^blob:/);
+    assert.equal(host.querySelector('.fb-pptx-slide-canvas').getAttribute('role'), 'group', 'interactive media remains exposed to assistive technology');
+    assert.equal(viewer.handleKeydown({ key: 'ArrowRight', target: video }), null, 'focused video keeps arrow keys for seeking');
+
+    const thumbnail = mount(150, 100);
+    await viewer.renderThumbnail(1, thumbnail);
+    assert.equal(thumbnail.querySelector('video'), null, 'thumbnail rails never create media players');
+    assert.ok(thumbnail.querySelector('.fb-pptx-video-poster'), 'the static poster represents video in a thumbnail');
+    removeMount(thumbnail);
+
+    video.dispatchEvent(new window.Event('error'));
+    assert.equal(host.querySelector('video'), null, 'unsupported codecs degrade to the slide’s poster instead of a broken player');
+    assert.ok(host.querySelector('.fb-pptx-video-codec-fallback'));
+  } finally {
+    viewer.destroy();
+    removeMount(host);
+  }
+});
+
+test('PPTX VIDEO OFFLINE FALLBACK: linked-only movies never fetch externally and retain their poster', async () => {
+  const host = mount();
+  const state = createDocumentViewerState('pptx');
+  const viewer = createPptxViewer({ container: host, state, fileName: 'linked-video.pptx' });
+  try {
+    await viewer.load(await buildPowerPointVideoDeck({ linked: true }));
+    assert.equal(state.status, 'ready');
+    assert.equal(host.querySelector('video'), null, 'an unavailable linked clip is not exposed as a broken player');
+    const poster = host.querySelector('.fb-pptx-video-poster');
+    assert.ok(poster, 'PowerPoint poster remains visible');
+    assert.match(poster.title, /linked rather than embedded/i);
+  } finally {
+    viewer.destroy();
+    removeMount(host);
   }
 });
 

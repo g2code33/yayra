@@ -37,11 +37,11 @@ export const DOCUMENT_ENGINES = Object.freeze({
       'application/vnd.ms-powerpoint.presentation.macroenabled.12'
     ]),
     engine: 'Native PPTX renderer (bundled)',
-    limitations: 'Animations, transitions, macros and OLE objects are not executed. Charts and SmartArt use static or explanatory frames; embedded pictures are rendered.',
+    limitations: 'Animations, transitions, macros and OLE objects are not executed. Embedded videos play when the browser supports their codec; linked-only clips stay offline and show their poster. Charts and SmartArt use static or explanatory frames.',
     capabilities: caps({
       view: true, search: true, zoom: true, pageNavigation: true,
       rotate: false, nightMode: false, outline: false, thumbnails: true,
-      notes: true, sheets: false, animate: false,
+      notes: true, sheets: false, animate: false, embeddedVideo: true,
       annotate: false, edit: false, save: false, export: false, print: false
     })
   }),
@@ -127,7 +127,7 @@ export const DOCUMENT_ENGINES = Object.freeze({
   })
 });
 
-export const MAX_DOCUMENT_BYTES = 150 * 1024 * 1024;
+export const MAX_DOCUMENT_BYTES = 300 * 1024 * 1024;
 
 export const DOCUMENT_ACCEPT = Object.freeze([
   '.pdf', '.pptx', '.pptm', '.docx', '.xlsx', '.xlsm', '.xls', '.csv',
@@ -199,7 +199,7 @@ function hasAscii(bytes, needle, start = 0, end = bytes.length) {
  * ZIP entry names are present uncompressed in both local and central headers,
  * so Office Open XML packages can be distinguished without parsing the whole
  * archive. We scan a bounded prefix plus the central-directory tail to keep a
- * 150 MB deck from causing an equally large temporary string allocation.
+ * 300 MB deck from causing an equally large temporary string allocation.
  */
 export function sniffDocumentKind(value, fileName = '', mimeType = '') {
   const bytes = bytesOf(value);

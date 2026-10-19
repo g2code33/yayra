@@ -102,12 +102,14 @@ test('REGISTRY: bundled viewers and explicit legacy fallbacks advertise honest c
   }
   assert.equal(DOCUMENT_ENGINES.pdf.capabilities.print, true);
   assert.equal(DOCUMENT_ENGINES.pptx.capabilities.notes, true);
+  assert.equal(DOCUMENT_ENGINES.pptx.capabilities.embeddedVideo, true);
   assert.equal(DOCUMENT_ENGINES.xlsx.capabilities.sheets, true);
   assert.equal(DOCUMENT_ENGINES.image.capabilities.search, false);
   assert.equal(DOCUMENT_ENGINES.unsupported.capabilities.view, false);
 });
 
 test('STORE: in-memory, no paths, unique ids, empty files refused', () => {
+  assert.equal(MAX_DOCUMENT_BYTES, 300 * 1024 * 1024, 'every renderer entry point shares the requested 300 MB ceiling');
   const store = makeStore();
   const a = store.add({ name: 'a.pdf', bytes: new Uint8Array([1, 2, 3]) });
   const b = store.add({ name: 'b.pdf', bytes: new Uint8Array([4, 5]) });
@@ -120,7 +122,7 @@ test('STORE: in-memory, no paths, unique ids, empty files refused', () => {
   assert.equal(store.get(a.id), null);
   assert.throws(() => store.add({ name: 'empty.pdf', bytes: new Uint8Array([]) }), /empty/);
   assert.throws(() => store.add({ name: 'too-large.pdf', bytes: { byteLength: MAX_DOCUMENT_BYTES + 1 } }), /document-too-large/,
-    'the document store enforces the same 150 MB ceiling for every open path');
+    'the document store enforces the same 300 MB ceiling for every open path');
 });
 
 test('VIEWER: load -> ready with page count; navigation is clamped to the document', async () => {
@@ -465,6 +467,7 @@ test('DRAWER ENTRY: "Open document" is offered in the menu on every platform', a
 
 test('SECURITY (source pin): the Electron document IPC returns BYTES ONLY - never a file path', () => {
   const src = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
+  assert.match(src, /const MAX_DOCUMENT_BYTES = 300 \* 1024 \* 1024;/, 'Electron pins the same 300 MB limit before reading');
   const start = src.indexOf("ipcMain.handle('yayra:doc-open'");
   assert.ok(start > -1, 'the doc-open handler exists');
   const block = src.slice(start, src.indexOf("'read-failed'", start) + 40);
@@ -472,7 +475,7 @@ test('SECURITY (source pin): the Electron document IPC returns BYTES ONLY - neve
   for (const extension of ['pdf', 'pptx', 'docx', 'xlsx', 'csv', 'png', 'txt']) {
     assert.match(block, new RegExp(`['"]${extension}['"]`), `${extension} is offered by the document picker`);
   }
-  assert.match(block, /150 \* 1024 \* 1024/, 'a size cap exists');
+  assert.match(block, /stat\.size > MAX_DOCUMENT_BYTES/, 'the shared 300 MB size cap is checked before readFile');
   // The response object carries exactly { ok, canceled?, reason?, name, size, data }.
   const returns = [...block.matchAll(/return \{([^}]*)\}/g)].map((m) => m[1]);
   assert.ok(returns.every((r) => !/:\s*filePath/.test(r)), 'no return value exposes the filesystem path');

@@ -196,7 +196,80 @@ function renderImage(doc, shape, showImages) {
   return clip;
 }
 
-function renderShape(doc, shape, helpers, showImages) {
+function stopMediaEvent(event) {
+  event?.stopPropagation?.();
+}
+
+function renderVideo(doc, shape, showImages, thumbnail) {
+  if (!showImages || shape.w <= 0 || shape.h <= 0) return null;
+
+  // Thumbnails must stay lightweight and non-interactive. Linked-only clips
+  // also remain offline: PowerPoint's poster frame is the honest fallback and
+  // no external relationship is fetched by the document engine.
+  if (thumbnail || !shape.videoUrl) {
+    if (shape.imageUrl) {
+      const poster = doc.createElement('img');
+      poster.className = 'fb-pptx-shape fb-pptx-video-poster';
+      poster.src = shape.imageUrl;
+      poster.alt = thumbnail ? '' : 'Video poster; the linked clip is unavailable offline';
+      poster.draggable = false;
+      poster.loading = 'lazy';
+      poster.style.cssText = `${shapeBase(shape)};object-fit:contain;background:#000;user-select:none;`;
+      if (!thumbnail && !shape.videoUrl) poster.title = 'This video is linked rather than embedded, so only its poster is available offline.';
+      return poster;
+    }
+    const unavailable = doc.createElement('div');
+    unavailable.className = 'fb-pptx-shape fb-pptx-video-unavailable';
+    unavailable.setAttribute('role', 'img');
+    unavailable.setAttribute('aria-label', 'Embedded video unavailable');
+    unavailable.style.cssText = `${shapeBase(shape)};display:flex;align-items:center;justify-content:center;padding:8px;box-sizing:border-box;background:#000;color:#fff;font:600 12px ${FONT_STACK};text-align:center;`;
+    unavailable.textContent = thumbnail ? 'Video' : 'Video unavailable';
+    return unavailable;
+  }
+
+  const video = doc.createElement('video');
+  video.className = 'fb-pptx-shape fb-pptx-video';
+  video.dataset.pptxVideo = 'true';
+  video.src = shape.videoUrl;
+  video.setAttribute('src', shape.videoUrl);
+  if (shape.imageUrl) {
+    video.poster = shape.imageUrl;
+    video.setAttribute('poster', shape.imageUrl);
+  }
+  video.controls = true;
+  video.setAttribute('controls', '');
+  video.preload = 'metadata';
+  video.setAttribute('preload', 'metadata');
+  video.playsInline = true;
+  video.setAttribute('playsinline', '');
+  video.tabIndex = 0;
+  video.setAttribute('aria-label', 'Embedded video');
+  video.title = 'Click to play. When focused, Space pauses or resumes and arrow keys seek.';
+  video.style.cssText = `${shapeBase(shape)};object-fit:contain;background:#000;`;
+  // Slide navigation uses the same keys as native media controls. Once the
+  // player is focused, its clicks and key presses belong to it alone.
+  for (const type of ['click', 'dblclick', 'mousedown', 'pointerdown', 'keydown']) {
+    video.addEventListener(type, stopMediaEvent);
+  }
+  video.addEventListener('error', () => {
+    // Chromium cannot decode every historical PowerPoint codec (notably some
+    // WMV variants). Keep the slide visually faithful instead of replacing
+    // the entire video frame with a broken-media glyph.
+    if (!shape.imageUrl || !video.parentElement) return;
+    const poster = doc.createElement('img');
+    poster.className = 'fb-pptx-shape fb-pptx-video-poster fb-pptx-video-codec-fallback';
+    poster.src = shape.imageUrl;
+    poster.alt = 'Video poster; this video codec is not supported on this device';
+    poster.draggable = false;
+    poster.title = 'This video’s codec is not supported on this device. The embedded poster is shown instead.';
+    poster.style.cssText = `${shapeBase(shape)};object-fit:contain;background:#000;user-select:none;`;
+    video.parentElement.replaceChild(poster, video);
+  });
+  return video;
+}
+
+function renderShape(doc, shape, helpers, showImages, thumbnail) {
+  if (shape.type === 'video') return renderVideo(doc, shape, showImages, thumbnail);
   if (shape.type === 'image') return renderImage(doc, shape, showImages);
   if (shape.type === 'table') return renderTable(doc, shape);
   if (shape.type === 'line') {
@@ -257,7 +330,11 @@ export function renderPptxSlide(container, {
   const canvas = doc.createElement('div');
   canvas.className = 'fb-pptx-slide-canvas';
   canvas.dataset.slide = String(slide.slideNumber || '');
-  canvas.setAttribute('role', 'img');
+  // role=img makes descendants presentational, which would hide playable
+  // videos from assistive technology. Interactive slides are labelled groups;
+  // ordinary slides retain the concise image-like announcement.
+  const hasVideo = !thumbnail && (slide.shapes || []).some((shape) => shape.type === 'video');
+  canvas.setAttribute('role', hasVideo ? 'group' : 'img');
   canvas.setAttribute('aria-label', `Slide ${slide.slideNumber || ''}${slide.title ? `: ${slide.title}` : ''}`);
   canvas.style.cssText = [
     'position:relative',
@@ -272,7 +349,7 @@ export function renderPptxSlide(container, {
     `font-family:${FONT_STACK}`,
     thumbnail ? 'pointer-events:none;user-select:none' : ''
   ].filter(Boolean).join(';');
-  for (const shape of slide.shapes || []) append(canvas, renderShape(doc, shape, helpers, showImages));
+  for (const shape of slide.shapes || []) append(canvas, renderShape(doc, shape, helpers, showImages, thumbnail));
   frame.appendChild(canvas);
   container.appendChild(frame);
   return { frame, canvas };

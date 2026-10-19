@@ -114,9 +114,9 @@ test('DRAG & DROP: oversized PDFs are refused before reading into memory', async
       size: MAX_DOCUMENT_BYTES + 1,
       arrayBuffer: async () => { readCalls += 1; return new ArrayBuffer(1); }
     }]);
-    assert.equal(readCalls, 0, 'the 150 MB guard runs before allocating file bytes');
+    assert.equal(readCalls, 0, 'the 300 MB guard runs before allocating file bytes');
     assert.equal(shell.state.tabs.filter((tab) => tab.isDocument).length, 0, 'no dead document tab is created');
-    assert.match(notices[0], /150 MB/);
+    assert.match(notices[0], /300 MB/);
   } finally {
     shell.destroy();
     delete globalThis.localStorage;
@@ -133,7 +133,7 @@ test('FILE PICKER: oversized PDFs are rejected before FileReader and the input c
     input.files = [{ name: 'huge.pdf', size: MAX_DOCUMENT_BYTES + 1 }];
     input.value = 'selected';
     input.dispatchEvent({ type: 'change', target: input });
-    assert.match(notices[0], /150 MB/);
+    assert.match(notices[0], /300 MB/);
     assert.equal(input.value, '', 'reset allows selecting a different file after rejection');
     assert.equal(shell.state.tabs.filter((tab) => tab.isDocument).length, 0);
   } finally {
@@ -320,6 +320,7 @@ test('DOWNLOADS RIGHT-CLICK: without the desktop bridge the honest notice shows 
 
 test('SOURCE PIN (main.cjs): OS "Open With" launches, desktop-app escape hatch, downloads->viewer bytes IPC', () => {
   const src = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
+  assert.match(src, /const MAX_DOCUMENT_BYTES = 300 \* 1024 \* 1024;/, 'desktop document routes share the 300 MB ceiling');
   // Open With: a real .pdf file argument is parsed, capped, and delivered.
   const parser = readFileSync(new URL('../electron/pdfLaunch.cjs', import.meta.url), 'utf8');
   assert.match(src, /require\('\.\/pdfLaunch\.cjs'\)/, 'main process uses the desktop-argument parser');
@@ -344,7 +345,7 @@ test('SOURCE PIN (main.cjs): OS "Open With" launches, desktop-app escape hatch, 
   assert.ok(dl > -1, 'downloads-open-pdf handler exists');
   const dlBlock = src.slice(dl, dl + 1000);
   assert.match(dlBlock, /downloadsStore\.load\(\)/, 'the download is looked up by id');
-  assert.match(dlBlock, /150 \* 1024 \* 1024/, 'size capped');
+  assert.match(dlBlock, /stat\.size > MAX_DOCUMENT_BYTES/, 'downloaded documents use the shared 300 MB cap');
   assert.ok(!/:\s*item\.path\s*[,}]/.test(dlBlock), 'no path leaks to the renderer');
 });
 

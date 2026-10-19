@@ -46,7 +46,10 @@ function clamp(value, min, max) {
 
 function isTypingTarget(event) {
   const tag = String(event?.target?.tagName || '').toUpperCase();
-  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || Boolean(event?.target?.isContentEditable);
+  // Native media players own Space/arrow keys for play, seek and volume. Do
+  // not let the document wrapper steal those keys for slide navigation.
+  return ['INPUT', 'TEXTAREA', 'SELECT', 'VIDEO', 'AUDIO', 'BUTTON', 'A'].includes(tag)
+    || Boolean(event?.target?.isContentEditable);
 }
 
 function searchMatches(text, query, page, limit = 500) {
@@ -115,6 +118,25 @@ export function createPptxViewer({
   let renderToken = 0;
   let textIndex = null;
   let textIndexPromise = null;
+  let prefetchTimer = null;
+
+  function scheduleNeighbourPreviews(page) {
+    if (!deck || disposed) return;
+    if (prefetchTimer) clearTimeout(prefetchTimer);
+    const activeDeck = deck;
+    prefetchTimer = setTimeout(() => {
+      prefetchTimer = null;
+      for (const neighbour of [page + 1, page - 1]) {
+        if (disposed || activeDeck !== deck || neighbour < 1 || neighbour > activeDeck.slideCount) continue;
+        // Warm layout, pictures and video posters only. A large movie is
+        // decompressed when its slide is actually opened, never speculatively.
+        void activeDeck.getSlide(neighbour)
+          .then((slideData) => slideData && activeDeck.ensureSlideMedia(neighbour, { includeClips: false }))
+          .catch(() => undefined);
+      }
+    }, 0);
+    prefetchTimer?.unref?.();
+  }
 
   function buildRoot() {
     const doc = host?.ownerDocument || (typeof document !== 'undefined' ? document : null);
@@ -184,6 +206,7 @@ export function createPptxViewer({
       if (body) body.textContent = slideData.notes || 'No speaker notes on this slide.';
       if (notes) notes.style.display = viewerState.showNotes ? 'block' : 'none';
       updates.patch({ slidePending: false, currentText: slideData.text || '', currentNotes: slideData.notes || '' });
+      scheduleNeighbourPreviews(page);
     } catch (error) {
       if (token !== renderToken || disposed) return;
       console.error?.('[yayra:pptx] slide render failed', error);
@@ -305,7 +328,7 @@ export function createPptxViewer({
     try {
       const slideData = await deck.getSlide(page);
       if (!slideData || disposed) return;
-      await deck.ensureSlideMedia(page);
+      await deck.ensureSlideMedia(page, { includeClips: false });
       const width = Math.max(90, Number(target.clientWidth || 132) - 8);
       renderPptxSlide(target, {
         slide: slideData, width: deck.slideWidth, height: deck.slideHeight,
@@ -327,6 +350,8 @@ export function createPptxViewer({
     disposed = true;
     loadToken += 1;
     renderToken += 1;
+    if (prefetchTimer) clearTimeout(prefetchTimer);
+    prefetchTimer = null;
     try { deck?.dispose?.(); } catch { /* already gone */ }
     deck = null;
     textIndex = null;
