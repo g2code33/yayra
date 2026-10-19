@@ -594,6 +594,18 @@ html {
 
 /* Real minimize / maximize / close for the frameless Electron window
    (window.yayra.windowControls - never rendered on web/PWA). */
+.fb-window-controls-safe-gap {
+  /* This basis is deliberately non-shrinkable. The auto margin on the
+     controls can collapse to zero when tabs fill the strip; this guard cannot,
+     leaving a clear target boundary between New Tab (+) and Minimize. */
+  width: 18px;
+  height: 1px;
+  flex: 0 0 18px;
+  align-self: center;
+  pointer-events: none;
+  -webkit-app-region: no-drag;
+}
+
 .fb-window-controls {
   display: flex;
   align-items: center;

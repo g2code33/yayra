@@ -2127,6 +2127,15 @@ export class BrowserShell {
     // minimize/maximize/close via IPC. Web/PWA builds omit the cluster; the
     // frameless mini window keeps its own expand/hide title bar.
     if (winControls) {
+      // Keep a permanent no-control zone between New Tab (+) and Minimize.
+      // Auto margins collapse when many tabs consume the strip; this fixed
+      // spacer never does, so the two unrelated actions cannot look like one
+      // cluster or be clicked by mistake at maximum tab density.
+      const controlsGap = document.createElement('span');
+      controlsGap.className = 'fb-window-controls-safe-gap';
+      controlsGap.setAttribute('aria-hidden', 'true');
+      tabStrip.appendChild(controlsGap);
+
       const controls = document.createElement('div');
       controls.className = 'fb-window-controls';
       const buttons = [

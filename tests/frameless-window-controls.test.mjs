@@ -59,6 +59,7 @@ test('web/PWA (no bridge): no window-control buttons - the browser owns the wind
 
   assert.equal(shell.windowControls, null);
   assert.equal(el.querySelector('.fb-window-controls'), null);
+  assert.equal(el.querySelector('.fb-window-controls-safe-gap'), null, 'web/PWA does not reserve space for controls it does not own');
   assert.equal(el.querySelector('.fb-tabstrip-drag-handle'), null, 'web/PWA has no desktop window drag handle');
 });
 
@@ -67,12 +68,15 @@ test('frameless top chrome has ZERO native drag regions, including the dedicated
   const tabStripRule = css.match(/\.fb-chrome-tabstrip\s*\{([\s\S]*?)\}/)?.[1] || '';
   const dragHandleRule = css.match(/\.fb-tabstrip-drag-handle\s*\{([\s\S]*?)\}/)?.[1] || '';
   const tabListRule = css.match(/\.fb-chrome-tabstrip \.fb-tab-item,[\s\S]*?\{([\s\S]*?)\}/)?.[1] || '';
+  const controlGapRule = css.match(/\.fb-window-controls-safe-gap\s*\{([\s\S]*?)\}/)?.[1] || '';
 
   assert.match(tabStripRule, /-webkit-app-region:\s*no-drag/, 'the tab strip stays renderer-interactive');
   assert.match(dragHandleRule, /-webkit-app-region:\s*no-drag/, 'the handle uses pointer IPC, never a native input grab');
   assert.doesNotMatch(dragHandleRule, /-webkit-app-region:\s*drag(?:\s|;)/, 'no native drag region survives on the handle');
   assert.match(dragHandleRule, /touch-action:\s*none/, 'the manual handle owns its pointer stream');
   assert.match(tabListRule, /-webkit-app-region:\s*no-drag/, 'tab items and their scroll area remain clickable');
+  assert.match(controlGapRule, /flex:\s*0\s+0\s+18px/, 'the new-tab/minimize safety gap can never shrink when tabs fill the strip');
+  assert.match(controlGapRule, /pointer-events:\s*none/, 'the safety gap is empty space, never another accidental target');
 });
 
 test('manual window handle starts only after movement and always ends the IPC drag', async () => {
@@ -135,7 +139,13 @@ test('Electron (bridge present): real minimize/maximize/close buttons render and
     const el = shell.render(container);
 
     const controls = el.querySelector('.fb-window-controls');
+    const controlsGap = el.querySelector('.fb-window-controls-safe-gap');
+    const newTab = el.querySelector('.fb-btn-newtab');
     assert.ok(controls, 'window controls cluster rendered in the tab strip');
+    assert.ok(controlsGap, 'Electron reserves a permanent gap before the minimize button');
+    const stripChildren = Array.from(controls.parentElement.children || []);
+    assert.ok(stripChildren.indexOf(newTab) < stripChildren.indexOf(controlsGap), 'gap follows New Tab');
+    assert.ok(stripChildren.indexOf(controlsGap) < stripChildren.indexOf(controls), 'gap precedes window controls');
     assert.ok(el.querySelector('.fb-tabstrip-drag-handle'), 'Electron retains window movement through a dedicated handle');
 
     el.querySelector('.fb-wc-minimize').click();

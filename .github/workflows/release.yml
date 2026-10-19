@@ -107,7 +107,18 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          npx --yes wrangler@4 pages deploy dist --project-name "$CLOUDFLARE_PROJECT_NAME" --branch main --commit-dirty=true
+          # A publishing run creates its final update manifest only after all
+          # native artifacts exist. Deploying here and again in `publish`
+          # made Wrangler hit /pages/assets/check-missing twice within minutes
+          # and Cloudflare throttled the release with code 971. Defer the
+          # single atomic deployment to the publish job; web-only preview
+          # dispatches still deploy from this job.
+          if [ "${{ github.event_name }}" = "push" ] || [ "${{ inputs.publish }}" = "true" ]; then
+            echo "Cloudflare deployment deferred until the final release manifest is ready."
+            echo "manifest_url=https://yayra-updates-api.g2code335.workers.dev/updates/manifest.json" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          node scripts/deploy-cloudflare-pages.mjs dist
           node scripts/deploy-cloudflare-worker.mjs
           echo "manifest_url=https://yayra-updates-api.g2code335.workers.dev/updates/manifest.json" >> "$GITHUB_OUTPUT"
 
@@ -591,7 +602,7 @@ jobs:
             echo "::warning:: Final Cloudflare manifest deployment skipped: configure the Cloudflare secrets"
             exit 0
           fi
-          npx --yes wrangler@4 pages deploy dist --project-name "$CLOUDFLARE_PROJECT_NAME" --branch main --commit-dirty=true
+          node scripts/deploy-cloudflare-pages.mjs dist
           node scripts/deploy-cloudflare-worker.mjs
       - name: Verify live release and manifest contract
         env:
