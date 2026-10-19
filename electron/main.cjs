@@ -256,8 +256,8 @@ if (relaunchingForX11) {
         return;
       }
     } catch { /* healing is best-effort - normal focusing below */ }
-    // A PDF was opened WITH Yayra from the desktop while it is already
-    // running: hand its bytes to the shell's document viewer.
+    // A local document was opened WITH Yayra while it is already running:
+    // hand its unchanged bytes to the matching in-shell viewer.
     const pdfFile = parsePdfFileArg(argv || []);
     if (pdfFile) {
       if (!mainWindow || mainWindow.isDestroyed()) createWindow();
@@ -343,7 +343,7 @@ function createAppModeWindow(url) {
   return win;
 }
 
-const pendingPdfFiles = []; // queued until the shell renderer is listening
+const pendingPdfFiles = []; // legacy name: local documents queued until the renderer listens
 
 function deliverPdfFile(filePath) {
   try {
@@ -363,7 +363,7 @@ function deliverPdfFile(filePath) {
     }
     return true;
   } catch (err) {
-    console.error('[yayra] pdf open-with delivery failed', err);
+    console.error('[yayra] document open-with delivery failed', err);
     return false;
   }
 }
@@ -545,9 +545,9 @@ app.whenReady().then(async () => {
   const isSmokeStartup = process.env.YAYRA_SMOKE === '1' || process.env.IBROWSE_SMOKE === '1';
   // Launched from an installed site-app shortcut: only the site's own
   // app window opens - no browser window, like chrome --app=<url>.
-  // Launched via the desktop's "Open with > yayra" on a PDF (the Linux
-  // desktop entry may pass a file:// URI while Windows passes a path): queue
-  // it - createWindow()'s did-finish-load flush delivers it to the viewer.
+  // Launched via desktop "Open with > yayra" on a local document (Linux may
+  // pass a file:// URI while Windows passes a path): queue it until the shell
+  // has loaded, then route it by sniffed bytes in the renderer.
   const coldPdfFile = parsePdfFileArg(process.argv);
   if (coldPdfFile && !isSmokeStartup) deliverPdfFile(coldPdfFile);
 
@@ -967,17 +967,23 @@ function registerIpcBridges() {
     }
   });
 
-  // DOCUMENT WORKSPACE (Phase 1: PDF - docs/DOCUMENT_WORKSPACE.md):
-  // opens ONE local PDF chosen in the native picker and transfers ONLY its
-  // bytes to the renderer. The file path never crosses the IPC boundary,
-  // nothing else on disk is reachable, and the size is capped. No state is
-  // kept in the main process - the renderer holds the bytes in memory for
-  // the tab's lifetime (local-first, no backend).
+  // LOCAL DOCUMENT WORKSPACE: opens one user-selected original file and
+  // transfers ONLY its bytes to the renderer. PDF, PPTX/PPTM, DOCX,
+  // spreadsheets, images and text have bundled offline viewers; older/unknown
+  // files receive an honest original-file fallback. The path never crosses
+  // IPC, nothing else on disk is reachable, and every format shares the same
+  // 150 MB ceiling.
   ipcMain.handle('yayra:doc-open', async () => {
     try {
       const picked = await dialog.showOpenDialog({
         properties: ['openFile'],
-        filters: [{ name: 'PDF documents', extensions: ['pdf'] }]
+        filters: [
+          { name: 'Viewable documents', extensions: ['pdf', 'pptx', 'pptm', 'docx', 'xlsx', 'xlsm', 'xls', 'csv', 'jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'avif', 'svg', 'txt', 'md', 'markdown', 'log', 'json', 'xml', 'yaml', 'yml', 'ppt', 'doc'] },
+          { name: 'PDF and presentations', extensions: ['pdf', 'pptx', 'pptm', 'ppt'] },
+          { name: 'Word and spreadsheets', extensions: ['docx', 'doc', 'xlsx', 'xlsm', 'xls', 'csv'] },
+          { name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'avif', 'svg'] },
+          { name: 'All files', extensions: ['*'] }
+        ]
       });
       if (picked.canceled || !picked.filePaths || picked.filePaths.length === 0) {
         return { ok: false, canceled: true };
@@ -994,15 +1000,14 @@ function registerIpcBridges() {
     }
   });
 
-  // DOCUMENT WORKSPACE: "Open with desktop app" - the in-viewer escape
-  // hatch for users who want their OS pdf reader (Acrobat, Evince,
-  // Edge...). The bytes come FROM the renderer (they are the same bytes
-  // the viewer holds); a sanitized temp file is written and opened with
-  // the OS default handler. Nothing else on disk is touched.
+  // DOCUMENT WORKSPACE: "Open with desktop app" / "Open original" escape
+  // hatch. The unchanged bytes come FROM the renderer; a sanitized temporary
+  // file is written and opened with the OS handler for its real extension.
+  // Nothing else on disk is touched.
   ipcMain.handle('yayra:doc-open-externally', async (_event, { name, data } = {}) => {
     try {
       if (!data) return { ok: false, reason: 'no-data' };
-      const safeName = String(name || 'document.pdf').replace(/[\\/:*?"<>|]+/g, '-').slice(0, 80) || 'document.pdf';
+      const safeName = String(name || 'document.bin').replace(/[\\/:*?"<>|]+/g, '-').slice(0, 120) || 'document.bin';
       const dir = path.join(app.getPath('temp'), 'yayra-docs');
       fs.mkdirSync(dir, { recursive: true });
       const filePath = path.join(dir, `${Date.now().toString(36)}-${safeName}`);
@@ -1116,6 +1121,8 @@ function registerIpcBridges() {
   // happen in the shared "persist:yayra-webview" session that regular
   // (non-private) tabs use, plus Yayra's own windows, and lets the user pick
   // where new downloads are saved.
+  // Legacy channel name retained: it now transfers any supported downloaded
+  // document to the unified viewer, still as capped bytes with no path.
   ipcMain.handle('yayra:downloads-open-pdf', async (_event, { id } = {}) => {
     try {
       const item = (downloadsStore.load().items || []).find((it) => it.id === id);

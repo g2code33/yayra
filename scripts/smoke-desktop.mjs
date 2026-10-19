@@ -117,8 +117,13 @@ async function staticSmokeFallback() {
     process.exit(1);
   }
   const pdfRoot = path.join(root, 'dist/packages/shared-ui/src/vendor/pdfjs');
-  if (!existsSync(path.join(pdfRoot, 'pdf.mjs')) || !existsSync(path.join(pdfRoot, 'pdf.worker.mjs'))) {
-    console.error('desktop smoke fallback failed: built PDF.js engine/worker assets are missing');
+  const documentRoot = path.join(root, 'dist/packages/shared-ui/src/vendor/documents');
+  if (!existsSync(path.join(pdfRoot, 'pdf.mjs')) || !existsSync(path.join(pdfRoot, 'pdf.worker.mjs'))
+      || !existsSync(path.join(documentRoot, 'pptxRenderer.mjs'))
+      || !existsSync(path.join(documentRoot, 'docxPreview.mjs'))
+      || !existsSync(path.join(documentRoot, 'xlsx.mjs'))
+      || !existsSync(path.join(documentRoot, 'manifest.json'))) {
+    console.error('desktop smoke fallback failed: one or more offline document engines are missing');
     process.exit(1);
   }
   if (!main.includes("headers.set('content-type', type)") || !main.includes("lower.endsWith('.mjs')")) {
@@ -129,6 +134,6 @@ async function staticSmokeFallback() {
     console.error('desktop smoke fallback failed: packaged smoke report bridge is missing');
     process.exit(1);
   }
-  console.log('[yayra-smoke] {"title":"yayra","hasRoot":true,"pdfAssets":true,"pdfModuleMime":true,"smokeReport":true,"mode":"static-fallback","reason":"Electron runtime was not installed in this sandbox"}');
-  console.log('desktop smoke fallback passed: built DOM, PDF.js assets, module MIME handling, report bridge, and retry ladder are present; packaged PDF parsing runs in CI');
+  console.log('[yayra-smoke] {"title":"yayra","hasRoot":true,"documentAssets":true,"pdfModuleMime":true,"smokeReport":true,"mode":"static-fallback","reason":"Electron runtime was not installed in this sandbox"}');
+  console.log('desktop smoke fallback passed: built DOM, offline document engines, module MIME handling, report bridge, and retry ladder are present; packaged PDF parsing runs in CI');
 }

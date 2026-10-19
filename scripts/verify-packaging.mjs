@@ -53,22 +53,26 @@ assert(nativeIos.includes(`<string>${pkg.version}</string>`), 'iOS CFBundleShort
 assert(webManifest.version === pkg.version && webManifest.cacheVersion === pkg.version, 'web manifest version/cacheVersion mismatch package.json');
 assert(JSON.parse(await readFile(path.join(root, 'electron/app-version.json'), 'utf8')).version === pkg.version, 'electron app-version mismatch package.json');
 
-// PDF.js is loaded lazily at runtime, so ordinary static imports cannot save
-// it from an over-aggressive packaging filter. Verify both the builder input
-// and the custom protocol's strict .mjs MIME handling.
-assert(build.files?.includes('dist/**/*'), 'Electron builder must include the complete dist tree (including lazy PDF.js modules)');
+// Document engines are loaded lazily at runtime, so ordinary static imports
+// cannot save them from an over-aggressive packaging filter. Verify the
+// builder input, every generated engine, and strict .mjs MIME handling.
+assert(build.files?.includes('dist/**/*'), 'Electron builder must include the complete dist tree (including lazy document modules)');
 const electronMain = await readFile(path.join(root, 'electron/main.cjs'), 'utf8');
 assert(electronMain.includes("lower.endsWith('.mjs')"), 'yayra:// MIME map must recognize .mjs');
 assert(electronMain.includes("headers.set('content-type', type)"), 'yayra:// responses must set deterministic asset Content-Type headers');
-const builtPdfAssets = [
-  'dist/packages/shared-ui/src/vendor/pdfjs/pdf.mjs',
-  'dist/packages/shared-ui/src/vendor/pdfjs/pdf.worker.mjs'
+const builtDocumentAssets = [
+  ['dist/packages/shared-ui/src/vendor/pdfjs/pdf.mjs', 100_000],
+  ['dist/packages/shared-ui/src/vendor/pdfjs/pdf.worker.mjs', 100_000],
+  ['dist/packages/shared-ui/src/vendor/documents/pptxRenderer.mjs', 150_000],
+  ['dist/packages/shared-ui/src/vendor/documents/docxPreview.mjs', 200_000],
+  ['dist/packages/shared-ui/src/vendor/documents/xlsx.mjs', 700_000],
+  ['dist/packages/shared-ui/src/vendor/documents/manifest.json', 100]
 ];
 if (existsSync(path.join(root, 'dist'))) {
-  for (const asset of builtPdfAssets) {
+  for (const [asset, minimumBytes] of builtDocumentAssets) {
     const absolute = path.join(root, asset);
     assert(existsSync(absolute), `${asset} missing from built desktop input`);
-    if (existsSync(absolute)) assert((await stat(absolute)).size > 100_000, `${asset} is unexpectedly truncated`);
+    if (existsSync(absolute)) assert((await stat(absolute)).size > minimumBytes, `${asset} is unexpectedly truncated`);
   }
 }
 
@@ -86,8 +90,9 @@ if (packagedAsars.length) {
     assert(asar.ok, `${target} app.asar listing failed: ${asar.error}`);
     if (!asar.ok) continue;
     assert(asar.entries.has('dist/index.html'), `${target} app.asar did not include dist/index.html`);
-    assert(asar.entries.has('dist/packages/shared-ui/src/vendor/pdfjs/pdf.mjs'), `${target} app.asar did not include the PDF.js engine`);
-    assert(asar.entries.has('dist/packages/shared-ui/src/vendor/pdfjs/pdf.worker.mjs'), `${target} app.asar did not include the PDF.js worker`);
+    for (const [asset] of builtDocumentAssets) {
+      assert(asar.entries.has(asset), `${target} app.asar did not include ${asset}`);
+    }
   }
 } else {
   console.log('packaging layout note: no unpacked desktop app is present; package a desktop target to inspect its real app.asar contents');
@@ -126,7 +131,7 @@ if (failures.length) {
   }
   process.exit(1);
 }
-console.log('packaging verification passed: desktop config, PDF.js app.asar assets, hook syntax, icons, and version lockstep are valid');
+console.log('packaging verification passed: desktop config, offline document engines, hook syntax, icons, and version lockstep are valid');
 
 function assert(condition, message) { if (!condition) failures.push(message); }
 function parseDesktop(text) {

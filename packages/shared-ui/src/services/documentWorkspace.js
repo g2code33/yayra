@@ -1,88 +1,76 @@
+import {
+  DOCUMENT_ACCEPT,
+  DOCUMENT_ENGINES,
+  MAX_DOCUMENT_BYTES,
+  classifyDocument,
+  documentExtension,
+  isAcceptedDocument,
+  mimeForDocument,
+  routeDocument,
+  sniffDocumentKind,
+  supportedDocumentKinds,
+  unsupportedDocumentKinds
+} from './documentRegistry.js';
+
+export {
+  DOCUMENT_ACCEPT,
+  DOCUMENT_ENGINES,
+  MAX_DOCUMENT_BYTES,
+  classifyDocument,
+  documentExtension,
+  isAcceptedDocument,
+  mimeForDocument,
+  routeDocument,
+  sniffDocumentKind,
+  supportedDocumentKinds,
+  unsupportedDocumentKinds
+};
+export {
+  createViewerForKind,
+  createPptxViewer,
+  createDocxViewer,
+  createSpreadsheetViewer,
+  createImageViewer,
+  createTextViewer,
+  createUnsupportedViewer
+} from './documentViewers.js';
+
 /**
- * YAYRA DOCUMENT WORKSPACE - the core abstraction (Phase 1: PDF).
+ * YAYRA UNIFIED DOCUMENT WORKSPACE.
  *
  * Design contract (docs/DOCUMENT_WORKSPACE.md):
  *  - Documents open in their OWN tab (`yayra://doc/<id>`) through the
- *    existing tab system - never by navigating a browsing tab away from
- *    its site.
- *  - Every engine reports its capabilities EXPLICITLY. The UI never
- *    implies an operation the engine does not support (no placeholder
- *    buttons for editing/annotation/export).
- *  - Documents are local-first: bytes live in memory in the renderer
- *    (Electron: chosen through the native dialog in the main process and
- *    transferred WITHOUT the file path; web/Android: the standard file
- *    input). No account, no backend, no cloud.
- *  - The PDF engine (PDF.js, Apache-2.0 - vendored under
- *    packages/shared-ui/src/vendor/pdfjs/) is INJECTED into the viewer so
- *    the viewer logic is unit-testable without a browser canvas.
+ *    existing tab system, never through the website frame.
+ *  - Every engine reports capabilities explicitly; the UI never claims
+ *    editing, annotation or export that the engine cannot perform.
+ *  - Original bytes remain in renderer memory (Electron transfers bytes but
+ *    never a source path; web/Android uses the standard file picker).
+ *  - All engines are injected/lazy local modules, making them independently
+ *    testable and keeping PDF, PPTX, DOCX and spreadsheet rendering offline.
  */
 
-/** The document-engine registry. Formats without an engine yet are
- *  intentionally absent - the UI says "on the roadmap" instead of
- *  pretending. Capabilities are per-format facts, not guesses. */
-export const DOCUMENT_ENGINES = Object.freeze({
-  pdf: Object.freeze({
-    label: 'PDF document',
-    extensions: Object.freeze(['pdf']),
-    mimeTypes: Object.freeze(['application/pdf']),
-    /** What the PDF engine can HONESTLY do (updated Phase 2 viewer). */
-    capabilities: Object.freeze({
-      view: true,       // full-page rendering with zoom
-      search: true,     // text search across pages (text layer extraction)
-      zoom: true,
-      pageNavigation: true,
-      rotate: true,     // 90-degree rotation steps
-      nightMode: true,  // inverted reading mode for the dark
-      outline: true,    // document table of contents (when the PDF has one)
-      thumbnails: true, // page thumbnail sidebar
-      annotate: false,  // roadmap
-      edit: false,      // not applicable to PDF in this architecture
-      save: false,
-      export: false,
-      print: false      // roadmap (Electron printToPDF/toPrinter)
-    })
-  })
-});
-
-/** Classify a file name into a supported document type, or null. */
-export function classifyDocument(fileName) {
-  const m = /\.([a-z0-9]+)$/i.exec(String(fileName || '').trim());
-  if (!m) return null;
-  const ext = m[1].toLowerCase();
-  for (const [type, engine] of Object.entries(DOCUMENT_ENGINES)) {
-    if (engine.extensions.includes(ext)) return type;
-  }
-  return null;
-}
-
-/** The human-side fact for honest UI: what is NOT supported yet. */
-export function unsupportedDocumentKinds() {
-  return ['doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'];
-}
-
-export const MAX_DOCUMENT_BYTES = 150 * 1024 * 1024;
-
+/** Sequence used only to make in-memory tab IDs unique. */
 let docSeq = 0;
 
 /**
- * In-memory document store. Holds the bytes the user explicitly opened -
- * nothing is written to disk, no paths are kept, nothing survives a
- * restart (the session snapshot deliberately excludes document tabs).
+ * In-memory original-file store. Bytes never leave the selected-file path,
+ * are never rewritten into another format, and disappear when the last tab
+ * holding them closes.
  */
 export class DocumentStore {
   constructor() {
     this._docs = new Map();
   }
 
-  /** Add a document; returns { id, name, bytes, type, size, openedAt }. */
-  add({ name, bytes }) {
+  add({ name, bytes, mime = '' }) {
     const size = bytes && Number.isFinite(bytes.byteLength)
       ? bytes.byteLength
       : (bytes && Number.isFinite(bytes.length) ? bytes.length : 0);
     if (size <= 0) throw new Error('empty-document');
     if (size > MAX_DOCUMENT_BYTES) throw new Error('document-too-large');
-    const cleanName = String(name || 'document.pdf').slice(0, 120);
-    const type = classifyDocument(cleanName) || 'pdf';
+    const cleanName = String(name || 'document').replace(/[\u0000-\u001f]/g, '').slice(0, 160) || 'document';
+    const sniffed = sniffDocumentKind(bytes, cleanName, mime);
+    const type = sniffed || classifyDocument(cleanName, mime) || 'unsupported';
     docSeq += 1;
     const id = `doc-${Date.now().toString(36)}-${docSeq}`;
     const doc = {
@@ -90,6 +78,9 @@ export class DocumentStore {
       name: cleanName,
       bytes,
       type,
+      extension: documentExtension(cleanName),
+      mime: String(mime || '').split(';', 1)[0].trim() || mimeForDocument(type, cleanName),
+      route: routeDocument(type),
       size,
       openedAt: Date.now()
     };
@@ -97,30 +88,33 @@ export class DocumentStore {
     return doc;
   }
 
-  get(id) {
-    return this._docs.get(id) || null;
-  }
-
-  remove(id) {
-    return this._docs.delete(id);
-  }
-
-  list() {
-    return [...this._docs.values()];
-  }
+  get(id) { return this._docs.get(id) || null; }
+  remove(id) { return this._docs.delete(id); }
+  list() { return [...this._docs.values()]; }
 }
 
 /** Default state shape for a document viewer instance. */
-export function createDocumentViewerState() {
+export function createDocumentViewerState(kind = 'pdf') {
   return {
+    viewer: kind,
     status: 'idle', numPages: 0, page: 1, zoom: 1.25,
+    zoomMode: kind === 'pptx' ? 'fit-page' : 'custom',
     query: '', matches: [], matchIndex: -1, error: null,
     progress: null, loadingStage: '',
-    rotation: 0,          // 0 | 90 | 180 | 270 (user rotation steps)
-    night: false,         // inverted reading mode
-    outline: [],          // flattened TOC: [{ title, page, depth }]
-    sidebarOpen: false,
-    sidebarTab: 'outline' // 'outline' | 'thumbnails'
+    rotation: 0,          // 0 | 90 | 180 | 270 where the engine supports it
+    night: false,
+    outline: [],          // flattened PDF TOC: [{ title, page, depth }]
+    sidebarOpen: kind === 'pptx',
+    sidebarTab: kind === 'pptx' ? 'thumbnails' : 'outline',
+    showNotes: kind === 'pptx',
+    slidePending: false,
+    searchPending: false,
+    searchProgress: null,
+    printPending: false,
+    printProgress: null,
+    sheetNames: [],
+    rowPage: 1,
+    rowPages: 1
   };
 }
 
@@ -135,41 +129,313 @@ export function createDocumentViewerState() {
  *   { status, numPages, page, zoom, query, matches, matchIndex, error }
  */
 export function createPdfViewer({ pdfjs, container, state, onStateChange = null, loadTimeoutMs = 90000 } = {}) {
-  const viewerState = state || createDocumentViewerState();
+  const viewerState = state || createDocumentViewerState('pdf');
   let pdfDoc = null;
   let loadingTask = null;
-  let loadToken = 0;
-  let renderToken = 0;
-  let activeLoadTimeout = null;
   let mountedContainer = container || null;
   let stateChange = onStateChange;
+  let root = null;
+  let loadToken = 0;
+  let renderGeneration = 0;
+  let activeLoadTimeout = null;
+  let scrollHost = null;
+  let scrollFrame = null;
+  let measurePromise = null;
 
-  const notify = () => { try { stateChange?.(viewerState); } catch { /* listener is optional */ } };
+  const pageShells = new Map();
+  const pageCanvases = new Map();
+  const textLayers = new Map();
+  const renderedKeys = new Map();
+  const renderTasks = new Map();
+  const rendering = new Set();
+  const baseSizes = [];
+  const pageTexts = [];
+  const textContents = [];
+  const RENDER_WINDOW = 2;
+  const KEEP_WINDOW = 8;
+
+  const notify = () => { try { stateChange?.(viewerState); } catch { /* optional listener */ } };
   const setState = (patch) => { Object.assign(viewerState, patch); notify(); };
+  const clampPage = (value) => Math.min(Math.max(1, Math.round(Number(value) || 1)), Math.max(1, viewerState.numPages || 1));
+  const ownerDocument = () => mountedContainer?.ownerDocument || (typeof document !== 'undefined' ? document : null);
 
-  const clampPage = (n) => Math.min(Math.max(1, n), Math.max(1, viewerState.numPages || 1));
+  function removeFromParent(element) {
+    if (!element?.parentElement) return;
+    try { element.parentElement.removeChild(element); } catch { /* native append will move it */ }
+  }
+
+  function clearElement(element) {
+    if (!element) return;
+    if (typeof element.replaceChildren === 'function') element.replaceChildren();
+    else element.innerHTML = '';
+  }
+
+  function scaledSize(pageNumber) {
+    const base = baseSizes[pageNumber - 1] || baseSizes[0] || { width: 612, height: 792 };
+    const swapped = (viewerState.rotation || 0) % 180 !== 0;
+    return {
+      width: Math.max(1, Math.floor((swapped ? base.height : base.width) * (viewerState.zoom || 1))),
+      height: Math.max(1, Math.floor((swapped ? base.width : base.height) * (viewerState.zoom || 1)))
+    };
+  }
+
+  function stylePageShell(shell, pageNumber) {
+    const size = scaledSize(pageNumber);
+    shell.style.width = `${size.width}px`;
+    shell.style.height = `${size.height}px`;
+    shell.style.cssText = `position:relative;flex:0 0 auto;width:${size.width}px;height:${size.height}px;margin:0 auto 16px;background:#fff;box-shadow:0 6px 26px rgba(0,0,0,.28);border-radius:2px;overflow:hidden;content-visibility:auto;`;
+  }
+
+  function buildPages() {
+    const doc = ownerDocument();
+    if (!mountedContainer || !doc || typeof doc.createElement !== 'function' || !viewerState.numPages) return null;
+    if (root) {
+      removeFromParent(root);
+      mountedContainer.appendChild?.(root);
+      return root;
+    }
+    root = doc.createElement('div');
+    root.className = 'fb-pdf-continuous-pages';
+    root.style.cssText = 'width:max-content;min-width:100%;min-height:100%;display:flex;flex-direction:column;align-items:center;box-sizing:border-box;padding:4px 8px 24px;';
+    pageShells.clear();
+    pageCanvases.clear();
+    textLayers.clear();
+    for (let pageNumber = 1; pageNumber <= viewerState.numPages; pageNumber += 1) {
+      const shell = doc.createElement('section');
+      shell.className = 'fb-pdf-page';
+      shell.dataset.page = String(pageNumber);
+      shell.setAttribute?.('aria-label', `PDF page ${pageNumber}`);
+      stylePageShell(shell, pageNumber);
+
+      const canvas = doc.createElement('canvas');
+      canvas.className = 'fb-doc-canvas fb-pdf-page-canvas';
+      canvas.dataset.page = String(pageNumber);
+      canvas.style.cssText = 'position:absolute;inset:0;display:block;z-index:1;';
+      if (viewerState.night) canvas.style.cssText += 'filter:invert(1) hue-rotate(180deg);';
+
+      const textLayer = doc.createElement('div');
+      textLayer.className = 'fb-pdf-text-layer';
+      textLayer.dataset.page = String(pageNumber);
+      textLayer.style.cssText = 'position:absolute;inset:0;z-index:2;overflow:hidden;line-height:1;transform-origin:0 0;-webkit-text-size-adjust:none;text-size-adjust:none;';
+
+      const label = doc.createElement('span');
+      label.className = 'fb-pdf-page-number';
+      label.textContent = String(pageNumber);
+      label.style.cssText = 'position:absolute;right:7px;bottom:6px;z-index:3;padding:2px 5px;border-radius:5px;background:rgba(255,255,255,.8);color:#64748b;font:700 10px system-ui;pointer-events:none;';
+
+      shell.appendChild?.(canvas);
+      shell.appendChild?.(textLayer);
+      shell.appendChild?.(label);
+      root.appendChild?.(shell);
+      pageShells.set(pageNumber, shell);
+      pageCanvases.set(pageNumber, canvas);
+      textLayers.set(pageNumber, textLayer);
+    }
+    clearElement(mountedContainer);
+    mountedContainer.appendChild?.(root);
+    bindScroll();
+    return root;
+  }
+
+  function refreshPageBoxes() {
+    for (const [pageNumber, shell] of pageShells) stylePageShell(shell, pageNumber);
+  }
+
+  function bindScroll() {
+    const nextHost = mountedContainer;
+    if (scrollHost === nextHost) return;
+    if (scrollHost && typeof scrollHost.removeEventListener === 'function') scrollHost.removeEventListener('scroll', onScroll);
+    scrollHost = nextHost;
+    if (scrollHost && typeof scrollHost.addEventListener === 'function') scrollHost.addEventListener('scroll', onScroll, { passive: true });
+  }
+
+  function pageNearestViewport() {
+    if (!mountedContainer || !pageShells.size) return viewerState.page || 1;
+    const hostRect = mountedContainer.getBoundingClientRect?.();
+    const target = hostRect && Number.isFinite(hostRect.top)
+      ? hostRect.top + (Number(hostRect.height || mountedContainer.clientHeight || 0) * 0.42)
+      : null;
+    if (target === null) return viewerState.page || 1;
+    let best = viewerState.page || 1;
+    let distance = Infinity;
+    for (const [pageNumber, shell] of pageShells) {
+      const rect = shell.getBoundingClientRect?.();
+      if (!rect) continue;
+      const centre = Number(rect.top || 0) + Number(rect.height || 0) / 2;
+      const next = Math.abs(centre - target);
+      if (next < distance) { distance = next; best = pageNumber; }
+    }
+    return best;
+  }
+
+  function onScroll() {
+    if (scrollFrame !== null) return;
+    const run = () => {
+      scrollFrame = null;
+      const page = pageNearestViewport();
+      if (page !== viewerState.page) setState({ page });
+      void renderWindow(page);
+    };
+    if (typeof requestAnimationFrame === 'function') scrollFrame = requestAnimationFrame(run);
+    else scrollFrame = setTimeout(run, 0);
+  }
+
+  async function ensureBaseSize(pageNumber) {
+    if (baseSizes[pageNumber - 1]) return baseSizes[pageNumber - 1];
+    if (!pdfDoc) return null;
+    try {
+      const page = await pdfDoc.getPage(pageNumber);
+      const viewport = page.getViewport({ scale: 1, rotation: page.rotate || 0 });
+      const size = { width: viewport.width || 612, height: viewport.height || 792 };
+      baseSizes[pageNumber - 1] = size;
+      const shell = pageShells.get(pageNumber);
+      if (shell) stylePageShell(shell, pageNumber);
+      return size;
+    } catch {
+      const fallback = baseSizes[pageNumber - 2] || baseSizes[0] || { width: 612, height: 792 };
+      baseSizes[pageNumber - 1] = fallback;
+      return fallback;
+    }
+  }
+
+  async function measureAllPages(token) {
+    if (!pdfDoc) return;
+    for (let pageNumber = 1; pageNumber <= pdfDoc.numPages; pageNumber += 1) {
+      if (token !== loadToken || !pdfDoc) return;
+      await ensureBaseSize(pageNumber);
+      if (pageNumber % 8 === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    if (token === loadToken) {
+      refreshPageBoxes();
+      setState({ pagesMeasured: baseSizes.length });
+    }
+  }
+
+  function clearTextLayer(layer) {
+    if (!layer) return;
+    if (typeof layer.replaceChildren === 'function') layer.replaceChildren();
+    else layer.innerHTML = '';
+  }
+
+  function paintSearchMarks(pageNumber) {
+    const layer = textLayers.get(pageNumber);
+    const query = String(viewerState.query || '').trim();
+    if (!layer || !query || typeof layer.querySelectorAll !== 'function') return;
+    // The PDF.js text layer is rebuilt on every scale change. Keeping search
+    // highlights as a translucent page badge avoids mutating its positioned
+    // spans while still making every matching page immediately discoverable.
+    const matching = (viewerState.matches || []).some((match) => match.page === pageNumber);
+    const shell = pageShells.get(pageNumber);
+    if (shell) shell.style.outline = matching ? '2px solid rgba(250,204,21,.8)' : '';
+  }
+
+  async function renderTextLayer(pageNumber, page, viewport) {
+    const layer = textLayers.get(pageNumber);
+    if (!layer || typeof page.getTextContent !== 'function') return;
+    try {
+      const content = textContents[pageNumber - 1] || await page.getTextContent();
+      textContents[pageNumber - 1] = content;
+      pageTexts[pageNumber - 1] = (content.items || []).map((item) => String(item.str || '')).join(' ');
+      clearTextLayer(layer);
+      layer.style.setProperty?.('--scale-factor', String(viewport.scale || viewerState.zoom || 1));
+      layer.style.width = `${Math.floor(viewport.width)}px`;
+      layer.style.height = `${Math.floor(viewport.height)}px`;
+      if (typeof pdfjs.renderTextLayer === 'function') {
+        await pdfjs.renderTextLayer({ textContentSource: content, container: layer, viewport }).promise;
+      } else if (typeof pdfjs.TextLayer === 'function' && viewport.rawDims) {
+        const textLayer = new pdfjs.TextLayer({ textContentSource: content, container: layer, viewport });
+        await textLayer.render();
+      }
+      paintSearchMarks(pageNumber);
+    } catch { /* text selection/search remains best-effort; pixels still render */ }
+  }
+
+  async function renderPage(pageNumber, force = false) {
+    if (!pdfDoc || viewerState.status !== 'ready') return;
+    const generation = renderGeneration;
+    const canvas = pageCanvases.get(pageNumber);
+    if (!canvas) return;
+    const key = `${Number(viewerState.zoom || 1).toFixed(3)}|${viewerState.rotation || 0}|${viewerState.night ? 1 : 0}`;
+    if (!force && renderedKeys.get(pageNumber) === key) { paintSearchMarks(pageNumber); return; }
+    if (rendering.has(pageNumber)) return;
+    rendering.add(pageNumber);
+    try { renderTasks.get(pageNumber)?.cancel?.(); } catch { /* old task settled */ }
+    try {
+      const page = await pdfDoc.getPage(pageNumber);
+      if (generation !== renderGeneration || !pdfDoc) return;
+      const rotation = ((page.rotate || 0) + (viewerState.rotation || 0)) % 360;
+      const viewport = page.getViewport({ scale: viewerState.zoom || 1, rotation });
+      baseSizes[pageNumber - 1] ||= (() => {
+        const base = page.getViewport({ scale: 1, rotation: page.rotate || 0 });
+        return { width: base.width || 612, height: base.height || 792 };
+      })();
+      const shell = pageShells.get(pageNumber);
+      if (shell) {
+        shell.style.width = `${Math.floor(viewport.width)}px`;
+        shell.style.height = `${Math.floor(viewport.height)}px`;
+      }
+      const ratio = Math.min(Number(globalThis.devicePixelRatio || globalThis.window?.devicePixelRatio || 1), 2);
+      canvas.width = Math.max(1, Math.floor(viewport.width * ratio));
+      canvas.height = Math.max(1, Math.floor(viewport.height * ratio));
+      canvas.style.width = `${Math.floor(viewport.width)}px`;
+      canvas.style.height = `${Math.floor(viewport.height)}px`;
+      canvas.style.cssText = `position:absolute;inset:0;display:block;z-index:1;width:${Math.floor(viewport.width)}px;height:${Math.floor(viewport.height)}px;${viewerState.night ? 'filter:invert(1) hue-rotate(180deg);' : ''}`;
+      const context = canvas.getContext?.('2d', { alpha: false });
+      if (!context) return;
+      context.setTransform?.(ratio, 0, 0, ratio, 0, 0);
+      const task = page.render({ canvasContext: context, viewport });
+      renderTasks.set(pageNumber, task);
+      await task.promise;
+      if (generation !== renderGeneration || !pdfDoc) return;
+      renderedKeys.set(pageNumber, key);
+      await renderTextLayer(pageNumber, page, viewport);
+      if (pageNumber === viewerState.page) setState({ pagePainted: pageNumber });
+    } catch (error) {
+      if (String(error?.name || '') !== 'RenderingCancelledException') console.warn?.('[yayra:pdf] page render failed', pageNumber, error);
+    } finally {
+      rendering.delete(pageNumber);
+      renderTasks.delete(pageNumber);
+    }
+  }
+
+  async function renderWindow(centre = viewerState.page || 1, force = false) {
+    if (!pdfDoc || viewerState.status !== 'ready') return;
+    buildPages();
+    const current = clampPage(centre);
+    const first = Math.max(1, current - RENDER_WINDOW);
+    const last = Math.min(viewerState.numPages, current + RENDER_WINDOW);
+    const jobs = [];
+    for (let pageNumber = first; pageNumber <= last; pageNumber += 1) jobs.push(renderPage(pageNumber, force));
+    for (const [pageNumber, canvas] of pageCanvases) {
+      if (Math.abs(pageNumber - current) <= KEEP_WINDOW) continue;
+      try { renderTasks.get(pageNumber)?.cancel?.(); } catch { /* settled */ }
+      renderedKeys.delete(pageNumber);
+      if (canvas) { canvas.width = 1; canvas.height = 1; }
+      clearTextLayer(textLayers.get(pageNumber));
+    }
+    await Promise.all(jobs);
+  }
 
   async function load(bytes) {
     const token = ++loadToken;
-    renderToken += 1;
+    renderGeneration += 1;
     if (!pdfjs || typeof pdfjs.getDocument !== 'function') {
       setState({ status: 'error', progress: null, loadingStage: '', error: 'The PDF reader is unavailable. Try again or open this file with your desktop PDF app.' });
       return viewerState;
     }
-    setState({ status: 'loading', progress: null, loadingStage: 'Preparing PDF…', error: null, matches: [], matchIndex: -1 });
+    setState({ viewer: 'pdf', status: 'loading', progress: null, loadingStage: 'Preparing PDF…', error: null, matches: [], matchIndex: -1, pagesMeasured: 0 });
     let task = null;
     let timeoutId = null;
     let timedOut = false;
     try {
-      // Copy into a plain Uint8Array: PDF.js DETACHES the buffer it is
-      // given (transfers it to the worker), which would neuter the
-      // renderer's copy for later re-renders.
-      const data = bytes.byteLength !== undefined
+      const data = bytes instanceof ArrayBuffer
         ? new Uint8Array(bytes.slice(0))
-        : new Uint8Array(Buffer.from(bytes));
+        : ArrayBuffer.isView(bytes)
+          ? new Uint8Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength))
+          : new Uint8Array(bytes || []);
       task = pdfjs.getDocument({ data });
       loadingTask = task;
-      if (task && typeof task === 'object' && 'onProgress' in task) {
+      if (task && typeof task === 'object') {
         task.onProgress = ({ loaded, total } = {}) => {
           if (token !== loadToken || timedOut) return;
           const progress = Number.isFinite(loaded) && Number.isFinite(total) && total > 0
@@ -178,35 +444,39 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null,
           setState({ progress, loadingStage: 'Reading PDF…' });
         };
       }
-      const documentPromise = task && task.promise ? task.promise : Promise.resolve(task);
-      if (Number.isFinite(loadTimeoutMs) && loadTimeoutMs > 0) {
-        const timeoutPromise = new Promise((_, reject) => {
-          timeoutId = setTimeout(() => {
-            timedOut = true;
-            const error = new Error('PDF load timed out');
-            error.name = 'PDFLoadTimeoutError';
-            reject(error);
-          }, loadTimeoutMs);
-          activeLoadTimeout = timeoutId;
-          // Do not keep a test runner or a closing shell alive solely for a
-          // background PDF task; active UI loads still report their timeout.
-          timeoutId?.unref?.();
-        });
-        pdfDoc = await Promise.race([documentPromise, timeoutPromise]);
-      } else {
-        pdfDoc = await documentPromise;
-      }
-      if (token !== loadToken) return viewerState; // superseded by a newer load
-      setState({ status: 'ready', progress: 100, loadingStage: '', numPages: pdfDoc.numPages || 1, page: clampPage(viewerState.page || 1) });
-      await renderCurrent();
-    } catch (err) {
+      const documentPromise = task?.promise || Promise.resolve(task);
+      const guarded = Number.isFinite(loadTimeoutMs) && loadTimeoutMs > 0
+        ? Promise.race([
+            documentPromise,
+            new Promise((_, reject) => {
+              timeoutId = setTimeout(() => {
+                timedOut = true;
+                const error = new Error('PDF load timed out');
+                error.name = 'PDFLoadTimeoutError';
+                reject(error);
+              }, loadTimeoutMs);
+              activeLoadTimeout = timeoutId;
+              timeoutId?.unref?.();
+            })
+          ])
+        : documentPromise;
+      pdfDoc = await guarded;
       if (token !== loadToken) return viewerState;
-      const name = err && err.name ? String(err.name) : '';
+      const total = Math.max(1, pdfDoc?.numPages || 1);
+      viewerState.numPages = total;
+      viewerState.page = clampPage(viewerState.page || 1);
+      await ensureBaseSize(viewerState.page);
+      setState({ status: 'ready', progress: 100, loadingStage: '', numPages: total, page: viewerState.page, engineName: 'PDF.js (bundled)' });
+      buildPages();
+      await renderWindow(viewerState.page, true);
+      // Measure the remaining page boxes after the first visible window is
+      // painted. This is the reference viewer's key responsiveness rule.
+      measurePromise = measureAllPages(token).catch(() => {});
+    } catch (error) {
+      if (token !== loadToken) return viewerState;
+      const name = String(error?.name || '');
       if (name === 'PDFLoadTimeoutError') {
-        try {
-          const cleanup = task?.destroy?.();
-          cleanup?.catch?.(() => {});
-        } catch { /* worker already gone */ }
+        try { task?.destroy?.(); } catch { /* worker already gone */ }
         if (loadingTask === task) loadingTask = null;
         setState({ status: 'error', progress: null, loadingStage: '', error: 'This PDF is taking too long to open. Try again or use Desktop app to open it externally.' });
       } else if (name === 'PasswordException') {
@@ -221,238 +491,237 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null,
     return viewerState;
   }
 
-  async function renderCurrent() {
-    if (!pdfDoc || viewerState.status !== 'ready') return;
-    const token = ++renderToken;
-    const currentDocument = pdfDoc;
-    const pageNum = clampPage(viewerState.page);
-    try {
-      const page = await currentDocument.getPage(pageNum);
-      if (token !== renderToken || currentDocument !== pdfDoc || viewerState.status !== 'ready') return;
-      const scale = Math.min(4, Math.max(0.5, viewerState.zoom));
-      // User rotation adds to the page's own default rotation.
-      const rotation = ((page.rotate || 0) + (viewerState.rotation || 0)) % 360;
-      const viewport = page.getViewport({ scale, rotation });
-      // Paint only where a real canvas exists (skipped in headless tests).
-      const target = mountedContainer;
-      if (target && typeof target.ownerDocument !== 'undefined' && viewerState.status === 'ready') {
-        try {
-          const canvas = target.ownerDocument.createElement('canvas');
-          canvas.className = 'fb-doc-canvas';
-          if (typeof canvas.getContext === 'function') {
-            canvas.width = Math.floor(viewport.width);
-            canvas.height = Math.floor(viewport.height);
-            // Night reading mode: invert luminance but keep hues usable
-            // (the classic dark-PDF trick - white pages become near-black
-            // without mangling colored diagrams).
-            canvas.style.cssText = 'max-width:100%; height:auto; box-shadow:0 8px 30px rgba(0,0,0,0.5); background:#fff;'
-              + (viewerState.night ? ' filter:invert(1) hue-rotate(180deg);' : '');
-            const ctx = canvas.getContext('2d');
-            if (ctx) {
-              const prev = target.querySelector ? target.querySelector('.fb-doc-canvas') : null;
-              if (prev && prev.remove) prev.remove();
-              if (target.appendChild) target.appendChild(canvas);
-              await page.render({ canvasContext: ctx, viewport }).promise;
-              if (token !== renderToken || currentDocument !== pdfDoc) {
-                canvas.remove?.();
-                return;
-              }
-              // If the shell re-rendered while the page was painting, move
-              // the completed canvas into the current mount instead of
-              // leaving a permanent spinner in the replaced DOM.
-              const latestTarget = mountedContainer;
-              if (latestTarget && latestTarget !== target) {
-                latestTarget.querySelector?.('.fb-doc-canvas')?.remove?.();
-                latestTarget.appendChild?.(canvas);
-              }
-            }
-          }
-        } catch { /* headless environment - state stays authoritative */ }
-      }
-    } catch { /* page render failures keep the last good paint */ }
-  }
-
-  async function setPage(n) {
+  async function setPage(value) {
     if (viewerState.status !== 'ready') return viewerState;
-    setState({ page: clampPage(n) });
-    await renderCurrent();
+    const page = clampPage(value);
+    setState({ page });
+    await renderWindow(page);
+    pageShells.get(page)?.scrollIntoView?.({ behavior: 'auto', block: 'start', inline: 'center' });
+    return viewerState;
+  }
+  const nextPage = () => setPage((viewerState.page || 1) + 1);
+  const prevPage = () => setPage((viewerState.page || 1) - 1);
+
+  async function setZoom(value) {
+    const zoom = Math.min(4, Math.max(0.5, Number(value) || 1));
+    renderGeneration += 1;
+    for (const task of renderTasks.values()) { try { task.cancel?.(); } catch { /* settled */ } }
+    rendering.clear();
+    renderedKeys.clear();
+    setState({ zoom, zoomMode: 'custom' });
+    refreshPageBoxes();
+    await renderWindow(viewerState.page, true);
     return viewerState;
   }
 
-  async function nextPage() { return setPage((viewerState.page || 1) + 1); }
-  async function prevPage() { return setPage((viewerState.page || 1) - 1); }
-
-  async function setZoom(z) {
-    const zoom = Math.min(4, Math.max(0.5, Number(z) || 1));
-    setState({ zoom });
-    await renderCurrent();
-    return viewerState;
-  }
-
-  /** Rotate the view in 90-degree steps (cumulative, wraps at 360). */
   async function rotate(delta = 90) {
+    renderGeneration += 1;
+    for (const task of renderTasks.values()) { try { task.cancel?.(); } catch { /* settled */ } }
+    rendering.clear();
+    renderedKeys.clear();
     setState({ rotation: (((viewerState.rotation || 0) + delta) % 360 + 360) % 360 });
-    await renderCurrent();
+    refreshPageBoxes();
+    await renderWindow(viewerState.page, true);
     return viewerState;
   }
 
-  /** Night reading mode (inverted canvas). */
   async function setNight(enabled) {
-    if (viewerState.night === Boolean(enabled)) return viewerState;
     setState({ night: Boolean(enabled) });
-    await renderCurrent();
+    for (const canvas of pageCanvases.values()) {
+      canvas.style.filter = viewerState.night ? 'invert(1) hue-rotate(180deg)' : '';
+    }
     return viewerState;
   }
 
-  /**
-   * Loads the document's table of contents (outline), flattened with
-   * depth for indentation and best-effort page numbers resolved from
-   * each destination. PDFs without an outline get an empty list - the
-   * sidebar shows the honest empty state.
-   */
-  async function loadOutline() {
-    if (!pdfDoc || typeof pdfDoc.getOutline !== 'function') return [];
-    let raw = [];
-    try { raw = await pdfDoc.getOutline(); } catch { raw = []; }
-    const out = [];
-    const walk = async (items, depth) => {
-      for (const item of raw ? items : []) {
-        if (!item) continue;
-        let pageNumber = null;
-        try {
-          let dest = item.dest;
-          if (typeof dest === 'string' && typeof pdfDoc.getDestination === 'function') {
-            dest = await pdfDoc.getDestination(dest);
-          }
-          if (Array.isArray(dest) && dest[0] !== undefined && typeof pdfDoc.getPageIndex === 'function') {
-            pageNumber = (await pdfDoc.getPageIndex(dest[0])) + 1;
-          }
-        } catch { /* unresolvable destination - keep the title, no jump */ }
-        out.push({ title: String(item.title || 'Section'), page: pageNumber, depth });
-        if (Array.isArray(item.items) && item.items.length && depth < 8) await walk(item.items, depth + 1);
-      }
-    };
-    await walk(raw || [], 0);
-    setState({ outline: out });
-    return out;
-  }
-
-  /** Fit the page to the container's width (accounting for rotation). */
   async function fitToWidth() {
-    const container = mountedContainer;
-    const width = container && (container.clientWidth || (container.parentElement && container.parentElement.clientWidth));
+    const width = mountedContainer && (mountedContainer.clientWidth || mountedContainer.parentElement?.clientWidth);
     if (!width || !pdfDoc) return viewerState;
     try {
       const page = await pdfDoc.getPage(viewerState.page);
       const rotation = ((page.rotate || 0) + (viewerState.rotation || 0)) % 360;
-      const base = page.getViewport({ scale: 1, rotation });
-      const target = Math.max(0.5, Math.min(4, (width - 32) / base.width));
-      setState({ zoom: target });
-      await renderCurrent();
-    } catch { /* headless - nothing to fit */ }
+      const viewport = page.getViewport({ scale: 1, rotation });
+      await setZoom(Math.max(0.5, Math.min(4, (width - 32) / viewport.width)));
+      viewerState.zoomMode = 'fit-width';
+    } catch { /* keep current zoom */ }
     return viewerState;
   }
 
-  /** Fit the whole page inside the container (width AND height). */
   async function fitToPage() {
-    const container = mountedContainer;
-    const box = container && (container.parentElement || container);
-    const width = box && (box.clientWidth || (box.parentElement && box.parentElement.clientWidth));
-    const height = box && (box.clientHeight || (box.parentElement && box.parentElement.clientHeight));
+    const box = mountedContainer?.parentElement || mountedContainer;
+    const width = box && (box.clientWidth || box.parentElement?.clientWidth);
+    const height = box && (box.clientHeight || box.parentElement?.clientHeight);
     if (!width || !height || !pdfDoc) return viewerState;
     try {
       const page = await pdfDoc.getPage(viewerState.page);
       const rotation = ((page.rotate || 0) + (viewerState.rotation || 0)) % 360;
-      const base = page.getViewport({ scale: 1, rotation });
-      const target = Math.max(0.5, Math.min(4, Math.min((width - 32) / base.width, (height - 32) / base.height)));
-      setState({ zoom: target });
-      await renderCurrent();
-    } catch { /* headless - nothing to fit */ }
+      const viewport = page.getViewport({ scale: 1, rotation });
+      await setZoom(Math.max(0.5, Math.min(4, Math.min((width - 32) / viewport.width, (height - 32) / viewport.height))));
+      viewerState.zoomMode = 'fit-page';
+    } catch { /* keep current zoom */ }
     return viewerState;
   }
 
-  /**
-   * Keyboard map for the focused viewer. Returns the action taken so the
-   * host can do the parts that need DOM focus (e.g. focusing search).
-   *   ArrowRight/PageDown/Space -> next page; ArrowLeft/PageUp -> prev
-   *   Home/End -> first/last page; +/=/- and 0 -> zoom
-   *   r -> rotate 90deg; n -> night mode; f -> fit width
-   *   Ctrl/Cmd+F -> focus the search field
-   */
-  function handleKeydown(e) {
-    if (!e) return null;
-    const tag = String((e.target && e.target.tagName) || '').toUpperCase();
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return null;
-    const key = String(e.key || '');
-    if ((e.ctrlKey || e.metaKey) && (key === 'f' || key === 'F')) return 'focus-search';
-    if (e.ctrlKey || e.metaKey || e.altKey) return null;
-    switch (key) {
-      case 'ArrowRight': case 'PageDown': case ' ': nextPage(); return 'page';
-      case 'ArrowLeft': case 'PageUp': prevPage(); return 'page';
-      case 'Home': setPage(1); return 'page';
-      case 'End': setPage(viewerState.numPages || 1); return 'page';
-      case '+': case '=': setZoom((viewerState.zoom || 1) + 0.25); return 'zoom';
-      case '-': case '_': setZoom((viewerState.zoom || 1) - 0.25); return 'zoom';
-      case '0': setZoom(1); return 'zoom';
-      case 'r': case 'R': rotate(90); return 'rotate';
-      case 'n': case 'N': setNight(!viewerState.night); return 'night';
-      case 'f': case 'F': fitToWidth(); return 'fit';
-      default: return null;
-    }
+  async function loadOutline() {
+    if (!pdfDoc || typeof pdfDoc.getOutline !== 'function') return [];
+    let raw = [];
+    try { raw = await pdfDoc.getOutline() || []; } catch { raw = []; }
+    const outline = [];
+    const walk = async (items, depth) => {
+      for (const item of items || []) {
+        let page = null;
+        try {
+          let destination = item.dest;
+          if (typeof destination === 'string' && typeof pdfDoc.getDestination === 'function') destination = await pdfDoc.getDestination(destination);
+          if (Array.isArray(destination) && destination[0] !== undefined && typeof pdfDoc.getPageIndex === 'function') page = (await pdfDoc.getPageIndex(destination[0])) + 1;
+        } catch { /* preserve an unresolvable title */ }
+        outline.push({ title: String(item?.title || 'Section'), page, depth });
+        if (item?.items?.length && depth < 8) await walk(item.items, depth + 1);
+      }
+    };
+    await walk(raw, 0);
+    setState({ outline });
+    return outline;
   }
 
-  /** Text search across every page (case-insensitive). Returns all
-   *  matches { page, snippet } and jumps to the first. */
+  async function textForPage(pageNumber) {
+    if (pageTexts[pageNumber - 1] !== undefined) return pageTexts[pageNumber - 1];
+    try {
+      const page = await pdfDoc.getPage(pageNumber);
+      const content = await page.getTextContent();
+      textContents[pageNumber - 1] = content;
+      const text = (content.items || []).map((item) => String(item.str || '')).join(' ');
+      pageTexts[pageNumber - 1] = text;
+      return text;
+    } catch { pageTexts[pageNumber - 1] = ''; return ''; }
+  }
+
   async function search(query) {
     const q = String(query || '').trim();
-    setState({ query: q, matches: [], matchIndex: -1 });
-    if (!q || !pdfDoc || viewerState.status !== 'ready') return viewerState;
-    const needle = q.toLowerCase();
+    setState({ query: q, matches: [], matchIndex: -1, searchPending: Boolean(q) });
+    if (!q || !pdfDoc || viewerState.status !== 'ready') { setState({ searchPending: false }); return viewerState; }
+    const needle = q.toLocaleLowerCase();
     const matches = [];
-    for (let p = 1; p <= (pdfDoc.numPages || 0); p += 1) {
-      let text = '';
-      try {
-        const page = await pdfDoc.getPage(p);
-        const content = await page.getTextContent();
-        text = (content.items || []).map((item) => String(item.str || '')).join(' ');
-      } catch { continue; }
-      const hay = text.toLowerCase();
-      let idx = hay.indexOf(needle);
-      while (idx !== -1 && matches.length < 500) {
-        const start = Math.max(0, idx - 30);
-        matches.push({ page: p, snippet: text.slice(start, idx + needle.length + 40).trim() });
-        idx = hay.indexOf(needle, idx + needle.length);
+    for (let pageNumber = 1; pageNumber <= pdfDoc.numPages && matches.length < 500; pageNumber += 1) {
+      const text = await textForPage(pageNumber);
+      const lower = text.toLocaleLowerCase();
+      let index = lower.indexOf(needle);
+      while (index >= 0 && matches.length < 500) {
+        const start = Math.max(0, index - 36);
+        matches.push({ page: pageNumber, index, snippet: text.slice(start, index + q.length + 52).trim() });
+        index = lower.indexOf(needle, index + Math.max(needle.length, 1));
+      }
+      if (pageNumber % 4 === 0) {
+        setState({ searchProgress: Math.round((pageNumber / pdfDoc.numPages) * 100) });
+        await new Promise((resolve) => setTimeout(resolve, 0));
       }
     }
-    setState({ matches, matchIndex: matches.length ? 0 : -1 });
+    setState({ matches, matchIndex: matches.length ? 0 : -1, searchPending: false, searchProgress: null });
+    for (let pageNumber = 1; pageNumber <= viewerState.numPages; pageNumber += 1) paintSearchMarks(pageNumber);
     if (matches.length) await setPage(matches[0].page);
     return viewerState;
   }
 
   function nextMatch() {
-    if (!viewerState.matches.length) return viewerState;
-    const matchIndex = (viewerState.matchIndex + 1) % viewerState.matches.length;
+    if (!viewerState.matches?.length) return viewerState;
+    const matchIndex = ((viewerState.matchIndex || 0) + 1) % viewerState.matches.length;
     setState({ matchIndex });
-    setPage(viewerState.matches[matchIndex].page);
+    void setPage(viewerState.matches[matchIndex].page);
     return viewerState;
   }
 
-  /** Rebind a loaded/in-flight document to a fresh shell mount without
-   *  parsing the PDF a second time. This is important because BrowserShell
-   *  rebuilds its DOM on tab switches and resize-driven renders. */
+  async function renderThumbnail(pageNumber, target) {
+    if (!pdfDoc || !target) return;
+    try {
+      const page = await pdfDoc.getPage(pageNumber);
+      const base = page.getViewport({ scale: 1, rotation: page.rotate || 0 });
+      const width = Math.max(80, Number(target.clientWidth || 130) - 8);
+      const viewport = page.getViewport({ scale: width / base.width, rotation: page.rotate || 0 });
+      const doc = target.ownerDocument || ownerDocument();
+      const canvas = doc.createElement('canvas');
+      canvas.className = 'fb-pdf-thumbnail-canvas';
+      const ratio = Math.min(Number(globalThis.devicePixelRatio || 1), 1.5);
+      canvas.width = Math.floor(viewport.width * ratio);
+      canvas.height = Math.floor(viewport.height * ratio);
+      canvas.style.width = `${Math.floor(viewport.width)}px`;
+      canvas.style.height = `${Math.floor(viewport.height)}px`;
+      const context = canvas.getContext?.('2d', { alpha: false });
+      if (!context) return;
+      context.setTransform?.(ratio, 0, 0, ratio, 0, 0);
+      await page.render({ canvasContext: context, viewport }).promise;
+      clearElement(target);
+      target.appendChild?.(canvas);
+      const label = doc.createElement('div');
+      label.textContent = String(pageNumber);
+      label.style.cssText = 'padding:3px 0;color:var(--fb-text-secondary,#9aa3b2);font-size:.7rem;';
+      target.appendChild?.(label);
+    } catch { /* numbered tile remains */ }
+  }
+
+  /** Paint every page before the browser's print snapshot. Normal viewing
+   *  deliberately keeps only a small canvas window; printing is the one
+   *  operation that needs a complete, short-lived set of page pixels. */
+  async function preparePrint() {
+    if (!pdfDoc || viewerState.status !== 'ready') return false;
+    const token = loadToken;
+    setState({ printPending: true, loadingStage: 'Preparing pages for print…' });
+    try {
+      for (let first = 1; first <= viewerState.numPages; first += 3) {
+        if (token !== loadToken || !pdfDoc) return false;
+        const jobs = [];
+        for (let page = first; page < first + 3 && page <= viewerState.numPages; page += 1) jobs.push(renderPage(page, true));
+        await Promise.all(jobs);
+        setState({ printProgress: Math.round((Math.min(first + 2, viewerState.numPages) / viewerState.numPages) * 100) });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      setState({ printPending: false, printProgress: 100, loadingStage: '' });
+      return true;
+    } catch {
+      setState({ printPending: false, printProgress: null, loadingStage: '' });
+      return false;
+    }
+  }
+
+  async function finishPrint() {
+    setState({ printPending: false, printProgress: null, loadingStage: '' });
+    await renderWindow(viewerState.page || 1);
+  }
+
+  async function renderCurrent() {
+    return renderWindow(viewerState.page, true);
+  }
+
+  function handleKeydown(event) {
+    if (!event) return null;
+    const tag = String(event.target?.tagName || '').toUpperCase();
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || event.target?.isContentEditable) return null;
+    const key = String(event.key || '');
+    if ((event.ctrlKey || event.metaKey) && key.toLowerCase() === 'f') return 'focus-search';
+    if (event.ctrlKey || event.metaKey || event.altKey) return null;
+    if (['ArrowRight', 'PageDown', ' '].includes(key)) { void nextPage(); return 'page'; }
+    if (['ArrowLeft', 'PageUp'].includes(key)) { void prevPage(); return 'page'; }
+    if (key === 'Home') { void setPage(1); return 'page'; }
+    if (key === 'End') { void setPage(viewerState.numPages || 1); return 'page'; }
+    if (key === '+' || key === '=') { void setZoom((viewerState.zoom || 1) + 0.25); return 'zoom'; }
+    if (key === '-' || key === '_') { void setZoom((viewerState.zoom || 1) - 0.25); return 'zoom'; }
+    if (key === '0') { void setZoom(1); return 'zoom'; }
+    if (key.toLowerCase() === 'r') { void rotate(90); return 'rotate'; }
+    if (key.toLowerCase() === 'n') { void setNight(!viewerState.night); return 'night'; }
+    if (key.toLowerCase() === 'f') { void fitToWidth(); return 'fit'; }
+    return null;
+  }
+
   function attach(nextContainer, nextStateChange = null) {
-    const previousContainer = mountedContainer;
+    if (scrollHost && scrollHost !== nextContainer && typeof scrollHost.removeEventListener === 'function') scrollHost.removeEventListener('scroll', onScroll);
     mountedContainer = nextContainer || null;
     if (typeof nextStateChange === 'function') stateChange = nextStateChange;
-
-    if (mountedContainer && mountedContainer !== previousContainer) {
-      const canvas = previousContainer?.querySelector?.('.fb-doc-canvas');
-      if (canvas) {
-        mountedContainer.querySelector?.('.fb-doc-canvas')?.remove?.();
-        mountedContainer.appendChild?.(canvas);
-      } else if (pdfDoc && viewerState.status === 'ready') {
-        return renderCurrent();
-      }
+    if (root && mountedContainer) {
+      removeFromParent(root);
+      clearElement(mountedContainer);
+      mountedContainer.appendChild?.(root);
+      bindScroll();
+    } else if (pdfDoc && viewerState.status === 'ready') {
+      buildPages();
+      void renderWindow(viewerState.page);
     }
     notify();
     return Promise.resolve(viewerState);
@@ -460,28 +729,38 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null,
 
   function destroy() {
     loadToken += 1;
-    renderToken += 1;
-    if (activeLoadTimeout !== null) {
-      clearTimeout(activeLoadTimeout);
-      activeLoadTimeout = null;
+    renderGeneration += 1;
+    if (activeLoadTimeout !== null) clearTimeout(activeLoadTimeout);
+    activeLoadTimeout = null;
+    if (scrollHost && typeof scrollHost.removeEventListener === 'function') scrollHost.removeEventListener('scroll', onScroll);
+    if (scrollFrame !== null) {
+      if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(scrollFrame);
+      else clearTimeout(scrollFrame);
     }
+    scrollFrame = null;
+    for (const task of renderTasks.values()) { try { task.cancel?.(); } catch { /* settled */ } }
+    renderTasks.clear();
+    rendering.clear();
     try {
-      if (typeof loadingTask?.destroy === 'function') {
-        const cleanup = loadingTask.destroy();
-        cleanup?.catch?.(() => {});
-      } else {
-        pdfDoc?.destroy?.();
-      }
+      const cleanup = typeof loadingTask?.destroy === 'function' ? loadingTask.destroy() : pdfDoc?.destroy?.();
+      cleanup?.catch?.(() => {});
     } catch { /* already gone */ }
     loadingTask = null;
     pdfDoc = null;
+    measurePromise = null;
+    clearElement(mountedContainer);
+    root = null;
     mountedContainer = null;
-    setState({ status: 'idle', numPages: 0, page: 1, progress: null, loadingStage: '', matches: [], matchIndex: -1 });
+    scrollHost = null;
+    pageShells.clear(); pageCanvases.clear(); textLayers.clear(); renderedKeys.clear();
+    baseSizes.length = 0; pageTexts.length = 0; textContents.length = 0;
+    setState({ status: 'idle', numPages: 0, page: 1, progress: null, loadingStage: '', matches: [], matchIndex: -1, searchPending: false, printPending: false, printProgress: null });
   }
 
   return {
     get state() { return viewerState; },
-    load, attach, setPage, nextPage, prevPage, setZoom, search, nextMatch, renderCurrent, destroy,
-    rotate, setNight, loadOutline, fitToWidth, fitToPage, handleKeydown
+    load, attach, setPage, nextPage, prevPage, setZoom, search, nextMatch,
+    renderCurrent, renderThumbnail, destroy, rotate, setNight, loadOutline,
+    fitToWidth, fitToPage, preparePrint, finishPrint, handleKeydown
   };
 }

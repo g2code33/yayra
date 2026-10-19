@@ -18,7 +18,18 @@
 
 import { Icons } from '../icons/icons.js';
 import qrcode from '../vendor/qrcode.js';
-import { classifyDocument, DocumentStore, createPdfViewer, createDocumentViewerState, DOCUMENT_ENGINES, MAX_DOCUMENT_BYTES } from '../services/documentWorkspace.js';
+import {
+  classifyDocument,
+  createDocumentViewerState,
+  createPdfViewer,
+  createViewerForKind,
+  DOCUMENT_ACCEPT,
+  DOCUMENT_ENGINES,
+  DocumentStore,
+  MAX_DOCUMENT_BYTES,
+  routeDocument,
+  sniffDocumentKind
+} from '../services/documentWorkspace.js';
 import { PasswordManager } from '../../../persistence/src/PasswordManager.js';
 import { PasskeyService } from '../services/passkeyService.js';
 import { ProfileService } from '../services/profileService.js';
@@ -9089,9 +9100,32 @@ export class BrowserShell {
     this.showTransientNotice("DevTools aren't available in the web build - use your browser's own (F12 / Ctrl+Shift+I).");
   }
 
-  /** Print the actual page: the native view's print dialog on desktop, window.print on web. */
-  printActivePage() {
+  /** Print the active website or local document. Document tabs never use the
+   *  native website surface; PDF pages are fully painted just for the print
+   *  snapshot and returned to their normal windowed-memory state afterward. */
+  async printActivePage() {
     const tab = this.getActiveTab();
+    if (tab?.isDocument || String(tab?.url || '').startsWith('yayra://doc/')) {
+      const viewer = this._activeDocViewer?.tabId === tab.id ? this._activeDocViewer.viewer : null;
+      if (!viewer || tab.docState?.status !== 'ready') {
+        this.showTransientNotice('Wait for the document to finish opening before printing.');
+        return;
+      }
+      try {
+        if (typeof viewer?.preparePrint === 'function') {
+          this.showTransientNotice('Preparing the PDF for printing…');
+          const ready = await viewer.preparePrint();
+          if (!ready) {
+            this.showTransientNotice('Couldn’t prepare this document for printing. The original is still available.');
+            return;
+          }
+        }
+        if (typeof window !== 'undefined' && typeof window.print === 'function') window.print();
+      } finally {
+        await viewer?.finishPrint?.();
+      }
+      return;
+    }
     if (this.nativeWebview && typeof this.nativeWebview.print === 'function' && tab) {
       try {
         const res = this.nativeWebview.print(tab.id);
@@ -15952,8 +15986,8 @@ export class BrowserShell {
    * PDF EVERYWHERE (user request): drag-and-drop, OS "Open with",
    * downloads right-click "Open in Yayra".
    * ----------------------------------------------------------- */
-  /** One global drop zone: any PDF dropped anywhere in Yayra opens in
-   *  the document viewer. Non-PDF files get the honest roadmap notice. */
+  /** One global drop zone: any supported local document or image dropped
+   *  anywhere in Yayra opens in the matching bundled viewer. */
   _armPdfDropZone() {
     if (this._pdfDropArmed || typeof document === 'undefined') return;
     this._pdfDropArmed = true;
@@ -15982,19 +16016,19 @@ export class BrowserShell {
   }
 
   async _openDroppedPdfFiles(files) {
-    const pdfs = files.filter((f) => classifyDocument(f && f.name) === 'pdf');
-    if (!pdfs.length) {
-      this.showTransientNotice('Only PDF documents open in Yayra right now - Word, Excel and PowerPoint are on the roadmap.');
-      return;
-    }
-    for (const file of pdfs.slice(0, 8)) {
+    // Do not reject solely by extension: DocumentStore sniffs the bytes, so a
+    // renamed PDF/Office package still reaches the right viewer. Truly unknown
+    // file types are rejected with a notice rather than creating a dead tab.
+    const documents = files.filter((file) => file && file.name);
+    if (!documents.length) return;
+    for (const file of documents.slice(0, 8)) {
       if (Number.isFinite(file?.size) && file.size > MAX_DOCUMENT_BYTES) {
-        this.showTransientNotice(`PDFs larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`);
+        this.showTransientNotice(`Documents larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`);
         continue;
       }
       try {
         const bytes = await this._readFileBytes(file);
-        this.addDocumentTab({ name: file.name, bytes });
+        this.addDocumentTab({ name: file.name, bytes, mime: file.type || '' });
       } catch { this.showTransientNotice(`Couldn\u2019t read \u201C${file.name}\u201D.`); }
     }
   }
@@ -16015,8 +16049,14 @@ export class BrowserShell {
       || (/\.pdf$/i.test(String(item.path || ''))));
   }
 
-  /** Right-click menu for a download: "Open in Yayra" for PDFs (the
-   *  in-app viewer), plus the OS open / reveal / copy actions. */
+  isViewableDocumentDownload(item) {
+    if (!item) return false;
+    const name = item.filename || item.name || item.path || '';
+    return classifyDocument(name, item.mime || item.mimeType || '') !== null;
+  }
+
+  /** Right-click menu: supported downloads open in the matching bundled
+   *  viewer; OS open/reveal/copy actions remain available beside it. */
   showDownloadsContextMenu(evt, item) {
     if (typeof document === 'undefined' || !document.body || !item) return;
     document.getElementById('yayra-dl-context-menu')?.remove();
@@ -16034,7 +16074,7 @@ export class BrowserShell {
       b.addEventListener('click', () => { dismiss(); fn(); });
       menu.appendChild(b);
     };
-    if (this.isPdfDownload(item)) entry('Open in Yayra', () => this.performDownloadAction(item.id, 'open-in-yayra'));
+    if (this.isViewableDocumentDownload(item)) entry('Open in Yayra', () => this.performDownloadAction(item.id, 'open-in-yayra'));
     if (this.downloadsBridge) {
       entry('Open (desktop app)', () => this.performDownloadAction(item.id, 'open'));
       entry('Show in folder', () => this.performDownloadAction(item.id, 'show'));
@@ -16103,7 +16143,7 @@ export class BrowserShell {
 
     for (const row of dropdown.querySelectorAll('.fb-dl-item')) {
       const id = (row.dataset && row.dataset.dlId) || row.getAttribute?.('data-dl-id');
-      // RIGHT-CLICK: the per-download menu ("Open in Yayra" for PDFs,
+      // RIGHT-CLICK: the per-download menu (internal document viewer plus
       // OS open / reveal / copy actions).
       row.addEventListener('contextmenu', (e) => {
         e.preventDefault();
@@ -16152,15 +16192,16 @@ export class BrowserShell {
         if (item.url) copy(item.url, 'Download address copied');
         break;
       case 'open-in-yayra': {
-        if (!bridge || typeof bridge.openPdf !== 'function') {
+        const openDownloadedDocument = bridge?.openDocument || bridge?.openPdf;
+        if (typeof openDownloadedDocument !== 'function') {
           this.showTransientNotice('Opening downloads inside Yayra needs the desktop app.');
           break;
         }
         this.state.isDownloadsDropdownOpen = false;
         this.state.isDownloadsDropdownExpanded = false;
-        const res = await bridge.openPdf(id);
+        const res = await openDownloadedDocument.call(bridge, id);
         if (res && res.ok) {
-          this.addDocumentTab({ name: res.name, bytes: res.data });
+          this.addDocumentTab({ name: res.name, bytes: res.data, mime: item.mime || item.mimeType || '' });
         } else {
           this.showTransientNotice(`Couldn't open it in Yayra${res && res.reason ? ` (${res.reason})` : ''}.`);
         }
@@ -16547,12 +16588,13 @@ export class BrowserShell {
   async openDocument() {
     try {
       const bridge = this.systemBridge?.documents;
-      if (bridge && typeof bridge.openPdf === 'function') {
-        const res = await bridge.openPdf();
+      const openNative = bridge && (bridge.openFile || bridge.openPdf);
+      if (typeof openNative === 'function') {
+        const res = await openNative.call(bridge);
         if (!res || !res.ok) {
           if (res && res.canceled) return; // user closed the picker
           if (res?.reason === 'file-too-large') {
-            this.showTransientNotice(`PDFs larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`);
+            this.showTransientNotice(`Documents larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`);
           } else {
             this.showTransientNotice(`Couldn\u2019t open the document${res && res.reason ? ` (${res.reason})` : ''}.`);
           }
@@ -16576,8 +16618,8 @@ export class BrowserShell {
     if (!input) {
       input = document.createElement('input');
       input.type = 'file';
-      input.accept = 'application/pdf,.pdf';
-      input.setAttribute('aria-label', 'Open a PDF document');
+      input.accept = DOCUMENT_ACCEPT.join(',');
+      input.setAttribute('aria-label', 'Open a document, presentation, spreadsheet, image, or text file');
       input.style.cssText = 'position:fixed; left:-9999px; top:0; opacity:0;';
       input.addEventListener('change', () => {
         const file = input.files && input.files[0];
@@ -16585,16 +16627,14 @@ export class BrowserShell {
         // Reset first so the same rejected file can be selected again after
         // the user chooses a smaller/different document.
         input.value = '';
-        if (classifyDocument(file.name) !== 'pdf') {
-          this.showTransientNotice('Only PDF documents are supported right now - Word, Excel and PowerPoint are on the roadmap.');
-          return;
-        }
+        // Read before final routing: the byte sniffer outranks the extension,
+        // so a renamed PDF or Office package still opens correctly.
         if (Number.isFinite(file.size) && file.size > MAX_DOCUMENT_BYTES) {
-          this.showTransientNotice(`PDFs larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`);
+          this.showTransientNotice(`Documents larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`);
           return;
         }
         const reader = new FileReader();
-        reader.onload = () => this.addDocumentTab({ name: file.name, bytes: reader.result });
+        reader.onload = () => this.addDocumentTab({ name: file.name, bytes: reader.result, mime: file.type || '' });
         reader.onerror = () => this.showTransientNotice('Couldn\u2019t read the file.');
         reader.readAsArrayBuffer(file);
       });
@@ -16604,14 +16644,19 @@ export class BrowserShell {
     input.click();
   }
 
-  /** Registers the document and opens it in a fresh tab of its own. */
-  addDocumentTab({ name, bytes }) {
+  /** Registers a recognized local document and opens a fresh in-memory tab. */
+  addDocumentTab({ name, bytes, mime = '' }) {
+    const kind = sniffDocumentKind(bytes, name, mime);
+    if (!kind) {
+      this.showTransientNotice('Yayra can’t safely display this file type. Use a supported document, image, or text file.');
+      return null;
+    }
     let doc;
     try {
-      doc = this.documentStore.add({ name, bytes });
+      doc = this.documentStore.add({ name, bytes, mime });
     } catch (error) {
       this.showTransientNotice(error?.message === 'document-too-large'
-        ? `PDFs larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`
+        ? `Documents larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`
         : 'That file appears to be empty.');
       return null;
     }
@@ -16622,7 +16667,8 @@ export class BrowserShell {
     tab.title = doc.name;
     tab.isDocument = true;
     tab.docId = doc.id;
-    tab.docState = { status: 'loading', numPages: 0, page: 1, zoom: 1.25, query: '', matches: [], matchIndex: -1, error: null };
+    tab.docState = createDocumentViewerState(doc.type);
+    tab.docState.status = 'loading';
     this.render();
     return doc;
   }
@@ -16674,6 +16720,10 @@ export class BrowserShell {
    *  the canvas host, driven by createPdfViewer. Honest states only -
    *  no placeholder buttons for unsupported operations. */
   renderDocumentViewer(viewport, tab) {
+    const doc = this.documentStore.get(tab.docId);
+    const documentKind = doc?.type || tab.docState?.viewer || 'unsupported';
+    const documentRoute = routeDocument(documentKind);
+    const capabilities = documentRoute.capabilities;
     const wrap = document.createElement('div');
     wrap.className = 'fb-doc-viewer';
     wrap.style.cssText = 'flex:1; min-height:0; display:flex; flex-direction:column; background:var(--fb-bg-app,#191c23); outline:none;';
@@ -16700,45 +16750,69 @@ export class BrowserShell {
       const session = this._activeDocViewer;
       return session && session.tabId === tab.id ? session.viewer : null;
     };
+    const openOriginal = async () => {
+      const current = this.documentStore.get(tab.docId);
+      if (!current) return;
+      const bridge = this.systemBridge?.documents;
+      if (typeof bridge?.openExternal === 'function') {
+        try {
+          const res = await bridge.openExternal({ name: current.name, data: current.bytes });
+          this.showTransientNotice(res?.ok
+            ? `Opening \u201C${current.name}\u201D with your desktop app...`
+            : `Couldn\u2019t open it externally${res?.reason ? ` (${res.reason})` : ''}.`);
+        } catch { this.showTransientNotice('Couldn\u2019t open it externally.'); }
+        return;
+      }
+      try {
+        const href = URL.createObjectURL(new Blob([current.bytes], { type: current.mime || 'application/octet-stream' }));
+        const link = document.createElement('a');
+        link.href = href;
+        link.download = current.name;
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(href), 1000);
+      } catch { this.showTransientNotice('Couldn\u2019t download the original file.'); }
+    };
 
-    // ---- Row A: identity + the big actions -----------------------------
+    // ---- Row A: identity + original-file escape hatch ------------------
     const bar = document.createElement('div');
     bar.className = 'fb-doc-toolbar';
-    bar.style.cssText = 'flex:none; display:flex; align-items:center; gap:6px; padding:6px 10px; background:var(--fb-bg-elevated,#141824); border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.8rem; color:var(--fb-text-primary,#dfe4ee);';
+    bar.style.cssText = 'flex:none; display:flex; align-items:center; gap:8px; padding:7px 10px; background:var(--fb-bg-elevated,#141824); border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.8rem; color:var(--fb-text-primary,#dfe4ee);';
+    const kindBadge = document.createElement('span');
+    kindBadge.className = `fb-doc-kind-badge fb-doc-kind-${documentKind}`;
+    kindBadge.textContent = documentRoute.shortLabel || 'Document';
+    kindBadge.title = `${documentRoute.engine}${documentRoute.limitations ? ` — ${documentRoute.limitations}` : ''}`;
+    kindBadge.style.cssText = 'flex:none;padding:3px 7px;border-radius:6px;background:rgba(109,93,242,.18);color:var(--fb-accent-primary,#9b8cff);font-size:.66rem;font-weight:800;text-transform:uppercase;letter-spacing:.06em;';
+    bar.appendChild(kindBadge);
     const nameEl = document.createElement('span');
     nameEl.textContent = tab.title || 'Document';
-    nameEl.style.cssText = 'max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600;';
+    nameEl.title = tab.title || 'Document';
+    nameEl.style.cssText = 'max-width:min(420px,42vw); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:650;';
     bar.appendChild(nameEl);
     const spacerA = document.createElement('span');
     spacerA.style.cssText = 'flex:1;';
     bar.appendChild(spacerA);
-    // "Use the desktop PDF app instead": the honest escape hatch from the
-    // in-Yayra viewer (main process writes a temp file + OS open-with).
-    if (this.systemBridge && this.systemBridge.documents && typeof this.systemBridge.documents.openExternal === 'function') {
-      bar.appendChild(mkBtn('Desktop app', 'Open this PDF with your desktop PDF app instead', async () => {
-        const d = this.documentStore.get(tab.docId);
-        if (!d) return;
-        try {
-          const res = await this.systemBridge.documents.openExternal({ name: d.name, data: d.bytes });
-          this.showTransientNotice(res && res.ok
-            ? `Opening \u201C${d.name}\u201D with your desktop PDF app...`
-            : `Couldn\u2019t open it externally${res && res.reason ? ` (${res.reason})` : ''}.`);
-        } catch { this.showTransientNotice('Couldn\u2019t open it externally.'); }
-      }));
-    }
+    const hasDesktopDocumentBridge = typeof this.systemBridge?.documents?.openExternal === 'function';
+    bar.appendChild(mkBtn(
+      hasDesktopDocumentBridge ? 'Desktop app' : 'Download original',
+      hasDesktopDocumentBridge
+        ? `Open this ${documentRoute.shortLabel.toLowerCase()} with the system default app`
+        : 'Download the unchanged original file',
+      openOriginal,
+      'fb-doc-original-btn'
+    ));
     bar.appendChild(mkBtn('\u2715 Close', 'Close the document and return to browsing', () => this.closeTab(tab.id), 'fb-doc-close-btn'));
 
-    // ---- Row B: pages, zoom, fit, rotate, night, outline, search -------
+    // ---- Row B: only controls the selected engine genuinely supports ----
     const bar2 = document.createElement('div');
     bar2.className = 'fb-doc-toolbar fb-doc-toolbar2';
     bar2.style.cssText = 'flex:none; display:flex; align-items:center; gap:6px; padding:5px 10px; background:var(--fb-bg-surface,#11141d); border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.78rem; color:var(--fb-text-primary,#dfe4ee); flex-wrap:wrap;';
 
-    bar2.appendChild(mkBtn('\u2039', 'Previous page (Left)', () => activeViewer()?.prevPage?.()));
+    const pageNoun = documentKind === 'pptx' ? 'slide' : documentKind === 'xlsx' ? 'sheet' : 'page';
     const pageInput = document.createElement('input');
     pageInput.type = 'number';
     pageInput.className = 'fb-doc-page-input';
     pageInput.min = '1';
-    pageInput.setAttribute('aria-label', 'Page number');
+    pageInput.setAttribute('aria-label', `${pageNoun[0].toUpperCase()}${pageNoun.slice(1)} number`);
     pageInput.style.cssText = 'width:52px; padding:4px 6px; border-radius:6px; border:1px solid var(--fb-border-glass,rgba(255,255,255,0.12)); background:var(--fb-bg-glass-input,#101218); color:inherit; font-size:0.78rem; text-align:center;';
     const pageLabel = document.createElement('span');
     pageLabel.className = 'fb-doc-page-label';
@@ -16750,44 +16824,65 @@ export class BrowserShell {
     };
     pageInput.addEventListener('change', gotoPage);
     pageInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { gotoPage(); wrap.focus?.(); } });
-    bar2.appendChild(pageInput);
-    bar2.appendChild(pageLabel);
-    bar2.appendChild(mkBtn('\u203a', 'Next page (Right)', () => activeViewer()?.nextPage?.()));
+    if (capabilities.pageNavigation) {
+      bar2.appendChild(mkBtn('\u2039', `Previous ${pageNoun} (Left)`, () => activeViewer()?.prevPage?.()));
+      bar2.appendChild(pageInput);
+      bar2.appendChild(pageLabel);
+      bar2.appendChild(mkBtn('\u203a', `Next ${pageNoun} (Right)`, () => activeViewer()?.nextPage?.()));
+    }
 
-    bar2.appendChild(mkBtn('\u2212', 'Zoom out (-)', () => activeViewer()?.setZoom?.((tab.docState?.zoom || 1.25) - 0.25)));
     const zoomLabel = document.createElement('span');
     zoomLabel.className = 'fb-doc-zoom-label';
     zoomLabel.style.cssText = 'min-width:40px; text-align:center; color:var(--fb-text-secondary,#9aa3b2);';
-    bar2.appendChild(zoomLabel);
-    bar2.appendChild(mkBtn('+', 'Zoom in (+)', () => activeViewer()?.setZoom?.((tab.docState?.zoom || 1.25) + 0.25)));
-
-    bar2.appendChild(mkBtn('\u2194 Fit', 'Fit the page to the window width (F)', () => activeViewer()?.fitToWidth?.(), 'fb-doc-btn-fitw'));
-    bar2.appendChild(mkBtn('\u29c9 Page', 'Show the whole page at once', () => activeViewer()?.fitToPage?.(), 'fb-doc-btn-fitp'));
-    bar2.appendChild(mkBtn('\u21bb', 'Rotate 90\u00b0 (R)', () => activeViewer()?.rotate?.(90), 'fb-doc-btn-rotate'));
-    bar2.appendChild(mkBtn('\u263d', 'Night reading mode - invert colors (N)', () => { activeViewer()?.setNight?.(!tab.docState?.night); }, 'fb-doc-btn-night'));
-    bar2.appendChild(mkBtn('\u2630', 'Outline and page thumbnails', () => {
-      tab.docState.sidebarOpen = !tab.docState.sidebarOpen;
-      if (this._activeDocViewer && this._activeDocViewer.tabId === tab.id) this._activeDocViewer.rerenderSidebar?.();
-      else this.render();
-    }, 'fb-doc-btn-outline'));
+    if (capabilities.zoom) {
+      bar2.appendChild(mkBtn('\u2212', 'Zoom out (-)', () => activeViewer()?.setZoom?.((tab.docState?.zoom || 1.25) - 0.25)));
+      bar2.appendChild(zoomLabel);
+      bar2.appendChild(mkBtn('+', 'Zoom in (+)', () => activeViewer()?.setZoom?.((tab.docState?.zoom || 1.25) + 0.25)));
+      bar2.appendChild(mkBtn('\u2194 Fit', `Fit the ${pageNoun} to the window width (F)`, () => activeViewer()?.fitToWidth?.(), 'fb-doc-btn-fitw'));
+      bar2.appendChild(mkBtn('\u29c9 Page', `Show the whole ${pageNoun} at once`, () => activeViewer()?.fitToPage?.(), 'fb-doc-btn-fitp'));
+    }
+    if (capabilities.rotate) bar2.appendChild(mkBtn('\u21bb', 'Rotate 90\u00b0 (R)', () => activeViewer()?.rotate?.(90), 'fb-doc-btn-rotate'));
+    if (capabilities.nightMode) bar2.appendChild(mkBtn('\u263d', 'Night reading mode (N)', () => { activeViewer()?.setNight?.(!tab.docState?.night); }, 'fb-doc-btn-night'));
+    if (capabilities.outline || capabilities.thumbnails) {
+      bar2.appendChild(mkBtn('\u2630', documentKind === 'pptx' ? 'Slide thumbnails' : 'Outline and page thumbnails', () => {
+        tab.docState.sidebarOpen = !tab.docState.sidebarOpen;
+        if (this._activeDocViewer?.tabId === tab.id) this._activeDocViewer.rerenderSidebar?.();
+        else this.render();
+      }, 'fb-doc-btn-outline'));
+    }
+    if (capabilities.notes) {
+      bar2.appendChild(mkBtn('Notes', 'Show or hide PowerPoint speaker notes', () => activeViewer()?.toggleNotes?.(), 'fb-doc-btn-notes'));
+    }
+    if (capabilities.print) {
+      bar2.appendChild(mkBtn('Print', 'Print every PDF page (Ctrl+P)', () => { void this.printActivePage(); }, 'fb-doc-btn-print'));
+    }
 
     const searchInput = document.createElement('input');
     searchInput.type = 'text';
     searchInput.className = 'fb-doc-search-input';
-    searchInput.placeholder = 'Find in document (Ctrl+F)';
-    searchInput.setAttribute('aria-label', 'Find in document');
-    searchInput.style.cssText = 'width:160px; padding:5px 9px; border-radius:7px; border:1px solid var(--fb-border-glass,rgba(255,255,255,0.12)); background:var(--fb-bg-glass-input,#101218); color:inherit; font-size:0.78rem;';
+    searchInput.placeholder = documentKind === 'xlsx' ? 'Find in sheet (Ctrl+F)' : `Find in ${pageNoun === 'slide' ? 'presentation' : 'document'} (Ctrl+F)`;
+    searchInput.setAttribute('aria-label', searchInput.placeholder);
+    searchInput.style.cssText = 'width:174px; padding:5px 9px; border-radius:7px; border:1px solid var(--fb-border-glass,rgba(255,255,255,0.12)); background:var(--fb-bg-glass-input,#101218); color:inherit; font-size:0.78rem;';
     let searchTimer = null;
     searchInput.addEventListener('input', () => {
       if (searchTimer) clearTimeout(searchTimer);
-      searchTimer = setTimeout(() => { activeViewer()?.search?.(searchInput.value); }, 350);
+      searchTimer = setTimeout(() => { activeViewer()?.search?.(searchInput.value); }, 300);
     });
-    bar2.appendChild(searchInput);
     const matchLabel = document.createElement('span');
     matchLabel.className = 'fb-doc-match-label';
     matchLabel.title = 'Show the list of matches';
     matchLabel.style.cssText = 'min-width:56px; color:var(--fb-text-secondary,#9aa3b2); font-size:0.72rem; cursor:pointer;';
-    bar2.appendChild(matchLabel);
+    if (capabilities.search) {
+      bar2.appendChild(searchInput);
+      bar2.appendChild(matchLabel);
+    }
+    if (!capabilities.view) {
+      const honest = document.createElement('span');
+      honest.className = 'fb-doc-limitations';
+      honest.textContent = documentRoute.limitations;
+      honest.style.cssText = 'color:var(--fb-text-secondary,#9aa3b2);line-height:1.35;';
+      bar2.appendChild(honest);
+    }
 
     // ---- Sidebar: outline + thumbnails ---------------------------------
     const sidebar = document.createElement('div');
@@ -16807,8 +16902,8 @@ export class BrowserShell {
       });
       return b;
     };
-    sidebarTabs.appendChild(mkTabBtn('Outline', 'outline'));
-    sidebarTabs.appendChild(mkTabBtn('Pages', 'thumbnails'));
+    if (capabilities.outline) sidebarTabs.appendChild(mkTabBtn('Outline', 'outline'));
+    if (capabilities.thumbnails) sidebarTabs.appendChild(mkTabBtn(documentKind === 'pptx' ? 'Slides' : 'Pages', 'thumbnails'));
     const sidebarBody = document.createElement('div');
     sidebarBody.className = 'fb-doc-sidebar-body';
     sidebar.appendChild(sidebarTabs);
@@ -16816,7 +16911,7 @@ export class BrowserShell {
 
     // ---- Host + status --------------------------------------------------
     const host = document.createElement('div');
-    host.className = 'fb-doc-host';
+    host.className = `fb-doc-host fb-doc-host-${documentKind}`;
     host.style.cssText = 'flex:1; min-height:0; overflow:auto; display:flex; flex-direction:column; align-items:center; gap:12px; padding:16px;';
     const statusEl = document.createElement('div');
     statusEl.className = 'fb-doc-status';
@@ -16863,27 +16958,42 @@ export class BrowserShell {
     viewport.appendChild(wrap);
     try { wrap.focus?.(); } catch { /* shim */ }
 
-    const doc = this.documentStore.get(tab.docId);
-    const state = tab.docState || (tab.docState = createDocumentViewerState());
+    const state = tab.docState || (tab.docState = createDocumentViewerState(documentKind));
     // Fresh mounts of an old tab state get the new fields.
-    for (const [k, v] of Object.entries(createDocumentViewerState())) {
+    for (const [k, v] of Object.entries(createDocumentViewerState(documentKind))) {
       if (state[k] === undefined) state[k] = v;
     }
 
+    let sidebarStructureKey = '';
     const renderSidebar = () => {
-      sidebarBody.innerHTML = '';
       try {
-        sidebar.style.display = state.sidebarOpen ? 'block' : 'none';
-        if (!state.sidebarOpen) return;
+        const canShowSidebar = capabilities.outline || capabilities.thumbnails;
+        sidebar.style.display = canShowSidebar && state.sidebarOpen ? 'block' : 'none';
+        if (!canShowSidebar || !state.sidebarOpen) {
+          sidebarStructureKey = '';
+          sidebarBody.innerHTML = '';
+          return;
+        }
+        const nextStructureKey = `${state.sidebarTab}|${state.numPages}|${state.outline.length}|${documentKind}`;
+        if (sidebarStructureKey === nextStructureKey && state.sidebarTab === 'thumbnails') {
+          for (const tile of sidebarBody.querySelectorAll('.fb-doc-thumb')) {
+            tile.style.borderColor = Number(tile.dataset.page) === Number(state.page)
+              ? 'var(--fb-accent-primary,#6d5df2)'
+              : 'var(--fb-border-glass,rgba(255,255,255,0.12))';
+          }
+          return;
+        }
+        sidebarStructureKey = nextStructureKey;
+        sidebarBody.innerHTML = '';
         for (const b of sidebarTabs.querySelectorAll('.fb-doc-sidebar-tab')) {
           b.style.background = 'var(--fb-bg-glass-input,rgba(255,255,255,0.07))';
         }
         const activeTabBtn = sidebarTabs.querySelector(`.fb-doc-sidebar-tab-${state.sidebarTab}`);
         if (activeTabBtn) activeTabBtn.style.background = 'rgba(109,93,242,0.35)';
         if (state.sidebarTab === 'thumbnails') {
-          const count = Math.min(state.numPages || 0, 60);
+          const count = state.numPages || 0;
           if (!count) {
-            sidebarBody.innerHTML = '<div style="color:var(--fb-text-secondary,#9aa3b2); padding:8px;">No pages yet.</div>';
+            sidebarBody.innerHTML = `<div style="color:var(--fb-text-secondary,#9aa3b2); padding:8px;">No ${documentKind === 'pptx' ? 'slides' : 'pages'} yet.</div>`;
             return;
           }
           for (let p = 1; p <= count; p += 1) {
@@ -16891,14 +17001,26 @@ export class BrowserShell {
             thumb.className = 'fb-doc-thumb';
             thumb.dataset.page = String(p);
             thumb.setAttribute('role', 'button');
-            thumb.setAttribute('aria-label', `Go to page ${p}`);
-            thumb.style.cssText = `margin:0 auto 10px; width:130px; padding:4px; border:1px solid ${p === state.page ? 'var(--fb-accent-primary,#6d5df2)' : 'var(--fb-border-glass,rgba(255,255,255,0.12))'}; border-radius:6px; cursor:pointer; text-align:center; background:var(--fb-bg-glass-input,#0e111a);`;
+            thumb.setAttribute('aria-label', `Go to ${pageNoun} ${p}`);
+            thumb.style.cssText = `margin:0 auto 10px; width:140px; min-height:44px; padding:4px; border:1px solid ${p === state.page ? 'var(--fb-accent-primary,#6d5df2)' : 'var(--fb-border-glass,rgba(255,255,255,0.12))'}; border-radius:7px; cursor:pointer; text-align:center; background:var(--fb-bg-glass-input,#0e111a); overflow:hidden;`;
             const label = document.createElement('div');
-            label.textContent = String(p);
-            label.style.cssText = 'padding:2px 0; color:var(--fb-text-secondary,#9aa3b2); font-size:0.7rem;';
+            label.textContent = `${documentKind === 'pptx' ? 'Slide ' : ''}${p}`;
+            label.style.cssText = 'padding:3px 0; color:var(--fb-text-secondary,#9aa3b2); font-size:0.7rem;';
             thumb.appendChild(label);
             thumb.addEventListener('click', () => activeViewer()?.setPage?.(p));
             sidebarBody.appendChild(thumb);
+            const renderPreview = () => activeViewer()?.renderThumbnail?.(p, thumb);
+            if (typeof IntersectionObserver === 'function') {
+              const observer = new IntersectionObserver((entries) => {
+                if (entries.some((entry) => entry.isIntersecting)) {
+                  observer.disconnect();
+                  renderPreview();
+                }
+              }, { root: sidebar, rootMargin: '320px 0px' });
+              observer.observe(thumb);
+            } else if (count <= 24 || Math.abs(p - (state.page || 1)) <= 6) {
+              renderPreview();
+            }
           }
           return;
         }
@@ -16924,13 +17046,18 @@ export class BrowserShell {
       try {
         pageInput.value = String(state.page || 1);
         pageInput.max = String(state.numPages || 1);
-        pageLabel.textContent = `/ ${state.numPages || '-'}`;
+        const sheetName = documentKind === 'xlsx' ? state.sheetNames?.[(state.page || 1) - 1] : '';
+        pageLabel.textContent = sheetName ? `${sheetName} · ${state.page} / ${state.numPages}` : `/ ${state.numPages || '-'}`;
         zoomLabel.textContent = `${Math.round((state.zoom || 1) * 100)}%`;
-        matchLabel.textContent = state.query
-          ? (state.matches.length ? `${state.matches.length} found \u25be` : '0 found')
-          : '';
+        matchLabel.textContent = state.searchPending
+          ? (Number.isFinite(state.searchProgress) ? `Searching ${state.searchProgress}%` : 'Searching…')
+          : state.query
+            ? (state.matches.length ? `${state.matches.length} found \u25be` : '0 found')
+            : '';
         const nightBtn = bar2.querySelector('.fb-doc-btn-night');
         if (nightBtn) nightBtn.style.background = state.night ? 'rgba(109,93,242,0.45)' : 'rgba(255,255,255,0.07)';
+        const notesBtn = bar2.querySelector('.fb-doc-btn-notes');
+        if (notesBtn) notesBtn.style.background = state.showNotes ? 'rgba(109,93,242,0.45)' : 'rgba(255,255,255,0.07)';
         const isLoading = state.status === 'loading';
         const hasError = state.status === 'error' || state.status === 'password';
         statusEl.style.display = state.status === 'ready' ? 'none' : 'flex';
@@ -16942,7 +17069,7 @@ export class BrowserShell {
             : stage;
         } else {
           statusMessage.textContent = state.error || (state.status === 'idle'
-            ? 'Preparing the PDF reader…'
+            ? `Preparing the ${documentRoute.shortLabel} viewer…`
             : 'This document can’t be displayed.');
         }
         progressTrack.style.display = isLoading && Number.isFinite(state.progress) ? 'block' : 'none';
@@ -16962,7 +17089,7 @@ export class BrowserShell {
             row.style.cssText = `padding:6px 8px; margin-bottom:4px; border-radius:6px; cursor:pointer; background:${i === state.matchIndex ? 'rgba(109,93,242,0.35)' : 'rgba(255,255,255,0.04)'}; line-height:1.4;`;
             const pageNumber = document.createElement('strong');
             pageNumber.style.cssText = 'color:var(--fb-text-secondary,#9aa3b2);';
-            pageNumber.textContent = `p.${m.page}`;
+            pageNumber.textContent = `${documentKind === 'pptx' ? 'slide' : documentKind === 'xlsx' ? 'sheet' : 'p.'}${m.page}`;
             const snippet = document.createElement('span');
             snippet.textContent = ` \u2014 ${String(m.snippet || '').slice(0, 90)}`;
             row.appendChild(pageNumber);
@@ -17020,6 +17147,7 @@ export class BrowserShell {
         host,
         sync,
         rerenderSidebar: renderSidebar,
+        openOriginal,
         viewer: null,
         loadPromise: null,
         disposed: false
@@ -17032,6 +17160,7 @@ export class BrowserShell {
       session.host = host;
       session.sync = sync;
       session.rerenderSidebar = renderSidebar;
+      session.openOriginal = openOriginal;
       session.state = state;
       session.viewer?.attach(host, () => {
         if (!session.disposed) session.sync?.();
@@ -17053,24 +17182,40 @@ export class BrowserShell {
     if (!session || session.disposed || session.loadPromise) return session?.loadPromise || null;
     const isCurrent = () => !session.disposed
       && this._documentViewerSessions?.get(session.tabId) === session;
+    const route = routeDocument(doc.type);
     Object.assign(session.state, {
+      viewer: doc.type,
       status: 'loading',
       progress: null,
-      loadingStage: 'Preparing PDF reader…',
+      loadingStage: `Preparing ${route.shortLabel} viewer…`,
       error: null
     });
     session.sync?.();
 
     const loadPromise = (async () => {
       try {
-        const engine = this._docEngineOverride || await this._pdfjsModule();
-        if (!isCurrent()) return;
-        const viewer = createPdfViewer({
-          pdfjs: engine,
-          container: session.host,
-          state: session.state,
-          onStateChange: () => { if (isCurrent()) session.sync?.(); }
-        });
+        let viewer;
+        if (doc.type === 'pdf') {
+          const engine = this._docEngineOverride || await this._pdfjsModule();
+          if (!isCurrent()) return;
+          viewer = createPdfViewer({
+            pdfjs: engine,
+            container: session.host,
+            state: session.state,
+            onStateChange: () => { if (isCurrent()) session.sync?.(); }
+          });
+        } else {
+          const override = this._documentEngineOverrides?.[doc.type];
+          viewer = createViewerForKind(doc.type, {
+            container: session.host,
+            state: session.state,
+            fileName: doc.name,
+            onOpenOriginal: () => session.openOriginal?.(),
+            onStateChange: () => { if (isCurrent()) session.sync?.(); },
+            ...(override ? { moduleLoader: async () => override } : {})
+          });
+        }
+        if (!isCurrent()) { viewer?.destroy?.(); return; }
         session.viewer = viewer;
         if (this.state.activeTabId === session.tabId) this._activeDocViewer = session;
         await viewer.load(doc.bytes);
@@ -17079,24 +17224,23 @@ export class BrowserShell {
           return;
         }
         session.sync?.();
-        // The first page is the priority. Build the TOC after it is visible
-        // so a complex outline can never hold the opening screen hostage.
-        if (session.state.status === 'ready') {
+        // A PDF's first painted page and a PPTX's first materialised slide are
+        // the priority. Optional navigation metadata is loaded afterwards.
+        if (doc.type === 'pdf' && session.state.status === 'ready') {
           Promise.resolve(viewer.loadOutline())
             .then(() => { if (isCurrent()) session.sync?.(); })
             .catch(() => {});
         }
       } catch (error) {
-        // Keep the UI concise, but retain the real startup reason in desktop
-        // logs/DevTools so a missing or rejected packaged module is never
-        // reduced to an undiagnosable generic screen again.
-        console.error?.('[yayra:pdf] reader startup failed', error);
+        console.error?.(`[yayra:${doc.type}] viewer startup failed`, error);
         if (!isCurrent()) return;
         Object.assign(session.state, {
           status: 'error',
           progress: null,
           loadingStage: '',
-          error: 'Yayra could not start the PDF reader. Try again, or choose Desktop app to open this file instead.'
+          error: doc.type === 'pdf'
+            ? 'Yayra could not start the PDF reader. Try again, or open the unchanged original file instead.'
+            : `Yayra could not start the ${route.shortLabel} viewer. Try again, or open the unchanged original file instead.`
         });
         session.sync?.();
       }
@@ -17118,7 +17262,7 @@ export class BrowserShell {
     Object.assign(session.state, {
       status: 'loading',
       progress: null,
-      loadingStage: 'Retrying PDF reader…',
+      loadingStage: `Retrying ${routeDocument(doc.type).shortLabel} viewer…`,
       error: null
     });
     session.sync?.();

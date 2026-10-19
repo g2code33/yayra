@@ -1,0 +1,14 @@
+{
+  "pptxRenderer.mjs": {
+    "bytes": 224848,
+    "sha256": "bf4943d5ec2124260e0403f5688c0ec836b6cbd94ffafc94adcf9e9d206bc201"
+  },
+  "docxPreview.mjs": {
+    "bytes": 285456,
+    "sha256": "9b8dba337af1d0341a3750b94afabee303a6d2609609de28f8d5fe3ff502ca25"
+  },
+  "xlsx.mjs": {
+    "bytes": 992986,
+    "sha256": "12cebfdfcb26dd600e8e15870b958e34c85d4c9dbab3627cd78ecfc48a5fbdd9"
+  }
+}

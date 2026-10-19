@@ -21,19 +21,14 @@ import {
 } from '../packages/shared-ui/src/services/documentWorkspace.js';
 
 /**
- * DOCUMENT WORKSPACE - PHASE 1 (PDF): the spec's first milestone.
- * "Yayra gains a sound, tested foundation for integrated document
- *  viewing, beginning with local PDFs, while preserving the existing
- *  browser."
+ * UNIFIED DOCUMENT WORKSPACE.
  *
  * Pinned here:
- *  - the capability registry is HONEST (no placeholder claims)
- *  - document tabs are real tabs (own tab, own title, doc icon) and NEVER
- *    touch the web frame / native engine path
- *  - the viewer: load, page navigation, zoom, search, error and password
- *    states - with the PDF engine injected (testable without a canvas)
- *  - security: the Electron IPC returns bytes only - never a file path
- *  - session restore excludes document tabs (bytes are in-memory only)
+ *  - the registry advertises only real bundled/offline capabilities
+ *  - local files use real document tabs and never touch a website engine
+ *  - PDF load, continuous painting, navigation, search and failure states
+ *  - security: Electron transfers selected bytes, never source paths
+ *  - session restore excludes ephemeral in-memory document tabs
  */
 
 /** A deterministic fake PDF.js engine (no canvas needed). */
@@ -89,28 +84,27 @@ function makeTinyPdfBytes(text = 'Fast local PDF reader') {
   return new Uint8Array(Buffer.from(pdf, 'ascii'));
 }
 
-test('REGISTRY: PDF is the Phase 1 engine and its capabilities are HONEST', () => {
-  assert.equal(classifyDocument('report.pdf'), 'pdf');
-  assert.equal(classifyDocument('REPORT.PDF'), 'pdf');
-  assert.equal(classifyDocument('file.tar.pdf'), 'pdf');
-  // Roadmap formats are NOT pretend-supported.
-  for (const ext of unsupportedDocumentKinds()) {
-    assert.equal(classifyDocument(`doc.${ext}`), null, `${ext} is not claimable yet`);
-  }
+test('REGISTRY: bundled viewers and explicit legacy fallbacks advertise honest capabilities', () => {
+  for (const [file, kind] of [
+    ['report.pdf', 'pdf'], ['DECK.PPTX', 'pptx'], ['notes.pptm', 'pptx'],
+    ['letter.docx', 'docx'], ['book.xlsx', 'xlsx'], ['old.xls', 'xlsx'],
+    ['table.csv', 'xlsx'], ['photo.webp', 'image'], ['readme.md', 'text'],
+    ['legacy.doc', 'unsupported'], ['legacy.ppt', 'unsupported']
+  ]) assert.equal(classifyDocument(file), kind, file);
+  assert.deepEqual(unsupportedDocumentKinds().sort(), ['doc', 'ppt']);
   assert.equal(classifyDocument('no-extension'), null);
   assert.equal(classifyDocument(''), null);
 
-  const caps = DOCUMENT_ENGINES.pdf.capabilities;
-  assert.equal(caps.view, true);
-  assert.equal(caps.search, true);
-  assert.equal(caps.zoom, true);
-  assert.equal(caps.pageNavigation, true);
-  // Explicitly NOT claimed in Phase 1 - no placeholder buttons.
-  assert.equal(caps.annotate, false);
-  assert.equal(caps.edit, false);
-  assert.equal(caps.save, false);
-  assert.equal(caps.export, false);
-  assert.equal(caps.print, false);
+  for (const kind of ['pdf', 'pptx', 'docx', 'xlsx', 'image', 'text']) {
+    assert.equal(DOCUMENT_ENGINES[kind].capabilities.view, true, `${kind} is actually viewable`);
+    assert.equal(DOCUMENT_ENGINES[kind].capabilities.edit, false, `${kind} does not claim editing`);
+    assert.equal(DOCUMENT_ENGINES[kind].capabilities.save, false, `${kind} does not claim saving`);
+  }
+  assert.equal(DOCUMENT_ENGINES.pdf.capabilities.print, true);
+  assert.equal(DOCUMENT_ENGINES.pptx.capabilities.notes, true);
+  assert.equal(DOCUMENT_ENGINES.xlsx.capabilities.sheets, true);
+  assert.equal(DOCUMENT_ENGINES.image.capabilities.search, false);
+  assert.equal(DOCUMENT_ENGINES.unsupported.capabilities.view, false);
 });
 
 test('STORE: in-memory, no paths, unique ids, empty files refused', () => {
@@ -475,13 +469,16 @@ test('SECURITY (source pin): the Electron document IPC returns BYTES ONLY - neve
   assert.ok(start > -1, 'the doc-open handler exists');
   const block = src.slice(start, src.indexOf("'read-failed'", start) + 40);
   assert.match(block, /showOpenDialog/, 'the native picker is used');
-  assert.match(block, /extensions: \['pdf'\]/, 'only PDFs are offered');
+  for (const extension of ['pdf', 'pptx', 'docx', 'xlsx', 'csv', 'png', 'txt']) {
+    assert.match(block, new RegExp(`['"]${extension}['"]`), `${extension} is offered by the document picker`);
+  }
   assert.match(block, /150 \* 1024 \* 1024/, 'a size cap exists');
   // The response object carries exactly { ok, canceled?, reason?, name, size, data }.
   const returns = [...block.matchAll(/return \{([^}]*)\}/g)].map((m) => m[1]);
   assert.ok(returns.every((r) => !/:\s*filePath/.test(r)), 'no return value exposes the filesystem path');
   const preloadSrc = readFileSync(new URL('../electron/preload.cjs', import.meta.url), 'utf8');
-  assert.match(preloadSrc, /documents:\s*\{\s*openPdf/, 'the preload exposes only openPdf');
+  assert.match(preloadSrc, /documents:\s*\{\s*openFile:/, 'the preload exposes the format-neutral picker');
+  assert.match(preloadSrc, /openPdf:/, 'the backward-compatible PDF alias remains available');
 });
 
 test('NO REGRESSION (source pin): document tabs cannot reach the web-frame path, and the session filter stays https-only', () => {

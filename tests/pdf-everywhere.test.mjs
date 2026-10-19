@@ -55,7 +55,9 @@ function fakeDesktop({ openPdfResult } = {}) {
       list: async () => ({ items: [], downloadRoot: null }),
       openPdf: async (id) => {
         calls.openPdf.push(id);
-        return openPdfResult || { ok: true, name: 'downloaded-report.pdf', data: PDF_BYTES };
+        return typeof openPdfResult === 'function'
+          ? openPdfResult(id)
+          : (openPdfResult || { ok: true, name: 'downloaded-report.pdf', data: PDF_BYTES });
       }
     }
   };
@@ -140,19 +142,26 @@ test('FILE PICKER: oversized PDFs are rejected before FileReader and the input c
   }
 });
 
-test('DRAG & DROP: non-PDF files get the honest roadmap notice, never a dead tab', async () => {
+test('DRAG & DROP: supported non-PDF documents open internally and unknown files are refused', async () => {
   const { shell } = await makeShell();
   try {
     const tabsBefore = shell.state.tabs.length;
     await shell._openDroppedPdfFiles([{ name: 'budget.xlsx', arrayBuffer: async () => new ArrayBuffer(4) }]);
-    assert.equal(shell.state.tabs.filter((t) => t.isDocument).length, 0, 'no document tab for unsupported files');
-    assert.equal(shell.state.tabs.length, tabsBefore, 'no stray tabs');
-    // isPdfDownload / classify agree on the boundary.
+    assert.equal(shell.state.tabs.filter((t) => t.isDocument).length, 1, 'a spreadsheet receives an internal document tab');
+    assert.equal(shell.getActiveTab().docState.viewer, 'xlsx');
+    assert.equal(shell.state.tabs.length, tabsBefore + 1);
+
+    const afterSpreadsheet = shell.state.tabs.length;
+    await shell._openDroppedPdfFiles([{ name: 'program.exe', arrayBuffer: async () => new ArrayBuffer(4) }]);
+    assert.equal(shell.state.tabs.length, afterSpreadsheet, 'an unknown executable never creates a dead tab');
+
+    // Existing download-specific PDF detection remains deliberately narrow.
     assert.equal(shell.isPdfDownload({ filename: 'x.pdf' }), true);
     assert.equal(shell.isPdfDownload({ filename: 'x.docx' }), false);
     assert.equal(shell.isPdfDownload({ filename: 'x.bin', mime: 'application/pdf' }), true);
   } finally {
     shell.destroy();
+    delete window.yayra;
     delete globalThis.localStorage;
   }
 });
@@ -177,15 +186,21 @@ test('SHELL DISPOSAL: PDF byte buffers and the hidden file input are released', 
   }
 });
 
-test('OPEN WITH ARGUMENTS: local PDF paths and Linux file:// URIs resolve to the same existing file', () => {
-  const tempDir = mkdtempSync(join(tmpdir(), 'yayra-pdf-open-'));
+test('OPEN WITH ARGUMENTS: registered document paths and Linux file:// URIs resolve locally', () => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'yayra-document-open-'));
   const pdfPath = join(tempDir, 'annual report 2026.pdf');
+  const pptxPath = join(tempDir, 'board deck.pptx');
+  const unknownPath = join(tempDir, 'program.exe');
   writeFileSync(pdfPath, '%PDF-1.7');
+  writeFileSync(pptxPath, 'PK');
+  writeFileSync(unknownPath, 'MZ');
   const fileUri = pathToFileURL(pdfPath).href;
   try {
     assert.equal(parsePdfFileArg(['--some-electron-flag', pdfPath]), pdfPath, 'ordinary OS path works');
     assert.equal(parsePdfFileArg(['--some-electron-flag', fileUri]), pdfPath, 'URI-encoded spaces from Linux %U become a filesystem path');
     assert.equal(parsePdfFileArg([`"${fileUri}"`]), pdfPath, 'quoted desktop URI is also accepted');
+    assert.equal(parsePdfFileArg([pptxPath]), pptxPath, 'non-PDF viewable documents use the same byte-only launch route');
+    assert.equal(parsePdfFileArg([unknownPath]), null, 'unregistered files are ignored');
     assert.equal(parsePdfFileArg(['https://example.com/remote.pdf']), null, 'remote URLs are never read as local files');
     assert.equal(parsePdfFileArg(['--pdf', join(tempDir, 'missing.pdf')]), null, 'a nonexistent PDF is ignored');
   } finally {
@@ -233,8 +248,12 @@ test('VIEWER BUTTON: "Desktop app" hands the CURRENT pdf to the OS pdf reader', 
   }
 });
 
-test('DOWNLOADS RIGHT-CLICK: a downloaded pdf offers "Open in Yayra" and it opens the built-in viewer', async () => {
-  const calls = fakeDesktop();
+test('DOWNLOADS RIGHT-CLICK: downloaded PDFs and images open in the matching built-in viewer', async () => {
+  const calls = fakeDesktop({
+    openPdfResult: (id) => id === 'dl-2'
+      ? { ok: true, name: 'downloaded-photo.png', data: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).buffer }
+      : { ok: true, name: 'downloaded-report.pdf', data: PDF_BYTES }
+  });
   const { shell, container } = await makeShell();
   try {
     shell.state.downloadsItems = [
@@ -264,11 +283,16 @@ test('DOWNLOADS RIGHT-CLICK: a downloaded pdf offers "Open in Yayra" and it open
     assert.ok(tab.isDocument, 'the downloaded pdf opened in the built-in viewer');
     assert.equal(tab.title, 'downloaded-report.pdf');
 
-    // A NON-pdf download never gets the "Open in Yayra" entry.
+    // Images and the other registered document formats use the same action.
     shell.showDownloadsContextMenu({ clientX: 120, clientY: 80, preventDefault: () => {} }, shell.state.downloadsItems[1]);
     const menu2 = document.getElementById('yayra-dl-context-menu');
-    const entries2 = Array.from(menu2.querySelectorAll('button')).map((b) => b.textContent);
-    assert.ok(!entries2.includes('Open in Yayra'), 'non-pdf downloads do not get the viewer entry');
+    const imageOpen = Array.from(menu2.querySelectorAll('button')).find((b) => b.textContent === 'Open in Yayra');
+    assert.ok(imageOpen, 'a downloaded image gets the internal viewer entry');
+    imageOpen.click();
+    await flush();
+    assert.deepEqual(calls.openPdf, ['dl-1', 'dl-2']);
+    assert.equal(shell.getActiveTab().title, 'downloaded-photo.png');
+    assert.equal(shell.getActiveTab().docState.viewer, 'image');
   } finally {
     shell.destroy();
     delete window.yayra;
@@ -300,7 +324,10 @@ test('SOURCE PIN (main.cjs): OS "Open With" launches, desktop-app escape hatch, 
   const parser = readFileSync(new URL('../electron/pdfLaunch.cjs', import.meta.url), 'utf8');
   assert.match(src, /require\('\.\/pdfLaunch\.cjs'\)/, 'main process uses the desktop-argument parser');
   assert.match(parser, /fileURLToPath\(fileUrl\)/, 'Linux file:// launches are decoded to local paths');
-  assert.match(parser, /\\.pdf\$\/i\.test\(candidate\)/, 'only .pdf files are accepted');
+  assert.match(parser, /DOCUMENT_EXTENSIONS\.has\(extension\)/, 'only registered local document extensions are accepted');
+  for (const extension of ['pdf', 'pptx', 'docx', 'xlsx', 'png', 'txt']) {
+    assert.match(parser, new RegExp(`['"]${extension}['"]`), `${extension} is accepted from OS Open With`);
+  }
   assert.match(src, /mainWindow\.webContents\.send\('yayra:open-pdf-file'/, 'bytes are pushed to the renderer');
   assert.match(src, /did-finish-load', \(\) => flushPendingPdfFiles\(\)\)/, 'cold-start launches flush once the shell is up');
   assert.match(src, /webContents\.isLoadingMainFrame\(\)/, 'a second-instance launch waits for a newly-created renderer');
@@ -321,15 +348,19 @@ test('SOURCE PIN (main.cjs): OS "Open With" launches, desktop-app escape hatch, 
   assert.ok(!/:\s*item\.path\s*[,}]/.test(dlBlock), 'no path leaks to the renderer');
 });
 
-test('SOURCE PIN (packaging): Yayra registers as an OS pdf handler so "Open with" lists it', () => {
+test('SOURCE PIN (packaging): Yayra registers its internal document formats for OS Open With', () => {
   const mainDesktop = readFileSync(new URL('../build/linux/yayra.desktop', import.meta.url), 'utf8');
-  assert.match(mainDesktop, /MimeType=.*application\/pdf/, 'the deb desktop entry claims pdf handling');
+  assert.match(mainDesktop, /MimeType=.*application\/pdf/, 'the deb desktop entry claims PDF handling');
+  assert.match(mainDesktop, /vnd\.openxmlformats-officedocument\.presentationml\.presentation/, 'the deb desktop entry claims PPTX handling');
+  assert.match(mainDesktop, /vnd\.openxmlformats-officedocument\.wordprocessingml\.document/, 'the deb desktop entry claims DOCX handling');
+  assert.match(mainDesktop, /vnd\.openxmlformats-officedocument\.spreadsheetml\.sheet/, 'the deb desktop entry claims XLSX handling');
   assert.match(mainDesktop, /Exec=yayra %U/, 'and receives file arguments');
   const appimageDesktop = readFileSync(new URL('../build/linux/yayra-appimage.desktop', import.meta.url), 'utf8');
   assert.match(appimageDesktop, /MimeType=.*application\/pdf/, 'the AppImage entry too');
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   assert.ok(Array.isArray(pkg.build.fileAssociations), 'electron-builder fileAssociations configured');
-  assert.ok(pkg.build.fileAssociations.some((fa) => fa.ext === 'pdf'), 'pdf is associated (Windows registry + NSIS)');
+  const associations = pkg.build.fileAssociations.flatMap((fa) => Array.isArray(fa.ext) ? fa.ext : [fa.ext]);
+  for (const extension of ['pdf', 'pptx', 'docx', 'xlsx', 'png']) assert.ok(associations.includes(extension), `${extension} is associated`);
   const preload = readFileSync(new URL('../electron/preload.cjs', import.meta.url), 'utf8');
   assert.match(preload, /openExternal: \(\{ name, data \}/, 'the desktop-app bridge exists');
   assert.match(preload, /onOpenPdfFile: \(callback\)/, 'the open-with push channel exists');

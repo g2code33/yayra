@@ -125,8 +125,9 @@ const api = {
     clear: () => ipcRenderer.invoke('yayra:downloads-clear'),
     remove: (id) => ipcRenderer.invoke('yayra:downloads-remove', { id }),
     open: (id) => ipcRenderer.invoke('yayra:downloads-open', { id }),
-    // "Open in Yayra": read a COMPLETED pdf download's bytes so the
-    // in-app document viewer can show it (bytes only - never a path).
+    // "Open in Yayra": read a completed supported download as bytes only.
+    // Keep openPdf as a compatibility alias for older renderer builds.
+    openDocument: (id) => ipcRenderer.invoke('yayra:downloads-open-pdf', { id }),
     openPdf: (id) => ipcRenderer.invoke('yayra:downloads-open-pdf', { id }),
     showInFolder: (id) => ipcRenderer.invoke('yayra:downloads-show-in-folder', { id }),
     getRoot: () => ipcRenderer.invoke('yayra:downloads-get-root'),
@@ -215,9 +216,11 @@ const api = {
     // reopen the site in its own minimal app window (yayra --app=<url>).
     installPageAsApp: ({ url, title, nameOverride } = {}) => ipcRenderer.invoke('yayra:install-page-as-app', { url, title, nameOverride }),
     installPageAsAppPreview: ({ url, title } = {}) => ipcRenderer.invoke('yayra:install-page-as-app-preview', { url, title }),
-    // Local document workspace: open ONE user-picked PDF; the renderer
-    // receives only the bytes (never a filesystem path).
+    // Local document workspace: open one explicitly selected original file;
+    // the renderer receives only bytes, never a filesystem path.
     documents: {
+      openFile: () => ipcRenderer.invoke('yayra:doc-open'),
+      // Backward-compatible alias for existing renderer/tests and older minis.
       openPdf: () => ipcRenderer.invoke('yayra:doc-open'),
       // "Open with desktop app": hand the CURRENT document's bytes to the
       // OS default pdf reader (main process writes a temp file).

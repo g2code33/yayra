@@ -8832,3 +8832,238 @@ button.fb-site-passkey-indicator {
   .fb-taskmgr-panel { padding: 14px; }
   .fb-taskmgr-footer { align-items: flex-start; flex-direction: column; }
 }
+
+/* -------------------------------------------------------------------------
+ * Local document workspace — PDF/PPTX/Office/image viewers                 *
+ * ------------------------------------------------------------------------- */
+.fb-doc-viewer {
+  color-scheme: dark;
+}
+
+.fb-doc-toolbar button,
+.fb-doc-toolbar input {
+  min-height: 30px;
+}
+
+.fb-doc-toolbar button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--fb-accent-primary, #6d5df2) 24%, transparent) !important;
+}
+
+.fb-doc-toolbar button:focus-visible,
+.fb-doc-toolbar input:focus-visible,
+.fb-doc-thumb:focus-visible {
+  outline: 2px solid var(--fb-accent-primary, #8b7cff);
+  outline-offset: 2px;
+}
+
+.fb-doc-host-pdf {
+  scroll-behavior: auto;
+  overflow-anchor: none;
+  background: radial-gradient(circle at 50% 0%, rgba(109, 93, 242, 0.08), transparent 38%), var(--fb-bg-app, #191c23);
+}
+
+.fb-pdf-page canvas {
+  background: #fff;
+}
+
+.fb-pdf-text-layer {
+  opacity: 1;
+  forced-color-adjust: none;
+  caret-color: transparent;
+}
+
+.fb-pdf-text-layer span,
+.fb-pdf-text-layer br {
+  position: absolute;
+  color: transparent;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0 0;
+}
+
+.fb-pdf-text-layer ::selection {
+  color: transparent;
+  background: rgba(109, 93, 242, 0.38);
+}
+
+.fb-pdf-text-layer .endOfContent {
+  position: absolute;
+  inset: 100% 0 0;
+  z-index: -1;
+  user-select: none;
+}
+
+.fb-doc-host-pptx {
+  background: radial-gradient(circle at 50% 5%, rgba(59, 130, 246, 0.12), transparent 42%), #111827;
+}
+
+.fb-pptx-slide-canvas,
+.fb-pptx-slide-canvas * {
+  box-sizing: border-box;
+}
+
+.fb-pptx-slide-canvas {
+  color-scheme: light;
+}
+
+.fb-pptx-text,
+.fb-pptx-table-shape {
+  line-height: normal;
+}
+
+.fb-pptx-stage-frame {
+  transition: width 120ms ease, height 120ms ease;
+}
+
+.fb-pptx-thumbnail-frame {
+  margin: 0 auto;
+  background: #fff;
+}
+
+.fb-doc-thumb .fb-pptx-slide-canvas,
+.fb-doc-thumb .fb-pdf-thumbnail-canvas {
+  display: block;
+  margin: 0 auto;
+}
+
+.fb-doc-host-docx {
+  padding: 0 !important;
+  align-items: stretch !important;
+}
+
+.fb-docx-body .docx-wrapper {
+  background: #cbd5e1;
+  padding: 20px 0;
+}
+
+.fb-docx-body section.docx {
+  margin: 0 auto 16px;
+  box-shadow: 0 8px 28px rgba(15, 23, 42, 0.2);
+}
+
+.fb-doc-host-xlsx,
+.fb-doc-host-text,
+.fb-doc-host-image,
+.fb-doc-host-unsupported {
+  padding: 0 !important;
+  align-items: stretch !important;
+}
+
+.fb-xlsx-grid td,
+.fb-xlsx-grid th {
+  box-sizing: border-box;
+}
+
+.fb-document-image {
+  image-rendering: auto;
+}
+
+@media (max-width: 680px) {
+  .fb-doc-toolbar {
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .fb-doc-toolbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .fb-doc-toolbar2 {
+    flex-wrap: nowrap !important;
+  }
+
+  .fb-doc-toolbar2 > * {
+    flex: 0 0 auto;
+  }
+
+  .fb-doc-sidebar {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: min(210px, 76vw) !important;
+    z-index: 6;
+    box-shadow: 12px 0 34px rgba(0, 0, 0, 0.42);
+  }
+
+  .fb-doc-kind-badge {
+    display: none;
+  }
+
+  .fb-doc-host {
+    padding: 8px !important;
+  }
+
+  .fb-pptx-notes {
+    width: 100% !important;
+  }
+}
+
+/* The shell is a browser, but a document print must contain the document only.
+   PDF preparePrint() paints evicted pages before this media query is captured. */
+@media print {
+  body * {
+    visibility: hidden !important;
+  }
+
+  .fb-doc-viewer,
+  .fb-doc-viewer * {
+    visibility: visible !important;
+  }
+
+  .fb-doc-viewer {
+    position: absolute !important;
+    inset: 0 !important;
+    width: 100% !important;
+    height: auto !important;
+    min-height: 0 !important;
+    overflow: visible !important;
+    background: #fff !important;
+    color: #000 !important;
+  }
+
+  .fb-doc-toolbar,
+  .fb-doc-sidebar,
+  .fb-doc-status,
+  .fb-doc-match-panel,
+  .fb-pdf-page-number,
+  .fb-pptx-notes {
+    display: none !important;
+  }
+
+  .fb-doc-viewer > div,
+  .fb-doc-host,
+  .fb-doc-host > div,
+  .fb-pdf-continuous-pages {
+    position: static !important;
+    display: block !important;
+    width: 100% !important;
+    height: auto !important;
+    min-height: 0 !important;
+    overflow: visible !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    background: #fff !important;
+  }
+
+  /* Keep this after the generic layout reset so its !important rule wins. */
+  .fb-doc-viewer .fb-doc-toolbar,
+  .fb-doc-viewer .fb-doc-sidebar,
+  .fb-doc-viewer .fb-doc-status,
+  .fb-doc-viewer .fb-doc-match-panel,
+  .fb-doc-viewer .fb-pdf-page-number,
+  .fb-doc-viewer .fb-pptx-notes {
+    display: none !important;
+  }
+
+  .fb-pdf-page {
+    break-after: page;
+    page-break-after: always;
+    margin: 0 auto !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+  }
+
+  .fb-pdf-page:last-child {
+    break-after: auto;
+    page-break-after: auto;
+  }
+}
