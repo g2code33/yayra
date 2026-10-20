@@ -11,6 +11,7 @@ import {
   supportedDocumentKinds,
   unsupportedDocumentKinds
 } from './documentRegistry.js';
+import { DEFAULT_PPTX_NOTES_COLOR } from './documentViewers.js';
 
 export {
   DOCUMENT_ACCEPT,
@@ -32,7 +33,9 @@ export {
   createSpreadsheetViewer,
   createImageViewer,
   createTextViewer,
-  createUnsupportedViewer
+  createUnsupportedViewer,
+  DEFAULT_PPTX_NOTES_COLOR,
+  normalizePptxNotesColor
 } from './documentViewers.js';
 
 /**
@@ -107,6 +110,7 @@ export function createDocumentViewerState(kind = 'pdf') {
     sidebarOpen: kind === 'pptx',
     sidebarTab: kind === 'pptx' ? 'thumbnails' : 'outline',
     showNotes: kind === 'pptx',
+    notesColor: DEFAULT_PPTX_NOTES_COLOR,
     slidePending: false,
     searchPending: false,
     searchProgress: null,

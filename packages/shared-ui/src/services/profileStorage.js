@@ -33,11 +33,13 @@ export function createProfileScopedStorage({ backing, getProfileId, legacyKeys =
     get profileId() { return pid(); },
     async get(key) {
       if (!store) return null;
-      const raw = store.getItem(scoped(key));
+      let raw = null;
+      try { raw = store.getItem(scoped(key)); } catch { return null; }
       if (raw !== null && raw !== undefined) return safeParse(raw, null);
       // Default profile: adopt the legacy un-scoped key once.
       if (pid() === 'default' && legacyKeys[key]) {
-        const legacy = store.getItem(legacyKeys[key]);
+        let legacy = null;
+        try { legacy = store.getItem(legacyKeys[key]); } catch { return null; }
         if (legacy !== null && legacy !== undefined) {
           const value = safeParse(legacy, null);
           if (value !== null) {

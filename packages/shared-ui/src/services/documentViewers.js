@@ -5,6 +5,20 @@ const MIN_ZOOM = 0.25;
 const MAX_ZOOM = 6;
 const DEFAULT_TIMEOUT = 90000;
 
+export const DEFAULT_PPTX_NOTES_COLOR = '#000000';
+
+/**
+ * Native colour inputs emit six-digit hexadecimal values. Keep that narrow
+ * shape at every persistence/render boundary so malformed profile data can
+ * never leak into presentation styles.
+ */
+export function normalizePptxNotesColor(value) {
+  const candidate = String(value || '').trim();
+  return /^#[0-9a-f]{6}$/i.test(candidate)
+    ? candidate.toLowerCase()
+    : DEFAULT_PPTX_NOTES_COLOR;
+}
+
 function notifyFactory(state, callback) {
   let listener = callback;
   return {
@@ -106,6 +120,7 @@ export function createPptxViewer({
   loadTimeoutMs = DEFAULT_TIMEOUT
 } = {}) {
   const viewerState = state;
+  viewerState.notesColor = normalizePptxNotesColor(viewerState.notesColor);
   const updates = notifyFactory(viewerState, onStateChange);
   let host = container || null;
   let root = null;
@@ -149,12 +164,17 @@ export function createPptxViewer({
     stageHost.style.cssText = 'flex:0 0 auto;box-shadow:0 14px 45px rgba(0,0,0,.38);background:#fff;';
     const notesHost = doc.createElement('section');
     notesHost.className = 'fb-pptx-notes';
-    notesHost.style.cssText = 'width:min(960px,96%);box-sizing:border-box;border:1px solid var(--fb-border-glass,rgba(255,255,255,.12));border-radius:10px;padding:12px 14px;background:var(--fb-bg-elevated,#141824);color:var(--fb-text-primary,#dfe4ee);white-space:pre-wrap;line-height:1.5;display:none;';
+    // Adapted from g2code33/pharmaTRACK_PERFECT_new v1.4.22: keep a
+    // fixed cream reading surface so the black default and manual colours
+    // stay independent from Yayra's app theme.
+    notesHost.style.cssText = 'width:min(960px,96%);max-height:38vh;overflow-y:auto;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:10px;padding:12px 14px;background:#FBF9F4;color:#000000;white-space:pre-wrap;line-height:1.5;box-shadow:0 8px 24px rgba(15,23,42,.2);display:none;';
     const notesTitle = doc.createElement('strong');
     notesTitle.textContent = 'Speaker notes';
-    notesTitle.style.cssText = 'display:block;margin-bottom:5px;font-size:.75rem;text-transform:uppercase;letter-spacing:.08em;color:var(--fb-text-secondary,#9aa3b2);';
+    notesTitle.style.cssText = 'display:block;margin-bottom:6px;font-size:.75rem;text-transform:uppercase;letter-spacing:.1em;color:#94a3b8;';
     const notesBody = doc.createElement('div');
     notesBody.className = 'fb-pptx-notes-body';
+    notesBody.style.cssText = 'font-size:.94rem;line-height:1.625;cursor:text;user-select:text;overflow-wrap:anywhere;';
+    notesBody.style.color = normalizePptxNotesColor(viewerState.notesColor);
     notesHost.appendChild(notesTitle);
     notesHost.appendChild(notesBody);
     nextRoot.appendChild(stageHost);
@@ -193,6 +213,10 @@ export function createPptxViewer({
         ? clamp(viewerState.zoom || 1, MIN_ZOOM, MAX_ZOOM)
         : fitScale(viewerState.zoomMode);
       viewerState.zoom = scale;
+      if (notes) {
+        notes.style.width = `${Math.max(220, deck.slideWidth * scale)}px`;
+        notes.style.maxWidth = '96%';
+      }
       renderPptxSlide(stage, {
         slide: slideData,
         width: deck.slideWidth,
@@ -203,7 +227,14 @@ export function createPptxViewer({
         thumbnail
       });
       const body = notes?.querySelector?.('.fb-pptx-notes-body');
-      if (body) body.textContent = slideData.notes || 'No speaker notes on this slide.';
+      if (body) {
+        const hasSpeakerNotes = Boolean(slideData.notes);
+        body.textContent = hasSpeakerNotes ? slideData.notes : 'No speaker notes on this slide.';
+        body.style.color = hasSpeakerNotes
+          ? normalizePptxNotesColor(viewerState.notesColor)
+          : '#94a3b8';
+        body.style.fontStyle = hasSpeakerNotes ? 'normal' : 'italic';
+      }
       if (notes) notes.style.display = viewerState.showNotes ? 'block' : 'none';
       updates.patch({ slidePending: false, currentText: slideData.text || '', currentNotes: slideData.notes || '' });
       scheduleNeighbourPreviews(page);
@@ -278,6 +309,16 @@ export function createPptxViewer({
   async function toggleNotes(force) {
     updates.patch({ showNotes: typeof force === 'boolean' ? force : !viewerState.showNotes });
     await renderCurrent();
+    return viewerState;
+  }
+
+  function setNotesColor(value) {
+    const notesColor = normalizePptxNotesColor(value);
+    updates.patch({ notesColor });
+    // Do not re-render the slide: changing a note colour must not restart an
+    // embedded video or rebuild any of the presentation media.
+    const body = notes?.querySelector?.('.fb-pptx-notes-body');
+    if (body && viewerState.currentNotes) body.style.color = notesColor;
     return viewerState;
   }
 
@@ -364,7 +405,7 @@ export function createPptxViewer({
   const controller = {
     get state() { return viewerState; }, load, attach, destroy, renderCurrent,
     setPage, nextPage, prevPage, setZoom, fitToWidth, fitToPage, search, nextMatch,
-    toggleNotes, renderThumbnail, loadOutline: async () => [], rotate: async () => viewerState,
+    toggleNotes, setNotesColor, renderThumbnail, loadOutline: async () => [], rotate: async () => viewerState,
     setNight: async () => viewerState,
     handleKeydown: (event) => handleCommonKeys(event, controller, viewerState)
   };

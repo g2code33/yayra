@@ -23,6 +23,8 @@ import {
   createDocumentViewerState,
   createPdfViewer,
   createViewerForKind,
+  DEFAULT_PPTX_NOTES_COLOR,
+  normalizePptxNotesColor,
   DOCUMENT_ACCEPT,
   DOCUMENT_ENGINES,
   DocumentStore,
@@ -379,6 +381,8 @@ export class BrowserShell {
         readerPinned: true,
         readerSpeechRate: 1,
         readerVoice: '',
+        // Per-profile preference for the native PPTX speaker-notes picker.
+        pptxNotesColor: DEFAULT_PPTX_NOTES_COLOR,
         floatingEnabledByDefault: true,
         startFloatingOnLaunch: true,
         alwaysOnTop: true,
@@ -1069,6 +1073,12 @@ export class BrowserShell {
         console.warn('Failed to load settings in BrowserShell:', err);
       }
     }
+    // Stored settings are user-editable local data. A malformed or legacy
+    // colour must degrade to the readable black default before any native
+    // colour input or notes element receives it.
+    this.state.settings.pptxNotesColor = normalizePptxNotesColor(
+      this.state.settings.pptxNotesColor
+    );
     // v1 live-sites policy: old profiles may carry the previous default
     // `backgroundTabThrottling:true`, but they have no keepSitesLive key.
     // The new positive setting defaults to true, so existing installs also
@@ -11553,7 +11563,14 @@ export class BrowserShell {
       try {
         const stored = await this.settingsRepo.getSettings();
         if (stored) this.state.settings = { ...this.state.settings, ...stored };
-      } catch { /* keep current */ }
+        // Unlike generic display settings, this preference must never bleed
+        // from the old profile when the new profile has no settings blob.
+        this.state.settings.pptxNotesColor = normalizePptxNotesColor(
+          stored?.pptxNotesColor
+        );
+      } catch {
+        this.state.settings.pptxNotesColor = DEFAULT_PPTX_NOTES_COLOR;
+      }
     }
     if (this.historyRepo?.getEntries) {
       try { this.state.historyItems = await this.historyRepo.getEntries(100); } catch { /* keep current */ }
@@ -16677,6 +16694,11 @@ export class BrowserShell {
     tab.isDocument = true;
     tab.docId = doc.id;
     tab.docState = createDocumentViewerState(doc.type);
+    if (doc.type === 'pptx') {
+      tab.docState.notesColor = normalizePptxNotesColor(
+        this.state.settings.pptxNotesColor
+      );
+    }
     tab.docState.status = 'loading';
     this.render();
     return doc;
@@ -16733,6 +16755,13 @@ export class BrowserShell {
     const documentKind = doc?.type || tab.docState?.viewer || 'unsupported';
     const documentRoute = routeDocument(documentKind);
     const capabilities = documentRoute.capabilities;
+    const state = tab.docState || createDocumentViewerState(documentKind);
+    tab.docState = state;
+    if (documentKind === 'pptx') {
+      state.notesColor = normalizePptxNotesColor(
+        this.state.settings.pptxNotesColor || state.notesColor
+      );
+    }
     const wrap = document.createElement('div');
     wrap.className = 'fb-doc-viewer';
     wrap.style.cssText = 'flex:1; min-height:0; display:flex; flex-direction:column; background:var(--fb-bg-app,#191c23); outline:none;';
@@ -16800,6 +16829,63 @@ export class BrowserShell {
     const spacerA = document.createElement('span');
     spacerA.style.cssText = 'flex:1;';
     bar.appendChild(spacerA);
+
+    // pharmaTRACK_PERFECT_new v1.4.22 introduced the manual notes colour
+    // picker beside Download. Yayra keeps the native platform picker, then
+    // adds profile scoping, malformed-value validation and an explicit
+    // current-colour swatch/focus ring for desktop, PWA and mobile.
+    let notesColorControl = null;
+    let notesColorInput = null;
+    let notesColorSwatch = null;
+    if (documentKind === 'pptx' && capabilities.notes) {
+      notesColorControl = document.createElement('label');
+      notesColorControl.className = 'fb-doc-notes-color-control';
+      notesColorControl.dataset.notesColor = state.notesColor;
+
+      const notesColorWheel = document.createElement('span');
+      notesColorWheel.className = 'fb-doc-notes-color-wheel';
+      notesColorWheel.setAttribute('aria-hidden', 'true');
+      notesColorSwatch = document.createElement('span');
+      notesColorSwatch.className = 'fb-doc-notes-color-swatch';
+      notesColorSwatch.style.backgroundColor = state.notesColor;
+      notesColorWheel.appendChild(notesColorSwatch);
+
+      notesColorInput = document.createElement('input');
+      notesColorInput.className = 'fb-doc-notes-color-input';
+      notesColorInput.type = 'color';
+      notesColorInput.value = state.notesColor;
+      notesColorInput.setAttribute('aria-label', 'Speaker notes text colour');
+      notesColorInput.setAttribute('aria-valuetext', state.notesColor);
+      notesColorInput.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;margin:0;padding:0;border:0;opacity:0;cursor:pointer;';
+
+      const describeNotesColor = (color) => {
+        const title = `Speaker notes text colour: ${color}`;
+        notesColorControl.title = title;
+        notesColorInput.title = title;
+        notesColorControl.dataset.notesColor = color;
+        notesColorInput.setAttribute('aria-valuetext', color);
+        if (notesColorSwatch) notesColorSwatch.style.backgroundColor = color;
+      };
+      const applyNotesColor = () => {
+        const color = normalizePptxNotesColor(notesColorInput.value);
+        notesColorInput.value = color;
+        describeNotesColor(color);
+        if (color === state.notesColor && color === this.state.settings.pptxNotesColor) return;
+        state.notesColor = color;
+        this.state.settings.pptxNotesColor = color;
+        activeViewer()?.setNotesColor?.(color);
+        // Fire-and-forget persistence keeps the selected colour live even if
+        // profile storage is unavailable or full.
+        this.persistSettings();
+      };
+      notesColorInput.addEventListener('input', applyNotesColor);
+      notesColorInput.addEventListener('change', applyNotesColor);
+      describeNotesColor(state.notesColor);
+      notesColorControl.appendChild(notesColorWheel);
+      notesColorControl.appendChild(notesColorInput);
+      bar.appendChild(notesColorControl);
+    }
+
     const hasDesktopDocumentBridge = typeof this.systemBridge?.documents?.openExternal === 'function';
     bar.appendChild(mkBtn(
       hasDesktopDocumentBridge ? 'Desktop app' : 'Download original',
@@ -16967,7 +17053,6 @@ export class BrowserShell {
     viewport.appendChild(wrap);
     try { wrap.focus?.(); } catch { /* shim */ }
 
-    const state = tab.docState || (tab.docState = createDocumentViewerState(documentKind));
     // Fresh mounts of an old tab state get the new fields.
     for (const [k, v] of Object.entries(createDocumentViewerState(documentKind))) {
       if (state[k] === undefined) state[k] = v;
@@ -17067,6 +17152,18 @@ export class BrowserShell {
         if (nightBtn) nightBtn.style.background = state.night ? 'rgba(109,93,242,0.45)' : 'rgba(255,255,255,0.07)';
         const notesBtn = bar2.querySelector('.fb-doc-btn-notes');
         if (notesBtn) notesBtn.style.background = state.showNotes ? 'rgba(109,93,242,0.45)' : 'rgba(255,255,255,0.07)';
+        if (notesColorControl && notesColorInput) {
+          const color = normalizePptxNotesColor(state.notesColor);
+          state.notesColor = color;
+          notesColorInput.value = color;
+          notesColorInput.setAttribute('aria-valuetext', color);
+          notesColorInput.title = `Speaker notes text colour: ${color}`;
+          notesColorControl.title = notesColorInput.title;
+          notesColorControl.dataset.notesColor = color;
+          notesColorControl.hidden = !state.showNotes;
+          notesColorControl.style.display = state.showNotes ? 'inline-flex' : 'none';
+          if (notesColorSwatch) notesColorSwatch.style.backgroundColor = color;
+        }
         const isLoading = state.status === 'loading';
         const hasError = state.status === 'error' || state.status === 'password';
         statusEl.style.display = state.status === 'ready' ? 'none' : 'flex';

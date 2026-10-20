@@ -261,9 +261,10 @@ test('PPTX VIDEO OFFLINE FALLBACK: linked-only movies never fetch externally and
   }
 });
 
-test('PPTX CONTROLLER: original bytes render a slide, thumbnails, notes and search offline', async () => {
+test('PPTX CONTROLLER: original bytes render a slide, thumbnails, colourable notes and search offline', async () => {
   const host = mount();
   const state = createDocumentViewerState('pptx');
+  assert.equal(state.notesColor, '#000000', 'speaker notes default to readable black');
   const viewer = createPptxViewer({ container: host, state, fileName: 'lecture.pptx' });
   try {
     await viewer.load(await buildPowerPointDeck());
@@ -272,12 +273,31 @@ test('PPTX CONTROLLER: original bytes render a slide, thumbnails, notes and sear
     assert.equal(state.aspectRatio, '1280 × 720');
     assert.match(host.textContent, /Cardiovascular Pharmacology/);
     assert.match(host.textContent, /Atenolol/);
-    assert.match(host.querySelector('.fb-pptx-notes-body').textContent, /contraindication/);
+    const notesPane = host.querySelector('.fb-pptx-notes');
+    const notesBody = host.querySelector('.fb-pptx-notes-body');
+    assert.match(notesBody.textContent, /contraindication/);
+    assert.match(notesPane.getAttribute('style'), /background:\s*#FBF9F4/i, 'notes use the fixed light reference card');
+    assert.equal(notesBody.style.color, '#000000');
+    assert.notEqual(notesPane.querySelector('strong').style.color, notesBody.style.color,
+      'the independent heading style is not recoloured');
     assert.equal(host.querySelectorAll('table').length, 1);
     assert.equal(host.querySelectorAll('img').length, 1);
 
+    const slideBeforeColourChange = host.querySelector('.fb-pptx-slide-canvas');
+    viewer.setNotesColor('#ff0000');
+    assert.equal(state.notesColor, '#ff0000');
+    assert.equal(notesBody.style.color, '#ff0000', 'the selected colour applies immediately');
+    assert.equal(host.querySelector('.fb-pptx-slide-canvas'), slideBeforeColourChange,
+      'a notes-only style update does not rebuild presentation media');
+
     await viewer.search('contraindication');
     assert.equal(state.matches.length, 1, 'speaker notes are included in search');
+    assert.equal(host.querySelector('.fb-pptx-notes-body').style.color, '#ff0000',
+      'the selected colour survives slide re-rendering');
+    viewer.setNotesColor('red; background:url(https://invalid.example)');
+    assert.equal(state.notesColor, '#000000', 'malformed values safely fall back to black');
+    assert.equal(host.querySelector('.fb-pptx-notes-body').style.color, '#000000');
+
     const thumb = mount(150, 100);
     await viewer.renderThumbnail(1, thumb);
     assert.match(thumb.textContent, /Cardiovascular Pharmacology/);

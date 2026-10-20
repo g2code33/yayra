@@ -8868,6 +8868,59 @@ button.fb-site-passkey-indicator {
   outline-offset: 2px;
 }
 
+/* Native PPTX notes colour picker. The transparent input covers the visible
+   wheel, so mouse/touch and keyboard all invoke the platform picker directly. */
+.fb-doc-notes-color-control {
+  position: relative;
+  flex: 0 0 34px;
+  width: 34px;
+  height: 30px;
+  min-height: 30px;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--fb-border-glass, rgba(255,255,255,.14));
+  border-radius: 7px;
+  background: var(--fb-bg-glass-input, rgba(255,255,255,.07));
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.fb-doc-notes-color-control:hover {
+  background: color-mix(in srgb, var(--fb-accent-primary, #6d5df2) 24%, transparent);
+  border-color: color-mix(in srgb, var(--fb-accent-primary, #8b7cff) 60%, transparent);
+}
+
+.fb-doc-notes-color-control:focus-within {
+  outline: 2px solid var(--fb-accent-primary, #8b7cff);
+  outline-offset: 2px;
+}
+
+.fb-doc-notes-color-wheel {
+  width: 19px;
+  height: 19px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  border: 1px solid rgba(255,255,255,.72);
+  border-radius: 50%;
+  background: conic-gradient(#ef4444, #f59e0b, #eab308, #22c55e, #06b6d4, #3b82f6, #8b5cf6, #ec4899, #ef4444);
+  box-shadow: 0 1px 3px rgba(0,0,0,.4);
+  pointer-events: none;
+}
+
+.fb-doc-notes-color-swatch {
+  width: 7px;
+  height: 7px;
+  box-sizing: border-box;
+  border: 1px solid #fff;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(15,23,42,.72);
+  pointer-events: none;
+}
+
 .fb-doc-host-pdf {
   scroll-behavior: auto;
   overflow-anchor: none;

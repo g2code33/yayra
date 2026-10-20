@@ -11,7 +11,7 @@ implementation adapts the proven offline viewer architecture from
 | Kind | Extensions | Bundled engine | Main capabilities | Explicit limitations |
 | --- | --- | --- | --- | --- |
 | PDF | `.pdf` | PDF.js | Continuous pages, selectable text, progressive/windowed painting, page jump, find, thumbnails, outline, fit/zoom, rotation, night mode, print/download | Image-only scans have no searchable text without OCR |
-| PowerPoint | `.pptx`, `.pptm` | Native OOXML slide renderer | Slide dimensions, master/layout/theme inheritance, backgrounds, text/runs, shapes, embedded and cropped images, playable embedded videos with poster frames and native controls, tables/merged cells, notes, thumbnails, navigation, find, fit/zoom | Does not execute macros, transitions, animations or OLE; linked-only videos stay offline and use their poster frame; unsupported video codecs use the browser’s native fallback; charts/SmartArt may use static or explanatory fallbacks |
+| PowerPoint | `.pptx`, `.pptm` | Native OOXML slide renderer | Slide dimensions, master/layout/theme inheritance, backgrounds, text/runs, shapes, embedded and cropped images, playable embedded videos with poster frames and native controls, tables/merged cells, speaker notes with a native text-colour picker, thumbnails, navigation, find, fit/zoom | Does not execute macros, transitions, animations or OLE; linked-only videos stay offline and use their poster frame; unsupported video codecs use the browser’s native fallback; charts/SmartArt may use static or explanatory fallbacks |
 | Word | `.docx` | `docx-preview` | Paged visual layout, styles, tables, headers/footers, notes, find, zoom | No macro execution, OLE, or tracked-change balloons |
 | Spreadsheet | `.xlsx`, `.xlsm`, `.xls`, `.csv` | SheetJS Community Edition | Worksheet tabs, cells, formatted values, merged cells, dimensions, formula/result display, find, bounded row windows | Does not reproduce charts, conditional formatting or frozen panes |
 | Image | `.jpg`, `.jpeg`, `.png`, `.webp`, `.gif`, `.bmp`, `.avif`, `.svg` | Browser decoder | Internal display, zoom, rotation; animation where the browser supports it | SVG is sanitised before display |
@@ -72,8 +72,13 @@ PPTX follows the same first-content-first rule: presentation structure opens
 before media, and embedded pictures, video poster frames and clips are
 materialised slide-by-slide. Video controls stay inside the slide, never load a
 linked external file, and keep their own keyboard shortcuts while focused.
-Search text is indexed lazily. Spreadsheet rendering limits each visible row
-window to 300 rows.
+Search text is indexed lazily. The speaker-notes colour control adapts the
+native-picker pattern introduced by `pharmaTRACK_PERFECT_new` v1.4.22: it sits
+beside **Download original** / **Desktop app**, updates only the notes text
+without rebuilding slide media, defaults to black on a fixed cream card, and
+stores a validated six-digit colour in the active Yayra profile. Malformed or
+unavailable storage falls back safely without disabling the live in-memory
+control. Spreadsheet rendering limits each visible row window to 300 rows.
 
 ## User entry points
 
@@ -91,7 +96,9 @@ engine path.
 
 The automated suite covers byte/MIME/filename routing, the shared 300 MB guard,
 a realistic PowerPoint fixture (master, layout, theme, background, image crop,
-merged table and speaker notes), both `a:videoFile` and `p14:media` video forms,
+merged table and speaker notes), the native notes-colour control (live update,
+black default, profile persistence, visibility sync, remount, malformed/storage
+fallback and mobile layout), both `a:videoFile` and `p14:media` video forms,
 lazy clip loading, poster thumbnails, linked-video offline fallback, native
 video controls and keyboard ownership, real DOCX and spreadsheet rendering,
 SVG sanitisation, safe text, continuous PDF windowing/text layers/thumbnails/

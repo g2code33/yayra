@@ -295,6 +295,8 @@ test('TAB INTEGRATION: a document opens in its OWN tab - never the web frame or 
     const viewport = shell.viewportElement;
     assert.ok(viewport.querySelector('.fb-doc-viewer'), 'the integrated viewer renders');
     assert.ok(viewport.querySelector('.fb-doc-toolbar'), 'with its toolbar');
+    assert.equal(viewport.querySelector('.fb-doc-notes-color-input'), null,
+      'the speaker-notes colour picker never leaks into non-PPTX viewers');
     assert.equal(viewport.querySelector('iframe'), null, 'no web iframe is created for a document');
     assert.equal(viewport.querySelector('.fb-native-webview-slot'), null, 'the native engine is never attached');
     // The engine promise resolves async; give it a tick then check the ready state.
@@ -512,6 +514,166 @@ async function bootShell() {
   shell.render(container);
   return { shell, container };
 }
+
+function makeMemoryStorage(seed = {}) {
+  const data = new Map(Object.entries(seed));
+  return {
+    get length() { return data.size; },
+    key(index) { return [...data.keys()][index] || null; },
+    getItem(key) { return data.has(String(key)) ? data.get(String(key)) : null; },
+    setItem(key, value) { data.set(String(key), String(value)); },
+    removeItem(key) { data.delete(String(key)); }
+  };
+}
+
+function fakePptxEngine() {
+  return {
+    openPptxDeck: async () => ({
+      slideCount: 1,
+      slideWidth: 1280,
+      slideHeight: 720,
+      getSlide: async () => ({
+        slideNumber: 1,
+        title: 'Colour notes fixture',
+        text: 'Colour notes fixture',
+        notes: 'This note changes colour immediately.',
+        background: '#ffffff',
+        shapes: []
+      }),
+      ensureSlideMedia: async () => {},
+      textIndex: async () => [{ slide: 1, text: 'Colour notes fixture This note changes colour immediately.' }],
+      dispose() {}
+    })
+  };
+}
+
+test('PPTX NOTES COLOUR: native wheel is beside Download, live, visibility-synchronised and profile-persistent', async () => {
+  const priorStorage = globalThis.localStorage;
+  const storage = makeMemoryStorage();
+  globalThis.localStorage = storage;
+  let firstShell = null;
+  let secondShell = null;
+  try {
+    const firstContainer = document.createElement('div');
+    firstShell = new BrowserShell({ container: firstContainer, platform: 'linux', isMobile: false });
+    firstShell._documentEngineOverrides = { pptx: fakePptxEngine() };
+    await firstShell.initialize();
+    firstShell.render(firstContainer);
+    firstShell.addDocumentTab({ name: 'lecture.pptx', bytes: new Uint8Array([1, 2, 3]) });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const primary = firstShell.viewportElement.querySelector('.fb-doc-toolbar');
+    const picker = primary.querySelector('.fb-doc-notes-color-input');
+    const control = primary.querySelector('.fb-doc-notes-color-control');
+    const original = primary.querySelector('.fb-doc-original-btn');
+    assert.ok(picker && control && original, 'PPTX primary toolbar exposes the notes picker and original-file action');
+    assert.equal(picker.type, 'color', 'the browser/OS-native colour input is used');
+    assert.equal(picker.getAttribute('aria-label'), 'Speaker notes text colour');
+    assert.match(control.title, /Speaker notes text colour: #000000/, 'the control exposes its colour in a tooltip');
+    assert.equal(picker.getAttribute('tabindex'), null, 'native keyboard focus is not suppressed');
+    assert.equal(picker.value, '#000000');
+    assert.equal(primary.children.indexOf(control) + 1, primary.children.indexOf(original),
+      'the colour wheel sits immediately beside Download original/Desktop app');
+    assert.equal(control.hidden, false, 'the picker starts visible with speaker notes');
+
+    picker.value = '#ff0000';
+    picker.dispatchEvent({ type: 'input', target: picker });
+    assert.equal(firstShell.getActiveTab().docState.notesColor, '#ff0000');
+    assert.equal(control.dataset.notesColor, '#ff0000', 'the visible swatch tracks the chosen colour');
+    assert.equal(firstShell.viewportElement.querySelector('.fb-pptx-notes-body').style.color, '#ff0000',
+      'the mounted notes update without a viewer remount');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const saved = JSON.parse(storage.getItem('yayra:p:default:settings'));
+    assert.equal(saved.pptxNotesColor, '#ff0000', 'the preference is scoped to the active profile');
+
+    firstShell.viewportElement.querySelector('.fb-doc-btn-notes').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(control.hidden, true, 'hiding notes hides the colour control in sync');
+    assert.equal(control.style.display, 'none');
+
+    const otherProfile = firstShell.profileService.createProfile({ name: 'Separate notes profile' });
+    firstShell.profileService.switchTo(otherProfile.id);
+    await firstShell.reloadProfileScopedState();
+    assert.equal(firstShell.state.settings.pptxNotesColor, '#000000',
+      'a new profile does not inherit another profile’s notes colour');
+    firstShell.profileService.switchTo('default');
+    await firstShell.reloadProfileScopedState();
+    assert.equal(firstShell.state.settings.pptxNotesColor, '#ff0000',
+      'switching back restores the original profile preference');
+
+    firstShell.destroy();
+    firstShell = null;
+    const secondContainer = document.createElement('div');
+    secondShell = new BrowserShell({ container: secondContainer, platform: 'linux', isMobile: true });
+    secondShell._documentEngineOverrides = { pptx: fakePptxEngine() };
+    await secondShell.initialize();
+    secondShell.render(secondContainer);
+    secondShell.addDocumentTab({ name: 'remounted.pptx', bytes: new Uint8Array([4, 5, 6]) });
+    const remountedPicker = secondShell.viewportElement.querySelector('.fb-doc-notes-color-input');
+    assert.equal(remountedPicker.value, '#ff0000', 'a fresh mobile/remounted viewer restores the profile colour');
+    assert.equal(secondShell.getActiveTab().docState.notesColor, '#ff0000');
+  } finally {
+    firstShell?.destroy();
+    secondShell?.destroy();
+    if (priorStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = priorStorage;
+  }
+});
+
+test('PPTX NOTES COLOUR: compact responsive styling keeps the native control keyboard-visible', () => {
+  const css = readFileSync(new URL('../packages/shared-ui/src/theme/design-system.css', import.meta.url), 'utf8');
+  assert.match(css, /\.fb-doc-notes-color-control\s*\{[\s\S]*?flex:\s*0 0 34px;[\s\S]*?height:\s*30px;/,
+    'the wheel remains compact in the primary toolbar');
+  assert.match(css, /\.fb-doc-notes-color-control:focus-within\s*\{[\s\S]*?outline:\s*2px solid/,
+    'the transparent native input gets a visible keyboard focus ring');
+  const mobile = css.slice(css.indexOf('@media (max-width: 680px)'));
+  assert.match(mobile, /\.fb-doc-toolbar\s*\{[\s\S]*?overflow-x:\s*auto;/,
+    'narrow toolbars scroll instead of clipping the native picker');
+  assert.match(mobile, /\.fb-pptx-notes\s*\{[\s\S]*?width:\s*100% !important;/,
+    'the cream notes card fits mobile viewports');
+});
+
+test('PPTX NOTES COLOUR: malformed or unavailable storage safely falls back to black', async () => {
+  const priorStorage = globalThis.localStorage;
+  let shell = null;
+  try {
+    globalThis.localStorage = makeMemoryStorage({
+      'yayra:p:default:settings': JSON.stringify({ pptxNotesColor: 'red; background:url(https://invalid.example)' })
+    });
+    const container = document.createElement('div');
+    shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+    shell._documentEngineOverrides = { pptx: fakePptxEngine() };
+    await shell.initialize();
+    shell.render(container);
+    shell.addDocumentTab({ name: 'malformed.pptx', bytes: new Uint8Array([1]) });
+    assert.equal(shell.viewportElement.querySelector('.fb-doc-notes-color-input').value, '#000000');
+    shell.destroy();
+    shell = null;
+
+    globalThis.localStorage = {
+      get length() { throw new Error('blocked'); },
+      key() { throw new Error('blocked'); },
+      getItem() { throw new Error('blocked'); },
+      setItem() { throw new Error('blocked'); },
+      removeItem() { throw new Error('blocked'); }
+    };
+    const blockedContainer = document.createElement('div');
+    shell = new BrowserShell({ container: blockedContainer, platform: 'linux', isMobile: false });
+    shell._documentEngineOverrides = { pptx: fakePptxEngine() };
+    await shell.initialize();
+    shell.render(blockedContainer);
+    shell.addDocumentTab({ name: 'blocked-storage.pptx', bytes: new Uint8Array([2]) });
+    const blockedPicker = shell.viewportElement.querySelector('.fb-doc-notes-color-input');
+    assert.equal(blockedPicker.value, '#000000');
+    blockedPicker.value = '#00ff00';
+    assert.doesNotThrow(() => blockedPicker.dispatchEvent({ type: 'input', target: blockedPicker }));
+    assert.equal(shell.getActiveTab().docState.notesColor, '#00ff00', 'in-memory live colour still works');
+  } finally {
+    shell?.destroy();
+    if (priorStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = priorStorage;
+  }
+});
 
 test('PDF OFFLINE: local document bytes and the vendored PDF.js engine do not require a network fetch', async () => {
   const { existsSync } = await import('node:fs');
