@@ -7,14 +7,15 @@
  * authenticator UI. A site can therefore sit in navigator.credentials.create
  * for Chromium's three-minute minimum timeout with no prompt at all. This
  * provider supplies a CTAP2-compatible local platform authenticator through
- * Chromium's WebAuthn DevTools domain, persists its P-256 private credentials encrypted
- * by Electron safeStorage, and releases user presence only after an explicit
- * browser-chrome click plus a successful PolicyKit system-password prompt.
+ * Chromium's WebAuthn DevTools domain and persists its P-256 private credentials
+ * encrypted by Electron safeStorage. User presence is released only after an
+ * explicit browser-chrome click plus either a one-shot grant from Yayra's
+ * configured vault passkey (PIN/Touch ID/system lock), or PolicyKit fallback.
  *
  * It is deliberately Linux-only. Windows keeps Windows Hello and macOS keeps
  * Electron's signed Touch ID integration. It also fails closed when Electron
- * is using Linux's insecure `basic_text` safeStorage fallback, PolicyKit is
- * unavailable, the tab is private, or the WebAuthn protocol cannot attach.
+ * uses Linux's insecure `basic_text` safeStorage fallback, the tab is private,
+ * its encrypted store is unsafe, or the WebAuthn protocol cannot attach.
  */
 
 const { spawn } = require('node:child_process');
@@ -24,7 +25,7 @@ const STORE_FILE = 'yayra-site-passkeys.json';
 const STORE_VERSION = 1;
 const SYSTEM_AUTH_TIMEOUT_MS = 90 * 1000;
 const CDP_COMMAND_TIMEOUT_MS = 5 * 1000;
-const PRESENCE_RESET_MS = 30 * 1000;
+const PRESENCE_RESET_MS = 60 * 1000;
 const MAX_PROFILE_CREDENTIALS = 100;
 const MAX_RP_CREDENTIALS = 20;
 const MAX_STORE_ENVELOPE_CHARS = 64 * 1024 * 1024;
@@ -154,10 +155,12 @@ function createWebsitePasskeyProvider({
 } = {}) {
   const storage = strongStorageStatus(safeStorageImpl, platform);
   const policyKit = createPolicyKitAuthorizer({ fsImpl, spawnImpl });
-  const globallyAvailable = storage.available && policyKit.available;
-  const globalReason = storage.available
-    ? (policyKit.available ? '' : 'system-auth-unavailable')
-    : storage.reason;
+  // Strong encrypted storage is the provider prerequisite. PolicyKit is a
+  // fallback verifier, not an availability gate: the desktop Yayra passkey
+  // can authorize a ceremony with a main-process one-shot grant even on a
+  // Linux setup where pkexec is not installed.
+  const globallyAvailable = storage.available;
+  const globalReason = storage.reason;
   const filePath = pathImpl?.join?.(userDataDir || '', STORE_FILE) || STORE_FILE;
   const backupPath = `${filePath}.bak`;
   const states = new Map();
@@ -272,6 +275,29 @@ function createWebsitePasskeyProvider({
     const state = states.get(webContents);
     if (state?.failed) return { mode: 'external', available: false, reason: state.reason || 'provider-unavailable' };
     return { mode: 'local', available: true, reason: state?.ready ? '' : 'initializing' };
+  }
+
+  /**
+   * Request-aware capability check. A generic virtual authenticator existing
+   * is not proof that Yayra owns the credential a site is requesting. For an
+   * assertion, advertise the local route only when this exact profile has at
+   * least one encrypted credential for the RP; otherwise fail fast to the
+   * honest system-browser path instead of releasing a request that can hang.
+   */
+  function describeRequest({ webContents, isPrivate = false, action, rpId } = {}) {
+    const base = describe({ webContents, isPrivate });
+    if (base.mode !== 'local' || action !== 'get') return base;
+    const relyingPartyId = typeof rpId === 'string' && /^[a-z0-9.-]{1,253}$/i.test(rpId)
+      ? rpId.toLowerCase()
+      : '';
+    const state = states.get(webContents);
+    if (!relyingPartyId || !state?.ready) return base;
+    const credentialCount = profileCredentials(state.profileKey)
+      .filter((credential) => credential.rpId === relyingPartyId).length;
+    if (credentialCount === 0) {
+      return { mode: 'external', available: false, reason: 'no-local-credential', credentialCount: 0 };
+    }
+    return { ...base, credentialCount };
   }
 
   async function send(state, method, params = {}) {
@@ -434,9 +460,12 @@ function createWebsitePasskeyProvider({
         || method === 'WebAuthn.credentialUpdated'
         || method === 'WebAuthn.credentialAsserted') {
       Promise.resolve(rememberCredential(state, params.credential)).catch(() => {});
-      if (method === 'WebAuthn.credentialAdded' || method === 'WebAuthn.credentialAsserted') {
-        Promise.resolve(resetPresence(state)).catch(() => {});
-      }
+      // Do NOT reset UP/UV on credentialAdded/credentialAsserted. CDP emits
+      // those events before Chromium has necessarily resolved the page's
+      // WebAuthn promise; clearing presence here races the final response and
+      // produced GitHub's permanent “Waiting for browser interaction” state.
+      // The metadata-only preload settlement (or the bounded main watchdog)
+      // calls settle() after the terminal page result instead.
     } else if (method === 'WebAuthn.credentialDeleted') {
       Promise.resolve(forgetCredential(state, params.credentialId)).catch(() => {});
     }
@@ -530,7 +559,14 @@ function createWebsitePasskeyProvider({
     return state.readyPromise;
   }
 
-  async function confirm({ webContents, requestId, action, rpId, isStillActive = () => true } = {}) {
+  async function confirm({
+    webContents,
+    requestId,
+    action,
+    rpId,
+    userVerification = null,
+    isStillActive = () => true
+  } = {}) {
     const id = typeof requestId === 'string' && /^yayra-wa-[a-z0-9-]{1,80}$/i.test(requestId)
       ? requestId
       : '';
@@ -558,19 +594,27 @@ function createWebsitePasskeyProvider({
       return { ok: false, reason: storeFailureReason };
     }
     const credentials = profileCredentials(state.profileKey);
+    const relyingPartyCredentials = credentials.filter((item) => item.rpId === relyingPartyId);
+    if (action === 'get' && relyingPartyCredentials.length === 0) {
+      return { ok: false, reason: 'no-local-credential' };
+    }
     if (action === 'create'
         && (credentials.length >= MAX_PROFILE_CREDENTIALS
-          || credentials.filter((item) => item.rpId === relyingPartyId).length >= MAX_RP_CREDENTIALS)) {
+          || relyingPartyCredentials.length >= MAX_RP_CREDENTIALS)) {
       return { ok: false, reason: 'credential-limit-reached' };
     }
     state.approvingRequestId = id;
     state.authorizing = true;
     profileApprovals.set(state.profileKey, { state, requestId: id });
     let gate;
+    const trustedYayraVerification = userVerification?.verified === true
+      && userVerification?.method === 'yayra-passkey';
     try {
-      gate = typeof authorizeImpl === 'function'
-        ? await authorizeImpl({ action, rpId: relyingPartyId })
-        : await policyKit.authorize({ action, rpId: relyingPartyId });
+      gate = trustedYayraVerification
+        ? { ok: true, prompted: true }
+        : typeof authorizeImpl === 'function'
+          ? await authorizeImpl({ action, rpId: relyingPartyId })
+          : await policyKit.authorize({ action, rpId: relyingPartyId });
     } catch (error) {
       state.authorizing = false;
       releaseApproval(state);
@@ -601,7 +645,12 @@ function createWebsitePasskeyProvider({
       state.presenceActive = true;
       state.resetTimer = setTimeout(() => resetPresence(state), PRESENCE_RESET_MS);
       state.resetTimer?.unref?.();
-      return { ok: true, prompted: true, presenceExpiresInMs: PRESENCE_RESET_MS };
+      return {
+        ok: true,
+        prompted: Boolean(gate?.prompted),
+        verification: trustedYayraVerification ? 'yayra-passkey' : 'system-auth',
+        presenceExpiresInMs: PRESENCE_RESET_MS
+      };
     } catch (error) {
       await resetPresence(state);
       return { ok: false, reason: String(error?.message || 'provider-unavailable').slice(0, 120) };
@@ -647,6 +696,7 @@ function createWebsitePasskeyProvider({
     detach,
     destroy,
     describe,
+    describeRequest,
     _filePath: filePath,
     _states: states,
     _storage: storage,

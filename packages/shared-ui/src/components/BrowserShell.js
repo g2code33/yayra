@@ -105,6 +105,10 @@ function describePasskeyReason(reason) {
     case 'pin-locked': return 'too many wrong PIN attempts - PIN entry is locked for a minute';
     case 'verification-cancelled': return 'the verification was cancelled';
     case 'system-auth-unavailable': return 'the system password prompt is unavailable on this device';
+    case 'no-local-credential': return 'Yayra has no saved website passkey for this site/profile';
+    case 'yayra-authorization-expired': return 'the Yayra verification expired - verify again';
+    case 'yayra-authorization-mismatch': return 'the Yayra verification did not match this website request';
+    case 'ceremony-timeout': return 'the website did not finish the passkey request in time';
     case 'no-lan': return 'phone approval needs your PC to be on a Wi-Fi/LAN network the phone can reach';
     default: return reason || 'unknown error';
   }
@@ -2308,28 +2312,37 @@ export class BrowserShell {
       let label = request.action === 'create' ? 'Creating passkey' : 'Passkey active';
       let title = `${request.rpId || 'This site'} is ${request.action === 'create' ? 'creating' : 'requesting'} a passkey. Complete the device or security-key prompt.`;
       if (providerMode === 'local') {
-        label = state === 'prompting' ? 'Confirm system password'
-          : state === 'approved' ? 'Completing passkey'
-            : state === 'handed-off' ? 'Opened in system browser'
-              : state === 'declined' ? 'Use system browser'
-                : 'Confirm passkey';
+        label = state === 'prompting' ? 'Verify with Yayra'
+          : state === 'system-prompt' ? 'Confirm system password'
+            : state === 'approved' ? 'Completing with Yayra'
+              : state === 'handed-off' ? 'Opened in system browser'
+                : state === 'declined' ? 'Use system browser'
+                  : state === 'retry' ? 'Retry Yayra passkey'
+                    : request.action === 'get' ? 'Use Yayra passkey' : 'Create with Yayra';
         title = state === 'handed-off'
           ? 'This exact page is open in your system browser. Complete the passkey request there.'
           : state === 'declined'
             ? 'Local verification did not complete. Open this exact page in your system browser instead.'
-            : 'Click to confirm this passkey request with your Linux system password.';
+            : state === 'retry'
+              ? 'Yayra verification was cancelled or failed. Click to try your configured Yayra passkey again.'
+              : state === 'approved'
+                ? `Yayra verified you and is completing the ${request.rpId || 'site'} passkey request.`
+                : `Verify with your configured Yayra passkey. The website credential remains isolated to ${request.rpId || 'this site'}.`;
       } else if (providerMode === 'external') {
         label = state === 'handed-off' ? 'Opened in system browser' : 'Use system browser';
         title = state === 'handed-off'
           ? 'This exact page is open in your system browser. Complete the passkey request there.'
-          : 'This Linux session has no secure local passkey provider. Open this exact page in your system browser.';
+          : request.provider?.reason === 'no-local-credential'
+            ? `No Yayra-managed passkey for ${request.rpId || 'this site'} exists in this profile. Open the page in your system browser or register one in Yayra.`
+            : 'This Linux session cannot securely complete this passkey request locally. Open this exact page in your system browser.';
       }
       indicator.setAttribute('title', title);
       indicator.setAttribute('aria-label', title);
       indicator.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="15" r="4"></circle><path d="m11 12 9-9m-4 4 3 3m-6 0 3 3"></path></svg>'
         + `<span>${label}</span>`;
       if (actionable) {
-        indicator.disabled = state === 'prompting' || state === 'approved' || state === 'handed-off';
+        indicator.disabled = state === 'prompting' || state === 'system-prompt'
+          || state === 'approved' || state === 'handed-off';
         indicator.addEventListener('click', () => this.continueWebsitePasskey(activeTab, request));
       }
       omnibox.appendChild(indicator);
@@ -3730,38 +3743,158 @@ export class BrowserShell {
     }
   }
 
+  _websitePasskeyAuthorizationContext(tab, request) {
+    let profileId = 'default';
+    try { profileId = String(this.profileService?.current?.()?.id || 'default'); } catch { /* default profile */ }
+    return {
+      tabId: String(tab.id),
+      requestId: String(request.requestId),
+      rpId: String(request.rpId || '').toLowerCase(),
+      profileId,
+      action: request.action === 'create' ? 'create' : 'get'
+    };
+  }
+
+  async _registerWebsiteApprovalPin(websiteRequest) {
+    const pin = await this._promptNewPin({ websiteApproval: true });
+    if (!pin) return { success: false, reason: 'verification-cancelled' };
+    const profile = this.state.googleAccount?.signedIn ? this.state.googleAccount.profile : null;
+    const accountLabel = (profile && (profile.email || profile.name)) || 'Yayra user';
+    const result = await this.passkeyService.registerPasskey({
+      accountLabel,
+      method: 'pin',
+      pin,
+      websiteRequest
+    });
+    if (result.success) {
+      this.state.passkeyInfo = result.passkey;
+      this._vaultUnlockedAt = Date.now();
+      this.showTransientNotice('Yayra PIN created. It now protects vault access and website-passkey approvals on this device.');
+    }
+    return result;
+  }
+
+  /**
+   * Verify the browser owner without conflating credentials: the Yayra account
+   * passkey authorizes one release, while the separate RP-scoped website key
+   * signs the site's challenge in main/Chromium. The returned opaque token is
+   * one-shot, request-bound and validated entirely in the main process.
+   */
+  async _authorizeWebsitePasskey(tab, request) {
+    if (!this.passkeyService?.usesNativeBridge) return { systemFallback: true };
+    const websiteRequest = this._websitePasskeyAuthorizationContext(tab, request);
+    let stored = this.state.passkeyInfo;
+    if (!stored) {
+      try { stored = await this.passkeyService.getRegisteredPasskey(); } catch { stored = null; }
+      this.state.passkeyInfo = stored;
+    }
+
+    if (!stored) {
+      const choice = await this._passkeyDialog({
+        title: 'Protect website passkeys with Yayra',
+        description: `Create a 6-digit Yayra PIN to approve the ${request.rpId || 'website'} passkey without a Linux system-password prompt. The site credential stays separate and RP-scoped.`,
+        buttons: [
+          { action: 'pin', label: 'Create a Yayra PIN', primary: true },
+          { action: 'system', label: 'Use system password once' },
+          { action: 'cancel', label: 'Cancel' }
+        ]
+      });
+      if (choice.action === 'system') return { systemFallback: true };
+      if (choice.action !== 'pin') return { success: false, reason: 'verification-cancelled' };
+      const registered = await this._registerWebsiteApprovalPin(websiteRequest);
+      return registered.success && registered.authorizationToken
+        ? { success: true, authorizationToken: registered.authorizationToken }
+        : { success: false, reason: registered.reason || 'yayra-authorization-unavailable' };
+    }
+
+    if (stored.method !== 'pin') {
+      const choice = await this._passkeyDialog({
+        title: 'Verify with your Yayra passkey',
+        description: 'Your configured Yayra passkey currently uses the system lock. You can verify with it now, or verify once and switch future website-passkey approvals to a Yayra PIN.',
+        buttons: [
+          { action: 'switch-pin', label: 'Switch to a Yayra PIN', primary: true },
+          { action: 'current', label: 'Use current Yayra passkey' },
+          { action: 'cancel', label: 'Cancel' }
+        ]
+      });
+      if (choice.action === 'cancel') return { success: false, reason: 'verification-cancelled' };
+      if (choice.action === 'switch-pin') {
+        // Replacing an existing verifier itself requires the existing verifier;
+        // an unlocked renderer can never silently downgrade system-lock auth.
+        const current = await this._performPasskeyCeremony();
+        if (!current?.success) return current || { success: false, reason: 'verification-failed' };
+        const registered = await this._registerWebsiteApprovalPin(websiteRequest);
+        return registered.success && registered.authorizationToken
+          ? { success: true, authorizationToken: registered.authorizationToken }
+          : { success: false, reason: registered.reason || 'yayra-authorization-unavailable' };
+      }
+    }
+
+    const verified = await this._performPasskeyCeremony({ websiteRequest });
+    if (!verified?.success || !verified.authorizationToken) {
+      return { success: false, reason: verified?.reason || 'yayra-authorization-unavailable' };
+    }
+    this._vaultUnlockedAt = Date.now();
+    return { success: true, authorizationToken: verified.authorizationToken };
+  }
+
   async continueWebsitePasskey(tab, request) {
     if (!tab || !request || !this.nativeWebview?.continuePasskey) return;
+    if (['prompting', 'system-prompt', 'approved', 'handed-off'].includes(request.providerState)) return;
     const external = request.provider?.mode === 'external'
       || request.providerState === 'declined';
-    request.providerState = external ? 'approved' : 'prompting';
+    let authorizationToken = '';
+
+    if (!external && request.provider?.mode === 'local') {
+      request.providerState = 'prompting';
+      if (tab.id === this.state.activeTabId) this.requestRender();
+      const authorization = await this._authorizeWebsitePasskey(tab, request);
+      if (!authorization?.success && !authorization?.systemFallback) {
+        request.providerState = 'retry';
+        this.showTransientNotice(`Yayra did not authorize this website passkey: ${describePasskeyReason(authorization?.reason)}. Click to retry.`);
+        if (tab.sitePasskeyRequest?.requestId === request.requestId
+            && tab.id === this.state.activeTabId) this.requestRender();
+        return;
+      }
+      authorizationToken = authorization.authorizationToken || '';
+      if (tab.sitePasskeyRequest?.requestId !== request.requestId) return;
+      request.providerState = authorization.systemFallback ? 'system-prompt' : 'prompting';
+    } else {
+      request.providerState = 'approved';
+    }
     if (tab.id === this.state.activeTabId) this.requestRender();
+
     try {
-      const result = await this.nativeWebview.continuePasskey(tab.id, request.requestId, external);
+      const result = await this.nativeWebview.continuePasskey(tab.id, request.requestId, {
+        external,
+        authorizationToken
+      });
       if (result?.handedOff) {
         request.providerState = 'handed-off';
         this.showTransientNotice('The passkey page opened in your system browser. Complete it there using that browser’s passkey provider.');
       } else if (result?.ok) {
+        // A fast authenticator can settle before the invoke response returns.
+        // In that ordering the terminal success event already removed the chip;
+        // never paint a stale “Completing” state over the newer success.
+        if (tab.sitePasskeyRequest?.requestId !== request.requestId) return;
         request.providerState = 'approved';
-        this.showTransientNotice('System verification accepted. Completing the passkey request...');
+        this.showTransientNotice(result.verification === 'yayra-passkey'
+          ? 'Yayra passkey verified. Completing the website sign-in...'
+          : 'System verification accepted. Completing the passkey request...');
         const expiresInMs = Math.max(0, Math.min(60000, Number(result.presenceExpiresInMs) || 0));
         if (expiresInMs > 0) {
           setTimeout(() => {
             if (tab.sitePasskeyRequest?.requestId !== request.requestId
                 || request.providerState !== 'approved') return;
-            // Chromium cannot replay a virtual-CTAP command that has already
-            // missed presence. Do not offer a misleading second confirmation;
-            // the safe recovery is a fresh site request or the system browser.
             request.providerState = 'declined';
             this.showTransientNotice('The site did not finish the passkey request. Retry it on the site, or click “Use system browser” to continue another way.');
             if (tab.id === this.state.activeTabId) this.requestRender();
           }, expiresInMs + 250);
         }
       } else {
-        request.providerState = 'declined';
-        this.showTransientNotice(result?.reason === 'user-declined-or-timeout'
-          ? 'System verification was cancelled. Click “Use system browser” to continue another way.'
-          : 'The secure local passkey provider is unavailable. Click “Use system browser” to continue.');
+        const retryable = String(result?.reason || '').startsWith('yayra-authorization');
+        request.providerState = retryable ? 'retry' : 'declined';
+        this.showTransientNotice(`${describePasskeyReason(result?.reason)}. ${retryable ? 'Click to verify with Yayra again.' : 'Use the system-browser fallback to continue.'}`);
       }
     } catch {
       request.providerState = 'declined';
@@ -3931,7 +4064,10 @@ export class BrowserShell {
               ? {
                   mode: evt.provider.mode,
                   available: evt.provider.available === true,
-                  reason: String(evt.provider.reason || '').slice(0, 120)
+                  reason: String(evt.provider.reason || '').slice(0, 120),
+                  ...(Number.isSafeInteger(evt.provider.credentialCount)
+                    ? { credentialCount: evt.provider.credentialCount }
+                    : {})
                 }
               : { mode: 'native', available: false, reason: '' },
             startedAt: Date.now()
@@ -3949,6 +4085,9 @@ export class BrowserShell {
               : `Passkey sign-in completed for ${evt.rpId || 'this site'}.`);
           } else if (tabId === this.state.activeTabId && evt.errorName && evt.errorName !== 'AbortError') {
             this.showTransientNotice(`The passkey request from ${evt.rpId || 'this site'} did not complete. You can retry with your device/security key or use the system-browser option.`);
+          } else if (tabId === this.state.activeTabId && evt.errorName === 'AbortError'
+              && current && !current.conditional && current.providerReason !== 'ceremony-timeout') {
+            this.showTransientNotice(`The passkey request from ${evt.rpId || 'this site'} was cancelled.`);
           }
         }
         break;
@@ -3958,7 +4097,13 @@ export class BrowserShell {
         if (!request || request.requestId !== evt.requestId) break;
         if (['prompting', 'approved', 'declined'].includes(evt.state)) {
           request.providerState = evt.state;
+          request.providerReason = String(evt.reason || '').slice(0, 120);
+          request.verification = evt.verification === 'yayra-passkey' ? 'yayra-passkey' : '';
           if (evt.state === 'declined') request.provider = { ...request.provider, mode: 'local' };
+          if (evt.state === 'declined' && request.providerReason === 'ceremony-timeout'
+              && tabId === this.state.activeTabId) {
+            this.showTransientNotice('The website did not finish the Yayra passkey request in time. It was cancelled safely; retry on the site or use the system-browser fallback.');
+          }
           if (tabId === this.state.activeTabId) this.requestRender();
         }
         break;
@@ -4311,6 +4456,9 @@ export class BrowserShell {
         const values = {};
         for (const [id, el] of Object.entries(fields)) values[id] = el.value || '';
         try { overlay.remove(); } catch { /* already gone */ }
+        // This dialog is body-mounted above the HTML renderer. Restore the
+        // native site surface only when no other real overlay still owns it.
+        try { this.healStuckPageSurface(); } catch { /* non-native/test host */ }
         resolve({ action, values });
       };
       const row = document.createElement('div');
@@ -4329,6 +4477,9 @@ export class BrowserShell {
       overlay.addEventListener('pointerdown', (e) => { if (e.target === overlay) done('cancel'); });
       overlay.appendChild(card);
       document.body.appendChild(overlay);
+      // A WebContentsView paints above renderer z-index; hide/capture it so
+      // the trusted Yayra verification UI is actually visible and clickable.
+      try { if (this.nativeWebview) this.setPageObscured(true); } catch { /* web/test host */ }
       const firstField = Object.values(fields)[0];
       if (firstField && typeof firstField.focus === 'function') firstField.focus();
     });
@@ -4367,10 +4518,12 @@ export class BrowserShell {
   }
 
   /** Ask for a new 6-digit PIN twice (typo protection). Returns pin or null. */
-  async _promptNewPin() {
+  async _promptNewPin({ websiteApproval = false } = {}) {
     const first = await this._passkeyDialog({
       title: 'Create your 6-digit PIN',
-      description: 'This PIN protects your Yayra vault on this device. It is stored only as a salted scrypt hash - never the digits themselves.',
+      description: websiteApproval
+        ? 'This PIN protects your Yayra vault and approves RP-isolated website passkeys on this device. It is stored only as a salted scrypt hash - never the digits themselves.'
+        : 'This PIN protects your Yayra vault on this device. It is stored only as a salted scrypt hash - never the digits themselves.',
       inputs: [{ id: 'pin', placeholder: '6-digit PIN' }],
       buttons: [{ action: 'confirm', label: 'Continue', primary: true }, { action: 'cancel', label: 'Cancel' }]
     });
@@ -4399,16 +4552,20 @@ export class BrowserShell {
    *  - everything else runs the silent device/Touch ID ceremony.
    * Returns the service's { success, reason } result.
    */
-  async _performPasskeyCeremony() {
+  async _performPasskeyCeremony({ websiteRequest = null } = {}) {
     const stored = this.state.passkeyInfo;
     if (stored?.method === 'pin') {
       const entry = await this._passkeyDialog({
-        title: 'Enter your 6-digit PIN',
-        description: 'Unlock the Yayra vault on this device.',
+        title: websiteRequest ? 'Verify with your Yayra passkey' : 'Enter your 6-digit PIN',
+        description: websiteRequest
+          ? `Approve the passkey request for ${websiteRequest.rpId}. Your PIN never leaves Yayra.`
+          : 'Unlock the Yayra vault on this device.',
         inputs: [{ id: 'pin', placeholder: '6-digit PIN' }],
         buttons: [
           { action: 'confirm', label: 'Unlock', primary: true },
-          ...(this.passkeyService?.supportsPhoneApproval ? [{ action: 'phone', label: 'Approve from my phone (QR)' }] : []),
+          ...(!websiteRequest && this.passkeyService?.supportsPhoneApproval
+            ? [{ action: 'phone', label: 'Approve from my phone (QR)' }]
+            : []),
           { action: 'cancel', label: 'Cancel' }
         ]
       });
@@ -4417,9 +4574,12 @@ export class BrowserShell {
         return ok ? { success: true } : { success: false, reason: 'verification-cancelled' };
       }
       if (entry.action !== 'confirm') return { success: false, reason: 'verification-cancelled' };
-      return this.passkeyService.verifyPasskey({ pin: entry.values.pin });
+      return this.passkeyService.verifyPasskey({
+        pin: entry.values.pin,
+        ...(websiteRequest ? { websiteRequest } : {})
+      });
     }
-    return this.passkeyService.verifyPasskey();
+    return this.passkeyService.verifyPasskey(websiteRequest ? { websiteRequest } : undefined);
   }
 
   /**
@@ -7621,7 +7781,7 @@ export class BrowserShell {
             <div>
               <strong>Website passkeys</strong>
               <p>${this.nativeWebview
-                ? 'Always active. Yayra recognizes secure sites when they call WebAuthn. On Linux, a clickable address-bar confirmation uses your system password and a KWallet/libsecret-encrypted local passkey; Windows Hello, entitled macOS Touch ID builds, and compatible security keys remain native. A system-browser fallback handles unavailable, phone, or synced providers.'
+                ? 'Always active. On Linux, Yayra keeps website credentials encrypted and profile-scoped, then uses your configured Yayra passkey (6-digit PIN, Touch ID, or system lock) to authorize each RP-isolated site request. A Yayra PIN avoids repeated system-password prompts. Windows Hello, entitled macOS Touch ID builds, and compatible security keys remain native; unavailable or synced credentials use the system-browser fallback.'
                 : 'Handled automatically by your browser when a secure site asks to create or use a passkey.'}</p>
             </div>
             <span class="fb-site-passkeys-ready" role="status">Active</span>

@@ -225,19 +225,31 @@ test('PasskeyService: honest failure reasons (decline, unsupported, nothing regi
 function installFakeWebviewBridge() {
   const fills = [];
   const passkeyContinuations = [];
+  const visibility = [];
   window.yayra = window.yayra || {};
   window.yayra.webview = {
     ensure: async () => ({}),
     setBounds: async () => ({}),
-    setVisible: async () => ({}),
+    setVisible: async (tabId, visible) => { visibility.push({ tabId, visible }); return {}; },
     goBack: async () => ({}),
     goForward: async () => ({}),
     reload: async () => ({}),
     stop: async () => ({}),
     destroy: async () => ({}),
-    continuePasskey: async (tabId, requestId, external) => {
-      passkeyContinuations.push({ tabId, requestId, external });
-      return { ok: true, prompted: !external, handedOff: Boolean(external) };
+    continuePasskey: async (tabId, requestId, options = {}) => {
+      const normalized = typeof options === 'boolean' ? { external: options } : options;
+      passkeyContinuations.push({
+        tabId,
+        requestId,
+        external: Boolean(normalized.external),
+        authorizationToken: normalized.authorizationToken || ''
+      });
+      return {
+        ok: true,
+        prompted: !normalized.external,
+        handedOff: Boolean(normalized.external),
+        verification: 'yayra-passkey'
+      };
     },
     fillCredentials: async (tabId, creds) => { fills.push({ tabId, ...creds }); return { filled: true }; },
     onEvent: () => () => {}
@@ -245,6 +257,7 @@ function installFakeWebviewBridge() {
   return {
     fills,
     passkeyContinuations,
+    visibility,
     uninstall: () => { delete window.yayra.webview; }
   };
 }
@@ -356,6 +369,42 @@ test('Autofill: detected login form gets saved credentials filled through the na
   }
 });
 
+test('Yayra passkey dialogs hide the native website surface so PIN controls stay visible and clickable', async () => {
+  const fakeBridge = installFakeWebviewBridge();
+  try {
+    const container = document.createElement('div');
+    const storage = new MemoryAdapter();
+    const shell = new BrowserShell({
+      container, isMobile: false, storageAdapter: storage,
+      passwordManager: new PasswordManager({ storageAdapter: storage })
+    });
+    await shell.initialize();
+    shell.render(container);
+    const tab = shell.getActiveTab();
+    tab.url = 'https://github.com/login';
+    shell.render(container);
+    const pending = shell._passkeyDialog({
+      title: 'Verify with Yayra',
+      description: 'Enter your PIN.',
+      inputs: [{ id: 'pin' }],
+      buttons: [{ action: 'cancel', label: 'Cancel' }]
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.ok(fakeBridge.visibility.some((item) => item.tabId === tab.id && item.visible === false),
+      'native page is hidden beneath the trusted renderer dialog');
+    const overlay = document.body.querySelector('.fb-passkey-dialog-overlay');
+    const cancel = overlay?.querySelector('button');
+    assert.ok(cancel, 'dialog cancel button is present');
+    cancel.click();
+    await pending;
+    assert.ok(fakeBridge.visibility.some((item) => item.tabId === tab.id && item.visible === true),
+      'native page is restored after the dialog closes');
+  } finally {
+    document.body.querySelector('.fb-passkey-dialog-overlay')?.remove();
+    fakeBridge.uninstall();
+  }
+});
+
 test('Website passkeys: a genuine native lifecycle request gets an immediate omnibox indicator and deterministic cleanup', async () => {
   const fakeBridge = installFakeWebviewBridge();
   try {
@@ -414,13 +463,14 @@ test('Website passkeys: a genuine native lifecycle request gets an immediate omn
     const confirm = container.querySelector('.fb-site-passkey-indicator');
     assert.ok(confirm, 'Linux local provider turns the dead status chip into an explicit confirmation control');
     assert.equal(confirm.tagName, 'BUTTON');
-    assert.match(confirm.textContent, /Confirm passkey/i);
+    assert.match(confirm.textContent, /Create with Yayra/i);
     confirm.click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.deepEqual(fakeBridge.passkeyContinuations.at(-1), {
       tabId: tab.id,
       requestId: 'yayra-wa-linux-local-1',
-      external: false
+      external: false,
+      authorizationToken: ''
     });
     assert.equal(tab.sitePasskeyRequest.providerState, 'approved');
 
@@ -484,6 +534,67 @@ test('Website passkeys: a genuine native lifecycle request gets an immediate omn
     shell.render(container);
     assert.ok(container.querySelector('.fb-site-passkey-indicator'),
       'account interaction promotes conditional mediation to a visible active ceremony');
+  } finally {
+    fakeBridge.uninstall();
+  }
+});
+
+test('Website passkeys: configured Yayra PIN mints a request-bound grant before the RP credential is released', async () => {
+  const fakeBridge = installFakeWebviewBridge();
+  try {
+    const storage = new MemoryAdapter();
+    const websiteRequestContexts = [];
+    const nativePasskey = {
+      status: async () => ({ available: true, registered: true, methods: { pin: true }, passkey: { method: 'pin' } }),
+      register: async () => ({
+        ok: true,
+        passkey: { credentialId: 'yayra-pin-credential', method: 'pin', createdAt: Date.now() }
+      }),
+      verify: async (options = {}) => {
+        websiteRequestContexts.push(options.websiteRequest);
+        return { ok: true, authorizationToken: 'opaque-bound-grant', authorizationExpiresAt: Date.now() + 30000 };
+      },
+      remove: async () => ({ ok: true })
+    };
+    const passkeyService = new PasskeyService({ storage, nativeBridge: nativePasskey });
+    await passkeyService.registerPasskey({ accountLabel: 'Ada', method: 'pin', pin: '204896' });
+    const container = document.createElement('div');
+    const shell = new BrowserShell({
+      container,
+      isMobile: false,
+      storageAdapter: storage,
+      passwordManager: new PasswordManager({ storageAdapter: storage }),
+      passkeyService
+    });
+    await shell.initialize();
+    shell._passkeyDialog = async () => ({ action: 'confirm', values: { pin: '204896' } });
+    shell.render(container);
+    const tab = shell.getActiveTab();
+    tab.url = 'https://github.com/login';
+    shell.handleNativeWebviewEvent({
+      tabId: tab.id,
+      type: 'webauthn-request',
+      phase: 'started',
+      requestId: 'yayra-wa-yayra-pin-1',
+      action: 'get',
+      rpId: 'github.com',
+      conditional: false,
+      provider: { mode: 'local', available: true, reason: '', credentialCount: 1 }
+    });
+    shell.render(container);
+    const useYayra = container.querySelector('.fb-site-passkey-indicator');
+    assert.match(useYayra.textContent, /Use Yayra passkey/i);
+    useYayra.click();
+    assert.ok(await waitFor(() => fakeBridge.passkeyContinuations.length === 1));
+    assert.deepEqual(websiteRequestContexts, [{
+      tabId: tab.id,
+      requestId: 'yayra-wa-yayra-pin-1',
+      rpId: 'github.com',
+      profileId: 'default',
+      action: 'get'
+    }]);
+    assert.equal(fakeBridge.passkeyContinuations[0].authorizationToken, 'opaque-bound-grant');
+    assert.equal(tab.sitePasskeyRequest.providerState, 'approved');
   } finally {
     fakeBridge.uninstall();
   }

@@ -1058,11 +1058,29 @@ function registerIpcBridges() {
     }
   });
 
+  // Device passkey for the desktop shell. Besides guarding the Yayra vault,
+  // a successful PIN/Touch ID/system-lock verification can mint a one-shot,
+  // main-process-only grant for one exact website WebAuthn request. The grant
+  // authorizes use of (but never replaces) that RP-scoped website credential.
+  const devicePasskeyBridge = createPasskeyBridge({
+    ipcMain,
+    fs,
+    path,
+    userDataDir: app.getPath('userData'),
+    safeStorageImpl: safeStorage,
+    systemPreferencesImpl: systemPreferences,
+    phoneApproval: createPhoneApproval({
+      httpImpl: http,
+      osImpl: os,
+      randomBytesImpl: (n) => crypto.randomBytes(n)
+    })
+  });
+
   // Linux has no Chromium platform-passkey UI in Electron: website
-  // navigator.credentials.create/get calls otherwise wait silently for at
-  // least three minutes. Supply a local CTAP2 authenticator only when its
-  // private credentials can be strongly encrypted and PolicyKit can perform
-  // real system-password verification for every user-approved ceremony.
+  // navigator.credentials.create/get calls otherwise wait silently. Supply a
+  // profile-scoped CTAP2 authenticator only when private credentials can be
+  // strongly encrypted. Each release still requires a verified Yayra grant
+  // above, or the PolicyKit fallback when the user explicitly chooses it.
   const websitePasskeyProvider = createWebsitePasskeyProvider({
     fsImpl: fs,
     pathImpl: path,
@@ -1089,7 +1107,8 @@ function registerIpcBridges() {
     // Chrome-style password capture/fill inside real pages (sandboxed
     // preload, nothing exposed to the page) - see autofillPreload.cjs.
     autofillPreloadPath: path.join(__dirname, 'autofillPreload.cjs'),
-    websitePasskeyProvider
+    websitePasskeyProvider,
+    consumeWebsitePasskeyGrant: devicePasskeyBridge.consumeWebsiteGrant
   });
 
   // "Sign in with Google" for Yayra's own app-level identity. See
@@ -1158,25 +1177,6 @@ function registerIpcBridges() {
     getMainWindow: () => mainWindow
   });
 
-  // Device passkey for the desktop shell: Chromium refuses real WebAuthn
-  // on the custom yayra:// scheme (no valid RP domain), so the desktop
-  // gets an OS-keychain-bound credential via safeStorage (+ a real Touch
-  // ID prompt on supporting Macs). See electron/passkeyBridge.cjs.
-  createPasskeyBridge({
-    ipcMain,
-    fs,
-    path,
-    userDataDir: app.getPath('userData'),
-    safeStorageImpl: safeStorage,
-    systemPreferencesImpl: systemPreferences,
-    // Fallback #3 for devices with no biometrics/keychain: approve the
-    // vault unlock from a phone by scanning a one-time LAN QR code.
-    phoneApproval: createPhoneApproval({
-      httpImpl: http,
-      osImpl: os,
-      randomBytesImpl: (n) => crypto.randomBytes(n)
-    })
-  });
 
   // Chrome-style profiles: "Add profile" / switching opens a NEW Yayra
   // window for that profile while the current window stays on its own.

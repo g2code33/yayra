@@ -186,6 +186,7 @@ if (contextBridge && typeof contextBridge.executeInMainWorld === 'function') {
                 let settled = false;
                 let abortSignal = null;
                 let abortListener = null;
+                let nativeAbortController = null;
                 const outer = new Promise((resolve, reject) => {
                   resolveOuter = resolve;
                   rejectOuter = reject;
@@ -213,8 +214,18 @@ if (contextBridge && typeof contextBridge.executeInMainWorld === 'function') {
                   if (invoked || settled) return;
                   invoked = true;
                   let nativeResult;
+                  let nativeArgs = args;
                   try {
-                    nativeResult = original.apply(credentials, args);
+                    // Keep an internal abort handle even after the untouched
+                    // request has entered Chromium. Main can therefore end a
+                    // released-but-stalled ceremony deterministically; the
+                    // site's own signal is forwarded by abortListener below.
+                    if (typeof window.AbortController === 'function') {
+                      nativeAbortController = new window.AbortController();
+                      nativeArgs = args.slice();
+                      nativeArgs[0] = { ...options, signal: nativeAbortController.signal };
+                    }
+                    nativeResult = original.apply(credentials, nativeArgs);
                   } catch (error) {
                     settle(false, error);
                     return;
@@ -231,8 +242,14 @@ if (contextBridge && typeof contextBridge.executeInMainWorld === 'function') {
                   );
                 };
                 const cancel = (reason) => {
-                  if (invoked || settled) return;
-                  settle(false, reason || abortError());
+                  if (settled) return;
+                  const error = reason || abortError();
+                  if (invoked && nativeAbortController) {
+                    try { nativeAbortController.abort(error); } catch { /* old AbortController */ }
+                  }
+                  // Resolve the page-facing promise immediately as cancelled;
+                  // the native rejection (if later) is ignored by settle().
+                  settle(false, error);
                 };
                 active.set(metadata.requestId, { metadata, release, cancel });
 

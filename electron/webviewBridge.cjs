@@ -70,6 +70,11 @@ const SITE_PASSKEY_REQUEST_CHANNEL = 'yayra:site-passkey-request';
 // Trusted main -> isolated preload -> capability-gated main-world observer.
 // This arms/cancels the native call without exposing ceremony data to chrome.
 const SITE_PASSKEY_CONTROL_CHANNEL = 'yayra:site-passkey-control';
+// Once Yayra has released a verified native request, it should settle almost
+// immediately. This bound is deliberately shorter than the provider's UP/UV
+// window; a broken Chromium/site exchange is aborted instead of leaving
+// “Completing passkey” on screen forever.
+const SITE_PASSKEY_COMPLETION_TIMEOUT_MS = 20_000;
 
 function sanitizeEmailAddress(value) {
   const email = String(value || '').trim();
@@ -422,7 +427,7 @@ function buildWebAuthnWatchdogScript() {
     var text = site + ' is asking to ' + verb + '. The secure Chromium WebAuthn request is active in Yayra. ';
     if (platformAuthenticator === true) {
       text += linuxSession
-        ? 'Click Confirm passkey in Yayra’s address bar, then approve the system-password prompt.'
+        ? 'Use the passkey action in Yayra’s address bar. Yayra will verify with your configured PIN, Touch ID, or system-lock method, or offer the exact-page fallback when this profile has no matching local credential.'
         : 'Complete the Windows Hello or Touch ID prompt, or use a security key.';
     } else if (platformAuthenticator === false) {
       text += 'A built-in device authenticator is not exposed in this session; a compatible USB/NFC security key can still work when no unsupported PIN prompt is needed. Phone and synced passkeys can be used by opening this page in your system browser.';
@@ -927,6 +932,10 @@ function createWebviewBridge({
   // WebAuthn machinery, encrypted per-profile credentials, and an explicit
   // browser-chrome confirmation before releasing user presence.
   websitePasskeyProvider = null,
+  // Main-process one-shot grant consumer from passkeyBridge.cjs. Renderer
+  // booleans are never trusted as user verification.
+  consumeWebsitePasskeyGrant = null,
+  sitePasskeyCompletionTimeoutMs = SITE_PASSKEY_COMPLETION_TIMEOUT_MS,
   logger = console,
   pageUnresponsiveReloadDelayMs = PAGE_UNRESPONSIVE_RELOAD_DELAY_MS,
   pageUnresponsiveReloadCooldownMs = PAGE_UNRESPONSIVE_RELOAD_COOLDOWN_MS
@@ -954,25 +963,37 @@ function createWebviewBridge({
     }
   }
 
-  function websitePasskeyInfo(entry) {
+  function websitePasskeyInfo(entry, request = null) {
     if (!websitePasskeyProvider || typeof websitePasskeyProvider.describe !== 'function') {
       return { mode: 'native', available: false, reason: 'native-platform-authenticator' };
     }
     try {
-      const info = websitePasskeyProvider.describe({
+      const describe = request && typeof websitePasskeyProvider.describeRequest === 'function'
+        ? websitePasskeyProvider.describeRequest
+        : websitePasskeyProvider.describe;
+      const info = describe({
         webContents: entry?.view?.webContents,
         profileId: entry?.profileId,
-        isPrivate: entry?.isPrivate
+        isPrivate: entry?.isPrivate,
+        action: request?.action,
+        rpId: request?.rpId
       }) || {};
       const mode = info.mode === 'local' || info.mode === 'external' ? info.mode : 'native';
       return {
         mode,
         available: mode === 'local' && info.available === true,
-        reason: typeof info.reason === 'string' ? info.reason.slice(0, 120) : ''
+        reason: typeof info.reason === 'string' ? info.reason.slice(0, 120) : '',
+        ...(Number.isSafeInteger(info.credentialCount) ? { credentialCount: info.credentialCount } : {})
       };
     } catch {
       return { mode: 'external', available: false, reason: 'provider-unavailable' };
     }
+  }
+
+  function clearSitePasskeyCompletionTimer(request) {
+    if (!request?.completionTimer) return;
+    clearTimeout(request.completionTimer);
+    request.completionTimer = null;
   }
 
   function controlSitePasskeyRequest(entry, requestId, command) {
@@ -989,6 +1010,33 @@ function createWebviewBridge({
     }
   }
 
+  function armSitePasskeyCompletionTimer(entry, request) {
+    clearSitePasskeyCompletionTimer(request);
+    const delay = Math.max(100, Number(sitePasskeyCompletionTimeoutMs) || SITE_PASSKEY_COMPLETION_TIMEOUT_MS);
+    request.completionTimer = setTimeout(async () => {
+      const active = entry?.sitePasskeyRequests?.get(request.requestId);
+      if (active !== request) return;
+      request.completionTimer = null;
+      // Publish the terminal reason before aborting the page promise; the
+      // AbortError settlement can otherwise arrive first and erase the active
+      // request before chrome has a chance to render the timeout.
+      sendTo(entry, 'webauthn-provider-state', {
+        requestId: request.requestId,
+        state: 'declined',
+        reason: 'ceremony-timeout'
+      });
+      finishPendingPasskeySelection(entry, request.requestId, false);
+      controlSitePasskeyRequest(entry, request.requestId, 'cancel');
+      try {
+        await websitePasskeyProvider?.settle?.({
+          webContents: entry.view?.webContents,
+          requestId: request.requestId
+        });
+      } catch { /* provider is already detached */ }
+    }, delay);
+    request.completionTimer?.unref?.();
+  }
+
   function finishPendingPasskeySelection(entry, requestId, approved) {
     const pending = entry?.pendingSitePasskeySelections?.get(requestId);
     if (!pending) return false;
@@ -1003,8 +1051,9 @@ function createWebviewBridge({
   function cancelSitePasskeyRequests(entry, errorName = 'AbortError') {
     if (!entry?.sitePasskeyRequests?.size) return;
     for (const [requestId, meta] of entry.sitePasskeyRequests) {
+      clearSitePasskeyCompletionTimer(meta);
       finishPendingPasskeySelection(entry, requestId, false);
-      if (meta.controlState === 'hold') controlSitePasskeyRequest(entry, requestId, 'cancel');
+      if (meta.controlled && meta.controlState !== 'cancel') controlSitePasskeyRequest(entry, requestId, 'cancel');
       try {
         websitePasskeyProvider?.settle?.({ webContents: entry.view?.webContents, requestId });
       } catch { /* provider is already detached */ }
@@ -1081,16 +1130,30 @@ function createWebviewBridge({
       let completed = false;
       let entry = null;
       let requestId = '';
+      let requestMeta = null;
+      let chooserTimer = null;
       const finish = (credentialId = undefined) => {
         if (completed) return;
+        if (chooserTimer) clearTimeout(chooserTimer);
+        chooserTimer = null;
         const selectedId = typeof credentialId === 'string' ? credentialId : undefined;
         // Conditional mediation must run far enough for Chromium to discover
         // resident accounts before Yayra can show a chooser. Once an account
         // is picked, however, do not return it to Chromium while the virtual
         // authenticator still reports no presence: that CTAP command would be
         // left pending and cannot be revived by toggling presence later.
-        if (selectedId && entry && requestId && websitePasskeyInfo(entry).mode === 'local') {
+        if (selectedId && entry && requestId && websitePasskeyInfo(entry, requestMeta).mode === 'local') {
           completed = true;
+          // Explicit requests are already Yayra-verified before Chromium can
+          // discover resident accounts. Return the user's chosen credential
+          // immediately and restart the short completion watchdog. Conditional
+          // autofill discovers accounts before verification, so it remains
+          // deferred behind the trusted toolbar action below.
+          if (requestMeta?.userVerified) {
+            try { callback(selectedId); } catch { /* request expired */ }
+            armSitePasskeyCompletionTimer(entry, requestMeta);
+            return;
+          }
           entry.pendingSitePasskeySelections ||= new Map();
           finishPendingPasskeySelection(entry, requestId, false);
           let finalized = false;
@@ -1107,6 +1170,7 @@ function createWebviewBridge({
         }
         completed = true;
         try { callback(selectedId); } catch { /* request expired */ }
+        if (entry && requestMeta?.userVerified) armSitePasskeyCompletionTimer(entry, requestMeta);
       };
       const accounts = (Array.isArray(details.accounts) ? details.accounts : [])
         .filter((account) => typeof account?.credentialId === 'string'
@@ -1124,21 +1188,28 @@ function createWebviewBridge({
       // attach an account chooser to an unrelated tab/window in that race.
       if (!entry) { finish(); return; }
       for (const [candidateId, meta] of entry.sitePasskeyRequests || []) {
-        if (meta?.action === 'get' && meta.conditional === true && meta.rpId === relyingPartyId) {
-          // Conditional mediation stays silent until Chromium asks the user to
-          // choose an account. From this point it is an active ceremony and
-          // the trusted toolbar may release presence after explicit approval.
-          meta.conditional = false;
+        if (meta?.action !== 'get' || meta.rpId !== relyingPartyId) continue;
+        // Prefer the conditional request that caused account discovery, but
+        // retain explicit get() metadata too so its account-sheet delay can be
+        // bounded and its already-completed Yayra verification reused.
+        if (!requestMeta || meta.conditional === true) {
           requestId = candidateId;
-          break;
+          requestMeta = meta;
         }
+        if (meta.conditional === true) break;
       }
+      if (requestMeta?.conditional) {
+        requestMeta.conditional = false;
+      }
+      if (requestMeta?.userVerified) clearSitePasskeyCompletionTimer(requestMeta);
       sendTo(entry, 'webauthn-account-selection', {
         relyingPartyId,
         accountCount: accounts.length,
         ...(requestId ? { requestId } : {})
       });
       const owner = entry.hostWin && !entry.hostWin.isDestroyed?.() ? entry.hostWin : getMainWindow();
+      chooserTimer = setTimeout(() => finish(), 55_000);
+      chooserTimer?.unref?.();
 
       // Match a mainstream browser's account sheet. The WebAuthn operation
       // remains pending until one callback is made, so every error/cancel
@@ -1852,7 +1923,12 @@ function createWebviewBridge({
     const { hostWc, hostWin } = resolveHost(event);
     return ensureView(viewKey(event, tabId), tabId, url, { isPrivate, hostWc, hostWin, profileId, pointerTheme, pointerSize });
   });
-  ipcMain.handle('yayra:webview-continue-passkey', async (event, { tabId, requestId, external = false } = {}) => {
+  ipcMain.handle('yayra:webview-continue-passkey', async (event, {
+    tabId,
+    requestId,
+    external = false,
+    authorizationToken = ''
+  } = {}) => {
     const entry = views.get(viewKey(event, tabId));
     const id = typeof requestId === 'string' && /^yayra-wa-[a-z0-9-]{1,80}$/i.test(requestId)
       ? requestId
@@ -1860,7 +1936,7 @@ function createWebviewBridge({
     const request = id ? entry?.sitePasskeyRequests?.get(id) : null;
     if (!entry || !request || request.conditional) return { ok: false, reason: 'request-ended' };
 
-    const provider = websitePasskeyInfo(entry);
+    const provider = websitePasskeyInfo(entry, request);
     const localCeremony = request.provider?.mode === 'local' && provider.mode === 'local';
     if (external || !localCeremony) {
       const currentUrl = String(entry.view?.webContents?.getURL?.() || entry.lastUrl || '');
@@ -1871,13 +1947,43 @@ function createWebviewBridge({
         // same page is handed to the system browser, cancel that dormant
         // promise (and any deferred account callback) instead of leaving a
         // fake active indicator behind in Yayra.
+        clearSitePasskeyCompletionTimer(request);
         finishPendingPasskeySelection(entry, id, false);
-        if (request.controlState === 'hold') controlSitePasskeyRequest(entry, id, 'cancel');
+        if (request.controlled && request.controlState !== 'cancel') controlSitePasskeyRequest(entry, id, 'cancel');
         sendTo(entry, 'system-browser-handoff', { url: currentUrl, reason: 'passkey' });
         return { ok: true, handedOff: true };
       } catch (error) {
         return { ok: false, reason: String(error?.message || 'open-failed').slice(0, 120) };
       }
+    }
+
+    let userVerification = null;
+    const token = typeof authorizationToken === 'string' && authorizationToken.length <= 128
+      ? authorizationToken
+      : '';
+    if (token) {
+      let grant;
+      try {
+        grant = typeof consumeWebsitePasskeyGrant === 'function'
+          ? consumeWebsitePasskeyGrant({
+            token,
+            event,
+            tabId: entry.tabId,
+            requestId: id,
+            rpId: request.rpId,
+            profileId: entry.profileId || 'default',
+            action: request.action
+          })
+          : { ok: false, reason: 'yayra-authorization-unavailable' };
+      } catch {
+        grant = { ok: false, reason: 'yayra-authorization-unavailable' };
+      }
+      if (!grant?.ok) {
+        const reason = grant?.reason || 'yayra-authorization-expired';
+        sendTo(entry, 'webauthn-provider-state', { requestId: id, state: 'declined', reason });
+        return { ok: false, reason, canUseSystemBrowser: true };
+      }
+      userVerification = { verified: true, method: 'yayra-passkey' };
     }
 
     sendTo(entry, 'webauthn-provider-state', { requestId: id, state: 'prompting' });
@@ -1888,36 +1994,47 @@ function createWebviewBridge({
         requestId: id,
         action: request.action,
         rpId: request.rpId,
+        userVerification,
         isStillActive: () => entry.sitePasskeyRequests?.has(id) === true
       });
     } catch (error) {
       result = { ok: false, reason: String(error?.message || 'provider-unavailable').slice(0, 120) };
     }
     if (result?.ok) {
-      // PolicyKit/browser-chrome interaction moves focus away from the site.
-      // WebAuthn rejects an unfocused top-level document, so restore the
-      // requesting view immediately before entering the native API.
-      try { entry.view?.webContents?.focus?.(); } catch { /* view closed while the prompt was up */ }
+      // PIN/PolicyKit/browser-chrome interaction can move focus away from the
+      // site. WebAuthn rejects an unfocused top-level document, so restore both
+      // the owning window and requesting view before entering the native API.
+      try {
+        entry.hostWin?.show?.();
+        entry.hostWin?.focus?.();
+        entry.view?.webContents?.focus?.();
+      } catch { /* view closed while the prompt was up */ }
       // Presence is armed *before* the untouched native WebAuthn operation is
       // started. Chromium's virtual CTAP device does not replay a transaction
       // that already returned "no touch", which was the reason GitHub reached
       // Yayra's “Completing passkey” state and then ended in NotAllowedError.
+      request.userVerified = true;
       const continued = finishPendingPasskeySelection(entry, id, true)
         || (request.controlState === 'hold' && controlSitePasskeyRequest(entry, id, 'release'));
       if (!continued) {
+        request.userVerified = false;
         try { await websitePasskeyProvider?.settle?.({ webContents: entry.view?.webContents, requestId: id }); } catch { /* fail closed */ }
         result = { ok: false, reason: 'request-gate-unavailable' };
+      } else {
+        armSitePasskeyCompletionTimer(entry, request);
       }
     }
     sendTo(entry, 'webauthn-provider-state', {
       requestId: id,
       state: result?.ok ? 'approved' : 'declined',
-      reason: result?.ok ? '' : String(result?.reason || 'provider-unavailable').slice(0, 120)
+      reason: result?.ok ? '' : String(result?.reason || 'provider-unavailable').slice(0, 120),
+      verification: result?.ok && result?.verification === 'yayra-passkey' ? 'yayra-passkey' : 'system-auth'
     });
     return result?.ok
       ? {
         ok: true,
         prompted: Boolean(result.prompted),
+        verification: result.verification === 'yayra-passkey' ? 'yayra-passkey' : 'system-auth',
         ...(Number(result.presenceExpiresInMs) > 0
           ? { presenceExpiresInMs: Math.min(60000, Number(result.presenceExpiresInMs)) }
           : {})
@@ -2242,6 +2359,7 @@ function createWebviewBridge({
 
       entry.sitePasskeyRequests ||= new Map();
       let requestMeta = {
+        requestId,
         action,
         rpId,
         conditional: Boolean(payload.conditional),
@@ -2249,11 +2367,13 @@ function createWebviewBridge({
           ? payload.attachment
           : 'any',
         controlled: payload.controlled === true,
-        controlState: 'none'
+        controlState: 'none',
+        userVerified: false,
+        completionTimer: null
       };
       if (phase === 'started') {
         if (entry.sitePasskeyRequests.size >= 8 || entry.sitePasskeyRequests.has(requestId)) return;
-        requestMeta.provider = websitePasskeyInfo(entry);
+        requestMeta.provider = websitePasskeyInfo(entry, requestMeta);
         // The local software authenticator is safe only when the preload can
         // start native WebAuthn *after* approval. An older observer that has
         // already entered CTAP cannot be repaired by toggling virtual touch,
@@ -2263,13 +2383,14 @@ function createWebviewBridge({
         }
         entry.sitePasskeyRequests.set(requestId, requestMeta);
         if (requestMeta.controlled) {
-          const shouldHold = requestMeta.provider.mode === 'local' && !requestMeta.conditional;
+          const shouldHold = requestMeta.provider.mode !== 'native' && !requestMeta.conditional;
           controlSitePasskeyRequest(entry, requestId, shouldHold ? 'hold' : 'release');
         }
       } else {
         requestMeta = entry.sitePasskeyRequests.get(requestId);
         if (!requestMeta) return;
         entry.sitePasskeyRequests.delete(requestId);
+        clearSitePasskeyCompletionTimer(requestMeta);
         finishPendingPasskeySelection(entry, requestId, false);
         try {
           websitePasskeyProvider?.settle?.({ webContents: entry.view?.webContents, requestId });

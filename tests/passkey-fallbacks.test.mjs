@@ -99,6 +99,40 @@ test('PIN: registers and verifies WITHOUT any OS keychain - the no-biometrics fa
   assert.equal(statusAfter.method, 'pin', 'status reflects the registered method');
 });
 
+test('PIN: website authorization is an opaque one-shot grant bound to shell, tab, profile, RP, and request', async () => {
+  const { bridge } = makeBridge();
+  const event = { sender: { id: 17 } };
+  const request = {
+    tabId: 'tab-1',
+    requestId: 'yayra-wa-grant-1',
+    rpId: 'github.com',
+    profileId: 'profile-a',
+    action: 'get'
+  };
+  const registered = await bridge.handleRegister(event, {
+    label: 'grant user', method: 'pin', pin: '204896', websiteRequest: request
+  });
+  assert.equal(registered.ok, true);
+  assert.match(registered.authorizationToken, /^[A-Za-z0-9_-]{40,}$/);
+  assert.equal(JSON.stringify(registered).includes('204896'), false, 'the grant never returns the PIN');
+
+  const mismatch = bridge.consumeWebsiteGrant({
+    token: registered.authorizationToken,
+    event,
+    ...request,
+    rpId: 'example.com'
+  });
+  assert.equal(mismatch.reason, 'yayra-authorization-mismatch');
+  assert.equal(bridge.consumeWebsiteGrant({ token: registered.authorizationToken, event, ...request }).ok, false,
+    'a mismatched attempt consumes the unguessable token');
+
+  const verified = await bridge.handleVerify(event, { pin: '204896', websiteRequest: request });
+  const consumed = bridge.consumeWebsiteGrant({ token: verified.authorizationToken, event, ...request });
+  assert.deepEqual({ ok: consumed.ok, method: consumed.method }, { ok: true, method: 'yayra-passkey' });
+  assert.equal(bridge.consumeWebsiteGrant({ token: verified.authorizationToken, event, ...request }).reason,
+    'yayra-authorization-expired', 'a successful grant cannot be replayed');
+});
+
 test('PIN: rejects anything that is not exactly 6 digits', async () => {
   const { bridge } = makeBridge();
   for (const bad of ['12345', '1234567', 'abcdef', '12 456', '', null, 123456]) {

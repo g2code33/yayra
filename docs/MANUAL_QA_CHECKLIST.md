@@ -78,28 +78,41 @@ this list is the reality check.
   Confirm startup logs say Touch ID website passkeys are enabled, then create
   and use a device-bound Touch ID credential. An unsigned/unentitled build must
   report Touch ID unavailable rather than claiming support.
-- [ ] **Linux local provider:** with a supported keyring backend and PolicyKit,
+- [ ] **Linux local provider:** with a supported KWallet/libsecret keyring,
   keep DevTools closed and register a platform passkey on GitHub. Before the
-  address-bar **Confirm passkey** action, confirm the site's native
-  `navigator.credentials.create()` has not entered CTAP. Approve the system
-  prompt and verify the same request completes, GitHub reports success, and
-  the credential still signs in after restarting Yayra. Repeat cancellation
-  and confirm it never releases virtual presence.
-- [ ] **Linux fallback:** open DevTools (which displaces the provider's single
-  CDP session), use a security key that needs unsupported Electron PIN UI, or
-  test without strong keyring/PolicyKit support. Confirm Yayra fails closed and
-  **Use system browser** opens the exact HTTPS page. A
+  address-bar action, confirm the site's native WebAuthn call has not entered
+  CTAP. Configure a 6-digit Yayra PIN under Passwords & Keys, authenticate on
+  GitHub, click **Use Yayra passkey**, enter that PIN, and verify GitHub signs
+  in without a Linux system-password prompt. Restart Yayra and repeat; the
+  encrypted RP credential must persist in the same profile.
+- [ ] Repeat with Yayra's Touch ID/system-lock verification method and with the
+  explicit PolicyKit fallback. Cancel/wrong-PIN/lockout paths must never release
+  presence. A verified request must move live from **Verify with Yayra** to
+  **Completing with Yayra**, then success, cancellation, or an actionable
+  timeout—never an indefinite state.
+- [ ] **Linux fallback:** use a profile that has no local credential for the RP,
+  open DevTools (which displaces the provider's single CDP session), use a
+  security key that needs unsupported Electron PIN UI, or test without a strong
+  keyring. Confirm no verification prompt is shown for a missing RP credential,
+  the held call is canceled, and **Use system browser** opens the exact HTTPS
+  page. A
   `collector.github.com/github/collect` refusal is GitHub telemetry and must
   not be reported as the WebAuthn failure.
 - [ ] Start a conditional-mediation request and leave it idle. Confirm no
-  unsolicited stuck-request banner appears; selecting an account should still
-  complete normally.
+  unsolicited stuck-request banner appears. Test one and multiple discoverable
+  accounts: selection must complete its Electron callback exactly once, reuse
+  an already-finished Yayra verification for explicit requests, and remain
+  deferred until verification for conditional discovery.
+- [ ] Force Chromium/the test page not to settle after release. Confirm the
+  main-process watchdog actively aborts the native request, clears UP/UV and
+  changes the live UI to a timeout with retry/system-browser recovery.
 - [ ] Inspect Electron renderer/main IPC while testing. Only lifecycle metadata
-  may cross into Yayra chrome—never challenge bytes, user handles, credential
-  IDs, attestation, authenticator data, or signatures.
-- [ ] Enable Yayra's separate vault-unlock passkey from the Passwords page and
-  confirm it gates Yayra secrets only. It must never be offered to a website as
-  an RP-bound WebAuthn credential.
+  and a short-lived opaque authorization token may cross Yayra chrome—never
+  PINs beyond their dedicated verification IPC, challenge bytes, user handles,
+  credential IDs, attestation, authenticator data, private keys, or signatures.
+- [ ] Enable Yayra's separate vault-unlock passkey from the Passwords page.
+  Confirm it may authorize one exact website ceremony, but is never offered or
+  substituted as the website's origin/RP-bound WebAuthn credential.
 
 ## 2. Update pipeline — live (per docs/RELEASE-PIPELINE.md)
 

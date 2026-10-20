@@ -101,7 +101,7 @@ test('credential records are tightly validated before entering the encrypted pro
   assert.equal(normalizeCredential({ ...credential, signCount: -2 }), null);
 });
 
-test('Linux provider waits for explicit PolicyKit approval, then persists and rehydrates a real virtual credential', async (t) => {
+test('Linux provider persists RP credentials, accepts a verified Yayra grant, and resets presence only after page settlement', async (t) => {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'yayra-site-passkeys-'));
   t.after(() => fs.rmSync(userDataDir, { recursive: true, force: true }));
   const safeStorage = strongSafeStorage();
@@ -124,6 +124,9 @@ test('Linux provider waits for explicit PolicyKit approval, then persists and re
   assert.equal(addAuthenticator.params.options.automaticPresenceSimulation, false,
     'the site cannot create a credential before an explicit toolbar confirmation');
   assert.equal(addAuthenticator.params.options.isUserVerified, false);
+  assert.deepEqual(provider.describeRequest({ webContents: wc, action: 'get', rpId: 'github.com' }), {
+    mode: 'external', available: false, reason: 'no-local-credential', credentialCount: 0
+  }, 'an RP assertion is never advertised locally before Yayra owns a matching credential');
 
   const approved = await provider.confirm({
     webContents: wc,
@@ -132,7 +135,9 @@ test('Linux provider waits for explicit PolicyKit approval, then persists and re
     rpId: 'github.com',
     isStillActive: () => true
   });
-  assert.deepEqual(approved, { ok: true, prompted: true, presenceExpiresInMs: 30000 });
+  assert.deepEqual(approved, {
+    ok: true, prompted: true, verification: 'system-auth', presenceExpiresInMs: 60000
+  });
   assert.ok(wc.commands.some((command) => command.method === 'WebAuthn.setUserVerified'
     && command.params.isUserVerified === true));
   assert.ok(wc.commands.some((command) => command.method === 'WebAuthn.setAutomaticPresenceSimulation'
@@ -146,6 +151,12 @@ test('Linux provider waits for explicit PolicyKit approval, then persists and re
   const rawStore = fs.readFileSync(provider._filePath, 'utf8');
   assert.equal(rawStore.includes(credential.privateKey), false, 'private key is never written in plaintext');
   assert.equal(rawStore.includes('github.com'), false, 'relying-party metadata is encrypted too');
+  assert.equal(wc.commands.some((command) => command.method === 'WebAuthn.setAutomaticPresenceSimulation'
+    && command.params.enabled === false), false,
+  'credentialAdded does not race Chromium by clearing presence before the page promise settles');
+  await provider.settle({ webContents: wc, requestId: 'yayra-wa-1' });
+  assert.ok(wc.commands.some((command) => command.method === 'WebAuthn.setAutomaticPresenceSimulation'
+    && command.params.enabled === false), 'page settlement closes presence deterministically');
 
   const restored = createWebsitePasskeyProvider({
     fsImpl: fsWithPolicyKit(),
@@ -153,23 +164,87 @@ test('Linux provider waits for explicit PolicyKit approval, then persists and re
     userDataDir,
     safeStorageImpl: safeStorage,
     platform: 'linux',
-    spawnImpl: approvedSpawn
+    spawnImpl: approvedSpawn,
+    authorizeImpl: async () => { throw new Error('trusted Yayra grant must bypass PolicyKit'); }
   });
   const secondView = fakeWebContents();
   await restored.attach({ webContents: secondView, profileId: 'default' });
   const hydrate = secondView.commands.find((command) => command.method === 'WebAuthn.addCredential');
   assert.ok(hydrate, 'encrypted credential is restored into a new Chromium authenticator');
   assert.deepEqual(hydrate.params.credential, credential);
+  assert.deepEqual(restored.describeRequest({ webContents: secondView, action: 'get', rpId: 'github.com' }), {
+    mode: 'local', available: true, reason: '', credentialCount: 1
+  });
 
+  const assertionApproval = await restored.confirm({
+    webContents: secondView,
+    requestId: 'yayra-wa-assert-1',
+    action: 'get',
+    rpId: 'github.com',
+    userVerification: { verified: true, method: 'yayra-passkey' }
+  });
+  assert.deepEqual(assertionApproval, {
+    ok: true, prompted: true, verification: 'yayra-passkey', presenceExpiresInMs: 60000
+  });
+  const resetsBeforeAssertion = secondView.commands.filter((command) =>
+    command.method === 'WebAuthn.setAutomaticPresenceSimulation' && command.params.enabled === false).length;
   secondView.debugger.emit('message', {}, 'WebAuthn.credentialAsserted', {
     authenticatorId: 'auth-1',
     credential: { ...credential, signCount: 1 }
   });
   await flush();
-  assert.ok(secondView.commands.some((command) => command.method === 'WebAuthn.setAutomaticPresenceSimulation'
-    && command.params.enabled === false), 'presence closes immediately after the assertion');
+  assert.equal(secondView.commands.filter((command) =>
+    command.method === 'WebAuthn.setAutomaticPresenceSimulation' && command.params.enabled === false).length,
+  resetsBeforeAssertion, 'credentialAsserted does not clear presence before the WebAuthn promise resolves');
+  await restored.settle({ webContents: secondView, requestId: 'yayra-wa-assert-1' });
+  assert.ok(secondView.commands.filter((command) =>
+    command.method === 'WebAuthn.setAutomaticPresenceSimulation' && command.params.enabled === false).length
+    > resetsBeforeAssertion, 'terminal page settlement closes presence');
   provider.destroy();
   restored.destroy();
+});
+
+test('a verified Yayra grant works without pkexec while unverified fallback still fails closed', async (t) => {
+  const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'yayra-site-passkeys-no-pkexec-'));
+  t.after(() => fs.rmSync(userDataDir, { recursive: true, force: true }));
+  const noPkexecFs = new Proxy(fs, {
+    get(target, property) {
+      if (property === 'existsSync') {
+        return (pathname) => ['/usr/bin/pkexec', '/bin/pkexec', '/usr/local/bin/pkexec'].includes(String(pathname))
+          ? false
+          : target.existsSync(pathname);
+      }
+      return target[property];
+    }
+  });
+  const provider = createWebsitePasskeyProvider({
+    fsImpl: noPkexecFs,
+    pathImpl: path,
+    userDataDir,
+    safeStorageImpl: strongSafeStorage(),
+    platform: 'linux'
+  });
+  const wc = fakeWebContents();
+  assert.equal(provider.describe({ webContents: wc }).mode, 'local');
+  await provider.attach({ webContents: wc });
+  const approved = await provider.confirm({
+    webContents: wc,
+    requestId: 'yayra-wa-no-pkexec-grant',
+    action: 'create',
+    rpId: 'github.com',
+    userVerification: { verified: true, method: 'yayra-passkey' }
+  });
+  assert.equal(approved.ok, true);
+  assert.equal(approved.verification, 'yayra-passkey');
+  await provider.settle({ webContents: wc, requestId: 'yayra-wa-no-pkexec-grant' });
+  const fallback = await provider.confirm({
+    webContents: wc,
+    requestId: 'yayra-wa-no-pkexec-fallback',
+    action: 'create',
+    rpId: 'github.com'
+  });
+  assert.deepEqual(fallback, { ok: false, reason: 'system-auth-unavailable', prompted: false });
+  provider.destroy();
 });
 
 test('private tabs and weak-storage Linux sessions fail closed to the system-browser mode', async () => {
@@ -337,7 +412,7 @@ test('one profile cannot authorize overlapping ceremonies in different tabs', as
   const first = provider.confirm({
     webContents: firstView,
     requestId: 'yayra-wa-first-profile-lock',
-    action: 'get',
+    action: 'create',
     rpId: 'github.com',
     isStillActive: () => false
   });
@@ -346,7 +421,7 @@ test('one profile cannot authorize overlapping ceremonies in different tabs', as
   const overlapping = await provider.confirm({
     webContents: secondView,
     requestId: 'yayra-wa-second-profile-lock',
-    action: 'get',
+    action: 'create',
     rpId: 'github.com'
   });
   assert.deepEqual(overlapping, { ok: false, reason: 'request-already-prompting' });

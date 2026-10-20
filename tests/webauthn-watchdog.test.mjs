@@ -203,15 +203,22 @@ test('isolated preload installs the main-world observer at document start and fo
   const sends = [];
   let resolveCreate;
   let nativeCreateCalls = 0;
+  let lastNativeSignal = null;
   const credentials = {
     get: () => Promise.resolve(null),
-    create: () => {
+    create: (options = {}) => {
       nativeCreateCalls += 1;
-      return new Promise((resolve) => { resolveCreate = resolve; });
+      lastNativeSignal = options.signal || null;
+      return new Promise((resolve, reject) => {
+        resolveCreate = resolve;
+        options.signal?.addEventListener?.('abort', () => reject(options.signal.reason), { once: true });
+      });
     }
   };
   const pageWindow = {
     PublicKeyCredential: function PublicKeyCredential() {},
+    AbortController,
+    DOMException,
     location: { href: 'https://login.github.com/security', hostname: 'login.github.com', origin: 'https://login.github.com' },
     addEventListener(type, listener) {
       const group = windowListeners.get(type) || [];
@@ -320,6 +327,24 @@ test('isolated preload installs the main-world observer at document start and fo
   assert.equal(nativeCreateCalls, 1, 'aborting a held request never enters native WebAuthn');
   assert.equal(sends.at(-1).payload.phase, 'settled');
   assert.equal(sends.at(-1).payload.errorName, 'AbortError');
+
+  const stalled = credentials.create({
+    publicKey: { challenge: new Uint8Array([4]), rp: { id: 'github.com' } }
+  });
+  const stalledStarted = sends.at(-1).payload;
+  ipcListeners.get('yayra:site-passkey-control')({}, {
+    requestId: stalledStarted.requestId,
+    command: 'release'
+  });
+  assert.equal(nativeCreateCalls, 2);
+  ipcListeners.get('yayra:site-passkey-control')({}, {
+    requestId: stalledStarted.requestId,
+    command: 'cancel'
+  });
+  await assert.rejects(stalled, { name: 'AbortError' });
+  assert.equal(lastNativeSignal?.aborted, true, 'trusted main can abort an already-released native request');
+  assert.equal(sends.at(-1).payload.phase, 'settled');
+  assert.equal(sends.at(-1).payload.errorName, 'AbortError');
 });
 
 test('decodeOpenExternalRequest is a security gate: only http(s) targets pass', () => {
@@ -335,7 +360,13 @@ test('decodeOpenExternalRequest is a security gate: only http(s) targets pass', 
 /* Bridge integration: injection on dom-ready + sentinel interception  */
 /* ------------------------------------------------------------------ */
 
-function makeBridgeHarness({ websitePasskeyProvider = null, webauthnSession = null, dialog = null } = {}) {
+function makeBridgeHarness({
+  websitePasskeyProvider = null,
+  consumeWebsitePasskeyGrant = null,
+  sitePasskeyCompletionTimeoutMs = undefined,
+  webauthnSession = null,
+  dialog = null
+} = {}) {
   const handlers = new Map();
   const listeners = new Map();
   const ipcMain = {
@@ -384,6 +415,8 @@ function makeBridgeHarness({ websitePasskeyProvider = null, webauthnSession = nu
     shell,
     getMainWindow: () => fakeWin,
     websitePasskeyProvider,
+    consumeWebsitePasskeyGrant,
+    ...(sitePasskeyCompletionTimeoutMs === undefined ? {} : { sitePasskeyCompletionTimeoutMs }),
     dialog,
     logger: { error: () => {}, warn: () => {} }
   });
@@ -484,7 +517,7 @@ test('bridge turns a Linux site passkey request into an explicit secure continua
     tabId: 'tab-passkey',
     requestId: 'yayra-wa-linux-1'
   });
-  assert.deepEqual(continued, { ok: true, prompted: true });
+  assert.deepEqual(continued, { ok: true, prompted: true, verification: 'system-auth' });
   assert.equal(calls.confirm.length, 1);
   assert.equal(calls.confirm[0].rpId, 'github.com');
   assert.equal(calls.confirm[0].isStillActive(), true);
@@ -505,6 +538,80 @@ test('bridge turns a Linux site passkey request into an explicit secure continua
     success: true
   });
   assert.equal(calls.settle.at(-1).requestId, 'yayra-wa-linux-1');
+});
+
+test('bridge consumes a one-shot Yayra grant and passes only trusted verification to the provider', async () => {
+  const consumed = [];
+  const confirmations = [];
+  const provider = {
+    describe: () => ({ mode: 'local', available: true, reason: '' }),
+    attach: async () => ({ ok: true }),
+    confirm: async (details) => {
+      confirmations.push(details);
+      return { ok: true, prompted: true, verification: 'yayra-passkey' };
+    },
+    settle: () => {},
+    detach: () => {}
+  };
+  const { handlers, listeners, views } = makeBridgeHarness({
+    websitePasskeyProvider: provider,
+    consumeWebsitePasskeyGrant: (details) => { consumed.push(details); return { ok: true, method: 'yayra-passkey' }; }
+  });
+  await handlers.get('yayra:webview-ensure')(null, {
+    tabId: 'tab-yayra-grant', url: 'https://github.com/settings/security', profileId: 'profile-a'
+  });
+  listeners.get('yayra:site-passkey-request')({ sender: views[0].webContents }, {
+    phase: 'started', requestId: 'yayra-wa-yayra-grant', action: 'get', rpId: 'github.com',
+    conditional: false, controlled: true
+  });
+  const result = await handlers.get('yayra:webview-continue-passkey')(null, {
+    tabId: 'tab-yayra-grant', requestId: 'yayra-wa-yayra-grant', authorizationToken: 'opaque-one-shot-token'
+  });
+  assert.equal(consumed.length, 1);
+  assert.deepEqual({
+    token: consumed[0].token,
+    tabId: consumed[0].tabId,
+    requestId: consumed[0].requestId,
+    rpId: consumed[0].rpId,
+    profileId: consumed[0].profileId,
+    action: consumed[0].action
+  }, {
+    token: 'opaque-one-shot-token', tabId: 'tab-yayra-grant', requestId: 'yayra-wa-yayra-grant',
+    rpId: 'github.com', profileId: 'profile-a', action: 'get'
+  });
+  assert.deepEqual(confirmations[0].userVerification, { verified: true, method: 'yayra-passkey' });
+  assert.deepEqual(result, { ok: true, prompted: true, verification: 'yayra-passkey' });
+});
+
+test('released passkey ceremonies have a terminal main-process timeout and active cancellation', async () => {
+  const settled = [];
+  const provider = {
+    describe: () => ({ mode: 'local', available: true, reason: '' }),
+    attach: async () => ({ ok: true }),
+    confirm: async () => ({ ok: true, prompted: true, verification: 'yayra-passkey' }),
+    settle: async (details) => { settled.push(details); },
+    detach: () => {}
+  };
+  const { handlers, listeners, views, pageMessages, sentEvents } = makeBridgeHarness({
+    websitePasskeyProvider: provider,
+    sitePasskeyCompletionTimeoutMs: 10
+  });
+  await handlers.get('yayra:webview-ensure')(null, {
+    tabId: 'tab-timeout', url: 'https://github.com/login'
+  });
+  listeners.get('yayra:site-passkey-request')({ sender: views[0].webContents }, {
+    phase: 'started', requestId: 'yayra-wa-timeout-1', action: 'get', rpId: 'github.com',
+    conditional: false, controlled: true
+  });
+  await handlers.get('yayra:webview-continue-passkey')(null, {
+    tabId: 'tab-timeout', requestId: 'yayra-wa-timeout-1'
+  });
+  await wait(130);
+  assert.ok(pageMessages.some((message) => message.channel === 'yayra:site-passkey-control'
+    && message.payload.command === 'cancel'), 'timeout cancels even after native release');
+  assert.ok(settled.some((details) => details.requestId === 'yayra-wa-timeout-1'));
+  assert.ok(sentEvents.some((event) => event.payload?.type === 'webauthn-provider-state'
+    && event.payload.state === 'declined' && event.payload.reason === 'ceremony-timeout'));
 });
 
 test('bridge fails an old ungated observer closed instead of attempting a late virtual touch', async () => {
@@ -595,9 +702,91 @@ test('bridge defers a conditional account callback until local user verification
     tabId: 'tab-conditional',
     requestId: 'yayra-wa-conditional-local-1'
   });
-  assert.deepEqual(result, { ok: true, prompted: true });
+  assert.deepEqual(result, { ok: true, prompted: true, verification: 'system-auth' });
   assert.deepEqual(selected, ['AQID']);
   assert.deepEqual(order, ['verified', 'account-callback'], 'presence is armed before Chromium receives the selected credential');
+});
+
+test('explicit discoverable-account selection reuses the completed Yayra verification without a second prompt', async () => {
+  const sessionListeners = new Map();
+  const session = { on: (event, listener) => sessionListeners.set(event, listener) };
+  let confirmations = 0;
+  const provider = {
+    describe: () => ({ mode: 'local', available: true, reason: '' }),
+    attach: async () => ({ ok: true }),
+    confirm: async () => { confirmations += 1; return { ok: true, prompted: true, verification: 'yayra-passkey' }; },
+    settle: () => {},
+    detach: () => {}
+  };
+  const dialog = { showMessageBox: async () => ({ response: 1 }) };
+  const { handlers, listeners, views, sentEvents } = makeBridgeHarness({
+    websitePasskeyProvider: provider,
+    webauthnSession: session,
+    dialog
+  });
+  await handlers.get('yayra:webview-ensure')(null, {
+    tabId: 'tab-explicit-account', url: 'https://github.com/login'
+  });
+  const frame = {};
+  views[0].webContents.mainFrame = frame;
+  listeners.get('yayra:site-passkey-request')({ sender: views[0].webContents }, {
+    phase: 'started', requestId: 'yayra-wa-explicit-account', action: 'get', rpId: 'github.com',
+    conditional: false, controlled: true
+  });
+  await handlers.get('yayra:webview-continue-passkey')(null, {
+    tabId: 'tab-explicit-account', requestId: 'yayra-wa-explicit-account'
+  });
+  const selected = [];
+  sessionListeners.get('select-webauthn-account')({}, {
+    relyingPartyId: 'github.com',
+    frame,
+    accounts: [
+      { credentialId: 'AQID', name: 'ada@example.com', displayName: 'Ada' },
+      { credentialId: 'BAUG', name: 'grace@example.com', displayName: 'Grace' }
+    ]
+  }, (credentialId) => selected.push(credentialId));
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(selected, ['BAUG']);
+  assert.equal(confirmations, 1, 'the verified request does not ask the user to authenticate twice');
+  assert.ok(sentEvents.some((event) => event.payload?.type === 'webauthn-account-selection'
+    && event.payload.requestId === 'yayra-wa-explicit-account'));
+  listeners.get('yayra:site-passkey-request')({ sender: views[0].webContents }, {
+    phase: 'settled', requestId: 'yayra-wa-explicit-account', action: 'get', rpId: 'github.com', success: true
+  });
+});
+
+test('bridge fails fast to system browser when this profile has no Yayra credential for the requested RP', async () => {
+  let confirmations = 0;
+  const provider = {
+    describe: () => ({ mode: 'local', available: true, reason: '' }),
+    describeRequest: ({ action }) => action === 'get'
+      ? { mode: 'external', available: false, reason: 'no-local-credential', credentialCount: 0 }
+      : { mode: 'local', available: true, reason: '' },
+    attach: async () => ({ ok: true }),
+    confirm: async () => { confirmations += 1; return { ok: true }; },
+    settle: () => {},
+    detach: () => {}
+  };
+  const { handlers, listeners, views, sentEvents, pageMessages, externalCalls } = makeBridgeHarness({
+    websitePasskeyProvider: provider
+  });
+  const url = 'https://github.com/login';
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-no-rp-key', url });
+  listeners.get('yayra:site-passkey-request')({ sender: views[0].webContents }, {
+    phase: 'started', requestId: 'yayra-wa-no-rp-key', action: 'get', rpId: 'github.com',
+    conditional: false, controlled: true
+  });
+  const started = sentEvents.find((event) => event.payload?.type === 'webauthn-request');
+  assert.equal(started.payload.provider.reason, 'no-local-credential');
+  assert.equal(pageMessages.at(-1).payload.command, 'hold', 'the unhandleable native call never starts');
+  const result = await handlers.get('yayra:webview-continue-passkey')(null, {
+    tabId: 'tab-no-rp-key', requestId: 'yayra-wa-no-rp-key'
+  });
+  assert.deepEqual(result, { ok: true, handedOff: true });
+  assert.equal(confirmations, 0, 'missing RP credentials never trigger an auth prompt');
+  assert.deepEqual(externalCalls, [url]);
+  assert.equal(pageMessages.at(-1).payload.command, 'cancel');
 });
 
 test('bridge passkey action opens the exact HTTPS page externally when secure local storage is unavailable', async () => {
