@@ -1,6 +1,7 @@
 'use strict';
 
 const { popupMenuWithRecovery } = require('./nativeMenuGuard.cjs');
+const { buildMediaCompatibilityScript, installMediaCompatibility } = require('./mediaCompatibility.cjs');
 
 /**
  * Yayra Floating Browser - Native Web Content Engine Bridge (Electron main process)
@@ -1448,7 +1449,11 @@ function createWebviewBridge({
       if (typeof wc.executeJavaScript === 'function') {
         const watchdogs = [
           buildWebAuthnWatchdogScript(),
-          buildGoogleSearchThinkingWatchdogScript()
+          buildGoogleSearchThinkingWatchdogScript(),
+          // Match Firefox-grade media resilience: recover Cloudinary format
+          // mismatches and retire decorative broken-image glyphs without
+          // changing meaningful image alt text or the site's chosen design.
+          buildMediaCompatibilityScript()
         ].join('\n');
         wc.executeJavaScript(watchdogs, true).catch(() => {});
       }
@@ -1626,6 +1631,11 @@ function createWebviewBridge({
     if (typeof view.webContents.setUserAgent === 'function') {
       view.webContents.setUserAgent(buildBrowserUserAgent());
     }
+    // Install before loadURL/cache lookup. Cloudinary f_auto/raw HEIC images
+    // are served as WebP when this machine's embedded Chromium codec set
+    // differs from Firefox's, rather than leaving a white backdrop and the
+    // browser's broken-image glyph in the corner.
+    installMediaCompatibility(view.webContents.session, logger);
     // Pre-paint background: Chromium's default surface is WHITE, which
     // flashes whenever a view is created/hidden/resized inside Yayra's
     // dark chrome. Pages paint their own background the moment they

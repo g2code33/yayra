@@ -31,6 +31,7 @@ const { createTrayController } = require('./tray.cjs');
 const { applyVaapiPolicy } = require('./vaapiProbe.cjs');
 const { createWindowDragController } = require('./windowDrag.cjs');
 const { popupMenuWithRecovery, closeNativeMenuForWindow } = require('./nativeMenuGuard.cjs');
+const { buildMediaCompatibilityScript, installMediaCompatibility } = require('./mediaCompatibility.cjs');
 
 const CUSTOM_SCHEME = 'yayra';
 const CHROME_INPUT_RECOVERY_CHANNEL = 'yayra:chrome-input-recover';
@@ -334,6 +335,11 @@ function createAppModeWindow(url) {
   try {
     win.webContents.setUserAgent(buildBrowserUserAgent({ platform: process.platform, chromeVersion: process.versions.chrome }));
   } catch { /* default UA still works */ }
+  installMediaCompatibility(win.webContents.session);
+  win.webContents.on('dom-ready', () => {
+    try { win.webContents.executeJavaScript(buildMediaCompatibilityScript(), true).catch(() => {}); }
+    catch { /* closing or an older Electron surface */ }
+  });
   win.webContents.setWindowOpenHandler(({ url: target }) => {
     try { if (/^https?:\/\//i.test(target)) shell.openExternal(target); } catch { /* best effort */ }
     return { action: 'deny' };
