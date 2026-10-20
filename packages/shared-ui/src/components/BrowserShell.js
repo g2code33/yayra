@@ -473,6 +473,16 @@ export class BrowserShell {
     this.omniboxInput = null;
     this.viewportElement = null;
     this.bubbleOverlay = null;
+    // Renderer-owned top-chrome input must have one deterministic lifecycle.
+    // Every tab/window drag registers its synchronous cancel function here;
+    // render/focus/blur/lost mouse-up recovery drains the set before stale
+    // pointer capture can strand the tab strip. Initialized eagerly (rather
+    // than lazily inside a gesture) so native recovery IPC can safely arrive
+    // at any point in startup.
+    this._activePointerCleanups = new Set();
+    this._topChromeRecoveryBindings = [];
+    this._topChromeRecoveryInstalled = false;
+    this._unsubscribeTopChromeRecovery = null;
     // Persistent web-frame layer (web/PWA): survives re-renders so embedded
     // pages never reload when the chrome re-renders. See ensureWebFrameLayer().
     this.webFrameLayer = null;
@@ -494,6 +504,11 @@ export class BrowserShell {
     // look like a frozen app - errors are logged (rate-limited) and the
     // UI loop keeps running (see installGlobalErrorShield).
     this.installGlobalErrorShield();
+    // Install before the first render: if the OS drops pointer-up/focus while
+    // the shell is booting, the first usable frame must already own all
+    // fallback cleanup paths. Electron also sends the same recovery signal
+    // from the main process on native focus/blur/minimize transitions.
+    this.installTopChromeInputRecovery();
 
     // Native website-rendering engine bridge (Electron desktop only - see
     // electron/webviewBridge.cjs). Subscribed once here, not per-render,
@@ -1363,10 +1378,21 @@ export class BrowserShell {
   }
 
   render(container = null) {
+    // Replacing the strip while a pointer is captured used to leave global
+    // reorder/window-drag listeners attached to a detached element. Revoke
+    // every gesture first and retire body-mounted lightweight menus: a render
+    // is a hard input-generation boundary, never a reason to keep capture.
+    this.recoverTopChromeInput('renderer re-render', { closeTransientMenus: true });
+    // Keep the live native page invariant explicit at the render boundary.
+    // A second truth-check below runs after an aged splash is retired.
+    try { this.healStuckPageSurface(); } catch { /* best-effort heal */ }
     if (this._tabHoverTimer) clearTimeout(this._tabHoverTimer);
     this._tabHoverTimer = null;
     this._activeTabHoverCard?.remove?.();
     this._activeTabHoverCard = null;
+    // The old strip is about to detach. Desktop rendering assigns the fresh
+    // one before overlays are built; mobile layout intentionally leaves null.
+    this.tabStripElement = null;
     // Global theme tokens must reach body-mounted dialogs too, not just
     // the shell node that render() rebuilds. Pointer preference follows the
     // same lifecycle and is also forwarded to the native website surfaces.
@@ -1732,6 +1758,211 @@ export class BrowserShell {
   }
 
   /**
+   * Cancel every renderer-owned pointer gesture synchronously.
+   *
+   * Pointer capture is deliberately treated as leased state, never as an
+   * assumption that pointerup will arrive. A renderer re-render, OS focus
+   * transition, mouseup fallback, native drag end, watchdog or Electron's
+   * main-process recovery signal can all revoke the lease. Each registered
+   * cancel function releases capture, removes global listeners/markers and,
+   * for window movement, ends the matching IPC session.
+   */
+  cancelActivePointerGestures(reason = 'recovery') {
+    const active = [...(this._activePointerCleanups || [])];
+    for (const cancelPointerGesture of active) {
+      try { cancelPointerGesture({ type: 'yayra-input-recovery', reason }); } catch { /* gesture already ended */ }
+    }
+    this._activePointerCleanups?.clear?.();
+    return active.length;
+  }
+
+  /**
+   * Remove only provably stale lightweight chrome blockers.
+   *
+   * The tab context menu is body-mounted while the ordinary dropdown scrims
+   * live inside the shell. If a re-render/focus loss separates the body menu
+   * from its scrim, the remaining transparent full-screen button intercepts
+   * the tab strip while the native website surface below can stay usable —
+   * exactly the reported "only the complete top row is frozen" split. The
+   * pair now has a shared dismiss hook, birth stamp and strict invariant:
+   * both exist, visibly, for at most one render/focus lifetime, or both go.
+   */
+  healTopChromeInputBlockers({ closeTransientMenus = false } = {}) {
+    if (typeof document === 'undefined' || !document.body) return false;
+    let healed = false;
+    try {
+      const menu = document.body.querySelector?.('.fb-tab-context-menu') || null;
+      const contextScrims = Array.from(document.body.querySelectorAll?.('.fb-dropdown-scrim') || [])
+        .filter((el) => el?.dataset?.tabCtx === 'true' || el?.parentElement === document.body);
+      const scrim = contextScrims.find((el) => el?.dataset?.tabCtx === 'true') || contextScrims[0] || null;
+      const bornAt = Number(menu?.dataset?.shownAt || scrim?.dataset?.shownAt || 0);
+      const expired = bornAt > 0 && Date.now() - bornAt > 30000;
+      const hiddenMenu = Boolean(menu && (menu.hidden === true || menu.getAttribute?.('aria-hidden') === 'true'));
+      const brokenPair = Boolean(menu) !== Boolean(scrim);
+      if ((menu || scrim) && (closeTransientMenus || expired || hiddenMenu || brokenPair)) {
+        const dismiss = menu?._yayraDismiss || scrim?._yayraDismiss;
+        if (typeof dismiss === 'function') dismiss();
+        else {
+          try { menu?.remove?.(); } catch { /* already gone */ }
+          for (const item of contextScrims) {
+            try { item?.remove?.(); } catch { /* already gone */ }
+          }
+        }
+        healed = true;
+      }
+
+      // A hover card never owns input (CSS pointer-events:none), but keeping
+      // a detached fixed layer around after focus/render loss serves no
+      // purpose and has historically made top-edge hit testing ambiguous.
+      if (closeTransientMenus && this._activeTabHoverCard) {
+        try { this._activeTabHoverCard.remove?.(); } catch { /* already gone */ }
+        this._activeTabHoverCard = null;
+        if (this._tabHoverTimer) clearTimeout(this._tabHoverTimer);
+        this._tabHoverTimer = null;
+      }
+    } catch { /* DOM probing is a recovery path and must itself never stall */ }
+
+    if (healed) {
+      try { this.healStuckPageSurface(); } catch { /* native surface absent */ }
+      this.logger?.('[top-chrome] retired a stale menu/scrim input blocker');
+    }
+    return healed;
+  }
+
+  /** Ensure the currently-rendered strip can never inherit a native drag or
+   * stale inert/pointer-events state, even if a theme/extension mutates CSS. */
+  ensureTopChromeHitTesting() {
+    const strip = this.tabStripElement;
+    if (!strip) return false;
+    const interactive = [
+      strip,
+      ...(strip.querySelectorAll?.('.fb-tabs-scroll-container') || []),
+      ...(strip.querySelectorAll?.('.fb-tab-item') || []),
+      ...(strip.querySelectorAll?.('.fb-btn-newtab') || []),
+      ...(strip.querySelectorAll?.('.fb-tabstrip-drag-handle') || []),
+      ...(strip.querySelectorAll?.('.fb-window-controls') || []),
+      ...(strip.querySelectorAll?.('.fb-wc-btn') || [])
+    ];
+    for (const el of interactive) {
+      try {
+        el.removeAttribute?.('inert');
+        el.style?.setProperty?.('-webkit-app-region', 'no-drag');
+        el.style?.setProperty?.('pointer-events', 'auto');
+      } catch { /* old DOM shim */ }
+    }
+    return true;
+  }
+
+  /**
+   * Tabs/caption controls are browser chrome, so a lightweight toolbar menu
+   * must never hold them hostage. This runs in the strip's capture phase:
+   * close dropdown/context-menu state without re-rendering the pressed strip,
+   * restore the native page if needed, then let the original pointer event
+   * continue to its intended tab/New Tab/window-control target in one click.
+   */
+  prepareTopChromeInteraction() {
+    this.cancelActivePointerGestures('new top-chrome pointer');
+    this.healTopChromeInputBlockers({ closeTransientMenus: true });
+
+    const hadDropdown = Boolean(
+      this.state.isSecurityDropdownOpen ||
+      this.state.isAccountMenuOpen ||
+      this.state.isDownloadsDropdownOpen
+    );
+    if (!hadDropdown) return;
+    this.state.isSecurityDropdownOpen = false;
+    this.state.isAccountMenuOpen = false;
+    this.state.isDownloadsDropdownOpen = false;
+    this.state.isDownloadsDropdownExpanded = false;
+    try {
+      for (const selector of ['.fb-dropdown-scrim', '.fb-security-dropdown', '.fb-account-dropdown', '.fb-downloads-dropdown']) {
+        for (const el of this.rootElement?.querySelectorAll?.(selector) || []) el.remove?.();
+      }
+    } catch { /* a concurrent render already removed them */ }
+
+    // State-tracked overlays hide the native WebContentsView without using
+    // isPageObscured. Since we intentionally avoid a re-render during the
+    // active pointerdown, restore that surface directly after removing them.
+    const tab = this.getActiveTab();
+    const url = String(tab?.url || '');
+    if (tab && /^https?:\/\//i.test(url)) {
+      try { this.syncNativeWebviewVisibility(tab.id, true); } catch { /* web build */ }
+      try { this.syncAndroidTabWebVisibility(tab.id, true); } catch { /* desktop/web build */ }
+      try { this.restoreActiveNativeBounds(tab.id); } catch { /* no native view */ }
+    }
+  }
+
+  recoverTopChromeInput(reason = 'recovery', { closeTransientMenus = false } = {}) {
+    const cancelled = this.cancelActivePointerGestures(reason);
+    const healed = this.healTopChromeInputBlockers({ closeTransientMenus });
+    try {
+      for (const el of this.rootElement?.querySelectorAll?.('.fb-tab-pointer-dragging') || []) {
+        el.classList?.remove?.('fb-tab-pointer-dragging');
+      }
+      for (const el of this.rootElement?.querySelectorAll?.('.fb-tab-pointer-target') || []) {
+        el.classList?.remove?.('fb-tab-pointer-target');
+      }
+    } catch { /* detached render tree */ }
+    this.ensureTopChromeHitTesting();
+    return { cancelled, healed };
+  }
+
+  /** Install redundant browser + native lifecycle recovery once per shell. */
+  installTopChromeInputRecovery() {
+    if (this._topChromeRecoveryInstalled) return;
+    this._topChromeRecoveryInstalled = true;
+    this._topChromeRecoveryBindings ||= [];
+    const bind = (target, type, listener, options = false) => {
+      if (!target || typeof target.addEventListener !== 'function') return;
+      try {
+        target.addEventListener(type, listener, options);
+        this._topChromeRecoveryBindings.push([target, type, listener, options]);
+      } catch { /* optional lifecycle event in a minimal embedder */ }
+    };
+    const cancelOnly = (event) => this.cancelActivePointerGestures(event?.type || 'lifecycle');
+    const recoverAndCloseTransient = (event) => this.recoverTopChromeInput(
+      event?.type || 'lifecycle',
+      { closeTransientMenus: true }
+    );
+    const onVisibility = (event) => {
+      // Both directions matter: hiding cancels the gesture before timers are
+      // throttled; returning performs the truth-based overlay sweep again.
+      recoverAndCloseTransient(event || { type: 'visibilitychange' });
+    };
+    const onPointerDown = () => {
+      // A new physical press proves any older pointer lease is stale. This
+      // capture-phase fallback runs even when an orphan scrim is the target.
+      this.cancelActivePointerGestures('new pointerdown');
+      this.healTopChromeInputBlockers();
+    };
+
+    if (typeof window !== 'undefined') {
+      bind(window, 'blur', recoverAndCloseTransient, true);
+      bind(window, 'focus', recoverAndCloseTransient, true);
+      // If Chromium loses pointerup but still emits legacy mouseup, release
+      // capture/IPC immediately instead of waiting for the watchdog.
+      bind(window, 'mouseup', cancelOnly, true);
+      bind(window, 'dragend', cancelOnly, true);
+      bind(window, 'drop', cancelOnly, true);
+      bind(window, 'pagehide', recoverAndCloseTransient, true);
+      bind(window, 'pointerdown', onPointerDown, true);
+    }
+    if (typeof document !== 'undefined') bind(document, 'visibilitychange', onVisibility, true);
+
+    // Main-process focus/blur/minimize recovery is independent of DOM event
+    // delivery, so even a compositor/pointer-capture anomaly can revoke the
+    // renderer gesture and its matching native window-drag session.
+    try {
+      const controls = this.windowControls;
+      if (controls && typeof controls.onInputRecovery === 'function') {
+        this._unsubscribeTopChromeRecovery = controls.onInputRecovery((payload = {}) => {
+          this.recoverTopChromeInput(payload.reason || 'native recovery', { closeTransientMenus: true });
+        });
+      }
+    } catch { /* web/PWA or older preload */ }
+  }
+
+  /**
    * Frameless-window movement without `-webkit-app-region: drag`.
    * Native drag regions own the mouse before Chromium and have repeatedly
    * wedged the Linux tab strip. Pointer capture + fire-and-forget IPC keeps
@@ -1742,9 +1973,22 @@ export class BrowserShell {
       || typeof controls.dragMove !== 'function' || typeof controls.dragEnd !== 'function') return;
     let pressed = null;
     let dragging = false;
+    let captureOwned = false;
     let globalsBound = false;
     let lastMoveEvent = null;
     let lastTapAt = 0;
+    let watchdog = null;
+    const clearWatchdog = () => {
+      if (watchdog) clearTimeout(watchdog);
+      watchdog = null;
+    };
+    const armWatchdog = () => {
+      clearWatchdog();
+      // Inactivity, not total drag duration: a long active drag remains
+      // valid, but a missing pointerup heals itself without a reload.
+      watchdog = setTimeout(() => cancel({ type: 'gesture-timeout' }), 4000);
+      watchdog?.unref?.();
+    };
     const pointerPoint = (event) => {
       const x = Number(event?.screenX);
       const y = Number(event?.screenY);
@@ -1766,6 +2010,7 @@ export class BrowserShell {
       const wasDragging = dragging;
       pressed = null;
       dragging = false;
+      clearWatchdog();
       removeGlobals();
       this._activePointerCleanups?.delete(cancel);
       handle.classList?.remove('is-dragging');
@@ -1780,8 +2025,15 @@ export class BrowserShell {
           lastTapAt = 0;
           Promise.resolve(controls.toggleMaximize?.()).catch(() => {});
         } else lastTapAt = now;
+      } else {
+        // A recovered/abandoned press must never become half of a later
+        // double-click gesture.
+        lastTapAt = 0;
       }
-      try { handle.releasePointerCapture?.(pointerId); } catch { /* capture already released */ }
+      if (captureOwned) {
+        try { handle.releasePointerCapture?.(pointerId); } catch { /* capture already released */ }
+      }
+      captureOwned = false;
     };
     const cancel = (event = null) => end(event);
     const move = (event) => {
@@ -1793,10 +2045,17 @@ export class BrowserShell {
       }
       const current = pointerPoint(event);
       if (!current) { cancel(event); return; }
+      armWatchdog();
       if (!dragging) {
         if (Math.abs(current.x - pressed.x) < 4 && Math.abs(current.y - pressed.y) < 4) return;
         dragging = true;
         lastTapAt = 0;
+        // Ordinary handle clicks/double-clicks never capture a pointer. Take
+        // capture only after real movement crosses the drag threshold.
+        try {
+          handle.setPointerCapture?.(pressed.pointerId);
+          captureOwned = typeof handle.setPointerCapture === 'function';
+        } catch { captureOwned = false; }
         handle.classList?.add('is-dragging');
         try { controls.dragStart({ x: pressed.x, y: pressed.y }); } catch { cancel(event); return; }
       }
@@ -1811,9 +2070,10 @@ export class BrowserShell {
       if (pressed) cancel();
       pressed = { ...start, pointerId: event?.pointerId };
       dragging = false;
+      captureOwned = false;
       lastMoveEvent = null;
-      this._activePointerCleanups ||= new Set();
       this._activePointerCleanups.add(cancel);
+      armWatchdog();
       if (typeof window !== 'undefined') {
         globalsBound = true;
         // Capture-phase window fallbacks survive a render replacing `handle`
@@ -1823,7 +2083,6 @@ export class BrowserShell {
         window.addEventListener?.('pointercancel', cancel, true);
         window.addEventListener?.('blur', cancel, true);
       }
-      try { handle.setPointerCapture?.(event.pointerId); } catch { /* optional */ }
       event?.preventDefault?.();
     });
     handle.addEventListener('pointermove', move);
@@ -1835,16 +2094,28 @@ export class BrowserShell {
   /**
    * Reorder tabs with normal pointer events only. HTML5 drag/drop enters a
    * native drag loop; when a Linux compositor loses its drop/end event the
-   * row remains input-grabbed and appears frozen. This implementation keeps
-   * the pointer captured by the source tab and commits once on pointerup.
+   * row remains input-grabbed and appears frozen. Pointer capture is delayed
+   * until movement proves this is a drag, so ordinary tab clicks never own a
+   * capture that could outlive a renderer re-render.
    */
   bindPointerTabReorder(tabEl, fromIndex, tabsScroll) {
     if (!tabEl || !tabsScroll) return;
     let pressed = null;
     let dragging = false;
+    let captureOwned = false;
     let globalsBound = false;
     let lastMoveEvent = null;
     let targetIndex = fromIndex;
+    let watchdog = null;
+    const clearWatchdog = () => {
+      if (watchdog) clearTimeout(watchdog);
+      watchdog = null;
+    };
+    const armWatchdog = () => {
+      clearWatchdog();
+      watchdog = setTimeout(() => cancel({ type: 'gesture-timeout' }), 4000);
+      watchdog?.unref?.();
+    };
     const clientPoint = (event) => {
       const x = Number(event?.clientX);
       const y = Number(event?.clientY);
@@ -1887,10 +2158,14 @@ export class BrowserShell {
       const wasDragging = dragging;
       pressed = null;
       dragging = false;
+      clearWatchdog();
       removeGlobals();
       this._activePointerCleanups?.delete(cancel);
       clearMarkers();
-      try { tabEl.releasePointerCapture?.(pointerId); } catch { /* optional */ }
+      if (captureOwned) {
+        try { tabEl.releasePointerCapture?.(pointerId); } catch { /* optional */ }
+      }
+      captureOwned = false;
       if (!wasDragging) return;
       tabEl._yayraSuppressClick = true;
       event?.preventDefault?.();
@@ -1908,10 +2183,15 @@ export class BrowserShell {
       }
       const current = clientPoint(event);
       if (!current) { cancel(event); return; }
+      armWatchdog();
       const { x, y } = current;
       if (!dragging) {
         if (Math.abs(x - pressed.x) < 6 && Math.abs(y - pressed.y) < 6) return;
         dragging = true;
+        try {
+          tabEl.setPointerCapture?.(pressed.pointerId);
+          captureOwned = typeof tabEl.setPointerCapture === 'function';
+        } catch { captureOwned = false; }
         tabEl.classList?.add('fb-tab-pointer-dragging');
       }
       targetIndex = nearestIndex(x);
@@ -1927,10 +2207,12 @@ export class BrowserShell {
       if (!start) return;
       if (pressed) cancel();
       pressed = { ...start, pointerId: event?.pointerId };
+      dragging = false;
+      captureOwned = false;
       targetIndex = fromIndex;
       lastMoveEvent = null;
-      this._activePointerCleanups ||= new Set();
       this._activePointerCleanups.add(cancel);
+      armWatchdog();
       if (typeof window !== 'undefined') {
         globalsBound = true;
         // Keep the gesture alive if a native navigation update re-renders
@@ -1940,7 +2222,6 @@ export class BrowserShell {
         window.addEventListener?.('pointercancel', cancel, true);
         window.addEventListener?.('blur', cancel, true);
       }
-      try { tabEl.setPointerCapture?.(event.pointerId); } catch { /* optional */ }
     });
     tabEl.addEventListener('pointermove', move);
     tabEl.addEventListener('pointerup', commit);
@@ -1957,6 +2238,22 @@ export class BrowserShell {
     tabStrip.className = 'fb-chrome-tabstrip';
     tabStrip.setAttribute('role', 'tablist');
     tabStrip.setAttribute('aria-label', 'Open tabs');
+    // Inline defense as well as CSS: theme injection or a stale class can
+    // never turn any top-strip pixel into a native app drag region.
+    tabStrip.style?.setProperty?.('-webkit-app-region', 'no-drag');
+    tabStrip.style?.setProperty?.('pointer-events', 'auto');
+    tabStrip.addEventListener('pointerdown', () => this.prepareTopChromeInteraction(), true);
+    tabStrip.addEventListener('dragstart', (event) => {
+      // No child may start Chromium/OS native drag-and-drop. Reordering and
+      // window movement are both renderer pointer gestures with watchdogs.
+      event?.preventDefault?.();
+      this.cancelActivePointerGestures('native dragstart blocked');
+    }, true);
+    tabStrip.addEventListener('dragend', () => this.cancelActivePointerGestures('native dragend'), true);
+    tabStrip.addEventListener('drop', (event) => {
+      event?.preventDefault?.();
+      this.cancelActivePointerGestures('native drop');
+    }, true);
 
     // Brand wordmark at the very top of the app - replaces the removed OS
     // title bar text ("yayra") with the official wordmark image.
@@ -2173,6 +2470,7 @@ export class BrowserShell {
     }
     root.appendChild(tabStrip);
     this.tabStripElement = tabStrip;
+    this.ensureTopChromeHitTesting();
 
     // 2. Browser Navigation Toolbar (Back, Forward, Reload/Stop, Brand, Lock + Search Engine, Omnibox, Star, Downloads, Extensions, Menu)
     const navbar = document.createElement('nav');
@@ -11492,13 +11790,29 @@ export class BrowserShell {
     const scrim = document.createElement('button');
     scrim.type = 'button';
     scrim.className = 'fb-dropdown-scrim';
+    scrim.setAttribute('data-chrome-dropdown', 'true');
     scrim.setAttribute('aria-label', 'Close menu');
-    scrim.addEventListener('click', onClose);
+    const stripBottom = Math.max(36, Number(this.tabStripElement?.getBoundingClientRect?.()?.bottom) || 0);
+    scrim.style.top = `${stripBottom}px`;
+    scrim.style.height = `calc(100% - ${stripBottom}px)`;
+    // Pointerdown closes before a potentially lost pointerup can strand the
+    // full-viewport hit target. The click listener remains for keyboard use.
+    let closed = false;
+    const closeOnce = (event) => {
+      if (closed) return;
+      closed = true;
+      onClose(event);
+    };
+    scrim.addEventListener('pointerdown', (event) => {
+      event?.preventDefault?.();
+      closeOnce(event);
+    });
+    scrim.addEventListener('click', closeOnce);
     // A right-click (or long-press context menu) anywhere outside must
     // dismiss the open menu too - exactly like native browser menus.
     scrim.addEventListener('contextmenu', (e) => {
       e.preventDefault();
-      onClose(e);
+      closeOnce(e);
     });
     root.appendChild(scrim);
     return scrim;
@@ -15181,8 +15495,15 @@ export class BrowserShell {
    * CHROME-STYLE RIGHT-CLICK CONTEXT MENU FOR THE TAB STRIP
    * ----------------------------------------------------------- */
   renderTabContextMenu(x, y, tab) {
-    document.body.querySelector('.fb-tab-context-menu')?.remove();
-    document.body.querySelector('.fb-dropdown-scrim[data-tab-ctx]')?.remove();
+    const previousMenu = document.body.querySelector('.fb-tab-context-menu');
+    const previousScrim = Array.from(document.body.querySelectorAll('.fb-dropdown-scrim') || [])
+      .find((el) => el?.dataset?.tabCtx === 'true');
+    const previousDismiss = previousMenu?._yayraDismiss || previousScrim?._yayraDismiss;
+    if (typeof previousDismiss === 'function') previousDismiss();
+    else {
+      previousMenu?.remove?.();
+      previousScrim?.remove?.();
+    }
 
     const scrim = document.createElement('button');
     scrim.type = 'button';
@@ -15196,16 +15517,36 @@ export class BrowserShell {
     if (!tab || !tab.id) return;
 
     // Clicking/tapping OR right-clicking anywhere outside the menu must
-    // dismiss BOTH the scrim and the menu (previously only the scrim was
-    // removed, stranding the menu on screen forever).
+    // dismiss BOTH the scrim and the menu. Pointerdown (not only click) is
+    // intentional: even if the OS loses pointerup/click, the transparent
+    // blocker is gone synchronously and can never freeze the next gesture.
+    let dismissed = false;
+    let safetyTimer = null;
     const dismiss = () => {
+      if (dismissed) return;
+      dismissed = true;
+      if (safetyTimer) clearTimeout(safetyTimer);
+      safetyTimer = null;
       scrim.remove();
       menu.remove();
-      // Un-obscure the native page surface (see below).
-      this.setPageObscured(false);
+      try { window.removeEventListener?.('blur', dismiss, true); } catch { /* shim */ }
+      // Truth-check all remaining overlays before restoring the native page;
+      // another real modal may still legitimately own it.
+      this.healStuckPageSurface();
     };
+    scrim._yayraDismiss = dismiss;
+    menu._yayraDismiss = dismiss;
+    const shownAt = String(Date.now());
+    scrim.dataset.shownAt = shownAt;
+    menu.dataset.shownAt = shownAt;
+    scrim.addEventListener('pointerdown', (e) => { e.preventDefault?.(); dismiss(); });
     scrim.addEventListener('click', dismiss);
     scrim.addEventListener('contextmenu', (e) => { e.preventDefault(); dismiss(); });
+    try { window.addEventListener?.('blur', dismiss, true); } catch { /* shim */ }
+    // Independent of pointer/focus/render delivery: a native/compositor
+    // anomaly cannot leave the body-mounted blocker around indefinitely.
+    safetyTimer = setTimeout(dismiss, 30000);
+    safetyTimer?.unref?.();
     const canCloseOthers = this.state.tabs.length > 1;
     const tabIndex = this.state.tabs.findIndex((t) => t.id === tab.id);
     const canCloseRight = tabIndex > -1 && tabIndex < this.state.tabs.length - 1;
@@ -15240,11 +15581,19 @@ export class BrowserShell {
 
     const menuWidth = 240;
     const baseMenuHeight = items.reduce((height, item) => height + (item ? 34 : 12), 16);
+    const stripRect = this.tabStripElement?.getBoundingClientRect?.();
+    const stripBottom = Math.max(36, Number(stripRect?.bottom) || 0);
+    // Keep the transparent outside-click target and the menu itself below
+    // tabs/New Tab/caption controls. Even a stale browser menu therefore
+    // cannot physically intercept the complete top row.
+    scrim.style.top = `${stripBottom}px`;
+    scrim.style.height = `calc(100% - ${stripBottom}px)`;
     const positionMenu = (extraHeight = 0) => {
       const left = Math.min(x, window.innerWidth - menuWidth - 8);
-      const top = Math.min(y, window.innerHeight - baseMenuHeight - extraHeight - 8);
+      const maxTop = window.innerHeight - baseMenuHeight - extraHeight - 8;
+      const top = Math.max(stripBottom + 4, Math.min(y, maxTop));
       menu.style.left = `${Math.max(8, left)}px`;
-      menu.style.top = `${Math.max(8, top)}px`;
+      menu.style.top = `${top}px`;
     };
 
     // Use textContent for labels: group names are user-entered and must
@@ -17916,10 +18265,14 @@ export class BrowserShell {
     // A shell may be torn down after its source tab/handle was replaced but
     // before pointerup. End every renderer-only gesture and release its IPC
     // session/global fallback listeners synchronously.
-    for (const cancelPointerGesture of [...(this._activePointerCleanups || [])]) {
-      try { cancelPointerGesture(); } catch { /* gesture already ended */ }
+    this.cancelActivePointerGestures('shell destroy');
+    for (const [target, type, listener, options] of this._topChromeRecoveryBindings || []) {
+      try { target.removeEventListener?.(type, listener, options); } catch { /* target already gone */ }
     }
-    this._activePointerCleanups?.clear?.();
+    this._topChromeRecoveryBindings = [];
+    this._topChromeRecoveryInstalled = false;
+    try { this._unsubscribeTopChromeRecovery?.(); } catch { /* native bridge already gone */ }
+    this._unsubscribeTopChromeRecovery = null;
     if (typeof window !== 'undefined') {
       window.removeEventListener('resize', this.boundResizeHandler);
       window.removeEventListener('keydown', this.boundKeyHandler);

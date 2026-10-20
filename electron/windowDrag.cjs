@@ -147,6 +147,14 @@ function createWindowDragController({
     begin,
     move,
     end,
+    // Native BrowserWindow focus/blur/minimize recovery does not carry an
+    // IPC event object, but the sender WebContents id is the same map key.
+    // This lets the main process revoke a renderer drag independently of a
+    // potentially lost pointerup message.
+    cancelForWebContents(contents, { flush = false } = {}) {
+      const key = contents?.id ?? contents ?? null;
+      return key !== null ? cancel(key, { flush }) : false;
+    },
     activeCount: () => active.size,
     destroy() {
       for (const key of [...active.keys()]) cancel(key);

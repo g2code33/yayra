@@ -535,6 +535,9 @@ html {
   padding: 0 10px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   user-select: none;
+  position: relative;
+  isolation: isolate;
+  pointer-events: auto;
   z-index: 20;
   /* The complete strip stays renderer-owned. Native Electron drag regions
      can retain a Linux compositor input grab and make tabs/buttons appear
@@ -568,7 +571,10 @@ html {
 .fb-chrome-tabstrip .fb-tabs-scroll-container,
 .fb-chrome-tabstrip .fb-btn-newtab,
 .fb-chrome-tabstrip .fb-window-controls,
-.fb-chrome-tabstrip button {
+.fb-chrome-tabstrip button,
+.fb-chrome-tabstrip * {
+  /* Defense in depth: SVG/icon descendants are also explicit no-drag hit
+     targets, so no inherited/injected native region can create an OS grab. */
   -webkit-app-region: no-drag;
 }
 
@@ -4969,7 +4975,18 @@ button.fb-site-passkey-indicator {
   border: 0;
   background: rgba(0, 0, 0, 0.12);
   cursor: default;
+  touch-action: none;
   animation: fb-fade-in 0.12s ease;
+}
+
+/* Lightweight dropdown/context-menu scrims never cover desktop tabs, New
+   Tab, the manual drag handle or caption controls. JavaScript writes the
+   exact measured strip bottom inline; 36px is the safe CSS fallback. */
+.fb-dropdown-scrim[data-tab-ctx="true"],
+.fb-dropdown-scrim[data-chrome-dropdown="true"] {
+  top: 36px;
+  bottom: 0;
+  height: calc(100% - 36px);
 }
 
 .fb-search-engine-option.active {

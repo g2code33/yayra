@@ -4,6 +4,7 @@ const WEBVIEW_EVENT_CHANNEL = 'yayra:webview-event';
 const AUTH_EVENT_CHANNEL = 'yayra:auth-event';
 const DOWNLOADS_EVENT_CHANNEL = 'yayra:downloads-event';
 const UPDATES_EVENT_CHANNEL = 'yayra:updates-event';
+const CHROME_INPUT_RECOVERY_CHANNEL = 'yayra:chrome-input-recover';
 
 const api = {
   getLaunchInfo: () => ipcRenderer.invoke('yayra:get-launch-info'),
@@ -20,6 +21,12 @@ const api = {
     dragStart: (point) => ipcRenderer.send('yayra:window-drag-start', point),
     dragMove: (point) => ipcRenderer.send('yayra:window-drag-move', point),
     dragEnd: () => ipcRenderer.send('yayra:window-drag-end'),
+    onInputRecovery: (callback) => {
+      if (typeof callback !== 'function') return () => {};
+      const listener = (_event, payload) => callback(payload || {});
+      ipcRenderer.on(CHROME_INPUT_RECOVERY_CHANNEL, listener);
+      return () => ipcRenderer.removeListener(CHROME_INPUT_RECOVERY_CHANNEL, listener);
+    },
     // Explicit menu > Exit: unlike close(), this quits the whole app and
     // its floating bubble/tray process, not only this BrowserWindow.
     quit: () => ipcRenderer.invoke('yayra:app-quit')

@@ -1,5 +1,7 @@
 'use strict';
 
+const { popupMenuWithRecovery } = require('./nativeMenuGuard.cjs');
+
 /**
  * Yayra Floating Browser - Native Web Content Engine Bridge (Electron main process)
  *
@@ -897,6 +899,22 @@ function sanitizeBounds(bounds) {
   };
 }
 
+// Native WebContentsViews are sibling OS surfaces above the renderer. Even
+// if a stale ResizeObserver reports y=0 during a re-render, a website must
+// never be allowed to own the custom title/tab row's hit-testing area.
+const MIN_NATIVE_PAGE_Y = 36;
+function sanitizePageBounds(bounds) {
+  const clean = sanitizeBounds(bounds);
+  // Preserve the zero rectangle used by setVisible(false).
+  if (clean.width === 0 || clean.height === 0 || clean.y >= MIN_NATIVE_PAGE_Y) return clean;
+  const covered = MIN_NATIVE_PAGE_Y - clean.y;
+  return {
+    ...clean,
+    y: MIN_NATIVE_PAGE_Y,
+    height: Math.max(0, clean.height - covered)
+  };
+}
+
 /**
  * Creates and wires the IPC surface used by the renderer's native-engine
  * bridge (see BrowserShell.js's `createWebContentFrame`). Dependency-injected
@@ -1259,8 +1277,9 @@ function createWebviewBridge({
             { label: 'Cancel', click: () => finish() }
           ];
           const menu = Menu.buildFromTemplate(template);
-          menu.popup({
-            ...(owner && !owner.isDestroyed?.() ? { window: owner } : {}),
+          popupMenuWithRecovery({
+            menu,
+            window: owner && !owner.isDestroyed?.() ? owner : null,
             callback: () => finish()
           });
           return;
@@ -1560,7 +1579,7 @@ function createWebviewBridge({
       });
       const win = (entry.hostWin && !entry.hostWin.isDestroyed?.()) ? entry.hostWin : getMainWindow();
       if (!win || win.isDestroyed()) return;
-      Menu.buildFromTemplate(template).popup({ window: win });
+      popupMenuWithRecovery({ menu: Menu.buildFromTemplate(template), window: win });
     });
     wc.setWindowOpenHandler(({ url }) => {
       // In-page WebAuthn helper asking to reopen this page in the user's
@@ -1742,7 +1761,9 @@ function createWebviewBridge({
   }
 
   function setBounds(key, bounds) {
-    withView(key, (view) => view.setBounds(sanitizeBounds(bounds)));
+    // Main-process enforcement: renderer mistakes/races can shrink the page,
+    // but can never place a native website surface over the tab/caption row.
+    withView(key, (view) => view.setBounds(sanitizePageBounds(bounds)));
   }
 
   /**
@@ -2470,6 +2491,8 @@ module.exports = {
   buildPointerThemeScript,
   buildPointerTextCursorScript,
   sanitizeBounds,
+  sanitizePageBounds,
+  MIN_NATIVE_PAGE_Y,
   buildBrowserUserAgent,
   buildContextMenuTemplate,
   reloadActionForInput,

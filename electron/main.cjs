@@ -30,8 +30,10 @@ const { createScreenRecorder } = require('./screenRecorder.cjs');
 const { createTrayController } = require('./tray.cjs');
 const { applyVaapiPolicy } = require('./vaapiProbe.cjs');
 const { createWindowDragController } = require('./windowDrag.cjs');
+const { popupMenuWithRecovery, closeNativeMenuForWindow } = require('./nativeMenuGuard.cjs');
 
 const CUSTOM_SCHEME = 'yayra';
+const CHROME_INPUT_RECOVERY_CHANNEL = 'yayra:chrome-input-recover';
 // Keep local-document IPC bounded before any file is read into memory. This
 // mirrors MAX_DOCUMENT_BYTES in the browser workspace (CommonJS cannot import
 // that browser ESM module during Electron startup).
@@ -1229,8 +1231,32 @@ function installShellFreezeRecovery(win, label = 'shell') {
     if (unresponsiveTimer) clearTimeout(unresponsiveTimer);
     unresponsiveTimer = null;
   };
+  const signalChromeInputRecovery = (reason, { closeMenu = false } = {}) => {
+    try { windowDragController?.cancelForWebContents?.(contents); } catch { /* no active drag */ }
+    if (closeMenu) {
+      try { closeNativeMenuForWindow(win, reason); } catch { /* no native popup */ }
+    }
+    try {
+      if (!contents.isDestroyed?.()) contents.send(CHROME_INPUT_RECOVERY_CHANNEL, { reason });
+    } catch { /* renderer/window raced shutdown */ }
+  };
+  const onWindowFocus = () => {
+    // A radial overlay is a separate transparent always-on-top window. If it
+    // was left expanded over Yayra, focusing the browser deterministically
+    // shrinks it before it can intercept the custom title/tab row.
+    try { overlayBridge?.closeRadialMenu?.(); } catch { /* overlay absent */ }
+    signalChromeInputRecovery('window-focus', { closeMenu: true });
+  };
+  const onWindowBlur = () => signalChromeInputRecovery('window-blur', { closeMenu: true });
+  const onWindowHide = () => signalChromeInputRecovery('window-hide', { closeMenu: true });
+  const onWindowMinimize = () => signalChromeInputRecovery('window-minimize', { closeMenu: true });
+  win.on?.('focus', onWindowFocus);
+  win.on?.('blur', onWindowBlur);
+  win.on?.('hide', onWindowHide);
+  win.on?.('minimize', onWindowMinimize);
   const onRenderGone = (_event, details) => {
     const reason = details && details.reason;
+    signalChromeInputRecovery(`renderer-${reason || 'gone'}`, { closeMenu: true });
     if (reason !== 'crashed' && reason !== 'oom' && reason !== 'killed') return;
     const now = Date.now();
     if (now - crashWindowStarted > 60000) {
@@ -1246,6 +1272,7 @@ function installShellFreezeRecovery(win, label = 'shell') {
     try { if (!win.isDestroyed()) win.webContents.reload(); } catch { /* already closing */ }
   };
   const onUnresponsive = () => {
+    signalChromeInputRecovery('renderer-unresponsive', { closeMenu: true });
     console.warn(`[yayra] ${label} renderer reported unresponsive; recovery grace period started`);
     if (unresponsiveTimer) return;
     unresponsiveTimer = setTimeout(() => {
@@ -1275,6 +1302,11 @@ function installShellFreezeRecovery(win, label = 'shell') {
   contents.on('responsive', onResponsive);
   return () => {
     clearUnresponsiveTimer();
+    try { closeNativeMenuForWindow(win, 'shell-recovery-destroy'); } catch { /* none */ }
+    try { win.removeListener?.('focus', onWindowFocus); } catch { /* destroyed */ }
+    try { win.removeListener?.('blur', onWindowBlur); } catch { /* destroyed */ }
+    try { win.removeListener?.('hide', onWindowHide); } catch { /* destroyed */ }
+    try { win.removeListener?.('minimize', onWindowMinimize); } catch { /* destroyed */ }
     try { contents.removeListener?.('render-process-gone', onRenderGone); } catch { /* destroyed */ }
     try { contents.removeListener?.('unresponsive', onUnresponsive); } catch { /* destroyed */ }
     try { contents.removeListener?.('responsive', onResponsive); } catch { /* destroyed */ }
@@ -1309,7 +1341,7 @@ function createProfileWindow(profileId) {
   win.webContents.on('context-menu', (_event, params) => {
     if (win.isDestroyed()) return;
     const template = buildContextMenuTemplate({ params, wc: win.webContents, tabId: null, send: () => {}, clipboard });
-    Menu.buildFromTemplate(template).popup({ window: win });
+    popupMenuWithRecovery({ menu: Menu.buildFromTemplate(template), window: win });
   });
   const winContents = win.webContents;
   win.on('closed', () => {
@@ -1379,7 +1411,7 @@ function createWindow() {
       send: () => {},
       clipboard
     });
-    Menu.buildFromTemplate(template).popup({ window: win });
+    popupMenuWithRecovery({ menu: Menu.buildFromTemplate(template), window: win });
   });
 
   // PRODUCTION FREEZE GUARDS: a crash or genuinely stuck chrome renderer

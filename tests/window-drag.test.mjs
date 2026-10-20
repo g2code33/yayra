@@ -94,6 +94,17 @@ test('manual drag rejects invalid, maximized, destroyed, and cross-sender moveme
   h.controller.destroy();
 });
 
+test('native window lifecycle can cancel a drag by sender WebContents without pointerup IPC', () => {
+  const h = harness();
+  h.controller.begin(h.event, { x: 50, y: 60 });
+  h.controller.move(h.event, { x: 70, y: 90 });
+  assert.equal(h.controller.activeCount(), 1);
+  assert.equal(h.controller.cancelForWebContents(h.event.sender), true);
+  assert.equal(h.controller.activeCount(), 0);
+  assert.equal(h.timers.size, 0, 'pending move and safety timers are both revoked');
+  h.controller.destroy();
+});
+
 test('lost-pointer safety deadline flushes and ends an abandoned drag', () => {
   const h = harness();
   h.controller.begin(h.event, { x: 50, y: 60 });

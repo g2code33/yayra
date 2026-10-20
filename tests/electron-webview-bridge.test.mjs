@@ -666,7 +666,11 @@ test('webview bridge: setBounds and setVisible(false) manipulate the native view
   await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-1', url: 'https://example.com/' });
 
   await handlers.get('yayra:webview-set-bounds')(null, { tabId: 'tab-1', bounds: { x: 10, y: 20, width: 800, height: 600 } });
-  assert.deepEqual(views[0].bounds, { x: 10, y: 20, width: 800, height: 600 });
+  assert.deepEqual(
+    views[0].bounds,
+    { x: 10, y: 36, width: 800, height: 584 },
+    'a stale y-coordinate is clipped below the custom tab/caption row'
+  );
 
   await handlers.get('yayra:webview-set-visible')(null, { tabId: 'tab-1', visible: false });
   assert.deepEqual(views[0].bounds, { x: 0, y: 0, width: 0, height: 0 }, 'hidden by zeroing bounds, not by destroying the guest page');

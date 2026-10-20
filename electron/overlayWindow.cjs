@@ -1,5 +1,7 @@
 'use strict';
 
+const { popupMenuWithRecovery } = require('./nativeMenuGuard.cjs');
+
 /**
  * Yayra's system-wide floating overlay bubble (desktop).
  *
@@ -1393,18 +1395,24 @@ function createOverlayBridge({
     // leave, so clicking anywhere else left the menu stuck open. Make
     // the window focusable just for the popup's lifetime: a click
     // anywhere else now blurs it, and blur closes the popup.
-    const onBlur = () => { try { menu.closePopup?.(overlayWin); } catch { /* popup already gone */ } };
     try {
       overlayWin.setFocusable?.(true);
       overlayWin.focus?.();
-      overlayWin.once?.('blur', onBlur);
     } catch { /* focus dance is best-effort */ }
-    menu.popup({
+    let guardedPopup = null;
+    // Keep the explicit once-listener as well as the generic guard. Older
+    // Electron/EventEmitter shims expose only once(); close() is idempotent,
+    // so whichever blur path runs first settles the popup exactly once.
+    const onBlur = () => guardedPopup?.close?.('overlay-window-blur');
+    try { overlayWin.once?.('blur', onBlur); } catch { /* optional */ }
+    guardedPopup = popupMenuWithRecovery({
+      menu,
       window: overlayWin,
-      // Fires on ANY close (item clicked, Esc, or the blur above) -
-      // restore the never-steal-focus contract and the topmost claim.
+      // Fires on ANY close (item clicked, Esc, blur, or the independent
+      // safety deadline) - restore the never-steal-focus contract and the
+      // topmost claim. A missing native callback cannot strand this state.
       callback: () => {
-        try { overlayWin.removeListener?.('blur', onBlur); } catch { /* listener already gone */ }
+        try { overlayWin.removeListener?.('blur', onBlur); } catch { /* already removed */ }
         try { overlayWin.setFocusable?.(false); } catch { /* window raced destruction */ }
         assertTopmost(overlayWin);
       }
