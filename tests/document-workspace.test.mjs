@@ -101,6 +101,8 @@ test('REGISTRY: bundled viewers and explicit legacy fallbacks advertise honest c
     assert.equal(DOCUMENT_ENGINES[kind].capabilities.save, false, `${kind} does not claim saving`);
   }
   assert.equal(DOCUMENT_ENGINES.pdf.capabilities.print, true);
+  assert.equal(DOCUMENT_ENGINES.pdf.capabilities.presentation, true);
+  assert.equal(DOCUMENT_ENGINES.pptx.capabilities.presentation, true);
   assert.equal(DOCUMENT_ENGINES.pptx.capabilities.notes, true);
   assert.equal(DOCUMENT_ENGINES.pptx.capabilities.embeddedVideo, true);
   assert.equal(DOCUMENT_ENGINES.xlsx.capabilities.sheets, true);
@@ -201,6 +203,62 @@ test('VIEWER: zoom is clamped to a sane range', async () => {
   await viewer.setZoom(0.01);
   assert.equal(state.zoom, 0.5, 'min 50%');
   viewer.destroy();
+});
+
+test('VIEWER: PDF projector mode fits one page at a time, including tall pages below the reader zoom floor', async () => {
+  const state = createDocumentViewerState('pdf');
+  const frame = document.createElement('div');
+  frame.clientWidth = 320;
+  frame.clientHeight = 240;
+  const projectorHost = document.createElement('div');
+  projectorHost.className = 'fb-document-slideshow-host';
+  projectorHost.clientWidth = 320;
+  projectorHost.clientHeight = 240;
+  frame.appendChild(projectorHost);
+  const sizes = [{ width: 600, height: 1200 }, { width: 1200, height: 600 }];
+  const pdfjs = {
+    getDocument: () => ({
+      promise: Promise.resolve({
+        numPages: 2,
+        getPage: async (number) => ({
+          rotate: 0,
+          getViewport: ({ scale = 1 } = {}) => ({
+            width: sizes[number - 1].width * scale,
+            height: sizes[number - 1].height * scale,
+            scale
+          }),
+          render: () => ({ promise: Promise.resolve() }),
+          getTextContent: async () => ({ items: [] })
+        }),
+        destroy() {}
+      })
+    })
+  };
+  const viewer = createPdfViewer({ pdfjs, container: projectorHost, state });
+  try {
+    await viewer.load(new Uint8Array([1]));
+    await viewer.fitToPage();
+    assert.ok(state.zoom < 0.5 && state.zoom > 0.19,
+      'a tall projector page can fit below the normal reader’s 50% floor');
+    assert.equal(projectorHost.querySelectorAll('.fb-pdf-page').filter((page) => page.style.display !== 'none').length, 1);
+
+    await viewer.setPage(2);
+    assert.equal(state.page, 2);
+    assert.ok(state.zoom > 0.25 && state.zoom < 0.27,
+      'a differently proportioned page is re-fitted when it becomes current');
+    assert.equal(projectorHost.querySelectorAll('.fb-pdf-page').filter((page) => page.style.display !== 'none').length, 1);
+
+    const readerHost = document.createElement('div');
+    readerHost.clientWidth = 900;
+    readerHost.clientHeight = 700;
+    await viewer.attach(readerHost);
+    await viewer.setZoom(0.01);
+    assert.equal(state.zoom, 0.5, 'leaving the projector restores the established continuous-reader floor');
+    assert.equal(readerHost.querySelectorAll('.fb-pdf-page').filter((page) => page.style.display !== 'none').length, 2,
+      'continuous reading shows every page shell again');
+  } finally {
+    viewer.destroy();
+  }
 });
 
 test('VIEWER: reports PDF.js progress and marks parsing complete before the first page draw', async () => {
@@ -547,7 +605,7 @@ function fakePptxEngine() {
   };
 }
 
-test('PPTX NOTES COLOUR: native wheel is beside Download, live, visibility-synchronised and profile-persistent', async () => {
+test('PPTX NOTES COLOUR: native wheel stays live beside the accessible presentation overflow and persists by profile', async () => {
   const priorStorage = globalThis.localStorage;
   const storage = makeMemoryStorage();
   globalThis.localStorage = storage;
@@ -565,15 +623,28 @@ test('PPTX NOTES COLOUR: native wheel is beside Download, live, visibility-synch
     const primary = firstShell.viewportElement.querySelector('.fb-doc-toolbar');
     const picker = primary.querySelector('.fb-doc-notes-color-input');
     const control = primary.querySelector('.fb-doc-notes-color-control');
-    const original = primary.querySelector('.fb-doc-original-btn');
-    assert.ok(picker && control && original, 'PPTX primary toolbar exposes the notes picker and original-file action');
+    const overflow = primary.querySelector('.fb-doc-overflow-btn');
+    const overflowMenu = primary.querySelector('.fb-doc-overflow-menu');
+    assert.ok(picker && control && overflow && overflowMenu,
+      'PPTX primary toolbar exposes the notes picker and accessible presentation overflow');
+    assert.equal(primary.querySelector('.fb-doc-original-btn'), null,
+      'Desktop app is no longer exposed as a direct PPTX toolbar control');
+    assert.equal(primary.querySelector('.fb-doc-close-btn'), null,
+      'Close is no longer exposed as a direct PPTX toolbar control');
+    assert.equal(overflow.getAttribute('aria-haspopup'), 'menu');
+    assert.equal(overflow.getAttribute('aria-expanded'), 'false');
     assert.equal(picker.type, 'color', 'the browser/OS-native colour input is used');
     assert.equal(picker.getAttribute('aria-label'), 'Speaker notes text colour');
     assert.match(control.title, /Speaker notes text colour: #000000/, 'the control exposes its colour in a tooltip');
     assert.equal(picker.getAttribute('tabindex'), null, 'native keyboard focus is not suppressed');
     assert.equal(picker.value, '#000000');
-    assert.equal(primary.children.indexOf(control) + 1, primary.children.indexOf(original),
-      'the colour wheel sits immediately beside Download original/Desktop app');
+    assert.equal(primary.children.indexOf(control) + 1, primary.children.indexOf(overflow.parentElement),
+      'the colour wheel sits immediately beside the presentation overflow');
+    overflow.click();
+    assert.equal(overflow.getAttribute('aria-expanded'), 'true', 'the overflow reports its open state');
+    assert.equal(overflowMenu.hidden, false, 'the menu opens from the keyboard-accessible button');
+    assert.match(overflowMenu.textContent, /Present from beginning/);
+    assert.match(overflowMenu.textContent, /Close presentation/);
     assert.equal(control.hidden, false, 'the picker starts visible with speaker notes');
 
     picker.value = '#ff0000';
@@ -617,6 +688,120 @@ test('PPTX NOTES COLOUR: native wheel is beside Download, live, visibility-synch
     secondShell?.destroy();
     if (priorStorage === undefined) delete globalThis.localStorage;
     else globalThis.localStorage = priorStorage;
+  }
+});
+
+test('PPTX SLIDESHOW: dedicated projector surface mounts the live deck, hides notes, and restores it on exit', async () => {
+  const container = document.createElement('div');
+  const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+  shell._documentEngineOverrides = { pptx: fakePptxEngine() };
+  try {
+    await shell.initialize();
+    shell.render(container);
+    shell.addDocumentTab({ name: 'projector.pptx', bytes: new Uint8Array([1, 2, 3]) });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const tab = shell.getActiveTab();
+    assert.equal(tab.docState.showNotes, true, 'ordinary viewer starts with notes visible');
+
+    const started = await shell.startPptxSlideshow(tab.id, { fromBeginning: true });
+    assert.equal(started, true);
+    assert.ok(shell._pptxSlideshow?.active);
+    assert.ok(document.getElementById('yayra-pptx-slideshow'));
+    assert.equal(tab.docState.slideshowMode, true);
+    assert.equal(tab.docState.showNotes, false, 'projector starts with a clean slide');
+    assert.ok(shell._pptxSlideshow.host.querySelector('.fb-pptx-reader'), 'the existing PPTX deck is moved into the projector host');
+
+    shell._pptxSlideshow.setBlank('black');
+    assert.equal(shell._pptxSlideshow.blank.hidden, false);
+    shell._pptxSlideshow.setPointerMode('laser');
+    assert.equal(shell._pptxSlideshow.pointerMode, 'laser');
+    shell._pptxSlideshow.toggleHelp(true);
+    assert.equal(shell._pptxSlideshow.help.hidden, false);
+    let helpEscapePrevented = false;
+    shell._pptxSlideshow.handleKeyDown({
+      key: 'Escape', target: { tagName: 'DIV' },
+      preventDefault() { helpEscapePrevented = true; }, stopImmediatePropagation() {}
+    });
+    assert.equal(helpEscapePrevented, true);
+    assert.equal(shell._pptxSlideshow.help.hidden, true, 'first Escape closes shortcut help without ending the show');
+    assert.equal(shell._pptxSlideshow.active, true);
+
+    assert.equal(await shell.exitPptxSlideshow(), true);
+    assert.equal(shell._pptxSlideshow, null);
+    assert.equal(document.getElementById('yayra-pptx-slideshow'), null);
+    assert.equal(tab.docState.slideshowMode, false);
+    assert.equal(tab.docState.showNotes, true, 'normal-view notes choice is restored');
+    assert.ok(shell.viewportElement.querySelector('.fb-doc-host-pptx .fb-pptx-reader')
+      || shell.viewportElement.querySelector('.fb-pptx-reader'), 'the live deck returns to the normal viewer');
+  } finally {
+    shell.destroy();
+  }
+});
+
+test('PDF SLIDESHOW: live PDF pages use the projector, show one fitted page, and restore continuous reading', async () => {
+  const container = document.createElement('div');
+  const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+  shell._docEngineOverride = fakePdfjs({ pages: 3 });
+  try {
+    await shell.initialize();
+    shell.render(container);
+    shell.addDocumentTab({ name: 'briefing.pdf', bytes: new Uint8Array([1, 2, 3]) });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const tab = shell.getActiveTab();
+    const session = shell._documentViewerSessions.get(tab.id);
+    await session.viewer.setPage(2);
+    await session.viewer.setZoom(1.5);
+    assert.ok(shell.viewportElement.querySelector('.fb-doc-btn-present'), 'PDF toolbar offers presentation mode');
+
+    let prevented = false;
+    shell.handleGlobalKeyDown({
+      key: 'F5', shiftKey: true, ctrlKey: false, metaKey: false, altKey: false,
+      preventDefault() { prevented = true; }
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(prevented, true, 'Shift+F5 belongs to the PDF presentation instead of hard reload');
+    assert.equal(await shell.startPdfSlideshow(tab.id), true, 'the compatibility PDF entry point focuses the active show');
+    assert.equal(document.getElementById('yayra-pdf-slideshow'), shell._documentSlideshow.overlay);
+    assert.equal(shell._pptxSlideshow, shell._documentSlideshow, 'the previous private field remains a compatibility alias');
+    assert.ok(shell._documentSlideshow.overlay.classList.contains('is-pdf'));
+    assert.equal(tab.docState.slideshowMode, true);
+    assert.equal(tab.docState.page, 2, 'present-current keeps the selected PDF page');
+    assert.ok(shell._pptxSlideshow.host.querySelector('.fb-pdf-continuous-pages'),
+      'the live selectable PDF.js document moves into the projector host');
+    assert.equal(shell._pptxSlideshow.controls.querySelector('.fb-pptx-slideshow-notes'), null,
+      'PDF presentation does not invent speaker notes');
+    assert.match(shell._pptxSlideshow.navigator.textContent, /All pages/);
+    const projectedPages = shell._pptxSlideshow.host.querySelectorAll('.fb-pdf-page');
+    assert.equal(projectedPages.filter((page) => page.style.display !== 'none').length, 1,
+      'projector mode hides every continuous-reader page except the current page');
+    let disruptiveShortcutPrevented = false;
+    shell._documentSlideshow.handleKeyDown({
+      key: 'n', ctrlKey: true, shiftKey: true, metaKey: false, altKey: false,
+      target: { tagName: 'DIV' }, preventDefault() { disruptiveShortcutPrevented = true; }, stopImmediatePropagation() {}
+    });
+    assert.equal(disruptiveShortcutPrevented, true,
+      'PDF mode suppresses the PowerPoint-only notes chord instead of opening a browser window');
+    shell._documentSlideshow.handleKeyDown({
+      key: 'ArrowRight', target: { tagName: 'BUTTON' },
+      preventDefault() {}, stopImmediatePropagation() {}
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(tab.docState.page, 3, 'navigation still works after a projector control receives focus');
+    shell._pptxSlideshow.setBlank('white');
+    assert.equal(shell._pptxSlideshow.blank.hidden, false);
+    shell._pptxSlideshow.setPointerMode('pen');
+    assert.equal(shell._pptxSlideshow.pointerMode, 'pen');
+
+    assert.equal(await shell.exitDocumentSlideshow(), true);
+    assert.equal(document.getElementById('yayra-pdf-slideshow'), null);
+    assert.equal(tab.docState.slideshowMode, false);
+    assert.equal(tab.docState.page, 3, 'the presented page becomes the restored reading position');
+    assert.equal(tab.docState.zoom, 1.5, 'the reader zoom is restored after presentation');
+    assert.ok(shell.viewportElement.querySelector('.fb-doc-host-pdf .fb-pdf-continuous-pages')
+      || shell.viewportElement.querySelector('.fb-pdf-continuous-pages'),
+    'the same live PDF returns to continuous reading without reloading');
+  } finally {
+    shell.destroy();
   }
 });
 

@@ -83,6 +83,63 @@ function searchMatches(text, query, page, limit = 500) {
   return out;
 }
 
+/**
+ * PowerPoint-style slideshow shortcut resolver shared by presentations and
+ * PDF page shows. It is deliberately pure so projector controls can be
+ * regression-tested without a DOM/fullscreen API. The historic PPTX export
+ * remains public for compatibility; resolveDocumentSlideshowShortcut below
+ * is the format-neutral name used by the shell.
+ */
+export function resolvePptxSlideshowShortcut(event, { digitBuffer = '' } = {}) {
+  if (!event) return null;
+  const key = String(event.key || '');
+  const lower = key.toLocaleLowerCase();
+  const tag = String(event?.target?.tagName || '').toUpperCase();
+  const mediaOrTyping = ['INPUT', 'TEXTAREA', 'SELECT', 'VIDEO', 'AUDIO'].includes(tag)
+    || Boolean(event?.target?.isContentEditable);
+  const nativeActivation = ['BUTTON', 'A'].includes(tag) && (key === ' ' || key === 'Enter');
+  if ((mediaOrTyping && key !== 'Escape') || nativeActivation) return null;
+
+  if (key === 'Escape') return { action: 'exit', digitBuffer: '' };
+  if (key === 'F1') return { action: 'help', digitBuffer };
+  if (key === 'F5' && !event.ctrlKey && !event.metaKey && !event.altKey) {
+    return { action: event.shiftKey ? 'current' : 'first', digitBuffer: '' };
+  }
+  if (event.altKey && key === 'F5') return { action: 'notes', digitBuffer };
+  if ((event.ctrlKey || event.metaKey) && !event.altKey) {
+    if (lower === 'l') return { action: 'laser', digitBuffer };
+    if (lower === 'p') return { action: 'pen', digitBuffer };
+    if (lower === 'a') return { action: 'pointer', digitBuffer };
+    if (lower === 'h') return { action: 'hide-pointer', digitBuffer };
+    if (event.shiftKey && lower === 'n') return { action: 'notes', digitBuffer };
+    return null;
+  }
+  if (event.ctrlKey || event.metaKey || event.altKey) return null;
+
+  if (/^[0-9]$/.test(key)) {
+    return { action: 'digits', digitBuffer: `${digitBuffer}${key}`.replace(/^0+(?=\d)/, '').slice(0, 5) || '0' };
+  }
+  if (key === 'Enter' && digitBuffer) return { action: 'jump', slide: Number(digitBuffer), digitBuffer: '' };
+  if (key === 'Backspace' && digitBuffer) return { action: 'digits', digitBuffer: digitBuffer.slice(0, -1) };
+  if (['ArrowRight', 'ArrowDown', 'PageDown', ' ', 'Enter'].includes(key) || lower === 'n' || lower === 'h') {
+    return { action: 'next', digitBuffer: '' };
+  }
+  if (['ArrowLeft', 'ArrowUp', 'PageUp', 'Backspace'].includes(key) || lower === 'p') {
+    return { action: 'previous', digitBuffer: '' };
+  }
+  if (key === 'Home') return { action: 'first', digitBuffer: '' };
+  if (key === 'End') return { action: 'last', digitBuffer: '' };
+  if (lower === 'b' || key === '.') return { action: 'black', digitBuffer };
+  if (lower === 'w' || key === ',') return { action: 'white', digitBuffer };
+  if (lower === 'e') return { action: 'erase', digitBuffer };
+  if (lower === 'a') return { action: 'pointer', digitBuffer };
+  if (lower === 'g' || key === '-') return { action: 'navigator', digitBuffer };
+  if (lower === 's') return { action: 'notes', digitBuffer };
+  return null;
+}
+
+export const resolveDocumentSlideshowShortcut = resolvePptxSlideshowShortcut;
+
 function handleCommonKeys(event, controller, state, { canRotate = false, canNight = false } = {}) {
   if (!event || isTypingTarget(event)) return null;
   const key = String(event.key || '');
@@ -188,8 +245,11 @@ export function createPptxViewer({
   function fitScale(mode = viewerState.zoomMode || 'fit-width') {
     if (!deck) return viewerState.zoom || 1;
     const box = host?.parentElement || host;
-    const availableWidth = Math.max(220, Number(box?.clientWidth || host?.clientWidth || 1000) - 42);
-    const availableHeight = Math.max(180, Number(box?.clientHeight || host?.clientHeight || 700) - (viewerState.showNotes ? 170 : 34));
+    const presenting = Boolean(host?.classList?.contains?.('fb-pptx-slideshow-host'));
+    // In slideshow mode notes float over the projector surface; they must not
+    // shrink the slide. The normal reader still reserves a notes row.
+    const availableWidth = Math.max(220, Number(box?.clientWidth || host?.clientWidth || 1000) - (presenting ? 8 : 42));
+    const availableHeight = Math.max(180, Number(box?.clientHeight || host?.clientHeight || 700) - (presenting ? 8 : (viewerState.showNotes ? 170 : 34)));
     if (mode === 'fit-page') return clamp(Math.min(availableWidth / deck.slideWidth, availableHeight / deck.slideHeight), MIN_ZOOM, MAX_ZOOM);
     if (mode === 'fit-width') return clamp(availableWidth / deck.slideWidth, MIN_ZOOM, MAX_ZOOM);
     return clamp(viewerState.zoom || 1, MIN_ZOOM, MAX_ZOOM);
@@ -910,11 +970,16 @@ export function createUnsupportedViewer({ container, state, fileName = 'document
     const card = doc.createElement('div');
     card.style.cssText = 'width:min(520px,100%);padding:28px;border:1px solid var(--fb-border-glass,rgba(255,255,255,.12));border-radius:16px;background:var(--fb-bg-elevated,#141824);color:var(--fb-text-primary,#e2e8f0);box-shadow:0 16px 50px rgba(0,0,0,.35);text-align:center;';
     const title = doc.createElement('h2'); title.textContent = 'This original file needs a desktop app'; title.style.cssText = 'margin:0 0 10px;font-size:1.1rem;';
-    const copy = doc.createElement('p'); copy.textContent = `${fileName} is an older binary Office format. Yayra will not pretend to render it or leave you on a loading screen.`; copy.style.cssText = 'margin:0;color:var(--fb-text-secondary,#a8b0bf);line-height:1.55;';
+    const legacyOffice = /\.(?:doc|ppt)$/i.test(String(fileName || ''));
+    const copy = doc.createElement('p');
+    copy.textContent = legacyOffice
+      ? `${fileName} is an older binary Office format. Yayra will not pretend to render it or leave you on a loading screen.`
+      : `${fileName} does not have a safe built-in Yayra viewer. Open the unchanged original with its desktop app.`;
+    copy.style.cssText = 'margin:0;color:var(--fb-text-secondary,#a8b0bf);line-height:1.55;';
     card.appendChild(title); card.appendChild(copy);
     if (typeof onOpenOriginal === 'function') {
       const button = doc.createElement('button');
-      button.type = 'button'; button.textContent = 'Open original with a desktop app';
+      button.type = 'button'; button.textContent = 'Open original or save unchanged file';
       button.style.cssText = 'margin-top:18px;border:0;border-radius:9px;padding:9px 14px;background:var(--fb-accent-primary,#6d5df2);color:white;font-weight:700;cursor:pointer;';
       button.addEventListener('click', onOpenOriginal);
       card.appendChild(button);

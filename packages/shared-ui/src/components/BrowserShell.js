@@ -25,12 +25,11 @@ import {
   createViewerForKind,
   DEFAULT_PPTX_NOTES_COLOR,
   normalizePptxNotesColor,
-  DOCUMENT_ACCEPT,
+  resolveDocumentSlideshowShortcut,
   DOCUMENT_ENGINES,
   DocumentStore,
   MAX_DOCUMENT_BYTES,
-  routeDocument,
-  sniffDocumentKind
+  routeDocument
 } from '../services/documentWorkspace.js';
 import { PasswordManager } from '../../../persistence/src/PasswordManager.js';
 import { PasskeyService } from '../services/passkeyService.js';
@@ -316,6 +315,16 @@ export class BrowserShell {
       // than showing fake placeholder downloads.
       downloadsItems: [],
       downloadRoot: null,
+      // Trusted desktop document catalog metadata. Source paths never enter
+      // this state; web/PWA session entries use a separate `session-*` id.
+      documentsItems: [],
+      documentsLoading: false,
+      documentsSearchQuery: '',
+      documentsTypeFilter: 'all',
+      documentsDateFilter: 'all',
+      documentsSizeFilter: 'all',
+      documentsSort: 'opened',
+      documentsSortDirection: 'desc',
       // System-wide floating overlay bubble (see electron/overlayWindow.cjs).
       // These mirror the Electron-side defaults so the UI shows sane values
       // even before overlayBridge.getSettings() resolves.
@@ -385,8 +394,19 @@ export class BrowserShell {
         readerPinned: true,
         readerSpeechRate: 1,
         readerVoice: '',
-        // Per-profile preference for the native PPTX speaker-notes picker.
+        // Per-profile preferences for documents and presentation mode. The
+        // desktop catalog itself is app-wide and path-isolated in Electron;
+        // these fields control only how this profile presents/manages it.
         pptxNotesColor: DEFAULT_PPTX_NOTES_COLOR,
+        pptxSlideshowFullscreen: true,
+        pptxSlideshowAutoHideControls: true,
+        documentsDefaultSort: 'opened',
+        documentsDefaultSortDirection: 'desc',
+        documentsDefaultType: 'all',
+        documentsDefaultDate: 'all',
+        documentsDefaultSize: 'all',
+        documentsShowMissing: true,
+        documentsRetentionDays: 0,
         floatingEnabledByDefault: true,
         startFloatingOnLaunch: true,
         alwaysOnTop: true,
@@ -1080,9 +1100,10 @@ export class BrowserShell {
     try {
       const docBridge = this.systemBridge && this.systemBridge.documents;
       if (docBridge && typeof docBridge.onOpenPdfFile === 'function') {
-        this._unsubscribeOpenPdfFile = docBridge.onOpenPdfFile(({ name, data } = {}) => {
+        this._unsubscribeOpenPdfFile = docBridge.onOpenPdfFile(({ name, data, libraryId } = {}) => {
           if (!data) return;
-          this.addDocumentTab({ name: name || 'document.pdf', bytes: data });
+          this.addDocumentTab({ name: name || 'document.pdf', bytes: data, libraryId });
+          void this.refreshDocumentLibrary({ render: false });
         });
       }
     } catch { /* optional bridge */ }
@@ -1109,6 +1130,43 @@ export class BrowserShell {
     this.state.settings.pptxNotesColor = normalizePptxNotesColor(
       this.state.settings.pptxNotesColor
     );
+    // Normalize legacy combined sort values (recent/oldest/largest/smallest)
+    // into independent field + direction controls. This keeps upgraded
+    // profiles behaving the same while allowing every sort to run both ways.
+    const storedDocumentSort = String(this.state.settings.documentsDefaultSort || 'opened');
+    const documentSortAliases = {
+      recent: 'opened', oldest: 'opened', largest: 'size', smallest: 'size'
+    };
+    this.state.documentsSort = ['opened', 'name', 'type', 'size', 'frequent'].includes(documentSortAliases[storedDocumentSort] || storedDocumentSort)
+      ? (documentSortAliases[storedDocumentSort] || storedDocumentSort)
+      : 'opened';
+    this.state.documentsSortDirection = ['oldest', 'smallest'].includes(storedDocumentSort)
+      ? 'asc'
+      : (this.state.settings.documentsDefaultSortDirection === 'asc' ? 'asc' : 'desc');
+    this.state.settings.documentsDefaultSort = this.state.documentsSort;
+    this.state.settings.documentsDefaultSortDirection = this.state.documentsSortDirection;
+    const savedDocumentType = String(this.state.settings.documentsDefaultType || 'all');
+    const savedDocumentDate = String(this.state.settings.documentsDefaultDate || 'all');
+    const savedDocumentSize = String(this.state.settings.documentsDefaultSize || 'all');
+    this.state.documentsTypeFilter = ['all', 'pdf', 'presentation', 'document', 'spreadsheet', 'image', 'text', 'archive', 'other'].includes(savedDocumentType)
+      ? savedDocumentType : 'all';
+    this.state.documentsDateFilter = ['all', 'today', 'week', 'month', 'year'].includes(savedDocumentDate)
+      ? savedDocumentDate : 'all';
+    this.state.documentsSizeFilter = ['all', 'under-1mb', '1mb-10mb', '10mb-100mb', '100mb-300mb', 'over-300mb'].includes(savedDocumentSize)
+      ? savedDocumentSize : 'all';
+    this.state.settings.documentsDefaultType = this.state.documentsTypeFilter;
+    this.state.settings.documentsDefaultDate = this.state.documentsDateFilter;
+    this.state.settings.documentsDefaultSize = this.state.documentsSizeFilter;
+    // Load safe catalog metadata in the background. Apply the user's
+    // retention policy first; pruning removes catalog rows only, never files.
+    const documentsRetentionDays = Math.max(0, Number(this.state.settings.documentsRetentionDays) || 0);
+    if (documentsRetentionDays > 0 && typeof this.systemBridge?.documents?.prune === 'function') {
+      Promise.resolve(this.systemBridge.documents.prune(documentsRetentionDays))
+        .then(() => this.refreshDocumentLibrary({ render: false }))
+        .catch(() => this.refreshDocumentLibrary({ render: false }));
+    } else {
+      void this.refreshDocumentLibrary({ render: false });
+    }
     // v1 live-sites policy: old profiles may carry the previous default
     // `backgroundTabThrottling:true`, but they have no keepSitesLive key.
     // The new positive setting defaults to true, so existing installs also
@@ -2738,6 +2796,17 @@ export class BrowserShell {
     });
     toolbarActions.appendChild(dlBtn);
 
+    // Local Documents hub sits directly beside Downloads. It is a full
+    // library page (not another transient dropdown), so filtering and file
+    // management stay usable even with thousands of remembered originals.
+    const documentsBtn = document.createElement('button');
+    documentsBtn.className = 'fb-action-btn fb-btn-documents fb-toolbar-documents-btn fb-toolbar-action-btn';
+    documentsBtn.setAttribute('title', 'Documents');
+    documentsBtn.setAttribute('aria-label', 'Open Documents library');
+    documentsBtn.innerHTML = Icons.document;
+    documentsBtn.addEventListener('click', () => this.openInternalPage('yayra://documents'));
+    toolbarActions.appendChild(documentsBtn);
+
     // Requirement 10: Extensions & Shields Button (Transparent, Compact, Matching Star Size)
     const extBtn = document.createElement('button');
     extBtn.className = 'fb-action-btn fb-btn-extensions fb-toolbar-extensions-btn fb-toolbar-action-btn';
@@ -2905,6 +2974,8 @@ export class BrowserShell {
     safariTabbar.className = 'fb-mobile-safari-tabbar';
     const topActions = [
       { className: 'fb-mobile-tab-overview', icon: Icons.tabs, title: 'Show all tabs', action: () => this.openModal('tab-switcher') },
+      { className: 'fb-mobile-tab-downloads', icon: Icons.download, title: 'Downloads', action: () => this.openInternalPage('yayra://downloads') },
+      { className: 'fb-mobile-tab-documents', icon: Icons.document, title: 'Documents', action: () => this.openInternalPage('yayra://documents') },
       { className: 'fb-mobile-tab-bookmarks', icon: Icons.bookmark, title: 'Bookmarks', action: () => this.openInternalPage('yayra://bookmarks') },
       { className: 'fb-mobile-tab-privacy', icon: Icons.shield, title: 'Privacy and shields', action: () => this.openInternalPage('yayra://permissions') },
       { className: 'fb-mobile-tab-history', icon: Icons.history, title: 'History', action: () => this.openInternalPage('yayra://history') }
@@ -3144,6 +3215,8 @@ export class BrowserShell {
       this.renderInternalBookmarksPage(viewport, activeTab);
     } else if (url === 'yayra://downloads') {
       this.renderInternalDownloadsPage(viewport, activeTab);
+    } else if (url === 'yayra://documents') {
+      this.renderInternalDocumentsPage(viewport, activeTab);
     } else if (url === 'yayra://passwords') {
       this.renderInternalPasswordsPage(viewport, activeTab);
     } else if (url === 'yayra://extensions') {
@@ -6577,6 +6650,9 @@ export class BrowserShell {
         <button class="fb-settings-nav-item ${activeCat === 'downloads' ? 'active' : ''}" data-cat="downloads" data-category="downloads">
           ${Icons.download} <span>Downloads</span>
         </button>
+        <button class="fb-settings-nav-item ${activeCat === 'documents' ? 'active' : ''}" data-cat="documents" data-category="documents">
+          ${Icons.document} <span>Documents</span>
+        </button>
         <button class="fb-settings-nav-item ${activeCat === 'extensions' ? 'active' : ''}" data-cat="extensions" data-category="extensions">
           ${Icons.shield} <span>Extensions & Shields</span>
         </button>
@@ -7023,6 +7099,7 @@ export class BrowserShell {
               <div class="fb-shortcut-row"><span>Hard reload (clear this site's cache)</span><kbd>Ctrl+Shift+R</kbd> <span class="fb-shortcut-alt">or</span> <kbd>Ctrl+F5</kbd></div>
               <div class="fb-shortcut-row"><span>History</span><kbd>Ctrl+H</kbd></div>
               <div class="fb-shortcut-row"><span>Downloads</span><kbd>Ctrl+J</kbd></div>
+              <div class="fb-shortcut-row"><span>Open a local file</span><kbd>Ctrl+O</kbd></div>
               <div class="fb-shortcut-row"><span>Find in page</span><kbd>Ctrl+F</kbd></div>
               <div class="fb-shortcut-row"><span>Open tab groups</span><kbd>Ctrl+Shift+G</kbd></div>
               <div class="fb-shortcut-row"><span>Stop loading / close menus &amp; overlays</span><kbd>Esc</kbd></div>
@@ -7053,6 +7130,94 @@ export class BrowserShell {
               <button class="fb-btn fb-btn-secondary fb-in-set-dl-choose-root" ${this.downloadsBridge ? '' : 'disabled'}>Change…</button>
             </div>
             <p style="font-size:0.78rem; color:var(--fb-text-muted); margin:0;">Every new download is saved here. ${this.downloadsBridge ? '' : 'Picking a custom folder (e.g. an external drive) requires the Yayra desktop app.'}</p>
+          </section>
+
+          <!-- Documents -->
+          <section class="fb-settings-group-card" id="sec-documents" style="${activeCat === 'documents' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
+            <h3 class="fb-settings-group-title">${Icons.document} Documents</h3>
+            <p>Control the Documents hub and presentation defaults. The desktop catalog is shared by Yayra windows on this device. Source locations stay only in the trusted desktop process; ordinary page and tab state receives opaque ids, never filesystem paths.</p>
+            <div class="fb-setting-row">
+              <label for="fb-in-documents-sort">Default sort field</label>
+              <select id="fb-in-documents-sort" class="fb-select">
+                <option value="opened" ${this.state.documentsSort === 'opened' ? 'selected' : ''}>Date opened</option>
+                <option value="name" ${this.state.documentsSort === 'name' ? 'selected' : ''}>Name</option>
+                <option value="type" ${this.state.documentsSort === 'type' ? 'selected' : ''}>File type</option>
+                <option value="size" ${this.state.documentsSort === 'size' ? 'selected' : ''}>File size</option>
+                <option value="frequent" ${this.state.documentsSort === 'frequent' ? 'selected' : ''}>Times opened</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-documents-sort-direction">Default sort direction</label>
+              <select id="fb-in-documents-sort-direction" class="fb-select">
+                <option value="desc" ${this.state.documentsSortDirection !== 'asc' ? 'selected' : ''}>Descending</option>
+                <option value="asc" ${this.state.documentsSortDirection === 'asc' ? 'selected' : ''}>Ascending</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-documents-type">Default file-type filter</label>
+              <select id="fb-in-documents-type" class="fb-select">
+                <option value="all" ${(this.state.settings.documentsDefaultType || 'all') === 'all' ? 'selected' : ''}>All types</option>
+                <option value="pdf" ${this.state.settings.documentsDefaultType === 'pdf' ? 'selected' : ''}>PDF</option>
+                <option value="presentation" ${this.state.settings.documentsDefaultType === 'presentation' ? 'selected' : ''}>Presentations</option>
+                <option value="document" ${this.state.settings.documentsDefaultType === 'document' ? 'selected' : ''}>Documents</option>
+                <option value="spreadsheet" ${this.state.settings.documentsDefaultType === 'spreadsheet' ? 'selected' : ''}>Spreadsheets</option>
+                <option value="image" ${this.state.settings.documentsDefaultType === 'image' ? 'selected' : ''}>Images</option>
+                <option value="text" ${this.state.settings.documentsDefaultType === 'text' ? 'selected' : ''}>Text</option>
+                <option value="archive" ${this.state.settings.documentsDefaultType === 'archive' ? 'selected' : ''}>Archives</option>
+                <option value="other" ${this.state.settings.documentsDefaultType === 'other' ? 'selected' : ''}>Other</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-documents-date">Default opening-date filter</label>
+              <select id="fb-in-documents-date" class="fb-select">
+                <option value="all" ${(this.state.settings.documentsDefaultDate || 'all') === 'all' ? 'selected' : ''}>Any time</option>
+                <option value="today" ${this.state.settings.documentsDefaultDate === 'today' ? 'selected' : ''}>Today</option>
+                <option value="week" ${this.state.settings.documentsDefaultDate === 'week' ? 'selected' : ''}>Last 7 days</option>
+                <option value="month" ${this.state.settings.documentsDefaultDate === 'month' ? 'selected' : ''}>Last 30 days</option>
+                <option value="year" ${this.state.settings.documentsDefaultDate === 'year' ? 'selected' : ''}>Last year</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-documents-size">Default file-size filter</label>
+              <select id="fb-in-documents-size" class="fb-select">
+                <option value="all" ${(this.state.settings.documentsDefaultSize || 'all') === 'all' ? 'selected' : ''}>Any size</option>
+                <option value="under-1mb" ${this.state.settings.documentsDefaultSize === 'under-1mb' ? 'selected' : ''}>Under 1 MB</option>
+                <option value="1mb-10mb" ${this.state.settings.documentsDefaultSize === '1mb-10mb' ? 'selected' : ''}>1–10 MB</option>
+                <option value="10mb-100mb" ${this.state.settings.documentsDefaultSize === '10mb-100mb' ? 'selected' : ''}>10–100 MB</option>
+                <option value="100mb-300mb" ${this.state.settings.documentsDefaultSize === '100mb-300mb' ? 'selected' : ''}>100–300 MB</option>
+                <option value="over-300mb" ${this.state.settings.documentsDefaultSize === 'over-300mb' ? 'selected' : ''}>Over 300 MB</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-documents-retention">History retention</label>
+              <select id="fb-in-documents-retention" class="fb-select">
+                <option value="0" ${Number(this.state.settings.documentsRetentionDays || 0) === 0 ? 'selected' : ''}>Keep until I clear it</option>
+                <option value="30" ${Number(this.state.settings.documentsRetentionDays) === 30 ? 'selected' : ''}>30 days</option>
+                <option value="90" ${Number(this.state.settings.documentsRetentionDays) === 90 ? 'selected' : ''}>90 days</option>
+                <option value="365" ${Number(this.state.settings.documentsRetentionDays) === 365 ? 'selected' : ''}>1 year</option>
+              </select>
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Show moved or unavailable files</strong><p>Keep missing entries visible with a Locate action instead of silently hiding them.</p></div>
+              <input type="checkbox" id="fb-in-documents-show-missing" ${this.state.settings.documentsShowMissing !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Start slideshows in true fullscreen</strong><p>Use the entire display for a projector when browser fullscreen permission is available.</p></div>
+              <input type="checkbox" id="fb-in-pptx-fullscreen" ${this.state.settings.pptxSlideshowFullscreen !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Auto-hide slideshow controls</strong><p>Hide projector controls after a short idle period; move the pointer to bring them back.</p></div>
+              <input type="checkbox" id="fb-in-pptx-autohide" ${this.state.settings.pptxSlideshowAutoHideControls !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-documents-settings-privacy">
+              <strong>What Clear does</strong>
+              <p>Removing or clearing history deletes only Yayra’s catalog metadata. It never deletes, moves, renames, uploads, or rewrites your original files.</p>
+            </div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+              <button class="fb-btn fb-btn-primary fb-in-open-documents">Open Documents hub</button>
+              <button class="fb-btn fb-btn-secondary fb-in-documents-clear-missing">Remove unavailable entries</button>
+              <button class="fb-btn fb-btn-danger fb-in-documents-clear">Clear Documents history</button>
+            </div>
           </section>
 
           <!-- Extensions -->
@@ -7237,10 +7402,42 @@ export class BrowserShell {
     bindSelect('#fb-in-set-theme', (v) => { this.state.settings.theme = v || 'dark'; });
     bindSelect('#fb-in-set-color-theme', (v) => { this.state.settings.colorTheme = v || 'blue'; });
     bindSelect('#fb-in-set-engine', (v) => { if (v) this.state.settings.searchEngine = v; });
+    bindSelect('#fb-in-documents-sort', (v) => {
+      this.state.settings.documentsDefaultSort = v || 'opened';
+      this.state.documentsSort = this.state.settings.documentsDefaultSort;
+    });
+    bindSelect('#fb-in-documents-sort-direction', (v) => {
+      this.state.settings.documentsDefaultSortDirection = v === 'asc' ? 'asc' : 'desc';
+      this.state.documentsSortDirection = this.state.settings.documentsDefaultSortDirection;
+    });
+    bindSelect('#fb-in-documents-type', (v) => {
+      this.state.settings.documentsDefaultType = v || 'all';
+      this.state.documentsTypeFilter = this.state.settings.documentsDefaultType;
+    });
+    bindSelect('#fb-in-documents-date', (v) => {
+      this.state.settings.documentsDefaultDate = v || 'all';
+      this.state.documentsDateFilter = this.state.settings.documentsDefaultDate;
+    });
+    bindSelect('#fb-in-documents-size', (v) => {
+      this.state.settings.documentsDefaultSize = v || 'all';
+      this.state.documentsSizeFilter = this.state.settings.documentsDefaultSize;
+    });
+    bindSelect('#fb-in-documents-retention', (v) => {
+      const days = Math.max(0, Number(v) || 0);
+      this.state.settings.documentsRetentionDays = days;
+      if (days > 0) {
+        Promise.resolve(this.systemBridge?.documents?.prune?.(days))
+          .then(() => this.refreshDocumentLibrary({ render: false }))
+          .catch(() => {});
+      }
+    });
 
     bindToggle('#fb-in-set-https', (on) => { this.state.settings.httpsFirst = on; });
     bindToggle('#fb-in-set-adblock', (on) => { this.state.settings.adBlockEnabled = on; });
     bindToggle('#fb-in-set-restore-session', (on) => { this.state.settings.restoreSessionOnLaunch = on; });
+    bindToggle('#fb-in-documents-show-missing', (on) => { this.state.settings.documentsShowMissing = on; });
+    bindToggle('#fb-in-pptx-fullscreen', (on) => { this.state.settings.pptxSlideshowFullscreen = on; });
+    bindToggle('#fb-in-pptx-autohide', (on) => { this.state.settings.pptxSlideshowAutoHideControls = on; });
     // (Chrome-style keep-alive: loaded pages are never auto-refreshed -
     // see mountPooledWebFrame(). The old auto-refresh toggle is gone.)
     bindToggle('#fb-in-set-floating-default', (on) => { this.state.settings.floatingEnabledByDefault = on; });
@@ -7353,6 +7550,16 @@ export class BrowserShell {
         this.state.downloadRoot = result.root;
         this.render();
       }
+    });
+
+    page.querySelector('.fb-in-open-documents')?.addEventListener('click', () => {
+      this.openInternalPage('yayra://documents');
+    });
+    page.querySelector('.fb-in-documents-clear-missing')?.addEventListener('click', () => {
+      void this.clearDocumentLibrary({ missingOnly: true });
+    });
+    page.querySelector('.fb-in-documents-clear')?.addEventListener('click', () => {
+      void this.clearDocumentLibrary();
     });
 
     page.querySelector('.fb-in-jump-passwords')?.addEventListener('click', () => {
@@ -11451,7 +11658,7 @@ export class BrowserShell {
     const tab = this.getActiveTab();
     if (!tab) return false;
     const url = String(tab.url || '');
-    const livePages = ['yayra://history', 'yayra://bookmarks', 'yayra://downloads', 'yayra://newtab'];
+    const livePages = ['yayra://history', 'yayra://bookmarks', 'yayra://downloads', 'yayra://documents', 'yayra://newtab'];
     if (!livePages.some((p) => url === p || url.startsWith(`${p}?`))) return false;
     // Never repaint over an open menu/modal/find bar - and never yank
     // the cursor out from under someone typing (e.g. the history search).
@@ -11700,6 +11907,7 @@ export class BrowserShell {
         </div>
         <div class="fb-toolbar-actions">
           <button class="fb-action-btn fb-toolbar-action-btn fb-mini-download-btn" title="Downloads" aria-label="Downloads">${Icons.download}</button>
+          <button class="fb-action-btn fb-toolbar-action-btn fb-mini-documents-btn" title="Documents" aria-label="Documents">${Icons.document}</button>
           <button class="fb-action-btn fb-toolbar-action-btn fb-mini-extensions-btn" title="Extensions and Shields" aria-label="Extensions and Shields">${Icons.shield}</button>
           ${this.authBridge ? `<button class="fb-action-btn fb-toolbar-action-btn fb-account-btn fb-mini-account-btn" title="Yayra account" aria-label="Account">${this.renderAccountAvatarHtml(this.state.googleAccount?.signedIn ? this.state.googleAccount.profile : null, 22)}</button>` : ''}
           <button class="fb-action-btn fb-menu-btn fb-toolbar-action-btn fb-mini-drawer-btn" title="Customize and control Yayra" aria-label="Main menu">${Icons.moreVertical}</button>
@@ -11755,6 +11963,10 @@ export class BrowserShell {
 
     win.querySelector('.fb-mini-download-btn')?.addEventListener('click', () => {
       this.openInternalPage('yayra://downloads');
+    });
+
+    win.querySelector('.fb-mini-documents-btn')?.addEventListener('click', () => {
+      this.openInternalPage('yayra://documents');
     });
 
     win.querySelector('.fb-mini-extensions-btn')?.addEventListener('click', () => {
@@ -11843,6 +12055,8 @@ export class BrowserShell {
         this.renderInternalBookmarksPage(miniViewport, activeTab);
       } else if (url === 'yayra://downloads') {
         this.renderInternalDownloadsPage(miniViewport, activeTab);
+      } else if (url === 'yayra://documents') {
+        this.renderInternalDocumentsPage(miniViewport, activeTab);
       } else if (url === 'yayra://passwords') {
         this.renderInternalPasswordsPage(miniViewport, activeTab);
       } else if (url === 'yayra://extensions') {
@@ -13376,8 +13590,9 @@ export class BrowserShell {
           </div>
         </div>
 
-        <!-- 4. Downloads -->
+        <!-- 4. Downloads and local Documents -->
         <button class="fb-drawer-item fb-dr-downloads">${Icons.download} <span>Downloads</span> <kbd>Ctrl+J</kbd></button>
+        <button class="fb-drawer-item fb-dr-documents">${Icons.document} <span>Documents</span></button>
 
         <!-- 5. Bookmarks & Lists with Submenu -->
         <div class="fb-drawer-item-has-submenu">
@@ -13786,6 +14001,11 @@ export class BrowserShell {
     drawer.querySelector('.fb-dr-downloads')?.addEventListener('click', () => {
       this.state.isSideDrawerOpen = false;
       this.openInternalPage('yayra://downloads');
+    });
+
+    drawer.querySelector('.fb-dr-documents')?.addEventListener('click', () => {
+      this.state.isSideDrawerOpen = false;
+      this.openInternalPage('yayra://documents');
     });
 
     drawer.querySelector('.fb-dr-bookmarks')?.addEventListener('click', () => {
@@ -15530,6 +15750,10 @@ export class BrowserShell {
   closeTab(tabId) {
     const tabIndex = this.state.tabs.findIndex((t) => t.id === tabId);
     if (tabIndex === -1) return;
+    const activeDocumentShow = this._documentSlideshow || this._pptxSlideshow;
+    if (activeDocumentShow?.active && activeDocumentShow.tabId === tabId) {
+      void this.exitDocumentSlideshow();
+    }
 
     this.destroyNativeWebview(tabId);
     this._systemBrowserHandoffs.delete(tabId);
@@ -15547,6 +15771,8 @@ export class BrowserShell {
       if (this._activeDocViewer?.tabId === tabId) this._activeDocViewer = null;
       if (!this.state.tabs.some((tab) => tab.docId === closedTab.docId)) {
         this.documentStore?.remove(closedTab.docId);
+        const sessionEntry = this.state.documentsItems?.find?.((entry) => entry.source === 'session' && entry.docId === closedTab.docId);
+        if (sessionEntry) sessionEntry.available = false;
       }
     }
 
@@ -15952,6 +16178,7 @@ export class BrowserShell {
     if (trimmed === 'history') return 'yayra://history';
     if (trimmed === 'bookmarks') return 'yayra://bookmarks';
     if (trimmed === 'downloads') return 'yayra://downloads';
+    if (trimmed === 'documents' || trimmed === 'docs') return 'yayra://documents';
     if (trimmed === 'passwords') return 'yayra://passwords';
     if (trimmed === 'extensions') return 'yayra://extensions';
     if (trimmed === 'permissions') return 'yayra://permissions';
@@ -15992,6 +16219,8 @@ export class BrowserShell {
       }).catch(() => {});
     } else if (schemeUrl === 'yayra://bookmarks' && this.bookmarksRepo?.getAllBookmarks) {
       this.refreshBookmarksState().then(() => this.render()).catch(() => {});
+    } else if (schemeUrl === 'yayra://documents') {
+      void this.refreshDocumentLibrary();
     }
   }
 
@@ -17234,6 +17463,7 @@ export class BrowserShell {
     if (tab.url === 'yayra://history') return 'History';
     if (tab.url === 'yayra://bookmarks') return 'Bookmarks';
     if (tab.url === 'yayra://downloads') return 'Downloads';
+    if (tab.url === 'yayra://documents') return 'Documents';
     if (tab.url === 'yayra://passwords') return 'Passwords';
     if (tab.url === 'yayra://extensions') return 'Extensions';
     if (tab.url === 'yayra://permissions') return 'Site Permissions';
@@ -17249,8 +17479,479 @@ export class BrowserShell {
   }
 
   /* -------------------------------------------------------------
-   * LOCAL DOCUMENT WORKSPACE (Phase 1: PDF - docs/DOCUMENT_WORKSPACE.md)
+   * LOCAL DOCUMENT LIBRARY + WORKSPACE
    * ----------------------------------------------------------- */
+
+  documentCategoryForKind(kind) {
+    if (kind === 'pdf') return 'pdf';
+    if (kind === 'pptx') return 'presentation';
+    if (kind === 'docx') return 'document';
+    if (kind === 'xlsx') return 'spreadsheet';
+    if (kind === 'image') return 'image';
+    if (kind === 'text') return 'text';
+    return 'other';
+  }
+
+  rememberSessionDocument(doc) {
+    if (!doc) return;
+    const id = `session-${doc.id}`;
+    const existing = this.state.documentsItems.find((entry) => entry.id === id);
+    const entry = {
+      id,
+      docId: doc.id,
+      source: 'session',
+      name: doc.name,
+      extension: doc.extension || '',
+      category: this.documentCategoryForKind(doc.type),
+      size: doc.size || 0,
+      firstOpenedAt: doc.openedAt || Date.now(),
+      lastOpenedAt: doc.openedAt || Date.now(),
+      modifiedAt: 0,
+      openedCount: existing?.openedCount || 1,
+      available: true,
+      canOpenInYayra: true,
+      preferredAction: 'yayra'
+    };
+    this.state.documentsItems = [
+      entry,
+      ...this.state.documentsItems.filter((item) => item.id !== id)
+    ];
+  }
+
+  async refreshDocumentLibrary({ render = true } = {}) {
+    if (this._documentsRefreshPromise) return this._documentsRefreshPromise;
+    const bridge = this.systemBridge?.documents;
+    if (typeof bridge?.list !== 'function') {
+      this._documentsLoaded = true;
+      return this.state.documentsItems;
+    }
+    this.state.documentsLoading = true;
+    const task = Promise.resolve(bridge.list()).then((result) => {
+      if (result?.ok && Array.isArray(result.entries)) {
+        const sessionEntries = this.state.documentsItems.filter((entry) => entry.source === 'session');
+        const desktopEntries = result.entries.map((entry) => ({ ...entry, source: 'desktop' }));
+        this.state.documentsItems = [...desktopEntries, ...sessionEntries];
+      }
+      this._documentsLoaded = true;
+      return this.state.documentsItems;
+    }).catch(() => this.state.documentsItems).finally(() => {
+      this.state.documentsLoading = false;
+      this._documentsRefreshPromise = null;
+      if (render && this.getActiveTab()?.url === 'yayra://documents') this.render();
+    });
+    this._documentsRefreshPromise = task;
+    return task;
+  }
+
+  formatDocumentBytes(value) {
+    const bytes = Math.max(0, Number(value) || 0);
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(bytes < 10240 ? 1 : 0)} KB`;
+    if (bytes < 1024 ** 3) return `${(bytes / (1024 ** 2)).toFixed(bytes < 10 * 1024 ** 2 ? 1 : 0)} MB`;
+    return `${(bytes / (1024 ** 3)).toFixed(1)} GB`;
+  }
+
+  formatDocumentOpenedAt(value) {
+    const timestamp = Number(value) || 0;
+    if (!timestamp) return 'Unknown date';
+    const elapsed = Date.now() - timestamp;
+    if (elapsed >= 0 && elapsed < 60000) return 'Just now';
+    if (elapsed >= 0 && elapsed < 3600000) return `${Math.max(1, Math.floor(elapsed / 60000))} min ago`;
+    if (elapsed >= 0 && elapsed < 86400000) return `${Math.max(1, Math.floor(elapsed / 3600000))} hr ago`;
+    return new Date(timestamp).toLocaleString(undefined, {
+      year: new Date(timestamp).getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+    });
+  }
+
+  documentTypeLabel(entry) {
+    const labels = {
+      pdf: 'PDF', presentation: 'Presentation', document: 'Document',
+      spreadsheet: 'Spreadsheet', image: 'Image', text: 'Text',
+      archive: 'Archive', other: 'Other file'
+    };
+    return entry?.extension
+      ? `${labels[entry.category] || labels.other} · ${String(entry.extension).toLocaleUpperCase()}`
+      : (labels[entry?.category] || labels.other);
+  }
+
+  filteredDocumentLibraryEntries() {
+    const query = String(this.state.documentsSearchQuery || '').trim().toLocaleLowerCase();
+    const type = this.state.documentsTypeFilter || 'all';
+    const date = this.state.documentsDateFilter || 'all';
+    const sizeFilter = this.state.documentsSizeFilter || 'all';
+    const now = Date.now();
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    const thresholds = {
+      today: startOfToday.getTime(),
+      week: now - (7 * 86400000),
+      month: now - (30 * 86400000),
+      year: now - (365 * 86400000)
+    };
+    const showMissing = this.state.settings.documentsShowMissing !== false;
+    const entries = (this.state.documentsItems || []).filter((entry) => {
+      if (!showMissing && entry.available === false) return false;
+      if (query && !`${entry.name || ''} ${entry.extension || ''} ${entry.category || ''}`.toLocaleLowerCase().includes(query)) return false;
+      if (type !== 'all' && entry.category !== type) return false;
+      if (date !== 'all' && thresholds[date] && Number(entry.lastOpenedAt || 0) < thresholds[date]) return false;
+      const bytes = Math.max(0, Number(entry.size) || 0);
+      const mb = 1024 ** 2;
+      if (sizeFilter === 'under-1mb' && bytes >= mb) return false;
+      if (sizeFilter === '1mb-10mb' && (bytes < mb || bytes >= 10 * mb)) return false;
+      if (sizeFilter === '10mb-100mb' && (bytes < 10 * mb || bytes >= 100 * mb)) return false;
+      if (sizeFilter === '100mb-300mb' && (bytes < 100 * mb || bytes > 300 * mb)) return false;
+      if (sizeFilter === 'over-300mb' && bytes <= 300 * mb) return false;
+      return true;
+    });
+    const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+    const rawSort = this.state.documentsSort || 'opened';
+    const sort = ({ recent: 'opened', oldest: 'opened', largest: 'size', smallest: 'size' })[rawSort] || rawSort;
+    const direction = ['oldest', 'smallest'].includes(rawSort)
+      ? 'asc'
+      : (this.state.documentsSortDirection === 'asc' ? 'asc' : 'desc');
+    entries.sort((a, b) => {
+      let comparison = 0;
+      if (sort === 'name') comparison = collator.compare(a.name || '', b.name || '');
+      else if (sort === 'type') comparison = collator.compare(`${a.category}-${a.extension}`, `${b.category}-${b.extension}`);
+      else if (sort === 'size') comparison = Number(a.size || 0) - Number(b.size || 0);
+      else if (sort === 'frequent') comparison = Number(a.openedCount || 0) - Number(b.openedCount || 0);
+      else comparison = Number(a.lastOpenedAt || 0) - Number(b.lastOpenedAt || 0);
+      if (comparison === 0) comparison = collator.compare(a.name || '', b.name || '');
+      return direction === 'desc' ? -comparison : comparison;
+    });
+    return entries;
+  }
+
+  async openDocumentLibraryEntry(id, { external = false } = {}) {
+    const entry = this.state.documentsItems.find((item) => item.id === id);
+    if (!entry) return false;
+    if (entry.source === 'session') {
+      const doc = this.documentStore?.get(entry.docId);
+      const existing = this.state.tabs.find((tab) => tab.docId === entry.docId);
+      if (existing) {
+        this.switchTab(existing.id);
+        return true;
+      }
+      if (!doc) {
+        entry.available = false;
+        this.showTransientNotice('This browser-session file is no longer available. Choose it again to reopen it.');
+        this.render();
+        return false;
+      }
+      return Boolean(this.addDocumentTab({ name: doc.name, bytes: doc.bytes, mime: doc.mime }));
+    }
+    const bridge = this.systemBridge?.documents;
+    const fn = external || !entry.canOpenInYayra ? bridge?.openLibraryExternal : bridge?.reopen;
+    if (typeof fn !== 'function') {
+      this.showTransientNotice('Persistent reopening is available in the Yayra desktop app.');
+      return false;
+    }
+    try {
+      const result = await fn.call(bridge, id);
+      if (result?.ok && result.action === 'yayra' && result.data) {
+        this.addDocumentTab({
+          name: result.name || entry.name,
+          bytes: result.data,
+          libraryId: result.libraryId || id
+        });
+      } else if (result?.ok) {
+        this.showTransientNotice(`Opening \u201C${result.entry?.name || entry.name}\u201D with its desktop app…`);
+      } else {
+        if (result?.reason === 'unavailable' || result?.reason === 'not-found') entry.available = false;
+        this.showTransientNotice(result?.reason === 'file-too-large'
+          ? `Files larger than ${MAX_DOCUMENT_SIZE_MB} MB must open in a desktop app.`
+          : result?.reason === 'permission-denied'
+            ? 'Yayra no longer has permission to read this file.'
+            : result?.reason === 'unavailable'
+              ? 'This file was moved or is unavailable. Use Locate to reconnect it.'
+              : `Couldn\u2019t open this file${result?.reason ? ` (${result.reason})` : ''}.`);
+      }
+      await this.refreshDocumentLibrary({ render: false });
+      if (this.getActiveTab()?.url === 'yayra://documents') this.render();
+      return Boolean(result?.ok);
+    } catch {
+      this.showTransientNotice('Couldn\u2019t open this file.');
+      return false;
+    }
+  }
+
+  async locateDocumentLibraryEntry(id) {
+    const bridge = this.systemBridge?.documents;
+    if (typeof bridge?.locate !== 'function') return false;
+    const result = await bridge.locate(id);
+    if (result?.canceled) return false;
+    this.showTransientNotice(result?.ok ? 'Document location updated.' : `Couldn\u2019t reconnect the file${result?.reason ? ` (${result.reason})` : ''}.`);
+    await this.refreshDocumentLibrary();
+    return Boolean(result?.ok);
+  }
+
+  async removeDocumentLibraryEntry(id) {
+    const entry = this.state.documentsItems.find((item) => item.id === id);
+    if (!entry) return;
+    if (entry.source === 'desktop') await this.systemBridge?.documents?.remove?.(id);
+    this.state.documentsItems = this.state.documentsItems.filter((item) => item.id !== id);
+    this.render();
+  }
+
+  async clearDocumentLibrary({ missingOnly = false } = {}) {
+    const bridge = this.systemBridge?.documents;
+    if (missingOnly) {
+      await bridge?.clearMissing?.();
+      this.state.documentsItems = this.state.documentsItems.filter((entry) => entry.available !== false);
+      await this.refreshDocumentLibrary({ render: false });
+      this.showTransientNotice('Unavailable document entries removed.');
+      this.render();
+      return;
+    }
+    const approved = typeof confirm !== 'function' || confirm('Clear the Documents history? Your original files will not be deleted.');
+    if (!approved) return;
+    await bridge?.clear?.();
+    this.state.documentsItems = [];
+    this.showTransientNotice('Documents history cleared. Original files were not deleted.');
+    this.render();
+  }
+
+  renderInternalDocumentsPage(viewport) {
+    if (!this._documentsLoaded && !this._documentsRefreshPromise) void this.refreshDocumentLibrary();
+    const page = document.createElement('div');
+    page.className = 'fb-internal-page fb-documents-page';
+    const container = document.createElement('div');
+    container.className = 'fb-internal-container fb-documents-container';
+
+    const header = document.createElement('header');
+    header.className = 'fb-internal-header fb-documents-header';
+    const titleGroup = document.createElement('div');
+    titleGroup.className = 'fb-internal-title-group';
+    titleGroup.innerHTML = `<span class="fb-internal-icon">${Icons.document}</span><div><h1 class="fb-internal-title">Documents</h1><p class="fb-documents-subtitle">Every local file you open through Yayra, ready to reopen.</p></div>`;
+    const headerActions = document.createElement('div');
+    headerActions.className = 'fb-documents-header-actions';
+    const settingsButton = document.createElement('button');
+    settingsButton.type = 'button';
+    settingsButton.className = 'fb-btn fb-btn-secondary';
+    settingsButton.innerHTML = `${Icons.settings} Settings`;
+    settingsButton.addEventListener('click', () => {
+      this.state.settingsActiveCategory = 'documents';
+      this.state.activeSettingsCategory = 'documents';
+      this.openInternalPage('yayra://settings');
+    });
+    const openButton = document.createElement('button');
+    openButton.type = 'button';
+    openButton.className = 'fb-btn fb-btn-primary fb-documents-open-file';
+    openButton.innerHTML = `${Icons.plus} Open local file`;
+    openButton.addEventListener('click', () => this.openDocument());
+    headerActions.appendChild(settingsButton);
+    headerActions.appendChild(openButton);
+    header.appendChild(titleGroup);
+    header.appendChild(headerActions);
+    container.appendChild(header);
+
+    const safeEntries = this.state.documentsItems || [];
+    const availableCount = safeEntries.filter((entry) => entry.available !== false).length;
+    const missingCount = safeEntries.length - availableCount;
+    const totalBytes = safeEntries.reduce((sum, entry) => sum + (Number(entry.size) || 0), 0);
+    const summary = document.createElement('section');
+    summary.className = 'fb-documents-summary';
+    summary.innerHTML = `
+      <div><strong>${safeEntries.length}</strong><span>Remembered</span></div>
+      <div><strong>${availableCount}</strong><span>Available</span></div>
+      <div><strong>${this.formatDocumentBytes(totalBytes)}</strong><span>Indexed size</span></div>
+      <div class="${missingCount ? 'is-warning' : ''}"><strong>${missingCount}</strong><span>Unavailable</span></div>`;
+    container.appendChild(summary);
+
+    const toolbar = document.createElement('section');
+    toolbar.className = 'fb-documents-toolbar';
+    const searchWrap = document.createElement('label');
+    searchWrap.className = 'fb-internal-search fb-documents-search';
+    searchWrap.innerHTML = `<span class="fb-internal-search-icon">${Icons.search}</span>`;
+    const search = document.createElement('input');
+    search.type = 'search';
+    search.placeholder = 'Search files by name or type';
+    search.setAttribute('aria-label', 'Search Documents');
+    search.value = this.state.documentsSearchQuery || '';
+    search.addEventListener('input', (event) => {
+      this.state.documentsSearchQuery = event.target.value;
+      if (this._documentsSearchTimer) clearTimeout(this._documentsSearchTimer);
+      this._documentsSearchTimer = setTimeout(() => {
+        this._documentsSearchTimer = null;
+        this.render();
+        const next = this.viewportElement?.querySelector?.('.fb-documents-search input');
+        next?.focus?.();
+        if (next && typeof next.setSelectionRange === 'function') {
+          const end = next.value.length;
+          next.setSelectionRange(end, end);
+        }
+      }, 140);
+    });
+    searchWrap.appendChild(search);
+    const makeSelect = (label, value, options, onChange) => {
+      const wrap = document.createElement('label');
+      wrap.className = 'fb-documents-filter';
+      const text = document.createElement('span');
+      text.textContent = label;
+      const select = document.createElement('select');
+      select.className = 'fb-select';
+      select.setAttribute('aria-label', label);
+      for (const [optionValue, optionLabel] of options) {
+        const option = document.createElement('option');
+        option.value = optionValue;
+        option.textContent = optionLabel;
+        option.selected = optionValue === value;
+        select.appendChild(option);
+      }
+      select.addEventListener('change', () => onChange(select.value));
+      wrap.appendChild(text);
+      wrap.appendChild(select);
+      return wrap;
+    };
+    toolbar.appendChild(searchWrap);
+    toolbar.appendChild(makeSelect('Type', this.state.documentsTypeFilter, [
+      ['all', 'All types'], ['pdf', 'PDF'], ['presentation', 'Presentations'],
+      ['document', 'Documents'], ['spreadsheet', 'Spreadsheets'], ['image', 'Images'],
+      ['text', 'Text'], ['archive', 'Archives'], ['other', 'Other']
+    ], (value) => { this.state.documentsTypeFilter = value; this.render(); }));
+    toolbar.appendChild(makeSelect('Opened', this.state.documentsDateFilter, [
+      ['all', 'Any time'], ['today', 'Today'], ['week', 'Last 7 days'],
+      ['month', 'Last 30 days'], ['year', 'Last year']
+    ], (value) => { this.state.documentsDateFilter = value; this.render(); }));
+    toolbar.appendChild(makeSelect('Size', this.state.documentsSizeFilter, [
+      ['all', 'Any size'], ['under-1mb', 'Under 1 MB'], ['1mb-10mb', '1–10 MB'],
+      ['10mb-100mb', '10–100 MB'], ['100mb-300mb', '100–300 MB'],
+      ['over-300mb', 'Over 300 MB']
+    ], (value) => { this.state.documentsSizeFilter = value; this.render(); }));
+    toolbar.appendChild(makeSelect('Sort by', this.state.documentsSort, [
+      ['opened', 'Date opened'], ['name', 'Name'], ['type', 'File type'],
+      ['size', 'File size'], ['frequent', 'Times opened']
+    ], (value) => { this.state.documentsSort = value; this.render(); }));
+    toolbar.appendChild(makeSelect('Order', this.state.documentsSortDirection, [
+      ['desc', 'Descending'], ['asc', 'Ascending']
+    ], (value) => { this.state.documentsSortDirection = value === 'asc' ? 'asc' : 'desc'; this.render(); }));
+    container.appendChild(toolbar);
+
+    const privacy = document.createElement('div');
+    privacy.className = 'fb-documents-privacy-note';
+    privacy.innerHTML = `${Icons.shield}<span>${typeof this.systemBridge?.documents?.list === 'function'
+      ? '<strong>Private by design:</strong> source locations stay in Yayra’s trusted desktop process. This page receives no filesystem paths.'
+      : '<strong>Session library:</strong> browsers cannot silently retain local-file access. Reopening after this session may require choosing the original again.'}</span>`;
+    container.appendChild(privacy);
+
+    const entries = this.filteredDocumentLibraryEntries();
+    const list = document.createElement('section');
+    list.className = 'fb-documents-list';
+    list.setAttribute('aria-label', 'Document library');
+    if (!entries.length) {
+      const empty = document.createElement('div');
+      empty.className = 'fb-empty-state fb-documents-empty';
+      empty.innerHTML = safeEntries.length
+        ? `<strong>No files match these filters.</strong><span>Try another name, type, opening date, or size.</span>`
+        : this.state.documentsLoading
+          ? `<span class="fb-documents-empty-icon">${Icons.hourglass}</span><strong>Checking your Documents…</strong><span>Yayra is verifying that remembered originals are still available.</span>`
+          : `<span class="fb-documents-empty-icon">${Icons.document}</span><strong>Your Documents hub is ready.</strong><span>Open any local file. Supported formats stay in Yayra; everything else opens honestly in its desktop app.</span>`;
+      if (safeEntries.length) {
+        const resetFilters = document.createElement('button');
+        resetFilters.type = 'button';
+        resetFilters.className = 'fb-btn fb-btn-secondary';
+        resetFilters.textContent = 'Reset filters';
+        resetFilters.addEventListener('click', () => {
+          this.state.documentsSearchQuery = '';
+          this.state.documentsTypeFilter = 'all';
+          this.state.documentsDateFilter = 'all';
+          this.state.documentsSizeFilter = 'all';
+          this.render();
+        });
+        empty.appendChild(resetFilters);
+      }
+      list.appendChild(empty);
+    } else {
+      for (const entry of entries) {
+        const row = document.createElement('article');
+        row.className = `fb-document-row${entry.available === false ? ' is-missing' : ''}`;
+        row.dataset.documentId = entry.id;
+        const glyph = document.createElement('span');
+        glyph.className = `fb-document-glyph fb-document-glyph-${entry.category || 'other'}`;
+        glyph.textContent = entry.extension ? String(entry.extension).slice(0, 5).toLocaleUpperCase() : 'FILE';
+        const details = document.createElement('div');
+        details.className = 'fb-document-details';
+        const name = document.createElement('strong');
+        name.className = 'fb-document-name';
+        name.textContent = entry.name || 'Local file';
+        name.title = entry.name || 'Local file';
+        const meta = document.createElement('span');
+        meta.className = 'fb-document-meta';
+        meta.textContent = entry.available === false
+          ? `${this.documentTypeLabel(entry)} · ${this.formatDocumentBytes(entry.size)} · File moved or unavailable`
+          : `${this.documentTypeLabel(entry)} · ${this.formatDocumentBytes(entry.size)} · Opened ${this.formatDocumentOpenedAt(entry.lastOpenedAt)} · ${entry.openedCount || 1}×`;
+        details.appendChild(name);
+        details.appendChild(meta);
+        const status = document.createElement('span');
+        status.className = `fb-document-status ${entry.available === false ? 'is-missing' : 'is-ready'}`;
+        status.textContent = entry.available === false ? 'Unavailable' : (entry.canOpenInYayra ? 'Opens in Yayra' : 'Desktop app');
+        const actions = document.createElement('div');
+        actions.className = 'fb-document-actions';
+        const button = (label, title, handler, className = 'fb-btn fb-btn-secondary') => {
+          const control = document.createElement('button');
+          control.type = 'button';
+          control.className = className;
+          control.textContent = label;
+          control.title = title;
+          control.setAttribute('aria-label', `${title}: ${entry.name}`);
+          control.addEventListener('click', handler);
+          return control;
+        };
+        if (entry.available === false && entry.source === 'desktop') {
+          actions.appendChild(button('Locate…', 'Locate moved file', () => this.locateDocumentLibraryEntry(entry.id), 'fb-btn fb-btn-primary'));
+        } else {
+          actions.appendChild(button('Open', entry.canOpenInYayra ? 'Open in Yayra' : 'Open with desktop app', () => this.openDocumentLibraryEntry(entry.id), 'fb-btn fb-btn-primary'));
+          if (entry.source === 'desktop' && entry.canOpenInYayra) {
+            actions.appendChild(button('Desktop app', 'Open unchanged original with desktop app', () => this.openDocumentLibraryEntry(entry.id, { external: true })));
+          }
+          if (entry.source === 'desktop') {
+            actions.appendChild(button('Show', 'Show original in folder', async () => {
+              const result = await this.systemBridge?.documents?.showInFolder?.(entry.id);
+              if (!result?.ok) {
+                if (result?.reason === 'unavailable') entry.available = false;
+                this.showTransientNotice('Couldn\u2019t show this file in its folder.');
+                this.render();
+              }
+            }));
+          }
+        }
+        actions.appendChild(button('Remove', 'Remove from Documents history (does not delete the file)', () => this.removeDocumentLibraryEntry(entry.id), 'fb-btn fb-btn-ghost fb-document-remove'));
+        row.appendChild(glyph);
+        row.appendChild(details);
+        row.appendChild(status);
+        row.appendChild(actions);
+        list.appendChild(row);
+      }
+    }
+    container.appendChild(list);
+
+    const footer = document.createElement('footer');
+    footer.className = 'fb-documents-footer';
+    const resultLabel = document.createElement('span');
+    resultLabel.textContent = `${entries.length} of ${safeEntries.length} file${safeEntries.length === 1 ? '' : 's'}`;
+    const footerActions = document.createElement('div');
+    if (missingCount) {
+      const clearMissing = document.createElement('button');
+      clearMissing.className = 'fb-btn fb-btn-secondary';
+      clearMissing.textContent = 'Remove unavailable';
+      clearMissing.addEventListener('click', () => this.clearDocumentLibrary({ missingOnly: true }));
+      footerActions.appendChild(clearMissing);
+    }
+    const clear = document.createElement('button');
+    clear.className = 'fb-btn fb-btn-danger';
+    clear.textContent = 'Clear Documents history';
+    clear.disabled = safeEntries.length === 0;
+    clear.addEventListener('click', () => this.clearDocumentLibrary());
+    footerActions.appendChild(clear);
+    footer.appendChild(resultLabel);
+    footer.appendChild(footerActions);
+    container.appendChild(footer);
+
+    page.appendChild(container);
+    viewport.appendChild(page);
+  }
+
   /**
    * Opens a local document. Electron: the native picker in the main
    * process (the file path never reaches the renderer - only the bytes of
@@ -17265,14 +17966,21 @@ export class BrowserShell {
         const res = await openNative.call(bridge);
         if (!res || !res.ok) {
           if (res && res.canceled) return; // user closed the picker
+          if (res?.libraryId) void this.refreshDocumentLibrary({ render: false });
           if (res?.reason === 'file-too-large') {
-            this.showTransientNotice(`Documents larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`);
+            this.showTransientNotice(`This file is in Documents, but files larger than ${MAX_DOCUMENT_SIZE_MB} MB must open in a desktop app.`);
           } else {
             this.showTransientNotice(`Couldn\u2019t open the document${res && res.reason ? ` (${res.reason})` : ''}.`);
           }
           return;
         }
-        this.addDocumentTab({ name: res.name, bytes: res.data });
+        if (res.action === 'system') {
+          void this.refreshDocumentLibrary({ render: false });
+          this.showTransientNotice(`Opening \u201C${res.entry?.name || 'file'}\u201D with its desktop app…`);
+          return;
+        }
+        this.addDocumentTab({ name: res.name, bytes: res.data, libraryId: res.libraryId });
+        void this.refreshDocumentLibrary({ render: false });
         return;
       }
     } catch { /* fall through to the file input */ }
@@ -17290,8 +17998,11 @@ export class BrowserShell {
     if (!input) {
       input = document.createElement('input');
       input.type = 'file';
-      input.accept = DOCUMENT_ACCEPT.join(',');
-      input.setAttribute('aria-label', 'Open a document, presentation, spreadsheet, image, or text file');
+      // Intentionally no `accept` restriction: every file can enter the hub.
+      // Known formats render safely; unknown ones get an honest unchanged-file
+      // fallback instead of being silently excluded from the picker.
+      input.removeAttribute?.('accept');
+      input.setAttribute('aria-label', 'Open any local file');
       input.style.cssText = 'position:fixed; left:-9999px; top:0; opacity:0;';
       input.addEventListener('change', () => {
         const file = input.files && input.files[0];
@@ -17316,22 +18027,19 @@ export class BrowserShell {
     input.click();
   }
 
-  /** Registers a recognized local document and opens a fresh in-memory tab. */
-  addDocumentTab({ name, bytes, mime = '' }) {
-    const kind = sniffDocumentKind(bytes, name, mime);
-    if (!kind) {
-      this.showTransientNotice('Yayra can’t safely display this file type. Use a supported document, image, or text file.');
-      return null;
-    }
+  /** Registers a local file and opens a fresh tab. Recognized types use a
+   * bundled viewer; unknown formats use the honest original-file fallback. */
+  addDocumentTab({ name, bytes, mime = '', libraryId = null }) {
     let doc;
     try {
-      doc = this.documentStore.add({ name, bytes, mime });
+      doc = this.documentStore.add({ name, bytes, mime, libraryId });
     } catch (error) {
       this.showTransientNotice(error?.message === 'document-too-large'
         ? `Documents larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`
         : 'That file appears to be empty.');
       return null;
     }
+    if (!doc.libraryId) this.rememberSessionDocument(doc);
     this.createNewTab();
     const tab = this.getActiveTab();
     if (!tab) return null;
@@ -17440,7 +18148,9 @@ export class BrowserShell {
       const bridge = this.systemBridge?.documents;
       if (typeof bridge?.openExternal === 'function') {
         try {
-          const res = await bridge.openExternal({ name: current.name, data: current.bytes });
+          const res = current.libraryId && typeof bridge.openLibraryExternal === 'function'
+            ? await bridge.openLibraryExternal(current.libraryId)
+            : await bridge.openExternal({ name: current.name, data: current.bytes });
           this.showTransientNotice(res?.ok
             ? `Opening \u201C${current.name}\u201D with your desktop app...`
             : `Couldn\u2019t open it externally${res?.reason ? ` (${res.reason})` : ''}.`);
@@ -17533,15 +18243,61 @@ export class BrowserShell {
     }
 
     const hasDesktopDocumentBridge = typeof this.systemBridge?.documents?.openExternal === 'function';
-    bar.appendChild(mkBtn(
-      hasDesktopDocumentBridge ? 'Desktop app' : 'Download original',
-      hasDesktopDocumentBridge
-        ? `Open this ${documentRoute.shortLabel.toLowerCase()} with the system default app`
-        : 'Download the unchanged original file',
-      openOriginal,
-      'fb-doc-original-btn'
-    ));
-    bar.appendChild(mkBtn('\u2715 Close', 'Close the document and return to browsing', () => this.closeTab(tab.id), 'fb-doc-close-btn'));
+    const originalLabel = hasDesktopDocumentBridge ? 'Desktop app' : 'Download original';
+    const originalTitle = hasDesktopDocumentBridge
+      ? `Open this ${documentRoute.shortLabel.toLowerCase()} with the system default app`
+      : 'Download the unchanged original file';
+    if (documentKind === 'pptx') {
+      // Presentation-destructive/escape actions live in one accessible
+      // overflow instead of competing with the slide controls.
+      const overflow = document.createElement('div');
+      overflow.className = 'fb-doc-overflow';
+      overflow.style.cssText = 'position:relative;flex:none;';
+      const overflowButton = mkBtn('\u22ee', 'Presentation menu', () => {}, 'fb-doc-overflow-btn');
+      overflowButton.setAttribute('aria-haspopup', 'menu');
+      overflowButton.setAttribute('aria-expanded', 'false');
+      const menu = document.createElement('div');
+      menu.className = 'fb-doc-overflow-menu';
+      menu.setAttribute('role', 'menu');
+      menu.hidden = true;
+      menu.style.cssText = 'position:absolute;right:0;top:calc(100% + 6px);z-index:20;min-width:220px;padding:6px;border:1px solid var(--fb-border-glass,rgba(255,255,255,.12));border-radius:10px;background:var(--fb-bg-elevated,#171a24);box-shadow:0 18px 45px rgba(0,0,0,.45);';
+      const closeMenu = () => {
+        menu.hidden = true;
+        overflowButton.setAttribute('aria-expanded', 'false');
+      };
+      const addMenuAction = (label, title, action, { danger = false } = {}) => {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.role = 'menuitem';
+        item.className = `fb-doc-overflow-item${danger ? ' is-danger' : ''}`;
+        item.textContent = label;
+        item.title = title;
+        item.style.cssText = `display:block;width:100%;padding:9px 10px;border:0;border-radius:7px;background:transparent;color:${danger ? '#fca5a5' : 'inherit'};text-align:left;cursor:pointer;font-size:.78rem;`;
+        item.addEventListener('click', () => { closeMenu(); action(); });
+        menu.appendChild(item);
+      };
+      overflowButton.addEventListener('click', (event) => {
+        event.stopPropagation();
+        menu.hidden = !menu.hidden;
+        overflowButton.setAttribute('aria-expanded', String(!menu.hidden));
+        if (!menu.hidden) menu.querySelector('button')?.focus?.();
+      });
+      overflow.addEventListener('focusout', () => {
+        setTimeout(() => { if (!overflow.contains?.(document.activeElement)) closeMenu(); }, 0);
+      });
+      overflow.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') { event.preventDefault(); closeMenu(); overflowButton.focus?.(); }
+      });
+      addMenuAction('\u25b6 Present from beginning', 'Start slideshow from slide 1', () => this.startDocumentSlideshow(tab.id, { fromBeginning: true }));
+      addMenuAction(originalLabel, originalTitle, openOriginal);
+      addMenuAction('Close presentation', 'Close this presentation tab', () => this.closeTab(tab.id), { danger: true });
+      overflow.appendChild(overflowButton);
+      overflow.appendChild(menu);
+      bar.appendChild(overflow);
+    } else {
+      bar.appendChild(mkBtn(originalLabel, originalTitle, openOriginal, 'fb-doc-original-btn'));
+      bar.appendChild(mkBtn('\u2715 Close', 'Close the document and return to browsing', () => this.closeTab(tab.id), 'fb-doc-close-btn'));
+    }
 
     // ---- Row B: only controls the selected engine genuinely supports ----
     const bar2 = document.createElement('div');
@@ -17590,6 +18346,10 @@ export class BrowserShell {
         if (this._activeDocViewer?.tabId === tab.id) this._activeDocViewer.rerenderSidebar?.();
         else this.render();
       }, 'fb-doc-btn-outline'));
+    }
+    if (capabilities.view && capabilities.presentation) {
+      const showNoun = documentKind === 'pptx' ? 'slideshow' : 'PDF presentation';
+      bar2.appendChild(mkBtn('\u25b6 Present', `Start ${showNoun} from the current ${pageNoun} (Shift+F5)`, () => this.startDocumentSlideshow(tab.id), 'fb-doc-btn-present'));
     }
     if (capabilities.notes) {
       bar2.appendChild(mkBtn('Notes', 'Show or hide PowerPoint speaker notes', () => activeViewer()?.toggleNotes?.(), 'fb-doc-btn-notes'));
@@ -17930,6 +18690,609 @@ export class BrowserShell {
     if (!session.viewer && !session.loadPromise) this._startDocumentViewerLoad(session, doc);
   }
 
+  // Compatibility entry points remain for integrations that adopted the
+  // original PPTX-only API. Both now delegate to one format-neutral show.
+  async startPptxSlideshow(tabId, options = {}) {
+    return this.startDocumentSlideshow(tabId, options);
+  }
+
+  async startPdfSlideshow(tabId, options = {}) {
+    return this.startDocumentSlideshow(tabId, options);
+  }
+
+  async startDocumentSlideshow(tabId, { fromBeginning = false } = {}) {
+    const activeShow = this._documentSlideshow || this._pptxSlideshow;
+    if (activeShow?.active) {
+      activeShow.overlay?.focus?.();
+      if (fromBeginning) void activeShow.viewer?.setPage?.(1);
+      return true;
+    }
+    const tab = this.state.tabs.find((item) => item.id === tabId);
+    const doc = tab?.docId ? this.documentStore?.get(tab.docId) : null;
+    const session = this._documentViewerSessions?.get(tabId);
+    const viewer = session?.viewer;
+    const documentKind = doc?.type;
+    const isPowerPoint = documentKind === 'pptx';
+    const isPdf = documentKind === 'pdf';
+    if (!tab || (!isPowerPoint && !isPdf) || !viewer || session.state?.status !== 'ready') {
+      this.showTransientNotice('Wait for the PDF or presentation to finish opening, then choose Present.');
+      return false;
+    }
+    if (typeof document === 'undefined' || !document.body) return false;
+    const pageNoun = isPowerPoint ? 'slide' : 'page';
+    const pageNounTitle = isPowerPoint ? 'Slide' : 'Page';
+
+    const overlay = document.createElement('div');
+    // Keep the established PPTX class as a styling/integration alias while
+    // the generic class identifies both PDF and PowerPoint projector modes.
+    overlay.className = `fb-document-slideshow fb-pptx-slideshow is-${documentKind}`;
+    overlay.id = isPowerPoint ? 'yayra-pptx-slideshow' : 'yayra-pdf-slideshow';
+    overlay.tabIndex = -1;
+    overlay.setAttribute('role', 'application');
+    overlay.setAttribute('aria-roledescription', isPowerPoint ? 'PowerPoint slideshow' : 'PDF page show');
+    overlay.setAttribute('aria-label', `${doc.name} ${isPowerPoint ? 'slideshow' : 'PDF presentation'}`);
+
+    const surface = document.createElement('div');
+    surface.className = 'fb-pptx-slideshow-surface';
+    const host = document.createElement('div');
+    host.className = 'fb-document-slideshow-host fb-pptx-slideshow-host';
+    const blank = document.createElement('div');
+    blank.className = 'fb-pptx-slideshow-blank';
+    blank.hidden = true;
+    blank.setAttribute('aria-hidden', 'true');
+    const ink = document.createElement('canvas');
+    ink.className = 'fb-pptx-slideshow-ink';
+    ink.setAttribute('aria-label', `${pageNounTitle} presentation pen canvas`);
+    const laser = document.createElement('span');
+    laser.className = 'fb-pptx-slideshow-laser';
+    laser.hidden = true;
+    laser.setAttribute('aria-hidden', 'true');
+    surface.appendChild(host);
+    surface.appendChild(ink);
+    surface.appendChild(laser);
+    surface.appendChild(blank);
+
+    const top = document.createElement('div');
+    top.className = 'fb-pptx-slideshow-top fb-pptx-slideshow-chrome';
+    const title = document.createElement('span');
+    title.className = 'fb-pptx-slideshow-title';
+    title.textContent = doc.name;
+    const count = document.createElement('span');
+    count.className = 'fb-pptx-slideshow-count';
+    count.setAttribute('aria-live', 'polite');
+    const jumpHint = document.createElement('span');
+    jumpHint.className = 'fb-pptx-slideshow-jump-hint';
+    jumpHint.hidden = true;
+    top.appendChild(title);
+    top.appendChild(count);
+    top.appendChild(jumpHint);
+
+    const controls = document.createElement('div');
+    controls.className = 'fb-pptx-slideshow-controls fb-pptx-slideshow-chrome';
+    controls.setAttribute('role', 'toolbar');
+    controls.setAttribute('aria-label', 'Slideshow controls');
+    const controlButton = (label, titleText, handler, className = '') => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = `fb-pptx-slideshow-button ${className}`.trim();
+      button.textContent = label;
+      button.title = titleText;
+      button.setAttribute('aria-label', titleText);
+      button.addEventListener('click', (event) => {
+        event.stopPropagation();
+        handler(event);
+      });
+      return button;
+    };
+    const previousButton = controlButton('\u2039', `Previous ${pageNoun} (Left, P, Page Up)`, () => viewer.prevPage?.());
+    const nextButton = controlButton('\u203a', `Next ${pageNoun} (Right, N, Space, Page Down)`, () => viewer.nextPage?.());
+    const slideForm = document.createElement('form');
+    slideForm.className = 'fb-pptx-slideshow-slide-form';
+    slideForm.setAttribute('aria-label', `Jump to ${pageNoun}`);
+    const slideInput = document.createElement('input');
+    slideInput.type = 'number';
+    slideInput.min = '1';
+    slideInput.max = String(session.state.numPages || 1);
+    slideInput.setAttribute('aria-label', `${pageNounTitle} number`);
+    const slideTotal = document.createElement('span');
+    slideTotal.textContent = `/ ${session.state.numPages || 1}`;
+    slideForm.appendChild(slideInput);
+    slideForm.appendChild(slideTotal);
+    slideForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const page = Number(slideInput.value);
+      if (Number.isFinite(page)) void viewer.setPage?.(page);
+      overlay.focus?.();
+    });
+    const notesButton = isPowerPoint
+      ? controlButton('Notes', 'Toggle speaker notes (S or Alt+F5)', () => viewer.toggleNotes?.(), 'fb-pptx-slideshow-notes')
+      : null;
+    const blackButton = controlButton('Black', 'Toggle black screen (B or period)', () => setBlank(show.blankMode || 'black'));
+    const pointerButton = controlButton('Laser', 'Toggle laser pointer (Ctrl+L)', () => setPointerMode(show.pointerMode === 'laser' ? 'pointer' : 'laser'), 'fb-pptx-slideshow-pointer');
+    const penButton = controlButton('Pen', `Draw on the ${pageNoun} show (Ctrl+P); E clears ink`, () => setPointerMode(show.pointerMode === 'pen' ? 'pointer' : 'pen'), 'fb-pptx-slideshow-pen');
+    const navigatorButton = controlButton(isPowerPoint ? 'Slides' : 'Pages', `See all ${pageNoun}s (G or minus)`, () => toggleNavigator(), 'fb-pptx-slideshow-navigator-button');
+    const helpButton = controlButton('?', 'Slideshow shortcuts (F1)', () => toggleHelp(), 'fb-pptx-slideshow-help-button');
+    const fullscreenButton = controlButton('Fullscreen', 'Enter or leave projector fullscreen', () => togglePresentationFullscreen(), 'fb-pptx-slideshow-fullscreen');
+    const exitButton = controlButton('Exit', `End ${isPowerPoint ? 'slideshow' : 'PDF presentation'} (Esc)`, () => this.exitDocumentSlideshow(), 'fb-pptx-slideshow-exit');
+    for (const control of [previousButton, slideForm, nextButton, notesButton, blackButton, pointerButton, penButton, navigatorButton, helpButton, fullscreenButton, exitButton].filter(Boolean)) {
+      controls.appendChild(control);
+    }
+
+    const help = document.createElement('section');
+    help.className = 'fb-pptx-slideshow-dialog fb-pptx-slideshow-help';
+    help.hidden = true;
+    help.setAttribute('role', 'dialog');
+    help.setAttribute('aria-modal', 'false');
+    help.setAttribute('aria-label', 'Slideshow keyboard shortcuts');
+    help.innerHTML = `
+      <div class="fb-pptx-slideshow-dialog-head"><strong>${isPowerPoint ? 'Slideshow' : 'PDF presentation'} shortcuts</strong><button type="button" aria-label="Close shortcut help">\u2715</button></div>
+      <div class="fb-pptx-shortcut-grid">
+        <span>Next ${pageNoun}</span><kbd>N</kbd><kbd>Enter</kbd><kbd>Space</kbd><kbd>\u2192</kbd><kbd>\u2193</kbd><kbd>PgDn</kbd>
+        <span>Previous ${pageNoun}</span><kbd>P</kbd><kbd>Backspace</kbd><kbd>\u2190</kbd><kbd>\u2191</kbd><kbd>PgUp</kbd>
+        <span>First / last ${pageNoun}</span><kbd>Home</kbd><kbd>End</kbd>
+        <span>Jump to ${pageNoun}</span><kbd>number</kbd><kbd>Enter</kbd>
+        <span>Black / white screen</span><kbd>B</kbd><kbd>.</kbd><kbd>W</kbd><kbd>,</kbd>
+        ${isPowerPoint ? '<span>Speaker notes</span><kbd>S</kbd><kbd>Alt+F5</kbd><kbd>Ctrl+Shift+N</kbd>' : ''}
+        <span>Laser / pen / arrow</span><kbd>Ctrl+L</kbd><kbd>Ctrl+P</kbd><kbd>Ctrl+A</kbd>
+        <span>Hide pointer / erase ink</span><kbd>Ctrl+H</kbd><kbd>E</kbd>
+        <span>All ${pageNoun}s / help</span><kbd>G</kbd><kbd>-</kbd><kbd>F1</kbd>
+        <span>End show</span><kbd>Esc</kbd>
+      </div>`;
+    help.querySelector('button')?.addEventListener('click', () => toggleHelp(false));
+
+    const navigator = document.createElement('section');
+    navigator.className = 'fb-pptx-slideshow-dialog fb-pptx-slideshow-navigator';
+    navigator.hidden = true;
+    navigator.setAttribute('role', 'dialog');
+    navigator.setAttribute('aria-label', `Choose a ${pageNoun}`);
+    const navigatorHead = document.createElement('div');
+    navigatorHead.className = 'fb-pptx-slideshow-dialog-head';
+    navigatorHead.innerHTML = `<strong>All ${pageNoun}s</strong>`;
+    const navigatorClose = document.createElement('button');
+    navigatorClose.type = 'button';
+    navigatorClose.textContent = '\u2715';
+    navigatorClose.setAttribute('aria-label', `Close ${pageNoun} navigator`);
+    navigatorClose.addEventListener('click', () => toggleNavigator(false));
+    navigatorHead.appendChild(navigatorClose);
+    const navigatorGrid = document.createElement('div');
+    navigatorGrid.className = 'fb-pptx-slideshow-navigator-grid';
+    for (let page = 1; page <= Number(session.state.numPages || 0); page += 1) {
+      const choice = document.createElement('button');
+      choice.type = 'button';
+      choice.className = 'fb-pptx-slideshow-slide-choice';
+      choice.dataset.slide = String(page);
+      choice.textContent = isPowerPoint ? String(page) : `Page ${page}`;
+      choice.setAttribute('aria-label', `Go to ${pageNoun} ${page}`);
+      choice.addEventListener('click', () => {
+        void viewer.setPage?.(page);
+        toggleNavigator(false);
+      });
+      navigatorGrid.appendChild(choice);
+    }
+    navigator.appendChild(navigatorHead);
+    navigator.appendChild(navigatorGrid);
+
+    overlay.appendChild(surface);
+    overlay.appendChild(top);
+    overlay.appendChild(controls);
+    overlay.appendChild(help);
+    overlay.appendChild(navigator);
+    document.body.appendChild(overlay);
+
+    const show = {
+      active: true,
+      overlay,
+      surface,
+      host,
+      ink,
+      laser,
+      blank,
+      controls,
+      top,
+      help,
+      navigator,
+      viewer,
+      session,
+      tabId,
+      documentKind,
+      isPowerPoint,
+      pageNoun,
+      restoreHost: session.host,
+      restoreFocus: document.activeElement,
+      restoreZoom: session.state.zoom,
+      restoreZoomMode: session.state.zoomMode,
+      restoreNotes: isPowerPoint ? Boolean(session.state.showNotes) : null,
+      pointerMode: 'pointer',
+      blankMode: null,
+      digitBuffer: '',
+      lastPage: session.state.page,
+      hideTimer: null,
+      resizeTimer: null,
+      jumpTimer: null,
+      wheelAt: 0,
+      enteredFullscreen: false,
+      suppressFullscreenExit: false,
+      drawing: false,
+      lastPoint: null,
+      cleanup: []
+    };
+    this._documentSlideshow = show;
+    this._pptxSlideshow = show; // compatibility alias for earlier integrations
+    tab.docState.slideshowMode = true;
+
+    const fullscreenWanted = this.state.settings.pptxSlideshowFullscreen !== false;
+    let fullscreenPromise = null;
+    if (fullscreenWanted && typeof overlay.requestFullscreen === 'function') {
+      try {
+        fullscreenPromise = Promise.resolve(overlay.requestFullscreen({ navigationUI: 'hide' }))
+          .catch(() => overlay.requestFullscreen?.())
+          .catch(() => null);
+      } catch { fullscreenPromise = null; }
+    }
+
+    const clearInk = () => {
+      const context = ink.getContext?.('2d');
+      if (context) context.clearRect(0, 0, ink.width || 0, ink.height || 0);
+    };
+    const sizeInk = () => {
+      const rect = surface.getBoundingClientRect?.() || { width: surface.clientWidth || 1, height: surface.clientHeight || 1 };
+      const ratio = Math.max(1, Math.min(2, Number(window.devicePixelRatio) || 1));
+      ink.width = Math.max(1, Math.floor((rect.width || 1) * ratio));
+      ink.height = Math.max(1, Math.floor((rect.height || 1) * ratio));
+      ink.style.width = `${Math.max(1, rect.width || 1)}px`;
+      ink.style.height = `${Math.max(1, rect.height || 1)}px`;
+      const context = ink.getContext?.('2d');
+      context?.setTransform?.(ratio, 0, 0, ratio, 0, 0);
+      if (context) {
+        context.strokeStyle = '#ef4444';
+        context.lineWidth = 3;
+        context.lineCap = 'round';
+        context.lineJoin = 'round';
+      }
+    };
+    const syncSlideshow = () => {
+      if (!show.active) return;
+      const page = Number(session.state.page || 1);
+      count.textContent = `${pageNounTitle} ${page} of ${session.state.numPages || 1}`;
+      slideInput.value = String(page);
+      slideInput.max = String(session.state.numPages || 1);
+      slideTotal.textContent = `/ ${session.state.numPages || 1}`;
+      previousButton.disabled = page <= 1;
+      nextButton.disabled = page >= Number(session.state.numPages || 1);
+      notesButton?.classList?.toggle('is-active', Boolean(session.state.showNotes));
+      notesButton?.setAttribute?.('aria-pressed', String(Boolean(session.state.showNotes)));
+      if (show.lastPage !== page) {
+        show.lastPage = page;
+        clearInk();
+      }
+      for (const choice of navigatorGrid.querySelectorAll?.('.fb-pptx-slideshow-slide-choice') || []) {
+        const current = Number(choice.dataset.slide) === page;
+        choice.classList.toggle('is-active', current);
+        choice.setAttribute('aria-current', current ? 'true' : 'false');
+      }
+    };
+    show.sync = syncSlideshow;
+
+    function revealControls() {
+      if (!show.active) return;
+      overlay.classList.remove('is-controls-hidden');
+      if (show.hideTimer) clearTimeout(show.hideTimer);
+      if (show.jumpTimer) { /* jump hint owns its own timer */ }
+      if (this.state.settings.pptxSlideshowAutoHideControls !== false && show.help.hidden && show.navigator.hidden) {
+        show.hideTimer = setTimeout(() => {
+          if (show.active && show.help.hidden && show.navigator.hidden && document.activeElement !== slideInput) {
+            overlay.classList.add('is-controls-hidden');
+          }
+        }, 3200);
+      }
+    }
+    const reveal = revealControls.bind(this);
+
+    function setPointerMode(mode) {
+      show.pointerMode = mode === 'laser' || mode === 'pen' || mode === 'hidden' ? mode : 'pointer';
+      laser.hidden = show.pointerMode !== 'laser';
+      ink.style.pointerEvents = show.pointerMode === 'pen' ? 'auto' : 'none';
+      pointerButton.classList.toggle('is-active', show.pointerMode === 'laser');
+      penButton.classList.toggle('is-active', show.pointerMode === 'pen');
+      pointerButton.setAttribute('aria-pressed', String(show.pointerMode === 'laser'));
+      penButton.setAttribute('aria-pressed', String(show.pointerMode === 'pen'));
+      overlay.classList.toggle('is-pointer-hidden', show.pointerMode === 'hidden');
+      if (show.pointerMode === 'hidden') overlay.style.setProperty('cursor', 'none', 'important');
+      else if (typeof overlay.style.removeProperty === 'function') overlay.style.removeProperty('cursor');
+      else overlay.style.setProperty('cursor', '');
+      reveal();
+    }
+
+    function setBlank(mode) {
+      const next = show.blankMode === mode ? null : mode;
+      show.blankMode = next;
+      blank.hidden = !next;
+      blank.style.background = next === 'white' ? '#fff' : '#000';
+      blackButton.classList.toggle('is-active', Boolean(next));
+      blackButton.setAttribute('aria-pressed', String(Boolean(next)));
+      blackButton.textContent = next === 'white' ? 'White' : 'Black';
+      blackButton.title = next ? `Resume the ${pageNoun} show` : 'Toggle black screen (B or period)';
+      blackButton.setAttribute('aria-label', blackButton.title);
+      reveal();
+    }
+
+    function toggleHelp(force) {
+      const open = typeof force === 'boolean' ? force : help.hidden;
+      help.hidden = !open;
+      if (open) {
+        navigator.hidden = true;
+        navigatorButton.classList.remove('is-active');
+      }
+      helpButton.classList.toggle('is-active', open);
+      reveal();
+      if (open) help.querySelector('button')?.focus?.(); else overlay.focus?.();
+    }
+
+    function toggleNavigator(force) {
+      const open = typeof force === 'boolean' ? force : navigator.hidden;
+      navigator.hidden = !open;
+      if (open) {
+        help.hidden = true;
+        helpButton.classList.remove('is-active');
+      }
+      navigatorButton.classList.toggle('is-active', open);
+      reveal();
+      if (open) navigatorGrid.querySelector(`[data-slide="${session.state.page || 1}"]`)?.focus?.(); else overlay.focus?.();
+    }
+
+    async function togglePresentationFullscreen() {
+      try {
+        if (document.fullscreenElement === overlay) {
+          // The toolbar's Window action intentionally keeps the full-window
+          // show alive. A browser/OS Escape from fullscreen ends the show.
+          show.suppressFullscreenExit = true;
+          await document.exitFullscreen?.();
+        } else {
+          await overlay.requestFullscreen?.({ navigationUI: 'hide' });
+        }
+      } catch { /* fixed overlay remains a full-window presentation surface */ }
+      reveal();
+    }
+
+    show.setPointerMode = setPointerMode;
+    show.setBlank = setBlank;
+    show.toggleHelp = toggleHelp;
+    show.toggleNavigator = toggleNavigator;
+    show.clearInk = clearInk;
+
+    const onPointerMove = (event) => {
+      reveal();
+      if (show.pointerMode === 'laser') {
+        laser.hidden = false;
+        laser.style.left = `${event.clientX}px`;
+        laser.style.top = `${event.clientY}px`;
+      }
+    };
+    const localInkPoint = (event) => {
+      const rect = ink.getBoundingClientRect?.() || { left: 0, top: 0 };
+      return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    };
+    const onInkDown = (event) => {
+      if (show.pointerMode !== 'pen' || event.button !== 0) return;
+      show.drawing = true;
+      show.lastPoint = localInkPoint(event);
+      ink.setPointerCapture?.(event.pointerId);
+      event.preventDefault();
+    };
+    const onInkMove = (event) => {
+      if (!show.drawing || show.pointerMode !== 'pen') return;
+      const next = localInkPoint(event);
+      const context = ink.getContext?.('2d');
+      if (context && show.lastPoint) {
+        context.beginPath();
+        context.moveTo(show.lastPoint.x, show.lastPoint.y);
+        context.lineTo(next.x, next.y);
+        context.stroke();
+      }
+      show.lastPoint = next;
+      event.preventDefault();
+    };
+    const stopInk = (event) => {
+      show.drawing = false;
+      show.lastPoint = null;
+      try { ink.releasePointerCapture?.(event?.pointerId); } catch { /* not captured */ }
+    };
+    ink.addEventListener('pointerdown', onInkDown);
+    ink.addEventListener('pointermove', onInkMove);
+    ink.addEventListener('pointerup', stopInk);
+    ink.addEventListener('pointercancel', stopInk);
+
+    let touchStart = null;
+    const onTouchStart = (event) => {
+      const point = event.touches?.[0];
+      if (point) touchStart = { x: point.clientX, y: point.clientY };
+    };
+    const onTouchEnd = (event) => {
+      if (!touchStart || show.pointerMode === 'pen') return;
+      const point = event.changedTouches?.[0];
+      if (!point) return;
+      const dx = point.clientX - touchStart.x;
+      const dy = point.clientY - touchStart.y;
+      touchStart = null;
+      if (Math.abs(dx) > 55 && Math.abs(dx) > Math.abs(dy)) {
+        if (dx < 0) void viewer.nextPage?.(); else void viewer.prevPage?.();
+      }
+    };
+    surface.addEventListener('touchstart', onTouchStart, { passive: true });
+    surface.addEventListener('touchend', onTouchEnd, { passive: true });
+    surface.addEventListener('click', (event) => {
+      if (event.defaultPrevented) return;
+      if (show.blankMode) {
+        setBlank(show.blankMode); // PowerPoint: click resumes from a blank screen.
+        return;
+      }
+      if (show.pointerMode !== 'pointer') return;
+      if (event.target?.closest?.('video,audio,button,a,input,textarea,select,[contenteditable="true"]')) return;
+      const selection = typeof window.getSelection === 'function' ? window.getSelection() : null;
+      if (selection && selection.isCollapsed === false && String(selection).trim()) return;
+      void viewer.nextPage?.();
+    });
+    surface.addEventListener('wheel', (event) => {
+      if (Math.abs(event.deltaY) < 16 || Date.now() - show.wheelAt < 350) return;
+      show.wheelAt = Date.now();
+      event.preventDefault();
+      if (event.deltaY > 0) void viewer.nextPage?.(); else void viewer.prevPage?.();
+    }, { passive: false });
+    overlay.addEventListener('contextmenu', (event) => { event.preventDefault(); reveal(); });
+
+    const showDigitBuffer = () => {
+      if (show.jumpTimer) clearTimeout(show.jumpTimer);
+      jumpHint.textContent = show.digitBuffer ? `Go to ${pageNoun} ${show.digitBuffer} — press Enter` : '';
+      jumpHint.hidden = !show.digitBuffer;
+      if (show.digitBuffer) {
+        show.jumpTimer = setTimeout(() => {
+          show.digitBuffer = '';
+          jumpHint.hidden = true;
+        }, 3500);
+      }
+    };
+    const onKeyDown = (event) => {
+      if (!show.active) return;
+      if (event.key === 'Escape' && (!show.help.hidden || !show.navigator.hidden)) {
+        event.preventDefault();
+        event.stopImmediatePropagation?.();
+        if (!show.help.hidden) toggleHelp(false);
+        if (!show.navigator.hidden) toggleNavigator(false);
+        return;
+      }
+      const resolved = resolveDocumentSlideshowShortcut(event, { digitBuffer: show.digitBuffer });
+      if (!resolved) return;
+      if (resolved.action === 'notes' && !isPowerPoint) {
+        // PDF has no notes, but do not let Alt+F5 reload the app or
+        // Ctrl+Shift+N open a browser window behind a running show.
+        if (event.altKey || event.ctrlKey || event.metaKey) {
+          event.preventDefault();
+          event.stopImmediatePropagation?.();
+        }
+        return;
+      }
+      event.preventDefault();
+      event.stopImmediatePropagation?.();
+      show.digitBuffer = resolved.digitBuffer ?? show.digitBuffer;
+      if (resolved.action === 'exit') { void this.exitDocumentSlideshow(); return; }
+      if (resolved.action === 'next') void viewer.nextPage?.();
+      else if (resolved.action === 'previous') void viewer.prevPage?.();
+      else if (resolved.action === 'first') void viewer.setPage?.(1);
+      else if (resolved.action === 'last') void viewer.setPage?.(session.state.numPages || 1);
+      else if (resolved.action === 'jump' && Number.isFinite(resolved.slide)) void viewer.setPage?.(resolved.slide);
+      else if (resolved.action === 'black') setBlank('black');
+      else if (resolved.action === 'white') setBlank('white');
+      else if (resolved.action === 'laser') setPointerMode('laser');
+      else if (resolved.action === 'pen') setPointerMode('pen');
+      else if (resolved.action === 'pointer') setPointerMode('pointer');
+      else if (resolved.action === 'hide-pointer') setPointerMode('hidden');
+      else if (resolved.action === 'erase') clearInk();
+      else if (resolved.action === 'notes') void viewer.toggleNotes?.();
+      else if (resolved.action === 'help') toggleHelp();
+      else if (resolved.action === 'navigator') toggleNavigator();
+      showDigitBuffer();
+      reveal();
+    };
+    show.handleKeyDown = onKeyDown;
+    document.addEventListener?.('keydown', onKeyDown, true);
+
+    const onResize = () => {
+      sizeInk();
+      if (show.resizeTimer) clearTimeout(show.resizeTimer);
+      show.resizeTimer = setTimeout(() => { if (show.active) void viewer.fitToPage?.(); }, 90);
+    };
+    const onFullscreenChange = () => {
+      const active = document.fullscreenElement === overlay;
+      if (active) {
+        show.enteredFullscreen = true;
+      } else if (show.active && show.enteredFullscreen) {
+        if (show.suppressFullscreenExit) show.suppressFullscreenExit = false;
+        else {
+          // Browser fullscreen consumes Escape before page keyboard handlers
+          // on some platforms. Treat that fullscreen exit as ending the show
+          // so one Escape still behaves like PowerPoint.
+          void this.exitDocumentSlideshow();
+          return;
+        }
+      }
+      fullscreenButton.textContent = active ? 'Window' : 'Fullscreen';
+      fullscreenButton.setAttribute('aria-label', active ? 'Leave projector fullscreen' : 'Enter projector fullscreen');
+      onResize();
+    };
+    window.addEventListener?.('resize', onResize);
+    document.addEventListener?.('fullscreenchange', onFullscreenChange);
+    overlay.addEventListener('pointermove', onPointerMove, { passive: true });
+    controls.addEventListener('pointerenter', reveal);
+    top.addEventListener('pointerenter', reveal);
+    show.cleanup.push(
+      () => document.removeEventListener?.('keydown', onKeyDown, true),
+      () => document.removeEventListener?.('fullscreenchange', onFullscreenChange),
+      () => window.removeEventListener?.('resize', onResize),
+      () => overlay.removeEventListener?.('pointermove', onPointerMove),
+      () => { if (show.hideTimer) clearTimeout(show.hideTimer); },
+      () => { if (show.resizeTimer) clearTimeout(show.resizeTimer); },
+      () => { if (show.jumpTimer) clearTimeout(show.jumpTimer); }
+    );
+
+    await viewer.attach(host, syncSlideshow);
+    if (fromBeginning) await viewer.setPage?.(1);
+    // PowerPoint projectors start with a clean slide. Notes remain one
+    // click/shortcut away and the reader's previous choice is restored on
+    // exit. PDFs have no synthetic notes control.
+    if (isPowerPoint) await viewer.toggleNotes?.(false);
+    await viewer.fitToPage?.();
+    sizeInk();
+    syncSlideshow();
+    reveal();
+    overlay.focus?.();
+    await fullscreenPromise;
+    onFullscreenChange();
+    return true;
+  }
+
+  async exitDocumentSlideshow() {
+    return this.exitPptxSlideshow();
+  }
+
+  async exitPptxSlideshow() {
+    const show = this._documentSlideshow || this._pptxSlideshow;
+    if (!show?.active) return false;
+    show.active = false;
+    this._documentSlideshow = null;
+    this._pptxSlideshow = null;
+    for (const cleanup of show.cleanup || []) {
+      try { cleanup(); } catch { /* teardown is best effort */ }
+    }
+    try {
+      if (typeof document !== 'undefined' && document.fullscreenElement === show.overlay) {
+        await document.exitFullscreen?.();
+      }
+    } catch { /* fullscreen may already be leaving */ }
+    const tab = this.state.tabs.find((item) => item.id === show.tabId);
+    if (tab?.docState) tab.docState.slideshowMode = false;
+    try {
+      await show.viewer?.attach?.(show.session?.host || show.restoreHost, () => {
+        if (!show.session?.disposed) show.session?.sync?.();
+      });
+      if (show.isPowerPoint) await show.viewer?.toggleNotes?.(show.restoreNotes);
+      if (show.restoreZoomMode === 'fit-width') await show.viewer?.fitToWidth?.();
+      else if (show.restoreZoomMode === 'custom') await show.viewer?.setZoom?.(show.restoreZoom || 1);
+      else await show.viewer?.fitToPage?.();
+      // Re-anchor continuous PDF reading to the page that was on the
+      // projector; a fresh normal host has no inherited scroll position.
+      await show.viewer?.setPage?.(show.session?.state?.page || show.lastPage || 1);
+    } catch { /* tab may have closed while the projector disconnected */ }
+    try { show.overlay?.remove?.(); } catch { /* already removed */ }
+    try { show.session?.sync?.(); } catch { /* stale tab */ }
+    const restoreFocus = show.restoreFocus;
+    const canRestoreFocus = Boolean(restoreFocus && (restoreFocus.isConnected === true
+      || (restoreFocus.isConnected === undefined && restoreFocus.parentElement)));
+    if (canRestoreFocus) restoreFocus.focus?.();
+    else (show.session?.host?.closest?.('.fb-doc-viewer') || this.rootElement?.querySelector?.('.fb-doc-viewer'))?.focus?.();
+    return true;
+  }
+
   _startDocumentViewerLoad(session, doc) {
     if (!session || session.disposed || session.loadPromise) return session?.loadPromise || null;
     const isCurrent = () => !session.disposed
@@ -18038,6 +19401,7 @@ export class BrowserShell {
     if (url.startsWith('yayra://history')) return Icons.history;
     if (url.startsWith('yayra://bookmarks')) return Icons.bookmark;
     if (url.startsWith('yayra://downloads')) return Icons.download;
+    if (url.startsWith('yayra://documents')) return Icons.document;
     if (url.startsWith('yayra://passwords')) return Icons.lock;
     if (url.startsWith('yayra://extensions')) return Icons.shield;
     if (url.startsWith('yayra://permissions')) return Icons.lock;
@@ -18204,6 +19568,10 @@ export class BrowserShell {
    */
   dismissAllOverlays() {
     let dismissed = false;
+    if ((this._documentSlideshow || this._pptxSlideshow)?.active) {
+      void this.exitDocumentSlideshow();
+      dismissed = true;
+    }
     const s = this.state;
     if (s.isSideDrawerOpen) { s.isSideDrawerOpen = false; dismissed = true; }
     if (s.activeModal) { this.closeModal(); dismissed = true; }
@@ -18270,8 +19638,16 @@ export class BrowserShell {
   }
 
   handleGlobalKeyDown(e) {
+    const activeDocumentTab = this.getActiveTab();
+    const activeDocument = activeDocumentTab?.docId ? this.documentStore?.get(activeDocumentTab.docId) : null;
+    // Presentation start keys own F5 while a PPTX or PDF tab is active.
+    // Shift+F5 begins at the current slide/page; plain F5 begins at 1.
+    if (e.key === 'F5' && !e.ctrlKey && !e.metaKey && !e.altKey && ['pptx', 'pdf'].includes(activeDocument?.type)) {
+      e.preventDefault();
+      this.startDocumentSlideshow(activeDocumentTab.id, { fromBeginning: !e.shiftKey });
+    }
     // Ctrl+T: New Tab
-    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 't') {
+    else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 't') {
       e.preventDefault();
       this.createNewTab();
     }
@@ -18334,6 +19710,11 @@ export class BrowserShell {
     else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'j') {
       e.preventDefault();
       this.openInternalPage('yayra://downloads');
+    }
+    // Ctrl+O: standard desktop "Open file" route into Documents.
+    else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'o') {
+      e.preventDefault();
+      this.openDocument();
     }
     // Ctrl+F: Find in Page
     else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
@@ -18440,6 +19821,23 @@ export class BrowserShell {
     if (this._sessionSnapshotTimer) {
       clearTimeout(this._sessionSnapshotTimer);
       this._sessionSnapshotTimer = null;
+    }
+    if (this._documentsSearchTimer) {
+      clearTimeout(this._documentsSearchTimer);
+      this._documentsSearchTimer = null;
+    }
+    // A dying shell does not need to restore the normal document mount; tear
+    // any PDF/PowerPoint projector down before its viewer is destroyed.
+    const activeDocumentShow = this._documentSlideshow || this._pptxSlideshow;
+    if (activeDocumentShow) {
+      activeDocumentShow.active = false;
+      for (const cleanup of activeDocumentShow.cleanup || []) { try { cleanup(); } catch { /* best effort */ } }
+      try { activeDocumentShow.overlay?.remove?.(); } catch { /* detached */ }
+      try {
+        if (typeof document !== 'undefined' && document.fullscreenElement === activeDocumentShow.overlay) void document.exitFullscreen?.();
+      } catch { /* already exiting */ }
+      this._documentSlideshow = null;
+      this._pptxSlideshow = null;
     }
     for (const session of this._documentViewerSessions?.values?.() || []) {
       session.disposed = true;

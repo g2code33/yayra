@@ -231,14 +231,24 @@ const api = {
     // reopen the site in its own minimal app window (yayra --app=<url>).
     installPageAsApp: ({ url, title, nameOverride } = {}) => ipcRenderer.invoke('yayra:install-page-as-app', { url, title, nameOverride }),
     installPageAsAppPreview: ({ url, title } = {}) => ipcRenderer.invoke('yayra:install-page-as-app-preview', { url, title }),
-    // Local document workspace: open one explicitly selected original file;
-    // the renderer receives only bytes, never a filesystem path.
+    // Local document workspace. Paths stay in the trusted main process: this
+    // surface exposes opaque catalog ids, safe display metadata and (only
+    // when opening a supported format) the explicitly requested file bytes.
     documents: {
       openFile: () => ipcRenderer.invoke('yayra:doc-open'),
       // Backward-compatible alias for existing renderer/tests and older minis.
       openPdf: () => ipcRenderer.invoke('yayra:doc-open'),
-      // "Open with desktop app": hand the CURRENT document's bytes to the
-      // OS default pdf reader (main process writes a temp file).
+      list: () => ipcRenderer.invoke('yayra:doc-library-list'),
+      reopen: (id) => ipcRenderer.invoke('yayra:doc-library-open', { id, external: false }),
+      openLibraryExternal: (id) => ipcRenderer.invoke('yayra:doc-library-open', { id, external: true }),
+      showInFolder: (id) => ipcRenderer.invoke('yayra:doc-library-show', { id }),
+      locate: (id) => ipcRenderer.invoke('yayra:doc-library-locate', { id }),
+      remove: (id) => ipcRenderer.invoke('yayra:doc-library-remove', { id }),
+      clear: () => ipcRenderer.invoke('yayra:doc-library-clear'),
+      clearMissing: () => ipcRenderer.invoke('yayra:doc-library-clear-missing'),
+      prune: (olderThanDays) => ipcRenderer.invoke('yayra:doc-library-prune', { olderThanDays }),
+      // "Open with desktop app" for session-only files: write the current
+      // unchanged bytes to a temp file. Catalog files use openLibraryExternal.
       openExternal: ({ name, data } = {}) => ipcRenderer.invoke('yayra:doc-open-externally', { name, data }),
       // OS "Open with > yayra" launches: the main process pushes the
       // user-chosen file's bytes; the shell opens them in its viewer.

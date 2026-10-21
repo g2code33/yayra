@@ -23,7 +23,7 @@ export const DOCUMENT_ENGINES = Object.freeze({
     capabilities: caps({
       view: true, search: true, zoom: true, pageNavigation: true,
       rotate: true, nightMode: true, outline: true, thumbnails: true,
-      notes: false, sheets: false, animate: false,
+      presentation: true, notes: false, sheets: false, animate: false,
       annotate: false, edit: false, save: false, export: false, print: true
     })
   }),
@@ -41,7 +41,7 @@ export const DOCUMENT_ENGINES = Object.freeze({
     capabilities: caps({
       view: true, search: true, zoom: true, pageNavigation: true,
       rotate: false, nightMode: false, outline: false, thumbnails: true,
-      notes: true, sheets: false, animate: false, embeddedVideo: true,
+      presentation: true, notes: true, sheets: false, animate: false, embeddedVideo: true,
       annotate: false, edit: false, save: false, export: false, print: false
     })
   }),
@@ -56,7 +56,7 @@ export const DOCUMENT_ENGINES = Object.freeze({
     capabilities: caps({
       view: true, search: true, zoom: true, pageNavigation: false,
       rotate: false, nightMode: false, outline: false, thumbnails: false,
-      notes: false, sheets: false, animate: false,
+      presentation: false, notes: false, sheets: false, animate: false,
       annotate: false, edit: false, save: false, export: false, print: false
     })
   }),
@@ -76,7 +76,7 @@ export const DOCUMENT_ENGINES = Object.freeze({
     capabilities: caps({
       view: true, search: true, zoom: false, pageNavigation: true,
       rotate: false, nightMode: false, outline: false, thumbnails: false,
-      notes: false, sheets: true, animate: false,
+      presentation: false, notes: false, sheets: true, animate: false,
       annotate: false, edit: false, save: false, export: false, print: false
     })
   }),
@@ -91,7 +91,7 @@ export const DOCUMENT_ENGINES = Object.freeze({
     capabilities: caps({
       view: true, search: false, zoom: true, pageNavigation: false,
       rotate: true, nightMode: false, outline: false, thumbnails: false,
-      notes: false, sheets: false, animate: true,
+      presentation: false, notes: false, sheets: false, animate: true,
       annotate: false, edit: false, save: false, export: false, print: false
     })
   }),
@@ -106,7 +106,7 @@ export const DOCUMENT_ENGINES = Object.freeze({
     capabilities: caps({
       view: true, search: true, zoom: true, pageNavigation: false,
       rotate: false, nightMode: true, outline: false, thumbnails: false,
-      notes: false, sheets: false, animate: false,
+      presentation: false, notes: false, sheets: false, animate: false,
       annotate: false, edit: false, save: false, export: false, print: false
     })
   }),
@@ -117,11 +117,11 @@ export const DOCUMENT_ENGINES = Object.freeze({
     extensions: Object.freeze(['doc', 'ppt']),
     mimeTypes: Object.freeze(['application/msword', 'application/vnd.ms-powerpoint']),
     engine: 'No safe in-app renderer',
-    limitations: 'Legacy binary .doc and .ppt files cannot be rendered safely in-app. The original file remains available to open with an installed office application.',
+    limitations: 'This file type has no safe built-in viewer (including legacy binary .doc and .ppt). The unchanged original remains available to open with its installed desktop application.',
     capabilities: caps({
       view: false, search: false, zoom: false, pageNavigation: false,
       rotate: false, nightMode: false, outline: false, thumbnails: false,
-      notes: false, sheets: false, animate: false,
+      presentation: false, notes: false, sheets: false, animate: false,
       annotate: false, edit: false, save: false, export: false, print: false
     })
   })

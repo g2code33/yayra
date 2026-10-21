@@ -35,7 +35,9 @@ export {
   createTextViewer,
   createUnsupportedViewer,
   DEFAULT_PPTX_NOTES_COLOR,
-  normalizePptxNotesColor
+  normalizePptxNotesColor,
+  resolveDocumentSlideshowShortcut,
+  resolvePptxSlideshowShortcut
 } from './documentViewers.js';
 
 /**
@@ -46,8 +48,9 @@ export {
  *    existing tab system, never through the website frame.
  *  - Every engine reports capabilities explicitly; the UI never claims
  *    editing, annotation or export that the engine cannot perform.
- *  - Original bytes remain in renderer memory (Electron transfers bytes but
- *    never a source path; web/Android uses the standard file picker).
+ *  - Original bytes remain in renderer memory. Electron transfers bytes and
+ *    an opaque catalog id but never a source path; web/Android uses the
+ *    standard file picker.
  *  - All engines are injected/lazy local modules, making them independently
  *    testable and keeping PDF, PPTX, DOCX and spreadsheet rendering offline.
  */
@@ -65,7 +68,7 @@ export class DocumentStore {
     this._docs = new Map();
   }
 
-  add({ name, bytes, mime = '' }) {
+  add({ name, bytes, mime = '', libraryId = null }) {
     const size = bytes && Number.isFinite(bytes.byteLength)
       ? bytes.byteLength
       : (bytes && Number.isFinite(bytes.length) ? bytes.length : 0);
@@ -85,6 +88,9 @@ export class DocumentStore {
       mime: String(mime || '').split(';', 1)[0].trim() || mimeForDocument(type, cleanName),
       route: routeDocument(type),
       size,
+      // Opaque main-process catalog capability. This is not a path and is
+      // useful only through the narrow document bridge.
+      libraryId: typeof libraryId === 'string' ? libraryId : null,
       openedAt: Date.now()
     };
     this._docs.set(id, doc);
@@ -111,6 +117,7 @@ export function createDocumentViewerState(kind = 'pdf') {
     sidebarTab: kind === 'pptx' ? 'thumbnails' : 'outline',
     showNotes: kind === 'pptx',
     notesColor: DEFAULT_PPTX_NOTES_COLOR,
+    slideshowMode: false,
     slidePending: false,
     searchPending: false,
     searchProgress: null,
@@ -162,6 +169,13 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null,
   const setState = (patch) => { Object.assign(viewerState, patch); notify(); };
   const clampPage = (value) => Math.min(Math.max(1, Math.round(Number(value) || 1)), Math.max(1, viewerState.numPages || 1));
   const ownerDocument = () => mountedContainer?.ownerDocument || (typeof document !== 'undefined' ? document : null);
+  // The same PDF controller powers normal continuous reading and projector
+  // mode. Presentation hosts show exactly one page and fit it to the display;
+  // normal hosts keep the windowed, selectable continuous document.
+  const isPresentationMode = () => Boolean(
+    mountedContainer?.classList?.contains?.('fb-document-slideshow-host')
+    || mountedContainer?.classList?.contains?.('fb-pptx-slideshow-host')
+  );
 
   function removeFromParent(element) {
     if (!element?.parentElement) return;
@@ -183,11 +197,28 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null,
     };
   }
 
+  function styleRoot() {
+    if (!root) return;
+    root.classList?.toggle?.('is-slideshow', isPresentationMode());
+    root.style.cssText = isPresentationMode()
+      ? 'width:100%;height:100%;min-width:0;min-height:0;display:flex;align-items:center;justify-content:center;box-sizing:border-box;padding:0;overflow:hidden;'
+      : 'width:max-content;min-width:100%;min-height:100%;display:flex;flex-direction:column;align-items:center;box-sizing:border-box;padding:4px 8px 24px;';
+  }
+
   function stylePageShell(shell, pageNumber) {
     const size = scaledSize(pageNumber);
     shell.style.width = `${size.width}px`;
     shell.style.height = `${size.height}px`;
-    shell.style.cssText = `position:relative;flex:0 0 auto;width:${size.width}px;height:${size.height}px;margin:0 auto 16px;background:#fff;box-shadow:0 6px 26px rgba(0,0,0,.28);border-radius:2px;overflow:hidden;content-visibility:auto;`;
+    const presenting = isPresentationMode();
+    shell.style.cssText = presenting
+      ? `position:relative;flex:0 0 auto;width:${size.width}px;height:${size.height}px;margin:0;background:#fff;box-shadow:0 0 70px rgba(0,0,0,.72);border-radius:2px;overflow:hidden;display:${pageNumber === clampPage(viewerState.page) ? 'block' : 'none'};content-visibility:visible;`
+      : `position:relative;flex:0 0 auto;width:${size.width}px;height:${size.height}px;margin:0 auto 16px;background:#fff;box-shadow:0 6px 26px rgba(0,0,0,.28);border-radius:2px;overflow:hidden;content-visibility:auto;`;
+    // Keep the visibility state explicit as well as in cssText. Besides being
+    // friendlier to limited embedders/test DOMs, this prevents a stale inline
+    // display value from surviving the move back to continuous reading.
+    shell.style.display = presenting
+      ? (pageNumber === clampPage(viewerState.page) ? 'block' : 'none')
+      : 'block';
   }
 
   function buildPages() {
@@ -196,11 +227,13 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null,
     if (root) {
       removeFromParent(root);
       mountedContainer.appendChild?.(root);
+      styleRoot();
+      refreshPageBoxes();
       return root;
     }
     root = doc.createElement('div');
     root.className = 'fb-pdf-continuous-pages';
-    root.style.cssText = 'width:max-content;min-width:100%;min-height:100%;display:flex;flex-direction:column;align-items:center;box-sizing:border-box;padding:4px 8px 24px;';
+    styleRoot();
     pageShells.clear();
     pageCanvases.clear();
     textLayers.clear();
@@ -242,6 +275,7 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null,
   }
 
   function refreshPageBoxes() {
+    styleRoot();
     for (const [pageNumber, shell] of pageShells) stylePageShell(shell, pageNumber);
   }
 
@@ -254,6 +288,7 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null,
   }
 
   function pageNearestViewport() {
+    if (isPresentationMode()) return viewerState.page || 1;
     if (!mountedContainer || !pageShells.size) return viewerState.page || 1;
     const hostRect = mountedContainer.getBoundingClientRect?.();
     const target = hostRect && Number.isFinite(hostRect.top)
@@ -499,15 +534,25 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null,
     if (viewerState.status !== 'ready') return viewerState;
     const page = clampPage(value);
     setState({ page });
+    refreshPageBoxes();
+    // PDF pages may have different proportions. Re-fit each newly presented
+    // page instead of carrying a landscape page's scale into a portrait page.
+    if (isPresentationMode() && viewerState.zoomMode === 'fit-page') {
+      await fitToPage();
+      return viewerState;
+    }
     await renderWindow(page);
-    pageShells.get(page)?.scrollIntoView?.({ behavior: 'auto', block: 'start', inline: 'center' });
+    if (!isPresentationMode()) pageShells.get(page)?.scrollIntoView?.({ behavior: 'auto', block: 'start', inline: 'center' });
     return viewerState;
   }
   const nextPage = () => setPage((viewerState.page || 1) + 1);
   const prevPage = () => setPage((viewerState.page || 1) - 1);
 
   async function setZoom(value) {
-    const zoom = Math.min(4, Math.max(0.5, Number(value) || 1));
+    // Very tall pages still need to fit on a short projector/mobile display;
+    // preserve the established 50% reader floor outside slideshow mode.
+    const minimumZoom = isPresentationMode() ? 0.1 : 0.5;
+    const zoom = Math.min(4, Math.max(minimumZoom, Number(value) || 1));
     renderGeneration += 1;
     for (const task of renderTasks.values()) { try { task.cancel?.(); } catch { /* settled */ } }
     rendering.clear();
@@ -544,23 +589,25 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null,
       const page = await pdfDoc.getPage(viewerState.page);
       const rotation = ((page.rotate || 0) + (viewerState.rotation || 0)) % 360;
       const viewport = page.getViewport({ scale: 1, rotation });
-      await setZoom(Math.max(0.5, Math.min(4, (width - 32) / viewport.width)));
-      viewerState.zoomMode = 'fit-width';
+      const gutter = isPresentationMode() ? 8 : 32;
+      await setZoom(Math.min(4, (width - gutter) / viewport.width));
+      setState({ zoomMode: 'fit-width' });
     } catch { /* keep current zoom */ }
     return viewerState;
   }
 
   async function fitToPage() {
     const box = mountedContainer?.parentElement || mountedContainer;
-    const width = box && (box.clientWidth || box.parentElement?.clientWidth);
-    const height = box && (box.clientHeight || box.parentElement?.clientHeight);
+    const width = box && (box.clientWidth || mountedContainer?.clientWidth || box.parentElement?.clientWidth);
+    const height = box && (box.clientHeight || mountedContainer?.clientHeight || box.parentElement?.clientHeight);
     if (!width || !height || !pdfDoc) return viewerState;
     try {
       const page = await pdfDoc.getPage(viewerState.page);
       const rotation = ((page.rotate || 0) + (viewerState.rotation || 0)) % 360;
       const viewport = page.getViewport({ scale: 1, rotation });
-      await setZoom(Math.max(0.5, Math.min(4, Math.min((width - 32) / viewport.width, (height - 32) / viewport.height))));
-      viewerState.zoomMode = 'fit-page';
+      const gutter = isPresentationMode() ? 8 : 32;
+      await setZoom(Math.min(4, Math.min((width - gutter) / viewport.width, (height - gutter) / viewport.height)));
+      setState({ zoomMode: 'fit-page' });
     } catch { /* keep current zoom */ }
     return viewerState;
   }
@@ -723,6 +770,8 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null,
       clearElement(mountedContainer);
       mountedContainer.appendChild?.(root);
       bindScroll();
+      refreshPageBoxes();
+      void renderWindow(viewerState.page);
     } else if (pdfDoc && viewerState.status === 'ready') {
       buildPages();
       void renderWindow(viewerState.page);

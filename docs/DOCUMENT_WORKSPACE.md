@@ -1,106 +1,200 @@
 # Yayra document workspace
 
-Yayra opens local documents in first-class `yayra://doc/<id>` tabs without
+Yayra opens local files in first-class `yayra://doc/<id>` tabs without
 uploading them to a converter or navigating the active website away. The
 implementation adapts the proven offline viewer architecture from
 `g2code33/pharmaTRACK_PERFECT_new` under its MIT license (see
 `LICENSE.reference-pharmatrack`).
 
-## Supported formats
+The toolbar **Documents** button opens `yayra://documents`, an indexed library
+of every local file explicitly opened through Yayra. It sits directly beside
+**Downloads**.
+
+## Supported formats and honest all-file routing
 
 | Kind | Extensions | Bundled engine | Main capabilities | Explicit limitations |
 | --- | --- | --- | --- | --- |
-| PDF | `.pdf` | PDF.js | Continuous pages, selectable text, progressive/windowed painting, page jump, find, thumbnails, outline, fit/zoom, rotation, night mode, print/download | Image-only scans have no searchable text without OCR |
-| PowerPoint | `.pptx`, `.pptm` | Native OOXML slide renderer | Slide dimensions, master/layout/theme inheritance, backgrounds, text/runs, shapes, embedded and cropped images, playable embedded videos with poster frames and native controls, tables/merged cells, speaker notes with a native text-colour picker, thumbnails, navigation, find, fit/zoom | Does not execute macros, transitions, animations or OLE; linked-only videos stay offline and use their poster frame; unsupported video codecs use the browser’s native fallback; charts/SmartArt may use static or explanatory fallbacks |
+| PDF | `.pdf` | PDF.js | Continuous pages, selectable text, progressive/windowed painting, page jump, find, thumbnails, outline, fit/zoom, rotation, night mode, print/download, and a dedicated full-screen page show | Image-only scans have no searchable text without OCR |
+| PowerPoint | `.pptx`, `.pptm` | Native OOXML slide renderer | Slide dimensions, master/layout/theme inheritance, backgrounds, text/runs, shapes, embedded and cropped images, playable embedded videos with poster frames and native controls, tables/merged cells, speaker notes with a native text-colour picker, thumbnails, navigation, find, fit/zoom and dedicated slideshow | Does not execute macros, transitions, animations or OLE; linked-only videos stay offline and use their poster frame; unsupported codecs use the browser fallback; charts/SmartArt may use static or explanatory fallbacks |
 | Word | `.docx` | `docx-preview` | Paged visual layout, styles, tables, headers/footers, notes, find, zoom | No macro execution, OLE, or tracked-change balloons |
 | Spreadsheet | `.xlsx`, `.xlsm`, `.xls`, `.csv` | SheetJS Community Edition | Worksheet tabs, cells, formatted values, merged cells, dimensions, formula/result display, find, bounded row windows | Does not reproduce charts, conditional formatting or frozen panes |
 | Image | `.jpg`, `.jpeg`, `.png`, `.webp`, `.gif`, `.bmp`, `.avif`, `.svg` | Browser decoder | Internal display, zoom, rotation; animation where the browser supports it | SVG is sanitised before display |
 | Text | `.txt`, `.md`, `.markdown`, `.log`, `.json`, `.xml`, `.yaml`, `.yml` | Safe text renderer | Bounded plain-text display, find, zoom, night mode | Markup is displayed literally and never executed |
-| Legacy Office | `.doc`, `.ppt` | Honest fallback | Download unchanged original or open it with an installed desktop application | No safe bundled binary-Office renderer |
+| Legacy Office | `.doc`, `.ppt` | Honest fallback | Open/download the unchanged original through an installed desktop application | No safe bundled binary-Office renderer |
+| Every other file | Any extension | System application / unchanged-file fallback | Remembered in Documents; reopened with the operating-system handler on desktop | Unknown bytes are never interpreted as trusted display content |
 
-Unknown file types are refused with a clear notice. Recognized but corrupt or
-password-protected documents transition to an actionable error state; they do
-not remain on an endless loading indicator. The unchanged original remains
-available through **Download** and, in Electron, **Desktop app**.
+Recognized but corrupt or password-protected documents transition to an
+actionable error state; they do not remain on an endless loading indicator.
+The unchanged original always remains available. Selecting or dropping an
+unknown format creates an honest fallback instead of silently excluding it.
+
+## Documents hub
+
+`yayra://documents` provides:
+
+- search by filename, extension, or family;
+- opening-date filters for today, 7 days, 30 days, one year, or any time;
+- type filters for PDF, presentation, document, spreadsheet, image, text,
+  archive, and other files;
+- file-size filters for under 1 MB, 1–10 MB, 10–100 MB, 100–300 MB, and
+  files over the internal-viewer limit;
+- independent ascending/descending sorting by opening date, name, type, size,
+  or opening frequency;
+- direct **Open**, **Desktop app**, and **Show in folder** actions;
+- explicit missing/moved-file state plus **Locate…** relinking;
+- removal of one row, all unavailable rows, or all history without deleting
+  original files; and
+- truthful browser/PWA session-only behavior where durable filesystem access
+  is unavailable.
+
+**Settings > Documents** controls the default sort field/direction plus type,
+date, and size filters, history retention, missing-file visibility, presentation
+fullscreen, presentation-control auto-hide, and history management. Retention and Clear delete catalog metadata
+only. They never delete, move, rename, rewrite, or upload source files.
+
+## Trusted catalog and path isolation
+
+`electron/documentLibrary.cjs` owns the persistent desktop catalog in
+Electron's trusted main process. Each source gets a random opaque `local-*` id.
+The on-disk main-process record includes the canonical source path and safe
+metadata. Renderer-facing records contain only:
+
+- opaque id;
+- basename, extension, and file family;
+- size and modified/opened timestamps;
+- opening count and current availability; and
+- whether the bundled viewer can handle it.
+
+No source path crosses IPC or enters ordinary renderer tab/localStorage state.
+Every reopen resolves the opaque id in the main process, stats the source again,
+rechecks permissions and the 300 MB internal-viewer ceiling, and then does one
+of two things:
+
+1. transfers the explicitly requested supported file's bytes to the bundled
+   viewer; or
+2. asks the OS to open the original path for an unsupported format or explicit
+   **Desktop app** action.
+
+The picker records a file before routing it, including supported files over the
+internal-viewer ceiling. OS **Open with Yayra** and Downloads **Open in Yayra**
+also record their source. Web/Android picker and drag-and-drop entries appear in
+a session catalog; if the browser can no longer access the bytes, the row says
+so and asks the user to choose the source again rather than pretending durable
+access exists.
+
+`DocumentStore` still keeps active original `ArrayBuffer`/`Uint8Array` values in
+renderer memory. It stores only an optional opaque catalog id, never a path.
+Document tabs remain excluded from browser-session persistence; closing the
+final session-only tab releases its bytes and marks that session row unavailable.
 
 ## Routing and trust model
 
-Routing does not trust a URL suffix alone:
+Internal rendering does not trust a filename suffix alone:
 
 1. Known byte signatures win (`%PDF-`, PNG/JPEG/GIF/BMP/WebP/AVIF and SVG).
 2. OOXML ZIP entry names distinguish `ppt/presentation.xml`,
    `word/document.xml`, and `xl/workbook.xml` using bounded prefix/tail scans.
 3. A declared MIME type can identify extensionless browser-selected files.
 4. The filename extension is the final fallback.
+5. If none match, the route is `unsupported`; bytes are not rendered as HTML,
+   script, media, or another trusted document family.
 
-`DocumentStore` keeps the original `ArrayBuffer`/`Uint8Array` in renderer
-memory. Document tabs are deliberately excluded from session persistence;
-closing the final tab releases the bytes and viewer resources.
+## PDF and PowerPoint presentation mode
 
-Electron's picker and OS **Open with Yayra** path read one explicitly selected
-local file, enforce the shared 300 MB ceiling, and send only `{ name, size,
-data }` over IPC. The source filesystem path never crosses into the renderer.
-The desktop-original escape hatch receives the already-held bytes, writes a
-sanitised temporary copy, and asks the OS to open that copy.
+PDF and PPTX/PPTM tabs expose a primary **Present** action. `F5` starts from page
+or slide 1; `Shift+F5` starts from the current page or slide. For PowerPoint,
+destructive/escape actions (**Desktop app / Download original** and **Close
+presentation**) live in the accessible three-dot menu rather than occupying the
+main toolbar. That menu also contains **Present from beginning**.
+
+Presentation mode is a dedicated full-window black projector surface, not CSS
+enlargement or a screenshot of the ordinary viewer. It:
+
+- requests true browser/Electron fullscreen with hidden navigation UI and
+  remains usable as a full-window show if permission is denied;
+- moves the existing live viewer controller into the projector, avoiding a
+  reload or lossy conversion;
+- switches PDF.js from continuous reading to exactly one proportionally fitted
+  page, re-fits pages whose proportions differ, and keeps its selectable text
+  layer/live canvas;
+- keeps the existing PowerPoint slide DOM, embedded video controls, and lazy
+  media alive;
+- restores the prior viewer mount, current page/slide, zoom mode, reading
+  position, focus, and PowerPoint notes state on exit;
+- has auto-hiding previous/next, number jump, black screen, laser, pen,
+  page/slide navigator, help, fullscreen, and exit controls;
+- supports swipe, click, and throttled wheel navigation while leaving keyboard
+  and pointer events on embedded PowerPoint video/audio controls alone;
+- provides black (`B` or `.`) and white (`W` or `,`) screens;
+- supports laser (`Ctrl+L`), pen (`Ctrl+P`), arrow (`Ctrl+A`), hidden pointer
+  (`Ctrl+H`), and clear ink (`E`);
+- supports page/slide overview (`G` or `-`) and in-show shortcut help (`F1`);
+  and
+- owns the comprehensive presentation navigation set: `F5`, `Shift+F5`,
+  arrows, `N`, `P`, `H`, Space, Enter, Backspace, Page Up/Down, Home/End,
+  number+Enter, and Escape.
+
+PowerPoint shows start with speaker notes hidden and allow Notes to be toggled
+with the control, `S`, `Alt+F5`, or `Ctrl+Shift+N`; PDF shows do not invent a
+notes feature. The pen layer is separate from document content, clears on
+page/slide changes, and never alters the original. A show never executes macros,
+transitions, scripts, OLE objects, or linked media.
 
 ## Offline and packaging contract
 
-All engines are local assets:
+All document engines are local assets:
 
 - `packages/shared-ui/src/vendor/pdfjs/`
 - `packages/shared-ui/src/vendor/documents/`
 
-`npm run build:document-vendors` deterministically bundles the attributed
-sources in `scripts/vendor-src/` and writes a hash manifest plus license files.
-`prebuild:web` runs this step automatically. The PWA precache and Electron
-`app.asar` verification gates explicitly require every lazy engine, the PDF
-worker, fonts/CMaps, and the generated manifest. Document bytes are never sent
-to a third-party conversion service.
+`npm run build:document-vendors` deterministically bundles attributed sources
+from `scripts/vendor-src/` and writes a hash manifest plus license files.
+`prebuild:web` runs it automatically. PWA precache and Electron `app.asar`
+verification require every lazy engine, the PDF worker, fonts/CMaps, and the
+generated manifest. Document bytes are never sent to a conversion service.
 
-## PDF performance and lifecycle
+## Performance and lifecycle
 
 The PDF controller creates lightweight page placeholders for continuous
 scrolling but paints only the current page and two neighbours on each side.
 Canvas pixels and text layers more than eight pages away are evicted. Page
 sizes are measured after the first visible window has painted, and text/search
-indexes are cached lazily. Zoom/rotation cancels obsolete render tasks. The
-controller also cancels pending loads, removes scroll listeners, destroys the
-PDF.js task/document, clears canvases/text layers, and releases references when
-a tab closes or the shell is destroyed.
+indexes are cached lazily. In presentation mode, non-current page shells are
+hidden and a page is re-fitted only when its dimensions require it.
+Zoom/rotation cancels obsolete tasks. Closing a tab
+cancels loads/listeners, destroys PDF.js resources, clears canvases/text layers,
+and releases references.
 
 PPTX follows the same first-content-first rule: presentation structure opens
-before media, and embedded pictures, video poster frames and clips are
-materialised slide-by-slide. Video controls stay inside the slide, never load a
-linked external file, and keep their own keyboard shortcuts while focused.
-Search text is indexed lazily. The speaker-notes colour control adapts the
-native-picker pattern introduced by `pharmaTRACK_PERFECT_new` v1.4.22: it sits
-beside **Download original** / **Desktop app**, updates only the notes text
-without rebuilding slide media, defaults to black on a fixed cream card, and
-stores a validated six-digit colour in the active Yayra profile. Malformed or
-unavailable storage falls back safely without disabling the live in-memory
-control. Spreadsheet rendering limits each visible row window to 300 rows.
+before media, and pictures, video posters, and clips are materialised
+slide-by-slide. Video controls stay inside the slide, never load a linked
+external file, and own their keyboard shortcuts while focused. Search indexes
+lazily. The validated six-digit notes colour updates only note text, defaults to
+black on a fixed cream card, and persists per profile without rebuilding slide
+media. Spreadsheet rendering limits each visible row window to 300 rows.
 
 ## User entry points
 
+- Toolbar: **Documents**
 - Drawer: **Open document**
-- Desktop native picker (or standard web/Android file input)
+- Desktop native all-file picker (or standard web/Android file input)
 - Drag and drop anywhere in Yayra
-- Downloads context menu: **Open in Yayra** for registered formats
+- Downloads context menu: **Open in Yayra** for internally viewable formats
 - Desktop OS file association / **Open with Yayra**
 
-Every document receives its own ordinary Yayra tab and participates in normal
-tab switching and closing, but never enters the web frame/native website
-engine path.
+Every internally handled file receives its own ordinary Yayra tab and
+participates in normal tab switching and closing, but never enters the web
+frame/native website engine path.
 
 ## Validation
 
-The automated suite covers byte/MIME/filename routing, the shared 300 MB guard,
-a realistic PowerPoint fixture (master, layout, theme, background, image crop,
-merged table and speaker notes), the native notes-colour control (live update,
-black default, profile persistence, visibility sync, remount, malformed/storage
-fallback and mobile layout), both `a:videoFile` and `p14:media` video forms,
-lazy clip loading, poster thumbnails, linked-video offline fallback, native
-video controls and keyboard ownership, real DOCX and spreadsheet rendering,
-SVG sanitisation, safe text, continuous PDF windowing/text layers/thumbnails/
-outline, corrupt-file errors, original-file fallback, byte-only IPC, file
-associations, packaging, and lifecycle cleanup.
+The automated suite covers catalog persistence, opaque-id/path isolation,
+all-file routing, availability checks, relinking, retention, non-destructive
+clear, filtering/sorting source contracts, the shared 300 MB guard, byte/MIME/
+filename routing, a realistic PowerPoint fixture, embedded-video fidelity and
+keyboard ownership, notes colour, complete shared presentation shortcuts,
+true-fullscreen/overflow wiring, live PDF projector mounting and restoration,
+variable-proportion PDF page fitting, DOCX/spreadsheet rendering, SVG
+sanitisation, safe text, continuous PDF windowing/search/thumbnails/outline, corrupt-file
+errors, original-file fallback, IPC, associations, packaging, and lifecycle
+cleanup.

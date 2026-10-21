@@ -19,6 +19,7 @@ const { resolveGoogleClientId, resolveGoogleClientSecret } = require('./googleAu
 const { APP_GOOGLE_AUTH_PARTITION, createGoogleAuthWindowManager } = require('./googleAuthWindow.cjs');
 const { createDownloadsStore } = require('./downloadsStore.cjs');
 const { createDownloadsBridge } = require('./downloadsBridge.cjs');
+const { createDocumentLibrary } = require('./documentLibrary.cjs');
 const { createPasskeyBridge } = require('./passkeyBridge.cjs');
 const { configureWebsiteWebAuthn } = require('./websiteWebAuthn.cjs');
 const { createWebsitePasskeyProvider } = require('./websitePasskeyProvider.cjs');
@@ -43,6 +44,9 @@ const MAX_DOCUMENT_BYTES = 300 * 1024 * 1024;
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 let mainWindow;
 let downloadsBridge = null;
+// Trusted local-file catalog. It alone owns source paths; renderer code only
+// ever receives opaque ids plus display metadata or bytes for one chosen id.
+let documentLibrary = null;
 // Extra per-profile shell windows (Chrome-style: one window per profile,
 // the previous window stays). Tracked for cleanup only.
 const profileWindows = new Set();
@@ -53,6 +57,20 @@ let globalHotkeys = null;
 let trayController = null;
 let windowDragController = null;
 let lastLoadError = null;
+
+function ensureDocumentLibrary() {
+  if (!documentLibrary) {
+    documentLibrary = createDocumentLibrary({
+      fs,
+      path,
+      crypto,
+      shell,
+      userDataDir: app.getPath('userData'),
+      maxViewBytes: MAX_DOCUMENT_BYTES
+    });
+  }
+  return documentLibrary;
+}
 
 // Boot launches (login items / XDG autostart) pass --yayra-autostart:
 // start the floating bubble + system tray ONLY, without popping the main
@@ -362,9 +380,19 @@ const pendingPdfFiles = []; // legacy name: local documents queued until the ren
 function deliverPdfFile(filePath) {
   try {
     const stat = fs.statSync(filePath);
-    if (!stat.isFile() || stat.size > MAX_DOCUMENT_BYTES) return false;
+    if (!stat.isFile()) return false;
+    // Remember the explicit OS "Open with Yayra" action even when the file is
+    // too large for the in-app 300 MB viewer. The hub can still reveal it or
+    // hand the original path to its system application later.
+    const libraryEntry = ensureDocumentLibrary().recordPathSync(filePath);
+    if (stat.size > MAX_DOCUMENT_BYTES) return false;
     const data = fs.readFileSync(filePath);
-    const payload = { name: path.basename(filePath), size: stat.size, data };
+    const payload = {
+      name: path.basename(filePath),
+      size: stat.size,
+      data,
+      libraryId: libraryEntry?.id || null
+    };
     const rendererReady = mainWindow && !mainWindow.isDestroyed()
       && (typeof mainWindow.webContents.isLoadingMainFrame !== 'function' || !mainWindow.webContents.isLoadingMainFrame());
     if (rendererReady) {
@@ -738,6 +766,8 @@ app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) creat
 function registerIpcBridges() {
   registerDesktopUpdateHandlers({ getWindow: () => mainWindow });
 
+  ensureDocumentLibrary();
+
   // Keep every pixel of the custom top chrome renderer-interactive. Native
   // CSS drag regions can hold a compositor input grab (most visibly on
   // Linux), leaving tabs and caption buttons looking frozen. The dedicated
@@ -987,22 +1017,18 @@ function registerIpcBridges() {
     }
   });
 
-  // LOCAL DOCUMENT WORKSPACE: opens one user-selected original file and
-  // transfers ONLY its bytes to the renderer. PDF, PPTX/PPTM, DOCX,
-  // spreadsheets, images and text have bundled offline viewers; older/unknown
-  // files receive an honest original-file fallback. The path never crosses
-  // IPC, nothing else on disk is reachable, and every format shares the same
-  // 300 MB ceiling.
+  // LOCAL DOCUMENT WORKSPACE: every explicitly selected file is recorded in
+  // the trusted main-process catalog. Viewable formats transfer capped bytes
+  // to the bundled renderer; every other type is handed, unchanged, to the
+  // operating system. Source paths never cross IPC.
   ipcMain.handle('yayra:doc-open', async () => {
     try {
       const picked = await dialog.showOpenDialog({
         properties: ['openFile'],
         filters: [
-          { name: 'Viewable documents', extensions: ['pdf', 'pptx', 'pptm', 'docx', 'xlsx', 'xlsm', 'xls', 'csv', 'jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'avif', 'svg', 'txt', 'md', 'markdown', 'log', 'json', 'xml', 'yaml', 'yml', 'ppt', 'doc'] },
-          { name: 'PDF and presentations', extensions: ['pdf', 'pptx', 'pptm', 'ppt'] },
-          { name: 'Word and spreadsheets', extensions: ['docx', 'doc', 'xlsx', 'xlsm', 'xls', 'csv'] },
-          { name: 'Images', extensions: ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'avif', 'svg'] },
-          { name: 'All files', extensions: ['*'] }
+          { name: 'All files', extensions: ['*'] },
+          { name: 'Documents and presentations', extensions: ['pdf', 'pptx', 'pptm', 'ppt', 'docx', 'doc', 'xlsx', 'xlsm', 'xls', 'csv'] },
+          { name: 'Images and text', extensions: ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'avif', 'svg', 'txt', 'md', 'markdown', 'log', 'json', 'xml', 'yaml', 'yml'] }
         ]
       });
       if (picked.canceled || !picked.filePaths || picked.filePaths.length === 0) {
@@ -1011,21 +1037,77 @@ function registerIpcBridges() {
       const filePath = picked.filePaths[0];
       const stat = await fs.promises.stat(filePath);
       if (!stat.isFile()) return { ok: false, reason: 'not-a-file' };
-      if (stat.size > MAX_DOCUMENT_BYTES) return { ok: false, reason: 'file-too-large' };
+      const entry = await documentLibrary.recordPath(filePath);
+      if (!documentLibrary.canOpenInYayra(filePath)) {
+        const error = await shell.openPath(filePath);
+        return error
+          ? { ok: false, reason: String(error), libraryId: entry.id, entry }
+          : { ok: true, action: 'system', libraryId: entry.id, entry };
+      }
+      if (stat.size > MAX_DOCUMENT_BYTES) {
+        return { ok: false, reason: 'file-too-large', libraryId: entry.id, entry };
+      }
       const data = await fs.promises.readFile(filePath);
-      return { ok: true, name: path.basename(filePath), size: stat.size, data };
+      return {
+        ok: true,
+        action: 'yayra',
+        name: path.basename(filePath),
+        size: stat.size,
+        data,
+        libraryId: entry.id,
+        entry
+      };
     } catch (err) {
       console.error('[yayra] doc-open failed', err);
-      return { ok: false, reason: 'read-failed' };
+      return { ok: false, reason: err && err.code === 'EACCES' ? 'permission-denied' : 'read-failed' };
     }
   });
+
+  // Opaque-id document hub operations. The library resolves ids to paths in
+  // this trusted process and re-checks existence/permissions on every action.
+  ipcMain.handle('yayra:doc-library-list', async () => {
+    try { return { ok: true, entries: await documentLibrary.list() }; }
+    catch (err) {
+      console.error('[yayra] document library list failed', err);
+      return { ok: false, reason: 'read-failed', entries: [] };
+    }
+  });
+  ipcMain.handle('yayra:doc-library-open', async (_event, { id, external = false } = {}) => {
+    try { return await documentLibrary.open(id, { external: Boolean(external) }); }
+    catch (err) {
+      console.error('[yayra] document library open failed', err);
+      return { ok: false, reason: 'open-failed' };
+    }
+  });
+  ipcMain.handle('yayra:doc-library-show', async (_event, { id } = {}) => {
+    try { return await documentLibrary.showInFolder(id); }
+    catch { return { ok: false, reason: 'show-failed' }; }
+  });
+  ipcMain.handle('yayra:doc-library-locate', async (_event, { id } = {}) => {
+    try {
+      const picked = await dialog.showOpenDialog({
+        title: 'Locate moved document',
+        properties: ['openFile'],
+        filters: [{ name: 'All files', extensions: ['*'] }]
+      });
+      if (picked.canceled || !picked.filePaths?.[0]) return { ok: false, canceled: true };
+      return await documentLibrary.relink(id, picked.filePaths[0]);
+    } catch { return { ok: false, reason: 'locate-failed' }; }
+  });
+  ipcMain.handle('yayra:doc-library-remove', (_event, { id } = {}) => documentLibrary.remove(id));
+  ipcMain.handle('yayra:doc-library-clear', () => documentLibrary.clear());
+  ipcMain.handle('yayra:doc-library-clear-missing', () => documentLibrary.clearMissing());
+  ipcMain.handle('yayra:doc-library-prune', (_event, { olderThanDays } = {}) => documentLibrary.prune({ olderThanDays }));
 
   // DOCUMENT WORKSPACE: "Open with desktop app" / "Open original" escape
   // hatch. The unchanged bytes come FROM the renderer; a sanitized temporary
   // file is written and opened with the OS handler for its real extension.
   // Nothing else on disk is touched.
-  ipcMain.handle('yayra:doc-open-externally', async (_event, { name, data } = {}) => {
+  ipcMain.handle('yayra:doc-open-externally', async (_event, { name, data, libraryId } = {}) => {
     try {
+      // Prefer the original source file when this tab came from the trusted
+      // catalog. This preserves its real location/name and avoids a temp copy.
+      if (libraryId) return await documentLibrary.open(libraryId, { external: true });
       if (!data) return { ok: false, reason: 'no-data' };
       const safeName = String(name || 'document.bin').replace(/[\\/:*?"<>|]+/g, '-').slice(0, 120) || 'document.bin';
       const dir = path.join(app.getPath('temp'), 'yayra-docs');
@@ -1184,9 +1266,10 @@ function registerIpcBridges() {
       if (!item || !item.path) return { ok: false, reason: 'not-found' };
       const stat = await fs.promises.stat(item.path);
       if (!stat.isFile()) return { ok: false, reason: 'not-a-file' };
-      if (stat.size > MAX_DOCUMENT_BYTES) return { ok: false, reason: 'file-too-large' };
+      const entry = await documentLibrary.recordPath(item.path);
+      if (stat.size > MAX_DOCUMENT_BYTES) return { ok: false, reason: 'file-too-large', libraryId: entry.id, entry };
       const data = await fs.promises.readFile(item.path);
-      return { ok: true, name: path.basename(item.path), size: stat.size, data };
+      return { ok: true, name: path.basename(item.path), size: stat.size, data, libraryId: entry.id, entry };
     } catch (err) {
       console.error('[yayra] downloads-open-pdf failed', err);
       return { ok: false, reason: 'read-failed' };

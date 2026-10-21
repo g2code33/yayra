@@ -142,7 +142,7 @@ test('FILE PICKER: oversized PDFs are rejected before FileReader and the input c
   }
 });
 
-test('DRAG & DROP: supported non-PDF documents open internally and unknown files are refused', async () => {
+test('DRAG & DROP: supported files render internally and unknown files get an honest original-file fallback', async () => {
   const { shell } = await makeShell();
   try {
     const tabsBefore = shell.state.tabs.length;
@@ -153,7 +153,10 @@ test('DRAG & DROP: supported non-PDF documents open internally and unknown files
 
     const afterSpreadsheet = shell.state.tabs.length;
     await shell._openDroppedPdfFiles([{ name: 'program.exe', arrayBuffer: async () => new ArrayBuffer(4) }]);
-    assert.equal(shell.state.tabs.length, afterSpreadsheet, 'an unknown executable never creates a dead tab');
+    assert.equal(shell.state.tabs.length, afterSpreadsheet + 1, 'every explicitly opened local file receives a safe tab');
+    assert.equal(shell.getActiveTab().docState.viewer, 'unsupported', 'unknown bytes are never rendered as trusted content');
+    assert.ok(shell.state.documentsItems.some((entry) => entry.name === 'program.exe' && entry.source === 'session'),
+      'the unknown file is still accessible from the session Documents hub');
 
     // Existing download-specific PDF detection remains deliberately narrow.
     assert.equal(shell.isPdfDownload({ filename: 'x.pdf' }), true);
