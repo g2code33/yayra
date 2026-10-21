@@ -435,6 +435,16 @@ test('KOTLIN PIN: the native tab engine exists, is safe, and reports through tab
   assert.ok(manager.includes("data-yayra-selectable-text") && manager.includes('caretRangeFromPoint'), 'actual page text gets an I-beam and remains selectable');
   assert.ok(manager.includes("ev.pointerType==='touch'&&ev.type!=='pointerdown'"), 'touch pointerdown enables Android native selection/action mode');
   assert.ok(manager.includes("style[nonce],script[nonce]"), 'site CSP nonces are reused where available so custom cursors remain visible');
+  assert.ok(manager.includes('applyGradientTextCompatibility'), 'native Android pages receive the same gradient-text recovery');
+  assert.ok(manager.includes("'-webkit-background-clip','text'") && manager.includes("'background-image','none'"),
+    'Android tries prefixed text clipping before removing an unsupported box gradient');
+  assert.ok(manager.includes("data-yayra-gradient-text") && manager.includes("attributeFilter:['class','style']"),
+    'Android gradient recovery is idempotent and follows dynamic class/style changes');
+  const gradientMethod = manager.slice(manager.indexOf('private fun applyGradientTextCompatibility'));
+  const gradientScriptStart = gradientMethod.indexOf('val script = """') + 'val script = """'.length;
+  const gradientScriptEnd = gradientMethod.indexOf('""".trimIndent()', gradientScriptStart);
+  assert.ok(gradientScriptStart > 'val script = """'.length && gradientScriptEnd > gradientScriptStart, 'Android gradient script is extractable');
+  assert.doesNotThrow(() => new Function(gradientMethod.slice(gradientScriptStart, gradientScriptEnd)), 'Android gradient script is valid JavaScript');
   assert.ok(manager.includes('Bitmap.createBitmap'), 'hiding captures the page frame (no blank flash under chrome)');
   assert.ok(manager.includes('fun navigate('), 'omnibox navigation');
   assert.ok(manager.includes('fun goBack('), 'back history');

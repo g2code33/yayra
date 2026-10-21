@@ -277,6 +277,130 @@ test('media compatibility: site-declared dark theme heals white-on-white full-pa
   assert.equal(heading.textContent, 'Which lecture theatre did we meet for the first time?');
 });
 
+test('media compatibility: gradient text gets prefixed clipping or a readable solid fallback instead of a painted rectangle', () => {
+  const runCase = ({ acceptsTextClip, acceptsPrefixedOnly = false, transparent = true, className = 'gradient-text bg-clip-text text-transparent' }) => {
+    const applied = new Map();
+    const attrs = new Map();
+    let textIsTransparent = transparent;
+    let currentClassName = className;
+    let observerCallback = null;
+    const parent = { parentElement: null };
+    const element = {
+      nodeType: 1,
+      get className() { return currentClassName; },
+      parentElement: parent,
+      style: {
+        getPropertyValue(name) { return applied.get(name) || ''; },
+        getPropertyPriority(name) { return applied.has(name) ? 'important' : ''; },
+        setProperty(name, value) { applied.set(name, value); },
+        removeProperty(name) { applied.delete(name); }
+      },
+      getAttribute(name) { return attrs.get(name) ?? null; },
+      setAttribute(name, value) { attrs.set(name, value); },
+      removeAttribute(name) { attrs.delete(name); },
+      matches() { return /(?:gradient-text|bg-clip-text|text-transparent)/.test(currentClassName); },
+      querySelectorAll() { return []; }
+    };
+    const documentElement = { clientWidth: 1200, clientHeight: 800, querySelectorAll: () => [] };
+    const body = { parentElement: documentElement, firstElementChild: element };
+    const document = {
+      documentElement,
+      body,
+      getElementById() { return null; },
+      querySelectorAll(selector) {
+        if (selector === '.gradient-text,[class*="gradient-text"],[class~="bg-clip-text"],[class~="text-transparent"]') return [element];
+        return [];
+      },
+      createElement() { return { style: {} }; }
+    };
+    const window = {
+      innerWidth: 1200,
+      innerHeight: 800,
+      addEventListener() {},
+      removeEventListener() {},
+      matchMedia: () => ({ matches: true })
+    };
+    window.window = window;
+    window.document = document;
+    class MutationObserver {
+      constructor(callback) { observerCallback = callback; }
+      observe() {}
+      disconnect() {}
+    }
+    const getComputedStyle = (target) => {
+      if (target === element) {
+        const requestedClip = applied.get('background-clip') || 'border-box';
+        return {
+          backgroundImage: applied.get('background-image') || 'linear-gradient(90deg, rgb(255, 210, 0), rgb(255, 255, 255))',
+          backgroundColor: 'rgba(0, 0, 0, 0)',
+          backgroundClip: acceptsTextClip ? requestedClip : 'border-box',
+          webkitBackgroundClip: (acceptsTextClip || acceptsPrefixedOnly) ? requestedClip : 'border-box',
+          color: applied.get('color') || (textIsTransparent ? 'rgba(0, 0, 0, 0)' : 'rgb(20, 30, 40)'),
+          webkitTextFillColor: applied.get('-webkit-text-fill-color') || (textIsTransparent ? 'transparent' : 'rgb(20, 30, 40)')
+        };
+      }
+      if (target === parent) return { color: 'rgb(15, 23, 42)', backgroundColor: 'rgb(255, 255, 255)' };
+      return { color: 'rgb(15, 23, 42)', backgroundColor: 'rgb(255, 255, 255)' };
+    };
+
+    vm.runInContext(buildMediaCompatibilityScript(), vm.createContext({
+      window,
+      document,
+      URL,
+      MutationObserver,
+      getComputedStyle,
+      setTimeout(callback) { callback(); return 1; },
+      clearTimeout() {}
+    }));
+    return {
+      applied,
+      attrs,
+      makeTransparent() {
+        textIsTransparent = true;
+        observerCallback?.([{ type: 'attributes', target: element, addedNodes: [] }]);
+      },
+      removeIntent() {
+        currentClassName = 'plain-heading';
+        observerCallback?.([{ type: 'attributes', target: element, addedNodes: [] }]);
+      }
+    };
+  };
+
+  const supported = runCase({ acceptsTextClip: true });
+  assert.equal(supported.applied.get('-webkit-background-clip'), 'text');
+  assert.equal(supported.applied.get('background-clip'), 'text');
+  assert.equal(supported.applied.get('-webkit-text-fill-color'), 'currentColor', 'the fill follows later site colour changes');
+  assert.equal(supported.applied.has('background-image'), false, 'a working gradient remains authored by the site');
+  assert.equal(supported.attrs.get('data-yayra-gradient-text'), 'clip');
+  supported.removeIntent();
+  assert.equal(supported.applied.size, 0, 'prefixed compatibility styles are reversible when intent is removed');
+
+  const prefixed = runCase({ acceptsTextClip: false, acceptsPrefixedOnly: true });
+  assert.equal(prefixed.applied.has('background-image'), false, 'a prefixed-only engine keeps the gradient rather than falling back');
+  assert.equal(prefixed.attrs.get('data-yayra-gradient-text'), 'clip');
+
+  const unsupported = runCase({ acceptsTextClip: false });
+  assert.equal(unsupported.applied.get('background-image'), 'none', 'the box-filling gradient is retired');
+  assert.equal(unsupported.applied.get('background-color'), 'transparent');
+  assert.equal(unsupported.applied.get('color'), 'rgb(15, 23, 42)', 'the readable inherited foreground is preserved');
+  assert.equal(unsupported.applied.get('-webkit-text-fill-color'), 'rgb(15, 23, 42)');
+  assert.equal(unsupported.attrs.get('data-yayra-gradient-text'), 'solid');
+
+  const opaque = runCase({ acceptsTextClip: false, transparent: false });
+  assert.equal(opaque.applied.has('background-image'), false, 'ordinary opaque gradient boxes are never rewritten');
+  assert.equal(opaque.attrs.has('data-yayra-gradient-text'), false);
+  opaque.makeTransparent();
+  assert.equal(opaque.applied.get('background-image'), 'none', 'a later framework class/style transition is repaired without reloading');
+  assert.equal(opaque.attrs.get('data-yayra-gradient-text'), 'solid');
+  opaque.removeIntent();
+  assert.equal(opaque.applied.size, 0, 'removing text-clip intent restores the site’s original inline styles');
+  assert.equal(opaque.attrs.has('data-yayra-gradient-text'), false);
+
+  const decorative = runCase({ acceptsTextClip: false, className: 'text-transparent decorative-overlay' });
+  assert.equal(decorative.applied.size, 0, 'transparent decorative gradient layers without text-clip intent remain site-owned');
+  assert.equal(decorative.attrs.has('data-yayra-gradient-text'), false);
+});
+
 test('media compatibility: document-start preload catches failures before site frameworks can remove the backdrop', () => {
   const preload = readFileSync(new URL('../electron/autofillPreload.cjs', import.meta.url), 'utf8');
   const start = preload.indexOf("const installKey = '__yayraEarlyMediaCompatibilityV2'");

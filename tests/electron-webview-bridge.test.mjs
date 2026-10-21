@@ -586,6 +586,8 @@ test('webview bridge: user-origin pointer styles bypass site CSP, style child fr
   await flushStyles();
   assert.equal(inserted.size, 1, 'a later frame load reapplies without leaving duplicate styles');
   assert.equal(insertionCalls.length, 3, 'the user stylesheet refreshes on later frame loads');
+  assert.ok(frameScripts.filter((script) => script.includes('data-yayra-gradient-text')).length >= 2,
+    'visual compatibility, including gradient-text recovery, reaches main and cross-origin child frames');
 
   setTheme(null, { tabId: 'tab-pointer', theme: 'system', size: 'normal' });
   await flushStyles();

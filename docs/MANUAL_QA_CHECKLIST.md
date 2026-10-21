@@ -153,7 +153,21 @@ this list is the reality check.
   dismiss Yayra's recovery page. Close a failed tab and navigate a failed tab
   to a new URL; no old retry may fire afterward.
 
-## 1d. PowerPoint compact toolbar and overflow
+## 1d. Third-party gradient-text compatibility
+
+- [ ] Open a site that uses `.gradient-text` or
+  `bg-clip-text text-transparent` on a heading. Confirm the gradient is clipped
+  to the glyphs and never paints the heading's full rectangular box.
+- [ ] Repeat in an engine/device without unprefixed `background-clip: text`
+  support. The WebKit-prefixed form should be used when available; otherwise
+  the gradient must disappear and the words must remain readable in a solid,
+  contrast-safe colour.
+- [ ] Trigger a client-side route or toggle classes/styles after load. The same
+  correction must happen live without refresh. Verify nearby opaque gradient
+  panels, transparent decorative layers, icons, masks, and hidden accessibility
+  content are unchanged. Repeat in Electron and an Android native website tab.
+
+## 1e. PowerPoint compact toolbar and overflow
 
 - [ ] Open a PPTX in dark and light themes. The first identity row must stay
   approximately 36 px high, the controls row must stay compact, and the slide
@@ -174,7 +188,7 @@ this list is the reality check.
   notes, and projector mode to confirm the density/contrast change did not
   alter behavior.
 
-## 1e. Document download, print, and presentation actions
+## 1f. Document download, print, and presentation actions
 
 - [ ] Open representative PPTX, DOCX, PDF, and PNG files. Each integrated
   viewer must keep rendering inside Yayra and show direct **Download** and
@@ -197,7 +211,7 @@ this list is the reality check.
   at slide 1; lower **From current slide** and `Shift+F5` must start at the
   selected slide. Repeat the equivalent first/current-page checks for PDF.
 
-## 1f. Tab reorder and downward tear-off
+## 1g. Tab reorder and downward tear-off
 
 - [ ] With at least five website tabs, drag tabs repeatedly left and right,
   including across several neighbors and to both ends. Order, active tab,
@@ -220,7 +234,7 @@ this list is the reality check.
   tabs, frozen titlebar, stuck pointer capture, hidden native surface, or
   orphan process remains.
 
-## 1g. Text pointer, highlighting, and contextual actions
+## 1h. Text pointer, highlighting, and contextual actions
 
 - [ ] With **Yayra** and **High visibility** pointer themes, hover readable
   text, blank space, a link, a button label, and text fields. Expect the OS

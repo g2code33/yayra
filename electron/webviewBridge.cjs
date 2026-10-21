@@ -1740,6 +1740,19 @@ function createWebviewBridge({
     }
   }
 
+  function installMediaCompatibilityInFrames(entry) {
+    const wc = entry?.view?.webContents;
+    if (!wc) return;
+    const script = buildMediaCompatibilityScript();
+    for (const frame of pageFrames(wc)) {
+      if (!frame || typeof frame.executeJavaScript !== 'function') continue;
+      try {
+        const result = frame.executeJavaScript(script, true);
+        if (result && typeof result.catch === 'function') result.catch(() => {});
+      } catch { /* one hostile frame must not affect its tab or sibling frames */ }
+    }
+  }
+
   function executePointerThemeFallback(frames, theme, size) {
     const script = buildPointerThemeScript(theme, size);
     for (const frame of frames) {
@@ -1865,11 +1878,13 @@ function createWebviewBridge({
         wc.executeJavaScript(watchdogs, true).catch(() => {});
       }
     });
-    // Apply the selected pointer to cross-origin child frames as each one
-    // finishes loading; a main-frame style cannot cross an iframe boundary.
+    // Apply page-level enhancements to cross-origin child frames as each one
+    // finishes loading; a main-frame script/style cannot cross an iframe
+    // boundary. Each installer is idempotent inside its own frame.
     wc.on('did-frame-finish-load', () => {
       if (entry.pointerTheme !== 'system') applyPointerThemeToPage(entry);
       installTextSelectionActions(entry);
+      installMediaCompatibilityInFrames(entry);
     });
     // Reload shortcuts pressed while the PAGE has focus (which is most
     // of the time): the guest WebContents swallows keystrokes, so

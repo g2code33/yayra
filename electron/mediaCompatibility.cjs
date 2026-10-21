@@ -188,17 +188,18 @@ function installMediaCompatibility(session, logger = console) {
 
 /**
  * Main-world recovery installed in each website document. The network rewrite
- * above handles the normal case before paint. This catches cached failures,
- * late/lazy images, and third-party markup that would otherwise leave the
- * broken-image glyph visible in the page.
+ * above handles normal images before paint. This also catches cached/lazy
+ * failures, repairs narrowly identified transparent gradient text, and keeps
+ * third-party markup from leaving a broken-image glyph or box-filling gradient
+ * visible in the page.
  */
 function buildMediaCompatibilityScript() {
   const forceFormatSource = forceCloudinaryImageFormat.toString();
   return `(function () {
     try {
-      var previousInstall = window.__yayraMediaCompatibilityV1;
+      var previousInstall = window.__yayraMediaCompatibilityV2 || window.__yayraMediaCompatibilityV1;
       try { if (previousInstall && previousInstall.cleanup) previousInstall.cleanup(); } catch (_err) {}
-      var installKey = '__yayraMediaCompatibilityV2';
+      var installKey = '__yayraMediaCompatibilityV3';
       if (window[installKey]) return;
       var attempts = new WeakMap();
       var forceCloudinaryImageFormat = ${forceFormatSource};
@@ -302,6 +303,162 @@ function buildMediaCompatibilityScript() {
         }
         return null;
       };
+
+      // Tailwind and many design systems implement gradient text with a
+      // background gradient + transparent glyphs. Older WebKit/Gecko builds
+      // and some embedded WebViews either ignore background-clip:text or
+      // require its prefixed spelling. In that failure mode the gradient
+      // paints the element's whole rectangle while its text disappears. Try
+      // both clip spellings first; if the engine still does not accept text
+      // clipping, remove only that decorative gradient and install a solid,
+      // contrast-safe foreground. Never touch opaque gradients or ordinary
+      // transparent utility elements.
+      var isTransparentPaint = function (value) {
+        var text = String(value || '').trim().toLowerCase();
+        if (text === 'transparent') return true;
+        var parsed = parseColor(text);
+        return Boolean(parsed && parsed[3] <= 0.05);
+      };
+      var relativeLuminance = function (color) {
+        if (!color) return -1;
+        var linear = color.slice(0, 3).map(function (channel) {
+          var value = Math.max(0, Math.min(255, channel)) / 255;
+          return value <= 0.04045 ? value / 12.92 : Math.pow((value + 0.055) / 1.055, 2.4);
+        });
+        return (0.2126 * linear[0]) + (0.7152 * linear[1]) + (0.0722 * linear[2]);
+      };
+      var contrastRatio = function (first, second) {
+        var a = relativeLuminance(first);
+        var b = relativeLuminance(second);
+        if (a < 0 || b < 0) return 0;
+        return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+      };
+      var solidGradientFallback = function (element) {
+        var background = paintedBackground(element);
+        var parent = element && element.parentElement;
+        for (var depth = 0; parent && depth < 6; depth += 1, parent = parent.parentElement) {
+          try {
+            var inherited = getComputedStyle(parent).color;
+            var parsed = parseColor(inherited);
+            if (parsed && parsed[3] > 0.5 && (!background || contrastRatio(parsed, background) >= 4.5)) {
+              return inherited;
+            }
+          } catch (_err) { break; }
+        }
+        var luminance = relativeLuminance(background);
+        return luminance >= 0 && luminance < 0.179 ? '#ffffff' : '#000000';
+      };
+      var gradientTextSelector = '.gradient-text,[class*="gradient-text"],[class~="bg-clip-text"],[class~="text-transparent"]';
+      var gradientRepairProperties = [
+        'background-image', 'background-color', 'background-clip', '-webkit-background-clip',
+        'color', '-webkit-text-fill-color'
+      ];
+      var gradientOriginalStyles = new WeakMap();
+      var gradientRepairedElements = new Set();
+      var pruneGradientRepairs = function () {
+        gradientRepairedElements.forEach(function (element) {
+          if (element && element.isConnected !== false) return;
+          gradientRepairedElements.delete(element);
+          gradientOriginalStyles.delete(element);
+        });
+      };
+      var rememberGradientStyles = function (element, classIntent) {
+        if (gradientOriginalStyles.has(element)) return true;
+        if (gradientRepairedElements.size >= 480) pruneGradientRepairs();
+        if (gradientRepairedElements.size >= 480) return false;
+        var values = {};
+        gradientRepairProperties.forEach(function (property) {
+          try {
+            values[property] = {
+              value: element.style.getPropertyValue ? element.style.getPropertyValue(property) : '',
+              priority: element.style.getPropertyPriority ? element.style.getPropertyPriority(property) : ''
+            };
+          } catch (_err) { values[property] = { value: '', priority: '' }; }
+        });
+        gradientOriginalStyles.set(element, { values: values, classIntent: classIntent });
+        gradientRepairedElements.add(element);
+        return true;
+      };
+      var restoreGradientStyles = function (element) {
+        var original = gradientOriginalStyles.get(element);
+        if (!original) return false;
+        gradientRepairProperties.forEach(function (property) {
+          var saved = original.values[property];
+          try {
+            if (saved && saved.value) element.style.setProperty(property, saved.value, saved.priority || '');
+            else if (element.style.removeProperty) element.style.removeProperty(property);
+          } catch (_err) {}
+        });
+        try { element.removeAttribute('data-yayra-gradient-text'); } catch (_err) {}
+        gradientOriginalStyles.delete(element);
+        gradientRepairedElements.delete(element);
+        return true;
+      };
+      var repairGradientText = function (element) {
+        if (!element || !element.style) return false;
+        var style;
+        try { style = getComputedStyle(element); } catch (_err) { return false; }
+        var className = '';
+        try { className = typeof element.className === 'string' ? element.className : (element.className && element.className.baseVal) || ''; } catch (_err) {}
+        var classHints = String(className).toLowerCase();
+        var classIntent = classHints.indexOf('gradient-text') >= 0
+          || /(?:^|\\s)bg-clip-text(?:\\s|$)/i.test(classHints);
+        var original = gradientOriginalStyles.get(element);
+        if (original && original.classIntent && !classIntent) return restoreGradientStyles(element);
+        var backgroundImage = String(style.backgroundImage || '');
+        if (!/(?:linear|radial|conic|repeating-linear|repeating-radial)-gradient\\s*\\(/i.test(backgroundImage)) return false;
+        var clip = [style.backgroundClip, style.webkitBackgroundClip].join(' ').toLowerCase();
+        var intended = classIntent || clip.indexOf('text') >= 0;
+        var transparent = isTransparentPaint(style.color) || isTransparentPaint(style.webkitTextFillColor);
+        if (!intended || !transparent) return false;
+        try {
+          if (element.getAttribute('data-yayra-gradient-text') === 'clip' && clip.indexOf('text') >= 0) return false;
+        } catch (_err) {}
+
+        if (!rememberGradientStyles(element, classIntent)) return false;
+        try {
+          element.style.setProperty('-webkit-background-clip', 'text', 'important');
+          element.style.setProperty('background-clip', 'text', 'important');
+          var accepted = getComputedStyle(element);
+          var acceptedClip = [accepted.backgroundClip, accepted.webkitBackgroundClip].join(' ').toLowerCase();
+          if (acceptedClip.indexOf('text') >= 0) {
+            // currentColor follows the site's existing transparent utility and
+            // automatically becomes opaque again if the framework later
+            // removes that utility; never pin dynamic text to transparent.
+            element.style.setProperty('-webkit-text-fill-color', 'currentColor', 'important');
+            element.setAttribute('data-yayra-gradient-text', 'clip');
+            return true;
+          }
+        } catch (_err) { /* use the solid fallback below */ }
+
+        var fallback = solidGradientFallback(element);
+        try {
+          element.style.setProperty('background-image', 'none', 'important');
+          element.style.setProperty('background-color', 'transparent', 'important');
+          element.style.setProperty('background-clip', 'border-box', 'important');
+          element.style.setProperty('-webkit-background-clip', 'border-box', 'important');
+          element.style.setProperty('color', fallback, 'important');
+          element.style.setProperty('-webkit-text-fill-color', fallback, 'important');
+          element.setAttribute('data-yayra-gradient-text', 'solid');
+          return true;
+        } catch (_err) {
+          restoreGradientStyles(element);
+          return false;
+        }
+      };
+      var healGradientText = function (root) {
+        var candidates = [];
+        try {
+          if (root && root.nodeType === 1) candidates.push(root);
+          if (root && root.querySelectorAll) candidates = candidates.concat(Array.from(root.querySelectorAll(gradientTextSelector)));
+        } catch (_err) { return 0; }
+        var changed = 0;
+        Array.from(new Set(candidates)).slice(0, 240).forEach(function (element) {
+          if (repairGradientText(element)) changed += 1;
+        });
+        return changed;
+      };
+
       var healLowContrastTheme = function () {
         try {
           var color = themeColor();
@@ -409,17 +566,51 @@ function buildMediaCompatibilityScript() {
         });
       };
       scan(document);
+      healGradientText(document);
       var healTimers = [0, 250, 1000, 3000].map(function (delay) {
-        return setTimeout(healLowContrastTheme, delay);
+        return setTimeout(function () {
+          healLowContrastTheme();
+          healGradientText(document);
+        }, delay);
       });
+      var mutationHealTimer = null;
+      var scheduleMutationHeal = function () {
+        if (mutationHealTimer !== null) return;
+        mutationHealTimer = setTimeout(function () {
+          mutationHealTimer = null;
+          healLowContrastTheme();
+          healGradientText(document);
+        }, 50);
+      };
 
       var observer = typeof MutationObserver === 'function' ? new MutationObserver(function (records) {
+        var addedContent = false;
         records.forEach(function (record) {
-          Array.from(record.addedNodes || []).forEach(scan);
+          if (record.type === 'attributes') {
+            try {
+              if (record.target && record.target.matches
+                  && (record.target.matches(gradientTextSelector)
+                    || record.target.getAttribute('data-yayra-gradient-text'))) {
+                healGradientText(record.target);
+              }
+            } catch (_err) {}
+            return;
+          }
+          Array.from(record.addedNodes || []).forEach(function (node) {
+            addedContent = true;
+            scan(node);
+            healGradientText(node);
+          });
         });
-        healLowContrastTheme();
+        pruneGradientRepairs();
+        if (addedContent) scheduleMutationHeal();
       }) : null;
-      if (observer && document.documentElement) observer.observe(document.documentElement, { childList: true, subtree: true });
+      if (observer && document.documentElement) observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['class', 'style']
+      });
 
       window[installKey] = {
         cleanup: function () {
@@ -427,6 +618,8 @@ function buildMediaCompatibilityScript() {
           try { window.removeEventListener('load', onLoad, true); } catch (_err) {}
           try { observer && observer.disconnect(); } catch (_err) {}
           try { healTimers.forEach(clearTimeout); } catch (_err) {}
+          try { if (mutationHealTimer !== null) clearTimeout(mutationHealTimer); } catch (_err) {}
+          try { Array.from(gradientRepairedElements).forEach(restoreGradientStyles); } catch (_err) {}
           try { delete window[installKey]; } catch (_err) {}
         }
       };

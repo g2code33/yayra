@@ -262,7 +262,10 @@ class YayraTabWebviewManager(
 
                             override fun onPageFinished(view: WebView?, target: String?) {
                                 val entryNow = tabs[id]
-                                entryNow?.let { applyPointerThemeToPage(it) }
+                                entryNow?.let {
+                                    applyPointerThemeToPage(it)
+                                    applyGradientTextCompatibility(it)
+                                }
                                 emitEvent(id, "loading-stop")
                                 val finishedUrl = view?.url ?: target ?: ""
                                 // Publish the final redirected URL first. BrowserShell can then
@@ -477,6 +480,40 @@ class YayraTabWebviewManager(
         }
         val script = styleScript + pointerTextScript(customTheme)
         try { entry.webView.evaluateJavascript(script, null) } catch (_: Exception) { /* best-effort styling only */ }
+    }
+
+    /**
+     * Repair the common gradient-text failure in embedded WebView builds:
+     * transparent glyphs plus an unrecognised background-clip:text rule paint
+     * a large gradient rectangle. The detector is deliberately limited to
+     * gradient-text utility patterns and leaves opaque/decorative gradients
+     * alone. It tries both clip spellings before choosing a contrast-safe
+     * solid foreground, and observes bounded dynamic DOM/class updates.
+     */
+    private fun applyGradientTextCompatibility(entry: TabEntry) {
+        val script = """
+            (function(){try{
+              var key='__yayraGradientTextCompatibilityV1';
+              if(window[key]&&window[key].scan){window[key].scan(document);return;}
+              var selector='.gradient-text,[class*="gradient-text"],[class~="bg-clip-text"],[class~="text-transparent"]';
+              var parse=function(value){var match=String(value||'').toLowerCase().match(/rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:\s*[,/]\s*([\d.]+))?/);return match?[+match[1],+match[2],+match[3],match[4]===undefined?1:+match[4]]:null;};
+              var transparent=function(value){var text=String(value||'').trim().toLowerCase(),color=parse(text);return text==='transparent'||!!(color&&color[3]<=0.05);};
+              var luminance=function(color){if(!color)return -1;var total=[0.2126,0.7152,0.0722],result=0;for(var i=0;i<3;i++){var value=Math.max(0,Math.min(255,color[i]))/255;value=value<=0.04045?value/12.92:Math.pow((value+0.055)/1.055,2.4);result+=value*total[i];}return result;};
+              var contrast=function(a,b){var first=luminance(a),second=luminance(b);return first<0||second<0?0:(Math.max(first,second)+0.05)/(Math.min(first,second)+0.05);};
+              var background=function(element){for(var depth=0;element&&depth<8;depth++,element=element.parentElement){var color=parse(getComputedStyle(element).backgroundColor);if(color&&color[3]>0.05)return color;}return null;};
+              var fallback=function(element){var surface=background(element),parent=element.parentElement;for(var depth=0;parent&&depth<6;depth++,parent=parent.parentElement){var value=getComputedStyle(parent).color,color=parse(value);if(color&&color[3]>0.5&&(!surface||contrast(color,surface)>=4.5))return value;}var level=luminance(surface);return level>=0&&level<0.179?'#ffffff':'#000000';};
+              var properties=['background-image','background-color','background-clip','-webkit-background-clip','color','-webkit-text-fill-color'],originals=new WeakMap();
+              var remember=function(element,classIntent){if(originals.has(element))return;var values={};for(var i=0;i<properties.length;i++){var property=properties[i];values[property]={value:element.style.getPropertyValue(property),priority:element.style.getPropertyPriority(property)};}originals.set(element,{values:values,classIntent:classIntent});};
+              var restore=function(element){var original=originals.get(element);if(!original)return false;for(var i=0;i<properties.length;i++){var property=properties[i],saved=original.values[property];if(saved.value)element.style.setProperty(property,saved.value,saved.priority||'');else element.style.removeProperty(property);}element.removeAttribute('data-yayra-gradient-text');originals.delete(element);return true;};
+              var repair=function(element){if(!element||!element.style)return false;var style=getComputedStyle(element),classes=' '+String(element.className&&element.className.baseVal||element.className||'').toLowerCase()+' ',classIntent=classes.indexOf('gradient-text')>=0||classes.indexOf(' bg-clip-text ')>=0,original=originals.get(element);if(original&&original.classIntent&&!classIntent)return restore(element);var image=String(style.backgroundImage||'');if(!/(?:linear|radial|conic|repeating-linear|repeating-radial)-gradient\s*\(/i.test(image))return false;var clip=[style.backgroundClip,style.webkitBackgroundClip].join(' ').toLowerCase(),intended=classIntent||clip.indexOf('text')>=0;if(!intended||!(transparent(style.color)||transparent(style.webkitTextFillColor)))return false;if(element.getAttribute('data-yayra-gradient-text')==='clip'&&clip.indexOf('text')>=0)return false;remember(element,classIntent);try{element.style.setProperty('-webkit-background-clip','text','important');element.style.setProperty('background-clip','text','important');var next=getComputedStyle(element),accepted=[next.backgroundClip,next.webkitBackgroundClip].join(' ').toLowerCase();if(accepted.indexOf('text')>=0){element.style.setProperty('-webkit-text-fill-color','currentColor','important');element.setAttribute('data-yayra-gradient-text','clip');return true;}}catch(error){}var solid=fallback(element);element.style.setProperty('background-image','none','important');element.style.setProperty('background-color','transparent','important');element.style.setProperty('background-clip','border-box','important');element.style.setProperty('-webkit-background-clip','border-box','important');element.style.setProperty('color',solid,'important');element.style.setProperty('-webkit-text-fill-color',solid,'important');element.setAttribute('data-yayra-gradient-text','solid');return true;};
+              var scan=function(root){var nodes=[];try{if(root&&root.nodeType===1)nodes.push(root);if(root&&root.querySelectorAll)nodes=nodes.concat(Array.prototype.slice.call(root.querySelectorAll(selector),0,240));}catch(error){return;}for(var i=0;i<nodes.length&&i<240;i++)repair(nodes[i]);};
+              var timer=0,schedule=function(){if(timer)return;timer=setTimeout(function(){timer=0;scan(document);},50);};
+              var observer=typeof MutationObserver==='function'&&document.documentElement?new MutationObserver(function(records){var changed=false;for(var i=0;i<records.length;i++){var record=records[i];if(record.type==='attributes'){try{if(record.target&&record.target.matches&&(record.target.matches(selector)||record.target.getAttribute('data-yayra-gradient-text')))scan(record.target);}catch(error){}continue;}var added=record.addedNodes||[];for(var j=0;j<added.length;j++){changed=true;scan(added[j]);}}if(changed)schedule();}):null;
+              if(observer)observer.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['class','style']});
+              window[key]={scan:scan,observer:observer};scan(document);setTimeout(function(){scan(document);},250);setTimeout(function(){scan(document);},1000);
+            }catch(error){}})();
+        """.trimIndent()
+        try { entry.webView.evaluateJavascript(script, null) } catch (_: Exception) { /* best-effort website compatibility */ }
     }
 
     /** Reposition/resize (CSS px) - follows the DOM slot on every layout. */
