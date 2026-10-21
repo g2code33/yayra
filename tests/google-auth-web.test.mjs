@@ -34,6 +34,8 @@ const CLIENT_ID = 'web-client-id.apps.googleusercontent.com';
 const ORIGIN = 'https://yayra.pages.dev';
 const EXCHANGE_URL = 'https://yayra-updates-api.g2code335.workers.dev/auth/google/exchange';
 const VALID_WEB_VERIFIER = 'A'.repeat(43);
+const VALID_WEB_STATE = 'state-xyz-12345678';
+const VALID_WEB_CHALLENGE = 'B'.repeat(43);
 
 // --- PKCE / state generation --------------------------------------------
 
@@ -58,21 +60,37 @@ test('web authorization URL carries PKCE S256 + account chooser and NEVER a clie
   const url = new URL(buildAuthorizationUrl({
     clientId: CLIENT_ID,
     redirectUri: `${ORIGIN}${CALLBACK_PATH}`,
-    state: 'state-123',
-    codeChallenge: 'challenge-456'
+    state: VALID_WEB_STATE,
+    codeChallenge: VALID_WEB_CHALLENGE
   }));
   assert.equal(url.origin + url.pathname, 'https://accounts.google.com/o/oauth2/v2/auth');
   assert.equal(url.searchParams.get('client_id'), CLIENT_ID);
   assert.equal(url.searchParams.get('redirect_uri'), 'https://yayra.pages.dev/auth/callback');
   assert.equal(url.searchParams.get('response_type'), 'code');
   assert.equal(url.searchParams.get('scope'), 'openid email profile');
-  assert.equal(url.searchParams.get('code_challenge'), 'challenge-456');
+  assert.equal(url.searchParams.get('code_challenge'), VALID_WEB_CHALLENGE);
   assert.equal(url.searchParams.get('code_challenge_method'), 'S256');
   assert.equal(url.searchParams.get('prompt'), 'consent select_account');
   // A browser client is public: no secret can exist here, and no long-lived
   // refresh token should ever be requested (nowhere safe to store it).
   assert.equal(url.searchParams.get('client_secret'), null);
   assert.equal(url.searchParams.get('access_type'), null);
+});
+
+test('web authorization URL rejects broad scopes and malformed PKCE/state inputs', () => {
+  assert.throws(() => buildAuthorizationUrl({
+    clientId: CLIENT_ID,
+    redirectUri: `${ORIGIN}${CALLBACK_PATH}`,
+    state: VALID_WEB_STATE,
+    codeChallenge: VALID_WEB_CHALLENGE,
+    scopes: ['openid', 'email', 'profile', 'https://mail.google.com/']
+  }), /invalid_scopes/);
+  assert.throws(() => buildAuthorizationUrl({
+    clientId: CLIENT_ID,
+    redirectUri: `${ORIGIN}${CALLBACK_PATH}`,
+    state: 'predictable',
+    codeChallenge: 'short'
+  }), /invalid_state|invalid_code_challenge/);
 });
 
 // --- beginSignIn (step 1: stash + full-page redirect) ---------------------
@@ -132,7 +150,13 @@ test('parseCallbackParams surfaces Google errors, rejects incomplete or ambiguou
 
 function pendingSession(overrides = {}) {
   return fakeStorage({
-    [PENDING_KEY]: JSON.stringify({ codeVerifier: VALID_WEB_VERIFIER, state: 'state-xyz', returnTo: '/settings', ...overrides })
+    [PENDING_KEY]: JSON.stringify({
+      codeVerifier: VALID_WEB_VERIFIER,
+      state: VALID_WEB_STATE,
+      returnTo: '/settings',
+      startedAt: new Date().toISOString(),
+      ...overrides
+    })
   });
 }
 
@@ -154,7 +178,7 @@ test('completeSignIn posts code+verifier+redirectUri to the worker and returns p
     }), { status: 200 });
   };
 
-  const result = await completeSignIn({ search: '?code=auth-code-1&state=state-xyz', origin: ORIGIN, exchangeUrl: EXCHANGE_URL, sessionStorage: session, fetchImpl });
+  const result = await completeSignIn({ search: `?code=auth-code-1&state=${VALID_WEB_STATE}`, origin: ORIGIN, exchangeUrl: EXCHANGE_URL, sessionStorage: session, fetchImpl });
 
   assert.equal(requests.length, 1);
   assert.equal(requests[0].url, EXCHANGE_URL);
@@ -186,7 +210,7 @@ test('completeSignIn validates state on OAuth error callbacks before surfacing t
     /state_mismatch/
   );
   await assert.rejects(
-    () => completeSignIn({ search: '?error=access_denied&state=state-xyz', origin: ORIGIN, exchangeUrl: EXCHANGE_URL, sessionStorage: pendingSession(), fetchImpl: async () => { throw new Error('must not fetch'); } }),
+    () => completeSignIn({ search: `?error=access_denied&state=${VALID_WEB_STATE}`, origin: ORIGIN, exchangeUrl: EXCHANGE_URL, sessionStorage: pendingSession(), fetchImpl: async () => { throw new Error('must not fetch'); } }),
     /access_denied/
   );
 });
@@ -194,13 +218,13 @@ test('completeSignIn validates state on OAuth error callbacks before surfacing t
 test('completeSignIn rejects a callback on an unexpected route or untrusted origin before exchanging', async () => {
   const session = pendingSession();
   await assert.rejects(
-    () => completeSignIn({ search: '?code=c&state=state-xyz', origin: ORIGIN, pathname: '/not-auth-callback', exchangeUrl: EXCHANGE_URL, sessionStorage: session, fetchImpl: async () => { throw new Error('must not fetch'); } }),
+    () => completeSignIn({ search: `?code=c&state=${VALID_WEB_STATE}`, origin: ORIGIN, pathname: '/not-auth-callback', exchangeUrl: EXCHANGE_URL, sessionStorage: session, fetchImpl: async () => { throw new Error('must not fetch'); } }),
     /invalid_callback/
   );
   assert.ok(session.getItem(PENDING_KEY), 'an unrelated route cannot consume the pending sign-in');
 
   await assert.rejects(
-    () => completeSignIn({ search: '?code=c&state=state-xyz', origin: 'http://evil.example', exchangeUrl: EXCHANGE_URL, sessionStorage: session, fetchImpl: async () => { throw new Error('must not fetch'); } }),
+    () => completeSignIn({ search: `?code=c&state=${VALID_WEB_STATE}`, origin: 'http://evil.example', exchangeUrl: EXCHANGE_URL, sessionStorage: session, fetchImpl: async () => { throw new Error('must not fetch'); } }),
     /invalid_redirect_uri/
   );
 });
@@ -208,10 +232,41 @@ test('completeSignIn rejects a callback on an unexpected route or untrusted orig
 test('completeSignIn rejects a malformed pending PKCE verifier before worker exchange', async () => {
   const session = pendingSession({ codeVerifier: 'short' });
   await assert.rejects(
-    () => completeSignIn({ search: '?code=c&state=state-xyz', origin: ORIGIN, exchangeUrl: EXCHANGE_URL, sessionStorage: session, fetchImpl: async () => { throw new Error('must not fetch'); } }),
+    () => completeSignIn({ search: `?code=c&state=${VALID_WEB_STATE}`, origin: ORIGIN, exchangeUrl: EXCHANGE_URL, sessionStorage: session, fetchImpl: async () => { throw new Error('must not fetch'); } }),
     /corrupt_pending_sign_in/
   );
   assert.equal(session.getItem(PENDING_KEY), null, 'the malformed attempt is consumed and cannot be replayed');
+});
+
+test('completeSignIn expires stale PKCE/state transactions before any worker request', async () => {
+  const session = pendingSession({ startedAt: '2026-01-01T00:00:00.000Z' });
+  await assert.rejects(
+    () => completeSignIn({
+      search: `?code=c&state=${VALID_WEB_STATE}`,
+      origin: ORIGIN,
+      exchangeUrl: EXCHANGE_URL,
+      sessionStorage: session,
+      fetchImpl: async () => { throw new Error('must not fetch'); },
+      now: () => Date.parse('2026-01-01T00:11:00.000Z')
+    }),
+    /expired_pending_sign_in/
+  );
+  assert.equal(session.getItem(PENDING_KEY), null, 'an expired transaction is consumed');
+});
+
+test('completeSignIn rejects non-HTTPS or wrong-route exchange endpoints before consuming state', async () => {
+  const session = pendingSession();
+  await assert.rejects(
+    () => completeSignIn({
+      search: `?code=c&state=${VALID_WEB_STATE}`,
+      origin: ORIGIN,
+      exchangeUrl: 'https://attacker.example/collect',
+      sessionStorage: session,
+      fetchImpl: async () => { throw new Error('must not fetch'); }
+    }),
+    /invalid_exchange_url/
+  );
+  assert.ok(session.getItem(PENDING_KEY), 'deployment misconfiguration does not consume a valid pending transaction');
 });
 
 test('completeSignIn rejects a callback with no pending sign-in (replayed/bookmarked URL)', async () => {
@@ -223,7 +278,7 @@ test('completeSignIn rejects a callback with no pending sign-in (replayed/bookma
 
 test('completeSignIn surfaces Google consent-screen cancellation as its error code', async () => {
   await assert.rejects(
-    () => completeSignIn({ search: '?error=access_denied&state=state-xyz', origin: ORIGIN, exchangeUrl: EXCHANGE_URL, sessionStorage: pendingSession(), fetchImpl: async () => { throw new Error('must not fetch'); } }),
+    () => completeSignIn({ search: `?error=access_denied&state=${VALID_WEB_STATE}`, origin: ORIGIN, exchangeUrl: EXCHANGE_URL, sessionStorage: pendingSession(), fetchImpl: async () => { throw new Error('must not fetch'); } }),
     /access_denied/
   );
 });
@@ -231,8 +286,32 @@ test('completeSignIn surfaces Google consent-screen cancellation as its error co
 test('completeSignIn reports a failed worker exchange with status detail', async () => {
   const fetchImpl = async () => new Response(JSON.stringify({ error: 'invalid_grant' }), { status: 502 });
   await assert.rejects(
-    () => completeSignIn({ search: '?code=c&state=state-xyz', origin: ORIGIN, exchangeUrl: EXCHANGE_URL, sessionStorage: pendingSession(), fetchImpl }),
-    /exchange_failed:502/
+    () => completeSignIn({ search: `?code=c&state=${VALID_WEB_STATE}`, origin: ORIGIN, exchangeUrl: EXCHANGE_URL, sessionStorage: pendingSession(), fetchImpl }),
+    /exchange_failed:502:invalid_grant/
+  );
+});
+
+test('completeSignIn bounds Worker responses and never echoes an arbitrary upstream body', async () => {
+  const secretBody = '<html>access_token=do-not-echo user diagnostic</html>';
+  await assert.rejects(
+    () => completeSignIn({
+      search: `?code=c&state=${VALID_WEB_STATE}`,
+      origin: ORIGIN,
+      exchangeUrl: EXCHANGE_URL,
+      sessionStorage: pendingSession(),
+      fetchImpl: async () => new Response(secretBody, { status: 502 })
+    }),
+    (error) => error.message === 'exchange_failed:502:upstream_error' && !error.message.includes('do-not-echo')
+  );
+  await assert.rejects(
+    () => completeSignIn({
+      search: `?code=c&state=${VALID_WEB_STATE}`,
+      origin: ORIGIN,
+      exchangeUrl: EXCHANGE_URL,
+      sessionStorage: pendingSession(),
+      fetchImpl: async () => new Response('x'.repeat(64 * 1024 + 1), { status: 200 })
+    }),
+    /exchange_response_too_large/
   );
 });
 

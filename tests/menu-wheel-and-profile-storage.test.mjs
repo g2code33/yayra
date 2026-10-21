@@ -28,6 +28,7 @@ import {
   createProfileScopedStorage,
   createHistoryRepo,
   createBookmarksRepo,
+  createEmailAddressesRepo,
   createSettingsRepo,
   createWheelRepo
 } from '../packages/shared-ui/src/services/profileStorage.js';
@@ -147,6 +148,63 @@ test('bookmarks repo: dedupes by url, answers isBookmarked, removes by url or id
 
   await repo.removeBookmark('https://a.com');
   assert.equal(await repo.isBookmarked('https://a.com'), false);
+});
+
+test('bookmark groups: migrate legacy items, set a profile-scoped default, move and remove groups safely', async () => {
+  let activeProfile = 'personal';
+  const backing = fakeLocalStorage({
+    'yayra:p:personal:bookmarks': JSON.stringify([{ id: 'legacy', url: 'https://legacy.example', title: 'Legacy' }])
+  });
+  const storage = createProfileScopedStorage({ backing, getProfileId: () => activeProfile });
+  const repo = createBookmarksRepo(storage);
+
+  const groups = await repo.getGroups();
+  assert.deepEqual(groups.slice(0, 3).map((group) => group.name), ['Bookmarks Bar', 'Mobile Bookmarks', 'Other Bookmarks']);
+  const migrated = await repo.getAllBookmarks();
+  assert.equal(migrated[0].groupId, 'bookmarks-bar', 'old bookmarks stay visible in the default folder');
+
+  const workResult = await repo.createGroup('Work');
+  assert.equal(workResult.ok, true);
+  const work = workResult.group;
+  assert.equal((await repo.setDefaultGroup(work.id)).ok, true);
+  const added = await repo.addBookmark({ url: 'https://work.example', title: 'Work' });
+  assert.equal(added.groupId, work.id, 'new bookmarks use the selected default group');
+  assert.equal(await repo.getDefaultGroupId(), work.id);
+
+  assert.equal((await repo.moveBookmark('legacy', work.id)).ok, true);
+  assert.equal((await repo.getAllBookmarks()).find((item) => item.id === 'legacy').groupId, work.id);
+  assert.equal((await repo.removeGroup(work.id)).ok, true);
+  assert.equal(await repo.getDefaultGroupId(), 'bookmarks-bar', 'removing the default group falls back to Bookmarks Bar');
+  assert.ok((await repo.getAllBookmarks()).every((item) => item.groupId === 'bookmarks-bar'), 'removed group bookmarks are preserved in the fallback');
+
+  activeProfile = 'work-profile';
+  assert.deepEqual(await repo.getGroups(), groups, 'custom folders do not leak across profiles');
+  assert.deepEqual(await repo.getAllBookmarks(), [], 'bookmarks remain profile-scoped');
+});
+
+test('email address repo: saves valid addresses locally per profile, deduplicates, and supports deletion', async () => {
+  let activeProfile = 'personal';
+  const storage = createProfileScopedStorage({ backing: fakeLocalStorage(), getProfileId: () => activeProfile });
+  const repo = createEmailAddressesRepo(storage);
+
+  assert.equal(await repo.addEmail('not-an-email'), null, 'invalid values are ignored');
+  assert.equal(await repo.addEmail('ada @example.com'), null, 'addresses containing spaces are rejected');
+  const first = await repo.addEmail('Ado.Example@example.com');
+  const duplicate = await repo.addEmail('ado.example@EXAMPLE.com');
+  assert.equal(duplicate.id, first.id, 'same address is deduplicated case-insensitively');
+  assert.equal((await repo.getAllEmails()).length, 1);
+  assert.equal((await repo.getAllEmails())[0].email, 'Ado.Example@example.com', 'the first user-entered casing is retained');
+
+  activeProfile = 'work';
+  assert.deepEqual(await repo.getAllEmails(), [], 'email addresses do not leak between profiles');
+  await repo.addEmail('work@example.org');
+  activeProfile = 'personal';
+  await repo.removeEmail(first.id);
+  assert.deepEqual(await repo.getAllEmails(), [], 'an address can be removed from its own profile');
+  activeProfile = 'work';
+  assert.deepEqual((await repo.getAllEmails()).map((item) => item.email), ['work@example.org']);
+  await repo.clear();
+  assert.deepEqual(await repo.getAllEmails(), []);
 });
 
 test('settings repo: updateSettings merges partials instead of overwriting the whole blob', async () => {

@@ -96,6 +96,24 @@ test('hourglass while loading and internal-page icons are untouched', async () =
   assert.doesNotMatch(settingsIcon, /fb-tab-site-logo/, 'yayra:// pages keep their own icons');
 });
 
+test('continue cards keep internal pages without requesting settings.ico or downloads.ico', async () => {
+  const shell = await makeShell();
+  shell.state.continueTabs = [
+    { url: 'yayra://settings', title: 'Settings' },
+    { url: 'yayra://downloads', title: 'Downloads' },
+    { url: 'https://afaregistration.com/', title: 'AFA Registration' }
+  ];
+  const cardHost = document.createElement('div');
+  shell.appendContinueCard(cardHost, []);
+  const card = cardHost.children[0];
+  assert.ok(card, 'continue card is appended');
+  assert.equal((card.innerHTML.match(/class="fb-continue-item"/g) || []).length, 3, 'session restoration still includes each saved tab');
+  assert.doesNotMatch(card.innerHTML, /settings\.ico|downloads\.ico/);
+  assert.match(card.innerHTML, /<svg/, 'internal pages use Yayra-owned icon markup');
+  assert.match(card.innerHTML, /fb-tab-site-logo/);
+  assert.doesNotMatch(card.innerHTML, /onerror=/, 'favicon fallback remains CSP-safe');
+});
+
 test('autofill matches known links from history AND bookmarks, anywhere in address or title', async () => {
   const shell = await makeShell();
   shell.state.historyItems = [
@@ -131,6 +149,44 @@ test('words the user searched before are remembered and suggested', async () => 
 
   const suggestions = shell.getLocalSearchSuggestions('jollof');
   assert.ok(suggestions.includes('best jollof recipe'), 'previously searched words resurface while typing');
+});
+
+test('pasted logs, multiline text, and internal routes stay local instead of being sent to remote search suggestions', async () => {
+  const shell = await makeShell();
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = async () => { requests += 1; return new Response(JSON.stringify(['x', []]), { status: 200 }); };
+  try {
+    assert.deepEqual(await shell.getGoogleSearchSuggestions('x'.repeat(500)), []);
+    assert.deepEqual(await shell.getGoogleSearchSuggestions('line one\nline two'), []);
+    assert.deepEqual(await shell.getGoogleSearchSuggestions('yayra://settings'), []);
+    assert.equal(requests, 0, 'sensitive, oversized, and internal text is never sent to the worker');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('a superseded suggestion request cannot return stale remote text', async () => {
+  const shell = await makeShell();
+  const originalFetch = globalThis.fetch;
+  let resolveRemote;
+  let requests = 0;
+  globalThis.fetch = () => {
+    requests += 1;
+    return new Promise((resolve) => { resolveRemote = resolve; });
+  };
+  try {
+    const previousQuery = shell.getGoogleSearchSuggestions('ghana weather');
+    await new Promise((resolve) => setTimeout(resolve, 210));
+    assert.equal(requests, 1, 'the first query reached the suggestion service after debounce');
+    const currentQuery = await shell.getGoogleSearchSuggestions('pasted log\nsecond line');
+    assert.deepEqual(currentQuery, [], 'multiline input remains local');
+    resolveRemote(new Response(JSON.stringify(['ghana weather', ['stale remote result']]), { status: 200 }));
+    const staleResult = await previousQuery;
+    assert.equal(staleResult.includes('stale remote result'), false, 'an older in-flight response is discarded');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('dropdown shows personal autofill rows for typed text', async () => {

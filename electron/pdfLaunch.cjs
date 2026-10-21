@@ -2,13 +2,23 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { fileURLToPath } = require('node:url');
 
+// Keep this module name/export backward-compatible with the v1 PDF-only
+// integration. The parser now accepts every local format for which Yayra has
+// either a bundled viewer or an explicit original-file fallback.
+const DOCUMENT_EXTENSIONS = new Set([
+  'pdf', 'pptx', 'pptm', 'docx', 'xlsx', 'xlsm', 'xls', 'csv',
+  'jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'avif', 'svg',
+  'txt', 'md', 'markdown', 'log', 'json', 'xml', 'yaml', 'yml',
+  'ppt', 'doc'
+]);
+
 /**
- * Find a desktop-opened PDF in Electron's launch arguments. Linux desktop
- * entries using the %U field code pass file:/// URLs (including percent-
- * encoded spaces); Windows/macOS commonly pass a filesystem path instead.
- * Only local, existing .pdf files are returned.
+ * Find a desktop-opened local document in Electron's launch arguments. Linux
+ * desktop entries using %U pass file:/// URLs (including encoded spaces);
+ * Windows/macOS commonly pass a filesystem path. Remote URLs, command-line
+ * switches, missing files and unregistered extensions are never read.
  */
-function parsePdfFileArg(argv) {
+function parseDocumentFileArg(argv) {
   for (const arg of argv || []) {
     if (typeof arg !== 'string' || arg === '' || arg.startsWith('--')) continue;
     const raw = arg.replace(/^["']|["']$/g, '');
@@ -23,20 +33,25 @@ function parsePdfFileArg(argv) {
         continue;
       }
     } else if (/^[a-z][a-z\d+.-]*:\/\//i.test(raw)) {
-      // Do not mistake arbitrary URLs for paths (a drive-letter path such
-      // as C:\\docs\\file.pdf is intentionally not matched by this test).
+      // Do not mistake a remote URL for a path. A Windows drive path such as
+      // C:\\docs\\file.pptx is intentionally not matched by this expression.
       continue;
     }
 
-    if (!/\.pdf$/i.test(candidate)) continue;
+    const extension = path.extname(candidate).slice(1).toLowerCase();
+    if (!DOCUMENT_EXTENSIONS.has(extension)) continue;
     try {
       const absolutePath = path.resolve(candidate);
       if (fs.existsSync(absolutePath) && fs.statSync(absolutePath).isFile()) return absolutePath;
     } catch {
-      // Not a readable local file - keep scanning for the next argument.
+      // Not a readable local file; continue scanning arguments.
     }
   }
   return null;
 }
 
-module.exports = { parsePdfFileArg };
+// Legacy API name retained so packaged installs and old source pins keep
+// working while its behavior grows from PDF-only to the unified workspace.
+const parsePdfFileArg = parseDocumentFileArg;
+
+module.exports = { DOCUMENT_EXTENSIONS, parseDocumentFileArg, parsePdfFileArg };

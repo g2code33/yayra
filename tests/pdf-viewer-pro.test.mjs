@@ -71,10 +71,10 @@ function bootViewer({ container = null } = {}) {
 
 test('CAPABILITIES: the upgraded feature set is honestly declared', () => {
   const caps = DOCUMENT_ENGINES.pdf.capabilities;
-  for (const cap of ['view', 'search', 'zoom', 'pageNavigation', 'rotate', 'nightMode', 'outline', 'thumbnails']) {
+  for (const cap of ['view', 'search', 'zoom', 'pageNavigation', 'rotate', 'nightMode', 'outline', 'thumbnails', 'print']) {
     assert.equal(caps[cap], true, `${cap} is supported`);
   }
-  for (const cap of ['annotate', 'edit', 'save', 'export', 'print']) {
+  for (const cap of ['annotate', 'edit', 'save', 'export']) {
     assert.equal(caps[cap], false, `${cap} is still honestly NOT claimed`);
   }
 });
@@ -204,12 +204,15 @@ test('SHELL INTEGRATION: the pro toolbar (jump-to-page, fit, rotate, night, outl
   const container = document.createElement('div');
   const shell = new BrowserShell({ container, isMobile: false });
   await shell.initialize();
+  const previousPrint = window.print;
+  let printCalls = 0;
+  window.print = () => { printCalls += 1; };
   try {
     shell._docEngineOverride = fakePdfjs();
     shell.addDocumentTab({ name: 'pro.pdf', bytes: new Uint8Array([1, 2, 3]) });
     await flush(25);
     const vp = shell.viewportElement;
-    for (const cls of ['fb-doc-page-input', 'fb-doc-btn-fitw', 'fb-doc-btn-fitp', 'fb-doc-btn-rotate', 'fb-doc-btn-night', 'fb-doc-btn-outline', 'fb-doc-close-btn']) {
+    for (const cls of ['fb-doc-page-input', 'fb-doc-btn-fitw', 'fb-doc-btn-fitp', 'fb-doc-btn-rotate', 'fb-doc-btn-night', 'fb-doc-btn-outline', 'fb-doc-btn-print', 'fb-doc-close-btn']) {
       assert.ok(vp.querySelector(`.${cls}`), `${cls} renders`);
     }
     // Rotate + night work through the buttons.
@@ -219,6 +222,9 @@ test('SHELL INTEGRATION: the pro toolbar (jump-to-page, fit, rotate, night, outl
     vp.querySelector('.fb-doc-btn-night').click();
     await flush();
     assert.equal(shell.getActiveTab().docState.night, true, 'night button inverts the page');
+    vp.querySelector('.fb-doc-btn-print').click();
+    await flush(40);
+    assert.equal(printCalls, 1, 'document print uses the shell print view after preparing all pages');
 
     // The sidebar opens with the outline and jumps on click.
     vp.querySelector('.fb-doc-btn-outline').click();
@@ -258,7 +264,15 @@ test('SHELL INTEGRATION: the pro toolbar (jump-to-page, fit, rotate, night, outl
     const rows = Array.from(vp.querySelectorAll('.fb-doc-match-row'));
     assert.equal(rows.length, 2, 'the match list shows every hit');
     assert.match(rows[0].textContent, /p\.1/);
+
+    // PDF text is untrusted input: render snippets as text, never HTML.
+    shell.getActiveTab().docState.matches[0].snippet = '<img src=x onerror=alert(1)>';
+    shell._activeDocViewer.sync();
+    const safeRow = vp.querySelector('.fb-doc-match-row');
+    assert.equal(safeRow.querySelector('img'), null, 'PDF content cannot inject elements into the browser chrome');
+    assert.match(safeRow.textContent, /<img src=x onerror=alert\(1\)>/, 'the snippet remains visible as literal text');
   } finally {
+    window.print = previousPrint;
     shell.destroy();
     delete globalThis.localStorage;
   }

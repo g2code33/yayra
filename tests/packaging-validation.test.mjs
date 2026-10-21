@@ -18,6 +18,7 @@ test('Android Packaging: Manifest declares stable applicationId, permissions and
   assert.match(xml, /android:name="android\.permission\.ACCESS_NETWORK_STATE"/);
   assert.match(xml, /android:name="android\.permission\.SYSTEM_ALERT_WINDOW"/);
   assert.match(xml, /android:name="android\.permission\.POST_NOTIFICATIONS"/);
+  assert.match(xml, /android:name="android\.permission\.RECORD_AUDIO"/);
   assert.match(xml, /android:name="android\.permission\.FOREGROUND_SERVICE"/);
   assert.match(xml, /android:name="android\.permission\.FOREGROUND_SERVICE_SPECIAL_USE"/);
 

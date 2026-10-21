@@ -18,13 +18,22 @@ export function buildContentSecurityPolicy() {
   return [
     `default-src 'self' ${scheme}`,
     `script-src 'self' ${scheme}`,
+    // The offline PDF.js worker normally runs from the same origin; blob:
+    // is also required for its cross-origin wrapper on file:// fallbacks.
+    `worker-src 'self' blob: ${scheme}`,
     `style-src 'self' 'unsafe-inline' ${scheme}`,
     `img-src ${imgSources.join(' ')}`,
+    // PPTX clips are read from the selected local file and exposed only as
+    // in-memory blob: URLs. No document media origin is reachable here.
+    `media-src 'self' blob: ${scheme}`,
     `connect-src ${connectSources.join(' ')}`,
     // The browser shell intentionally hosts navigated HTTP(S) pages in its
     // sandboxed webview. frame-ancestors is an HTTP-response directive and is
     // ignored when this policy is delivered through the index meta tag.
     `frame-src http: https: ${scheme}`,
+    // Local-image Lens searches use a native multipart form so the File goes
+    // straight from the user's browser to Google; no Yayra server can see it.
+    `form-action 'self' https://lens.google.com`,
     `object-src 'none'`,
     `base-uri 'self'`
   ].join('; ');

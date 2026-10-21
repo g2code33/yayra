@@ -4,6 +4,7 @@ const WEBVIEW_EVENT_CHANNEL = 'yayra:webview-event';
 const AUTH_EVENT_CHANNEL = 'yayra:auth-event';
 const DOWNLOADS_EVENT_CHANNEL = 'yayra:downloads-event';
 const UPDATES_EVENT_CHANNEL = 'yayra:updates-event';
+const CHROME_INPUT_RECOVERY_CHANNEL = 'yayra:chrome-input-recover';
 
 const api = {
   getLaunchInfo: () => ipcRenderer.invoke('yayra:get-launch-info'),
@@ -15,6 +16,17 @@ const api = {
     toggleMaximize: () => ipcRenderer.invoke('yayra:window-maximize-toggle'),
     isMaximized: () => ipcRenderer.invoke('yayra:window-is-maximized'),
     close: () => ipcRenderer.invoke('yayra:window-close'),
+    // Manual dragging keeps the complete tab strip out of Electron's native
+    // app-region path, which can swallow input and leave Linux chrome stuck.
+    dragStart: (point) => ipcRenderer.send('yayra:window-drag-start', point),
+    dragMove: (point) => ipcRenderer.send('yayra:window-drag-move', point),
+    dragEnd: () => ipcRenderer.send('yayra:window-drag-end'),
+    onInputRecovery: (callback) => {
+      if (typeof callback !== 'function') return () => {};
+      const listener = (_event, payload) => callback(payload || {});
+      ipcRenderer.on(CHROME_INPUT_RECOVERY_CHANNEL, listener);
+      return () => ipcRenderer.removeListener(CHROME_INPUT_RECOVERY_CHANNEL, listener);
+    },
     // Explicit menu > Exit: unlike close(), this quits the whole app and
     // its floating bubble/tray process, not only this BrowserWindow.
     quit: () => ipcRenderer.invoke('yayra:app-quit')
@@ -50,6 +62,8 @@ const api = {
       pointerSize: pointer && pointer.size
     }),
     setPointerTheme: (tabId, theme, size) => ipcRenderer.invoke('yayra:webview-set-pointer-theme', { tabId, theme, size }),
+    setBackgroundThrottling: (enabled) => ipcRenderer.invoke('yayra:webview-set-background-throttling', { enabled }),
+    taskTabs: () => ipcRenderer.invoke('yayra:webview-list-task-tabs'),
     setBounds: (tabId, bounds) => ipcRenderer.invoke('yayra:webview-set-bounds', { tabId, bounds }),
     setVisible: (tabId, visible, options = {}) => ipcRenderer.invoke('yayra:webview-set-visible', { tabId, visible, capture: Boolean(options && options.capture) }),
     // Snapshot the live page WITHOUT hiding it - lets the renderer paint
@@ -59,6 +73,10 @@ const api = {
     goBack: (tabId) => ipcRenderer.invoke('yayra:webview-go-back', { tabId }),
     goForward: (tabId) => ipcRenderer.invoke('yayra:webview-go-forward', { tabId }),
     reload: (tabId) => ipcRenderer.invoke('yayra:webview-reload', { tabId }),
+    // Recovery uses the retained requested URL explicitly. Chromium may have
+    // no committed URL after ERR_INTERNET_DISCONNECTED, so plain reload()
+    // alone can otherwise reload about:blank/the previous document.
+    retry: (tabId, url) => ipcRenderer.invoke('yayra:webview-retry', { tabId, url }),
     // Chrome Ctrl+Shift+R: clear this site's caches, then reload from
     // the network. clearSiteCache does the cache part without reloading.
     hardReload: (tabId) => ipcRenderer.invoke('yayra:webview-hard-reload', { tabId }),
@@ -66,8 +84,25 @@ const api = {
     stop: (tabId) => ipcRenderer.invoke('yayra:webview-stop', { tabId }),
     isLoading: (tabId) => ipcRenderer.invoke('yayra:webview-is-loading', { tabId }),
     destroy: (tabId) => ipcRenderer.invoke('yayra:webview-destroy', { tabId }),
+    // Linux website passkeys: an explicit toolbar click supplies a one-shot
+    // Yayra-passkey grant (or intentionally falls back to PolicyKit), then
+    // releases the exact held WebAuthn call. No credential data crosses IPC.
+    continuePasskey: (tabId, requestId, options = {}) => {
+      const normalized = typeof options === 'boolean' ? { external: options } : (options || {});
+      return ipcRenderer.invoke('yayra:webview-continue-passkey', {
+        tabId,
+        requestId,
+        external: Boolean(normalized.external),
+        authorizationToken: typeof normalized.authorizationToken === 'string'
+          ? normalized.authorizationToken
+          : ''
+      });
+    },
     // Autofill saved credentials into the page's login form (Chrome-style).
     fillCredentials: (tabId, { username, password } = {}) => ipcRenderer.invoke('yayra:webview-fill-credentials', { tabId, username, password }),
+    // Suggest this profile's saved email addresses in a focused email field.
+    // The main process rejects private-tab requests and validates the list.
+    suggestEmailAddresses: (tabId, emails = []) => ipcRenderer.invoke('yayra:webview-suggest-email-addresses', { tabId, emails }),
     // Menu > More tools: REAL page-level actions on the native engine.
     openDevTools: (tabId) => ipcRenderer.invoke('yayra:webview-open-devtools', { tabId }),
     print: (tabId) => ipcRenderer.invoke('yayra:webview-print', { tabId }),
@@ -109,8 +144,9 @@ const api = {
     clear: () => ipcRenderer.invoke('yayra:downloads-clear'),
     remove: (id) => ipcRenderer.invoke('yayra:downloads-remove', { id }),
     open: (id) => ipcRenderer.invoke('yayra:downloads-open', { id }),
-    // "Open in Yayra": read a COMPLETED pdf download's bytes so the
-    // in-app document viewer can show it (bytes only - never a path).
+    // "Open in Yayra": read a completed supported download as bytes only.
+    // Keep openPdf as a compatibility alias for older renderer builds.
+    openDocument: (id) => ipcRenderer.invoke('yayra:downloads-open-pdf', { id }),
     openPdf: (id) => ipcRenderer.invoke('yayra:downloads-open-pdf', { id }),
     showInFolder: (id) => ipcRenderer.invoke('yayra:downloads-show-in-folder', { id }),
     getRoot: () => ipcRenderer.invoke('yayra:downloads-get-root'),
@@ -144,7 +180,13 @@ const api = {
   // Chrome-style profiles: open a profile in its OWN new Yayra window
   // while the current window stays on its profile.
   profiles: {
-    openWindow: (profileId) => ipcRenderer.invoke('yayra:open-profile-window', { profileId })
+    // Optional URL powers Chrome-style tab tear-off: the new Yayra window
+    // boots directly on that site while preserving the selected profile.
+    openWindow: (profileId, url = null, options = {}) => ipcRenderer.invoke('yayra:open-profile-window', {
+      profileId,
+      url,
+      isPrivate: Boolean(options && options.isPrivate)
+    })
   },
   // System-wide floating overlay bubble settings (see
   // electron/overlayWindow.cjs). The overlay window itself is a completely
@@ -185,21 +227,42 @@ const api = {
     }
   },
   // Desktop-only system facilities: real process metrics for the task
-  // manager and real desktop shortcuts for "Create shortcut...".
+  // manager and real desktop shortcuts for "Create desktop shortcut...".
   system: {
     appMetrics: () => ipcRenderer.invoke('yayra:app-metrics'),
+    // Direct image bytes/URL -> Google's official Lens endpoints. The image
+    // never passes through a Yayra server; main validates payload and result.
+    googleLensUpload: ({ name, type, data, imageUrl, language, startedAt, width, height, viewportWidth, viewportHeight, tabId, isPrivate, profileId } = {}) => ipcRenderer.invoke('yayra:google-lens-upload', {
+      name, type, data, imageUrl, language, startedAt, width, height, viewportWidth, viewportHeight,
+      tabId, isPrivate, profileId
+    }),
     createShortcut: ({ url, title } = {}) => ipcRenderer.invoke('yayra:create-shortcut', { url, title }),
     // Chrome-style "Install page as app...": real launcher entries that
     // reopen the site in its own minimal app window (yayra --app=<url>).
-    installPageAsApp: ({ url, title } = {}) => ipcRenderer.invoke('yayra:install-page-as-app', { url, title }),
+    installPageAsApp: ({ url, title, nameOverride } = {}) => ipcRenderer.invoke('yayra:install-page-as-app', { url, title, nameOverride }),
     installPageAsAppPreview: ({ url, title } = {}) => ipcRenderer.invoke('yayra:install-page-as-app-preview', { url, title }),
-    // Local document workspace: open ONE user-picked PDF; the renderer
-    // receives only the bytes (never a filesystem path).
+    // Local document workspace. Paths stay in the trusted main process: this
+    // surface exposes opaque catalog ids, safe display metadata and (only
+    // when opening a supported format) the explicitly requested file bytes.
     documents: {
+      openFile: () => ipcRenderer.invoke('yayra:doc-open'),
+      // Backward-compatible alias for existing renderer/tests and older minis.
       openPdf: () => ipcRenderer.invoke('yayra:doc-open'),
-      // "Open with desktop app": hand the CURRENT document's bytes to the
-      // OS default pdf reader (main process writes a temp file).
+      list: () => ipcRenderer.invoke('yayra:doc-library-list'),
+      reopen: (id) => ipcRenderer.invoke('yayra:doc-library-open', { id, external: false }),
+      openLibraryExternal: (id) => ipcRenderer.invoke('yayra:doc-library-open', { id, external: true }),
+      showInFolder: (id) => ipcRenderer.invoke('yayra:doc-library-show', { id }),
+      locate: (id) => ipcRenderer.invoke('yayra:doc-library-locate', { id }),
+      remove: (id) => ipcRenderer.invoke('yayra:doc-library-remove', { id }),
+      clear: () => ipcRenderer.invoke('yayra:doc-library-clear'),
+      clearMissing: () => ipcRenderer.invoke('yayra:doc-library-clear-missing'),
+      prune: (olderThanDays) => ipcRenderer.invoke('yayra:doc-library-prune', { olderThanDays }),
+      // "Open with desktop app" for session-only files: write the current
+      // unchanged bytes to a temp file. Catalog files use openLibraryExternal.
       openExternal: ({ name, data } = {}) => ipcRenderer.invoke('yayra:doc-open-externally', { name, data }),
+      // Download is separate from Desktop app: save the unchanged source
+      // bytes to a user-selected destination instead of opening a temp copy.
+      saveCopy: ({ name, data } = {}) => ipcRenderer.invoke('yayra:doc-save-copy', { name, data }),
       // OS "Open with > yayra" launches: the main process pushes the
       // user-chosen file's bytes; the shell opens them in its viewer.
       onOpenPdfFile: (callback) => {

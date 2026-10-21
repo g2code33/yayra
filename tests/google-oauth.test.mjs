@@ -6,6 +6,7 @@ import {
   generateState,
   buildAuthorizationUrl,
   parseCallbackUrl,
+  runLoopbackAuthorization,
   exchangeCodeForTokens,
   fetchUserProfile,
   signInWithGoogle,
@@ -96,9 +97,47 @@ test('parseCallbackUrl: ignores non-origin-form, untrusted-origin, and lookalike
   assert.deepEqual(parseCallbackUrl('//evil.example/callback?code=c&state=s'), { ignored: true });
 });
 
-test('parseCallbackUrl: rejects duplicate OAuth security parameters', () => {
+test('parseCallbackUrl: rejects duplicate, oversized, control-character, and markup-shaped OAuth parameters', () => {
   assert.deepEqual(parseCallbackUrl('/callback?code=one&code=two&state=s'), { error: 'invalid_callback_parameters' });
   assert.deepEqual(parseCallbackUrl('/callback?code=c&state=one&state=two'), { error: 'invalid_callback_parameters' });
+  assert.deepEqual(parseCallbackUrl(`/callback?code=${'A'.repeat(4100)}&state=s`), { error: 'invalid_callback_parameters', state: 's' });
+  assert.deepEqual(parseCallbackUrl('/callback?error=%3Cscript%3E&state=s'), { error: 'invalid_callback_parameters', state: 's' });
+  assert.deepEqual(parseCallbackUrl(`/callback?code=c&state=${'s'.repeat(300)}`), { error: 'invalid_callback_parameters' });
+});
+
+test('loopback callback response is no-store, no-referrer, CSP-locked, and removes the one-time code from history', async () => {
+  let callbackResponsePromise = null;
+  const state = 'secure-state-123456';
+  const code = await runLoopbackAuthorization({
+    clientId: 'desktop-client.apps.googleusercontent.com',
+    state,
+    codeChallenge: 'C'.repeat(43),
+    timeoutMs: 5000,
+    logger: { info() {} },
+    openExternal: async (authUrl) => {
+      const callback = new URL(new URL(authUrl).searchParams.get('redirect_uri'));
+      callback.searchParams.set('code', 'one-shot-code');
+      callback.searchParams.set('state', state);
+      callbackResponsePromise = new Promise((resolve, reject) => {
+        http.get(callback, (response) => {
+          let body = '';
+          response.setEncoding('utf8');
+          response.on('data', (chunk) => { body += chunk; });
+          response.on('end', () => resolve({ status: response.statusCode, headers: response.headers, body }));
+        }).on('error', reject);
+      });
+      await callbackResponsePromise;
+    }
+  });
+  assert.equal(code, 'one-shot-code');
+  assert.ok(callbackResponsePromise, 'the system-browser callback request was issued');
+  const callbackResponse = await callbackResponsePromise;
+  assert.equal(callbackResponse.status, 200);
+  assert.equal(callbackResponse.headers['cache-control'], 'no-store, max-age=0');
+  assert.equal(callbackResponse.headers['referrer-policy'], 'no-referrer');
+  assert.match(callbackResponse.headers['content-security-policy'], /default-src 'none'/);
+  assert.match(callbackResponse.body, /history\.replaceState\(null,"","\/complete"\)/);
+  assert.equal(callbackResponse.body.includes('one-shot-code'), false);
 });
 
 // --- Token exchange / userinfo (fetch injected, no real network) ---------
@@ -179,11 +218,33 @@ test('fetchUserProfile: throws on a non-OK response', async () => {
   await assert.rejects(() => fetchUserProfile({ accessToken: 'bad', fetchImpl: fakeFetch }), /userinfo_failed:401/);
 });
 
+test('token and profile requests stop when the OAuth attempt is aborted after callback', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  let fetchCalls = 0;
+  const fakeFetch = async () => { fetchCalls += 1; throw new Error('should not be called'); };
+
+  await assert.rejects(() => exchangeCodeForTokens({
+    clientId: 'c',
+    code: 'x',
+    codeVerifier: 'v',
+    redirectUri: 'http://127.0.0.1/callback',
+    fetchImpl: fakeFetch,
+    signal: controller.signal
+  }), /oauth_window_closed/);
+  await assert.rejects(() => fetchUserProfile({
+    accessToken: 'token',
+    fetchImpl: fakeFetch,
+    signal: controller.signal
+  }), /oauth_window_closed/);
+  assert.equal(fetchCalls, 0);
+});
+
 // --- Full signInWithGoogle flow (real loopback socket, fake browser+fetch) -
 
 function openExternalThatHitsCallback(query) {
-  // Simulates the user completing consent in their real system browser by
-  // issuing the exact redirect request Google would send, against whatever
+  // Simulates the user completing consent in the OS browser by issuing the
+  // exact redirect request Google would send, against whatever
   // ephemeral port the loopback server actually bound to.
   return async (authUrl) => {
     const url = new URL(authUrl);
@@ -259,6 +320,21 @@ test('signInWithGoogle: rejects on timeout if the browser never completes the re
   await assert.rejects(
     () => signInWithGoogle({ clientId: 'c', openExternal, fetchImpl: async () => { throw new Error('should not be called'); }, timeoutMs: 50 }),
     /oauth_timeout/
+  );
+});
+
+test('signInWithGoogle: an explicit shutdown abort signal ends the loopback wait immediately', async () => {
+  const controller = new AbortController();
+  const openExternal = async () => { controller.abort(); };
+  await assert.rejects(
+    () => signInWithGoogle({
+      clientId: 'c',
+      openExternal,
+      signal: controller.signal,
+      fetchImpl: async () => { throw new Error('should not be called'); },
+      timeoutMs: 5000
+    }),
+    /oauth_window_closed/
   );
 });
 

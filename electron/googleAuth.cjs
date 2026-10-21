@@ -3,22 +3,18 @@
 /**
  * Yayra "Sign in with Google" - Electron desktop OAuth 2.0 client
  * ----------------------------------------------------------------
- * This is a SEPARATE concern from electron/webviewBridge.cjs's embedded-auth
- * handoff. That file stops Yayra from ever trying (and failing) to complete
- * a Google sign-in INSIDE the embedded browsing surface, because Google
- * actively refuses that for any embedded webview - see the comment at the
- * top of webviewBridge.cjs and
- * https://developers.google.com/identity/protocols/oauth2/policies#embedded-webviews.
+ * This is a SEPARATE concern from electron/webviewBridge.cjs's website-auth
+ * routing. Both avoid completing Google OAuth INSIDE an app-controlled page
+ * surface, because Google rejects embedded user agents. See webviewBridge.cjs
+ * and https://developers.google.com/identity/protocols/oauth2/policies#embedded-webviews.
  *
- * This file is how Yayra ITSELF authenticates a user against their Google
- * account for its own app-level features (not for browsing Google services
- * logged in inside the embedded view - that is never possible, by Google's
- * own design, from ANY embedded browser surface, and this file does not
- * attempt it). It implements the OAuth 2.0 flow Google explicitly recommends
- * for native/installed apps per RFC 8252 ("OAuth 2.0 for Native Apps"):
+ * This file authenticates a user against Google for Yayra's own app-level
+ * features. It uses the loopback callback + PKCE security model and the OS
+ * default browser as the external user-agent Google and RFC 8252 require:
  *
- *   1. Open the user's real SYSTEM browser to Google's consent screen
- *      (shell.openExternal - never an embedded view).
+ *   1. Open Google's consent screen in the OS default secure browser. A
+ *      separate Electron BrowserWindow is still app-controlled and therefore
+ *      is not a compliant external user-agent.
  *   2. Use the Authorization Code + PKCE flow. Google's docs call "Desktop
  *      app" OAuth clients public/non-confidential, but Google's token
  *      endpoint still rejects the code exchange without a client_secret in
@@ -94,10 +90,10 @@ function buildAuthorizationUrl({ clientId, redirectUri, state, codeChallenge, sc
  * function, no I/O, fully unit-testable.
  */
 function parseCallbackUrl(requestUrl) {
-  // Node's loopback HTTP server should receive an origin-form path only.
-  // Reject absolute-form URLs, authority-relative targets and path lookalikes
-  // before URL normalization can turn them into the trusted callback path.
-  if (typeof requestUrl !== 'string'
+  // Node's loopback HTTP server should receive a bounded origin-form path
+  // only. Reject absolute-form URLs, authority-relative targets and path
+  // lookalikes before URL normalization can turn them into the trusted path.
+  if (typeof requestUrl !== 'string' || requestUrl.length > 8192
     || (requestUrl !== CALLBACK_PATH && !requestUrl.startsWith(`${CALLBACK_PATH}?`))) {
     return { ignored: true };
   }
@@ -111,25 +107,46 @@ function parseCallbackUrl(requestUrl) {
   const error = errors[0];
   const code = codes[0];
   const state = states[0];
-  if (error) return { error, state };
+  if (state && !/^[A-Za-z0-9_-]{1,256}$/.test(state)) return { error: 'invalid_callback_parameters' };
+  if (error) {
+    if (!/^[A-Za-z0-9_]{1,64}$/.test(error)) return { error: 'invalid_callback_parameters', state };
+    return { error, state };
+  }
   if (!code) return { error: 'missing_code', state };
+  if (code.length > 4096 || /[\u0000-\u0020\u007f]/.test(code)) return { error: 'invalid_callback_parameters', state };
   return { code, state };
 }
 
-const SUCCESS_HTML = `<!doctype html><html><head><meta charset="utf-8"><title>Yayra sign-in complete</title></head>
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[character]);
+}
+
+const CLEAN_CALLBACK_SCRIPT = '<script>try{history.replaceState(null,"","/complete")}catch(e){}</script>';
+const SUCCESS_HTML = `<!doctype html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>Yayra sign-in complete</title></head>
 <body style="font-family:system-ui,sans-serif;background:#0b0d12;color:#e7e9ee;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
-<div style="text-align:center;"><h2>Signed in to Yayra</h2><p>You can close this tab and return to the Yayra app.</p></div>
+<div style="text-align:center;"><h2>Signed in to Yayra</h2><p>Return to Yayra. You may close this browser tab.</p></div>${CLEAN_CALLBACK_SCRIPT}
 </body></html>`;
 
-const FAILURE_HTML = (reason) => `<!doctype html><html><head><meta charset="utf-8"><title>Yayra sign-in failed</title></head>
+const FAILURE_HTML = (reason) => `<!doctype html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>Yayra sign-in failed</title></head>
 <body style="font-family:system-ui,sans-serif;background:#0b0d12;color:#e7e9ee;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
-<div style="text-align:center;"><h2>Sign-in did not complete</h2><p>${reason}</p><p>You can close this tab and return to the Yayra app.</p></div>
+<div style="text-align:center;"><h2>Sign-in did not complete</h2><p>${escapeHtml(reason)}</p><p>Return to Yayra.</p></div>${CLEAN_CALLBACK_SCRIPT}
 </body></html>`;
+
+const CALLBACK_RESPONSE_HEADERS = Object.freeze({
+  'content-type': 'text/html; charset=utf-8',
+  'cache-control': 'no-store, max-age=0',
+  pragma: 'no-cache',
+  'referrer-policy': 'no-referrer',
+  'x-content-type-options': 'nosniff',
+  'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+});
 
 /**
- * Starts the one-shot loopback HTTP server, opens the user's system browser
- * to Google's consent screen once the server's real assigned port is known
- * (needed to build the exact redirect_uri), and resolves with the
+ * Starts the one-shot loopback HTTP server, opens the injected OS external
+ * user-agent to Google's consent screen once the server's assigned port is
+ * known (needed to build the exact redirect_uri), and resolves with the
  * authorization code once Google redirects back. Rejects on state mismatch,
  * an error param from Google (e.g. the user clicked "Cancel"), or timeout.
  */
@@ -142,31 +159,37 @@ function runLoopbackAuthorization({
   httpModule = http,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   logger = console,
-  onRedirectUriKnown
+  onRedirectUriKnown,
+  signal = null
 }) {
   return new Promise((resolve, reject) => {
     let settled = false;
+    let abortHandler = null;
     const timer = setTimeout(() => finish(new Error('oauth_timeout')), timeoutMs);
     timer.unref?.();
 
     const server = httpModule.createServer((req, res) => {
+      if (req.method !== 'GET') {
+        res.writeHead(405, { ...CALLBACK_RESPONSE_HEADERS, allow: 'GET' }).end();
+        return;
+      }
       const parsed = parseCallbackUrl(req.url);
       if (parsed.ignored) {
-        res.writeHead(404).end();
+        res.writeHead(404, CALLBACK_RESPONSE_HEADERS).end();
         return;
       }
       if (parsed.state !== state) {
-        res.writeHead(400, { 'content-type': 'text/html' }).end(FAILURE_HTML('This sign-in attempt could not be verified and was rejected for your security.'));
+        res.writeHead(400, CALLBACK_RESPONSE_HEADERS).end(FAILURE_HTML('This sign-in attempt could not be verified and was rejected for your security.'));
         finish(new Error('oauth_state_mismatch'));
         return;
       }
       if (parsed.error) {
         const message = parsed.error === 'access_denied' ? 'You cancelled sign-in.' : `Google reported: ${parsed.error}`;
-        res.writeHead(200, { 'content-type': 'text/html' }).end(FAILURE_HTML(message));
+        res.writeHead(200, CALLBACK_RESPONSE_HEADERS).end(FAILURE_HTML(message));
         finish(new Error(`oauth_error:${parsed.error}`));
         return;
       }
-      res.writeHead(200, { 'content-type': 'text/html' }).end(SUCCESS_HTML);
+      res.writeHead(200, CALLBACK_RESPONSE_HEADERS).end(SUCCESS_HTML);
       finish(null, parsed.code);
     });
 
@@ -174,19 +197,32 @@ function runLoopbackAuthorization({
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      server.close();
+      if (abortHandler && signal?.removeEventListener) {
+        try { signal.removeEventListener('abort', abortHandler); } catch { /* optional signal shim */ }
+      }
+      try { server.close(); } catch { /* server may not have started yet */ }
       if (err) reject(err);
       else resolve(code);
     }
 
+    if (signal) {
+      abortHandler = () => finish(new Error('oauth_window_closed'));
+      if (signal.aborted) {
+        finish(new Error('oauth_window_closed'));
+        return;
+      }
+      try { signal.addEventListener('abort', abortHandler, { once: true }); } catch { /* optional signal shim */ }
+    }
+
     server.on('error', finish);
     server.listen(0, '127.0.0.1', async () => {
+      if (settled) return;
       try {
         const { port } = server.address();
         const redirectUri = `http://127.0.0.1:${port}${CALLBACK_PATH}`;
         onRedirectUriKnown?.(redirectUri);
         const authUrl = buildAuthorizationUrl({ clientId, redirectUri, state, codeChallenge, scopes });
-        logger?.info?.(`[yayra:auth] opening system browser for Google sign-in (redirect ${redirectUri})`);
+        logger?.info?.('[yayra:auth] opening Google sign-in in the system browser with a one-shot loopback callback');
         await openExternal(authUrl);
       } catch (err) {
         finish(err);
@@ -196,7 +232,7 @@ function runLoopbackAuthorization({
 }
 
 
-async function exchangeCodeForTokens({ clientId, clientSecret, code, codeVerifier, redirectUri, fetchImpl = globalThis.fetch }) {
+async function exchangeCodeForTokens({ clientId, clientSecret, code, codeVerifier, redirectUri, fetchImpl = globalThis.fetch, signal = null }) {
   const body = new URLSearchParams({
     client_id: clientId,
     code,
@@ -207,38 +243,61 @@ async function exchangeCodeForTokens({ clientId, clientSecret, code, codeVerifie
   // Google requires this for Desktop-app clients despite PKCE - see the
   // file header comment above for why this is still safe to send.
   if (clientSecret) body.set('client_secret', clientSecret);
-  const response = await fetchImpl(GOOGLE_TOKEN_ENDPOINT, {
+  if (signal?.aborted) throw new Error('oauth_window_closed');
+  const request = {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: body.toString()
-  });
+  };
+  if (signal) request.signal = signal;
+  const response = await fetchImpl(GOOGLE_TOKEN_ENDPOINT, request);
   if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`token_exchange_failed:${response.status}:${text}`);
+    let detail = 'upstream_error';
+    try {
+      const text = await response.text();
+      const parsed = JSON.parse(text);
+      if (typeof parsed?.error === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(parsed.error)) detail = parsed.error;
+    } catch { /* never echo an upstream body into logs or renderer errors */ }
+    throw new Error(`token_exchange_failed:${response.status}:${detail}`);
   }
-  return response.json();
+  const tokens = await response.json();
+  if (!tokens || typeof tokens.access_token !== 'string' || !tokens.access_token
+    || tokens.access_token.length > 8192 || /[\u0000-\u0020\u007f]/.test(tokens.access_token)) {
+    throw new Error('token_exchange_malformed');
+  }
+  return tokens;
 }
 
-async function fetchUserProfile({ accessToken, fetchImpl = globalThis.fetch }) {
-  const response = await fetchImpl(GOOGLE_USERINFO_ENDPOINT, {
-    headers: { authorization: `Bearer ${accessToken}` }
-  });
+async function fetchUserProfile({ accessToken, fetchImpl = globalThis.fetch, signal = null }) {
+  if (signal?.aborted) throw new Error('oauth_window_closed');
+  const request = { headers: { authorization: `Bearer ${accessToken}` } };
+  if (signal) request.signal = signal;
+  const response = await fetchImpl(GOOGLE_USERINFO_ENDPOINT, request);
   if (!response.ok) {
     throw new Error(`userinfo_failed:${response.status}`);
   }
   const data = await response.json();
-  return {
-    sub: data.sub,
-    email: data.email || null,
-    emailVerified: Boolean(data.email_verified),
-    name: data.name || null,
-    picture: data.picture || null
-  };
+  const sub = typeof data?.sub === 'string' && /^[A-Za-z0-9_-]{1,255}$/.test(data.sub) ? data.sub : null;
+  const email = typeof data?.email === 'string' && data.email.length <= 254 && /^[^\s@]+@[^\s@]+$/.test(data.email)
+    ? data.email
+    : null;
+  if (!sub || !email) throw new Error('userinfo_malformed');
+  const name = typeof data.name === 'string'
+    ? data.name.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 200)
+    : null;
+  let picture = null;
+  if (typeof data.picture === 'string' && data.picture.length <= 2048) {
+    try {
+      const parsedPicture = new URL(data.picture);
+      if (parsedPicture.protocol === 'https:' && !parsedPicture.username && !parsedPicture.password) picture = parsedPicture.toString();
+    } catch { /* optional picture is dropped */ }
+  }
+  return { sub, email, emailVerified: Boolean(data.email_verified), name, picture };
 }
 
 /**
  * Runs the full interactive sign-in flow end to end: PKCE/state generation,
- * loopback server + system browser handoff, code-for-token exchange, and
+ * loopback server + OS external browser, code-for-token exchange, and
  * profile fetch. Returns { profile, tokens } on success, where tokens is the
  * raw Google token response ({ access_token, refresh_token?, expires_in,
  * id_token, ... }). Throws on cancellation, state mismatch, timeout, or any
@@ -254,7 +313,8 @@ async function signInWithGoogle({
   fetchImpl = globalThis.fetch,
   randomBytesImpl = crypto.randomBytes,
   timeoutMs = DEFAULT_TIMEOUT_MS,
-  logger = console
+  logger = console,
+  signal = null
 }) {
   if (!clientId) throw new Error('google_oauth_not_configured');
   if (typeof openExternal !== 'function') throw new Error('openExternal_required');
@@ -272,11 +332,12 @@ async function signInWithGoogle({
     httpModule,
     timeoutMs,
     logger,
+    signal,
     onRedirectUriKnown: (uri) => { capturedRedirectUri = uri; }
   });
 
-  const tokens = await exchangeCodeForTokens({ clientId, clientSecret, code, codeVerifier, redirectUri: capturedRedirectUri, fetchImpl });
-  const profile = await fetchUserProfile({ accessToken: tokens.access_token, fetchImpl });
+  const tokens = await exchangeCodeForTokens({ clientId, clientSecret, code, codeVerifier, redirectUri: capturedRedirectUri, fetchImpl, signal });
+  const profile = await fetchUserProfile({ accessToken: tokens.access_token, fetchImpl, signal });
 
   return { profile, tokens };
 }

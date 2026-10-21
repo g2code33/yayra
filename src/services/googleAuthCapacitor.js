@@ -59,7 +59,11 @@ import {
   generatePkcePair,
   generateState,
   loadProfile,
-  saveProfile
+  readBoundedExchangeResponse,
+  safeExchangeErrorCode,
+  sanitizeGoogleProfile,
+  saveProfile,
+  validatedExchangeUrl
 } from './googleAuthWeb.js';
 
 export const DEFAULT_MOBILE_REDIRECT_URI = 'com.yayra.app:/oauth2redirect';
@@ -67,7 +71,7 @@ export const DEFAULT_SIGN_IN_TIMEOUT_MS = 5 * 60 * 1000; // match the Electron f
 
 /** Accept only the exact registered app callback URI, with OAuth query data. */
 export function isExpectedMobileCallbackUrl(candidate, redirectUri = DEFAULT_MOBILE_REDIRECT_URI) {
-  if (typeof candidate !== 'string' || typeof redirectUri !== 'string') return false;
+  if (typeof candidate !== 'string' || candidate.length > 8192 || typeof redirectUri !== 'string') return false;
   if (candidate !== redirectUri && !candidate.startsWith(`${redirectUri}?`)) return false;
   try {
     const actual = new URL(candidate);
@@ -118,6 +122,9 @@ export async function signInWithGoogleCapacitor({
 }) {
   if (!clientId) throw new Error('not_configured');
   if (!exchangeUrl) throw new Error('not_configured');
+  if (platform !== 'android' && platform !== 'ios') throw new Error('invalid_platform');
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 10 * 60 * 1000) throw new Error('invalid_timeout');
+  const safeExchangeUrl = validatedExchangeUrl(exchangeUrl);
   // The Worker and generated Android/iOS manifests are bound to this one
   // registered app callback. Never let a caller substitute an arbitrary URI.
   if (redirectUri !== DEFAULT_MOBILE_REDIRECT_URI) throw new Error('invalid_redirect_uri');
@@ -168,6 +175,12 @@ export async function signInWithGoogleCapacitor({
   }
 
   const params = new URL(callbackUrl).searchParams;
+  // Bearer credentials are never valid in the app callback. Reject rather
+  // than ignore them so a future provider/config regression cannot normalize
+  // token-bearing deep links into accepted input.
+  if (['access_token', 'refresh_token', 'id_token', 'token'].some((key) => params.has(key))) {
+    throw new Error('token_in_callback_rejected');
+  }
   const codes = params.getAll('code');
   const states = params.getAll('state');
   const errors = params.getAll('error');
@@ -175,25 +188,30 @@ export async function signInWithGoogleCapacitor({
   const returnedState = states[0];
   if (!returnedState) throw new Error('missing_code_or_state');
   if (returnedState !== state) throw new Error('state_mismatch');
-  if (errors[0]) throw new Error(errors[0]);
+  if (!/^[A-Za-z0-9_-]{16,256}$/.test(returnedState)) throw new Error('invalid_callback');
+  if (errors[0]) {
+    if (!/^[A-Za-z0-9_]{1,64}$/.test(errors[0])) throw new Error('invalid_callback');
+    throw new Error(errors[0]);
+  }
   const code = codes[0];
   if (!code) throw new Error('missing_code_or_state');
+  if (code.length > 4096 || /[\u0000-\u0020\u007f]/.test(code)) throw new Error('invalid_callback');
 
   // Server-side exchange: tokens never enter this process (see header).
-  const response = await fetchImpl(exchangeUrl, {
+  const response = await fetchImpl(safeExchangeUrl, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify({ code, codeVerifier, redirectUri, platform })
   });
+  const responseText = await readBoundedExchangeResponse(response);
   if (!response.ok) {
-    let detail = '';
-    try { detail = await response.text(); } catch { /* best effort */ }
-    throw new Error(`exchange_failed:${response.status}${detail ? `:${detail.slice(0, 200)}` : ''}`);
+    throw new Error(`exchange_failed:${response.status}:${safeExchangeErrorCode(responseText)}`);
   }
-  const body = await response.json();
-  if (!body || !body.profile || !body.profile.email) throw new Error('exchange_malformed_response');
-  const { sub, name, email, picture } = body.profile;
-  return { profile: { sub, name, email, picture } };
+  let body;
+  try { body = JSON.parse(responseText); } catch { throw new Error('exchange_malformed_response'); }
+  const profile = sanitizeGoogleProfile(body?.profile);
+  if (!profile) throw new Error('exchange_malformed_response');
+  return { profile };
 }
 
 /**

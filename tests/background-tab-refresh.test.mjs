@@ -104,6 +104,30 @@ test('CHROME KEEP-ALIVE: a loaded pooled page stays INTACT across renders, tab s
   }
 });
 
+test('POOLED SITE LIFECYCLE: a real iframe navigation starts and settles loading live without a chrome refresh', async () => {
+  delete globalThis.window.yayra;
+  const container = document.createElement('div');
+  const shell = new BrowserShell({ container, platform: 'pwa', isMobile: false });
+  await shell.initialize();
+  try {
+    const tab = shell.getActiveTab();
+    tab.url = 'https://live.example.com/stream';
+    const root = shell.render(container);
+    const frame = shell.webFrames.get(tab.id);
+    assert.ok(frame, 'live pooled frame exists');
+    assert.equal(tab.isLoading, true, 'touching iframe.src starts loading state immediately');
+    assert.equal(root.querySelector('.fb-nav-reload').getAttribute('aria-label'), 'Stop');
+
+    const rootBefore = shell.rootElement;
+    frame.iframe.dispatchEvent({ type: 'load' });
+    assert.equal(tab.isLoading, false, 'the iframe load event settles the site');
+    assert.equal(shell.rootElement, rootBefore, 'settling never reconstructs the site or browser chrome');
+    assert.equal(root.querySelector('.fb-nav-reload').getAttribute('aria-label'), 'Reload');
+  } finally {
+    shell.destroy();
+  }
+});
+
 test('CHROME KEEP-ALIVE: memory saver LRU - beyond the cap only the OLDEST background frames are discarded; the active frame is untouchable; a discarded tab re-mounts fresh on return', async () => {
   delete globalThis.window.yayra;
   const container = document.createElement('div');

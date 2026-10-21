@@ -9,11 +9,11 @@
  * ceremony, exactly like Chrome gates "show password" behind Windows
  * Hello / Touch ID.
  *
- * What it is NOT: Yayra cannot act as the passkey provider for
- * third-party websites - that requires OS-level credential-provider
- * integration which browsers get from the platform itself. Sites you
- * visit inside Yayra still talk to the platform authenticator directly
- * through their own WebAuthn calls.
+ * What it is NOT: this account credential is never a third-party site's
+ * credential. Supported Linux desktop builds have a separate encrypted,
+ * profile-scoped website CTAP2 provider. This service may verify the user and
+ * mint a one-shot authorization for that provider, but the site's own RP-bound
+ * key still performs its WebAuthn signature inside Chromium/main.
  *
  * Local-first: no server. The credential is created with a locally
  * generated challenge and verified by the authenticator's user-presence
@@ -127,7 +127,13 @@ export class PasskeyService {
    * Register a passkey for the Yayra account on this device.
    * Returns { success, passkey } or { success: false, reason }.
    */
-  async registerPasskey({ accountLabel = 'Yayra user', accountId, method = null, pin = null } = {}) {
+  async registerPasskey({
+    accountLabel = 'Yayra user',
+    accountId,
+    method = null,
+    pin = null,
+    websiteRequest = null
+  } = {}) {
     if (!this.isSupported()) {
       return { success: false, reason: 'passkeys-unsupported' };
     }
@@ -136,7 +142,9 @@ export class PasskeyService {
         // method 'pin' (+ the 6 digits) is the fallback for devices with
         // no fingerprint/Face ID/security key and no usable OS keychain;
         // the default 'device' method binds to the OS login (system lock).
-        const options = method ? { method, pin } : undefined;
+        const options = (method || websiteRequest)
+          ? { ...(method ? { method, pin } : {}), ...(websiteRequest ? { websiteRequest } : {}) }
+          : undefined;
         const res = await this.nativeBridge.register(accountLabel, options);
         if (!res || !res.ok) {
           return { success: false, reason: (res && res.reason) || 'creation-cancelled' };
@@ -150,7 +158,14 @@ export class PasskeyService {
           lastVerifiedAt: null
         };
         await this._set(STORAGE_KEY, passkey);
-        return { success: true, passkey };
+        return {
+          success: true,
+          passkey,
+          ...(res.authorizationToken ? {
+            authorizationToken: res.authorizationToken,
+            authorizationExpiresAt: res.authorizationExpiresAt
+          } : {})
+        };
       } catch (err) {
         return { success: false, reason: errorReason(err) };
       }
@@ -197,7 +212,7 @@ export class PasskeyService {
    * Run a user-verification ceremony against the registered passkey.
    * Returns { success } or { success: false, reason }.
    */
-  async verifyPasskey({ pin = null } = {}) {
+  async verifyPasskey({ pin = null, websiteRequest = null } = {}) {
     if (!this.isSupported()) {
       return { success: false, reason: 'passkeys-unsupported' };
     }
@@ -207,7 +222,10 @@ export class PasskeyService {
     }
     if (this.usesNativeBridge) {
       try {
-        const res = await this.nativeBridge.verify(pin != null ? { pin } : undefined);
+        const options = (pin != null || websiteRequest)
+          ? { ...(pin != null ? { pin } : {}), ...(websiteRequest ? { websiteRequest } : {}) }
+          : undefined;
+        const res = await this.nativeBridge.verify(options);
         if (!res || !res.ok) {
           const reason = (res && res.reason) || 'verification-failed';
           if (reason === 'no-passkey-registered') {
@@ -221,7 +239,7 @@ export class PasskeyService {
             // records - the verifier cannot be rebuilt without trusting
             // whatever PIN was just typed).
             if (stored.method && stored.method !== 'pin') {
-              const repaired = await this._repairDeviceRecord(stored);
+              const repaired = await this._repairDeviceRecord(stored, websiteRequest);
               if (repaired) return repaired;
             }
             await this._delete(STORAGE_KEY);
@@ -229,7 +247,13 @@ export class PasskeyService {
           return { success: false, reason };
         }
         await this._set(STORAGE_KEY, { ...stored, lastVerifiedAt: Date.now() });
-        return { success: true };
+        return {
+          success: true,
+          ...(res.authorizationToken ? {
+            authorizationToken: res.authorizationToken,
+            authorizationExpiresAt: res.authorizationExpiresAt
+          } : {})
+        };
       } catch (err) {
         return { success: false, reason: errorReason(err) };
       }
@@ -262,9 +286,12 @@ export class PasskeyService {
    * proving themselves. Returns a { success, repaired } result on
    * success, or null when the repair could not complete.
    */
-  async _repairDeviceRecord(stored) {
+  async _repairDeviceRecord(stored, websiteRequest = null) {
     try {
-      const res = await this.nativeBridge.register(stored.accountLabel || 'Yayra user', { method: 'device' });
+      const res = await this.nativeBridge.register(stored.accountLabel || 'Yayra user', {
+        method: 'device',
+        ...(websiteRequest ? { websiteRequest } : {})
+      });
       if (!res || !res.ok || !res.passkey) return null;
       const passkey = {
         credentialId: res.passkey.credentialId,
@@ -275,7 +302,14 @@ export class PasskeyService {
         lastVerifiedAt: Date.now()
       };
       await this._set(STORAGE_KEY, passkey);
-      return { success: true, repaired: true };
+      return {
+        success: true,
+        repaired: true,
+        ...(res.authorizationToken ? {
+          authorizationToken: res.authorizationToken,
+          authorizationExpiresAt: res.authorizationExpiresAt
+        } : {})
+      };
     } catch {
       return null;
     }

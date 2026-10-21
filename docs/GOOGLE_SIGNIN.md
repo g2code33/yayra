@@ -1,401 +1,307 @@
-# Sign in with Google (Electron desktop) — setup & architecture
+# Google sign-in and Google website sessions
 
-## What this is, and what it is not
+## Security contract
 
-This feature gives **Yayra itself** a real, app-level Google identity (name,
-email, profile picture), so Yayra's own UI can show "Signed in as ..." /
-"Sign out". It is **not** a way to use Gmail, Drive, or any other Google
-service logged-in *inside* Yayra's embedded browsing view — Google actively
-detects and blocks sign-in inside any embedded browser surface (WebView,
-WebContentsView, iframe, etc.) as an anti-phishing measure. See
-[Google's own policy](https://developers.google.com/identity/protocols/oauth2/policies#embedded-webviews).
-Yayra does not attempt to bypass that. `electron/webviewBridge.cjs` sends
-Google sign-in/OAuth endpoints to the user's real system browser, while
-ordinary Google pages and Search remain in the native in-app view where the
-platform allows it. System-browser cookies are not copied into Yayra.
+Yayra supports two different Google experiences. They must not be conflated:
 
-The setup and architecture are documented here for Electron desktop, Web/PWA,
-and Android/iOS. The original implementation started with desktop; all three
-transports are now implemented, with remaining live-provider/device checks
-listed in "Status by platform" below.
+1. **Yayra app identity** — Settings → Account → **Sign in with Google** gives
+   Yayra a basic profile (`sub`, name, email, picture) using OAuth 2.0
+   Authorization Code + PKCE.
+2. **Google website sessions** — Gmail, Google Account, Search, YouTube, and a
+   third-party website's **Continue with Google** flow use browser cookies owned
+   by the browser surface that created them.
 
-## How it works
+An app OAuth token does not create a Gmail/Google website cookie session, and
+Yayra never copies cookies from Chrome, Edge, Safari, or Firefox. It also never
+spoofs Google security checks.
 
-Yayra uses the OAuth 2.0 flow Google explicitly recommends for native/desktop
-apps (RFC 8252, "OAuth 2.0 for Native Apps"):
+The production rules are:
 
-1. Yayra opens your **real system browser** (never an embedded view) to
-   Google's consent screen.
-2. It uses **Authorization Code + PKCE**. Google calls "Desktop app" OAuth
-   clients public/non-confidential, but Google's token endpoint still
-   requires the **Client Secret** in the code-exchange request even with
-   PKCE — a known Google-specific quirk, not a security requirement (the
-   secret is still fine to ship inside the built app, same as the Client ID;
-   see step 5 below).
-3. A short-lived local HTTP server on `127.0.0.1` (an OS-assigned free port,
-   picked fresh every sign-in) catches Google's redirect. This is Google's
-   own documented ["loopback interface redirect"](https://developers.google.com/identity/protocols/oauth2/native-app#loopback-ip-address)
-   pattern — **no domain, no custom URL scheme, and no fixed port need to be
-   registered.**
-4. Yayra exchanges the authorization code for tokens directly with Google,
-   then fetches your basic profile (name/email/picture).
-5. The profile (not the tokens) is shown in Yayra's UI. The raw tokens are
-   encrypted at rest using Electron's `safeStorage` (backed by your OS
-   keychain — Keychain on macOS, libsecret on Linux, DPAPI on Windows) and
-   are never sent to the renderer/web UI process.
+- Google OAuth and interactive Google Account sign-in never load in an iframe,
+  Android `WebView`, Electron `WebContentsView`, or Electron `BrowserWindow`.
+  They use the OS external user-agent required by RFC 8252 and Google's
+  [embedded-user-agent policy](https://developers.google.com/identity/protocols/oauth2/policies#embedded-webviews).
+- Matching is limited to the exact `accounts.google.com` host and known OAuth
+  or interactive sign-in routes. Search, Gmail content, account management,
+  logout, and other Google product navigation are not broad-matched.
+- Authorization Code + PKCE (`S256`) and an unpredictable, single-use `state`
+  are used on every platform.
+- Only `openid email profile` scopes are requested. Yayra does **not** request
+  Gmail, Drive, Calendar, or broad `googleapis.com` scopes for basic sign-in.
+- A custom-scheme callback may contain only a one-time authorization code,
+  state, or provider error. Access, refresh, and ID tokens in a callback URL
+  are rejected. No token is ever put in a `yayra://` or
+  `com.yayra.app:` URL.
+- Redirect origins and paths are exact, callback and request inputs are
+  bounded, duplicate security parameters are rejected, pending transactions
+  expire, and auth responses are `no-store`.
+- Browser/WebView code receives only the display profile. Raw Google tokens
+  never enter Web/PWA or Capacitor renderer JavaScript.
 
-Relevant source files:
-- `electron/googleAuth.cjs` — the OAuth flow itself (PKCE, loopback server,
-  token exchange, userinfo fetch). Fully unit-tested in
-  `tests/google-oauth.test.mjs` with a real local socket and a fake Google
-  (no live network access).
-- `electron/authStore.cjs` — encrypted-at-rest session persistence. Tested in
-  `tests/google-auth-store.test.mjs`.
-- `electron/authBridge.cjs` — wires the above to IPC channels
-  (`yayra:auth-sign-in`, `yayra:auth-sign-out`, `yayra:auth-get-session`).
-  Tested in `tests/google-auth-bridge.test.mjs`.
-- `electron/googleAuthConfig.cjs` — resolves your Client ID and Client
-  Secret. Tested in `tests/google-auth-config.test.mjs`.
-- `electron/preload.cjs` — exposes `window.yayra.auth.{signIn, signOut,
-  getSession, onEvent}` to the renderer.
-- `packages/shared-ui/src/components/BrowserShell.js` — the "Account"
-  section inside Settings (`yayra://settings`) that calls the above.
+## Google Account, Gmail, and Google product sign-in
 
-## Creating your own Google Cloud OAuth Client ID
+Google can reject an app-controlled browser with “This browser or app may not
+be secure.” A separate Electron `BrowserWindow` is still app-controlled, so
+making it larger or removing `Electron` from the user-agent is not a compliant
+fix.
 
-You (not this agent) need to create this, because it ties to a Google Cloud
-project you own. **No domain purchase is required.**
+Yayra handles the problem as follows:
 
-1. Go to the [Google Cloud Console](https://console.cloud.google.com/) and
-   create (or select) a project.
-2. Go to **APIs & Services → OAuth consent screen**. Choose "External" (or
-   "Internal" if you have a Google Workspace), fill in the app name/logo/
-   support email, and add the `openid`, `email`, and `profile` scopes (these
-   are the only ones Yayra requests). While the app is in "Testing" mode you
-   can add your own Google account as a test user; "Publish" it later if you
-   want any Google account to be able to sign in.
-3. Go to **APIs & Services → Credentials → Create Credentials → OAuth client
-   ID**.
-4. For **Application type, choose "Desktop app"**. Give it any name (e.g.
-   "Yayra Desktop"). Click Create.
-5. Copy the generated **Client ID** (it looks like
-   `123456789-abc...apps.googleusercontent.com`) **and the Client Secret**
-   shown right next to it. Despite the "Desktop app" type and PKCE, Google's
-   token endpoint rejects sign-in with `client_secret is missing` if you
-   don't configure the secret too — you need both values.
-6. No redirect URI needs to be registered for "Desktop app" clients using the
-   loopback pattern — Google allows any `http://127.0.0.1:<port>/...` or
-   `http://localhost:<port>/...` redirect automatically for this client type.
+- `electron/webviewBridge.cjs`, `BrowserShell.js`, and Android's
+  `YayraTabWebviewManager.kt` recognize exact Google OAuth and interactive
+  sign-in routes such as `/o/oauth2/...`, `/oauth2/...`, `/signin/oauth/...`,
+  `/gsi/select/...`, `/signin/v2/...`, `/v3/signin/...`, `/ServiceLogin`,
+  `/InteractiveLogin`, `/AccountChooser`, and `/AddSession`.
+- Main-frame navigations, redirects, and popups to those routes are canceled
+  before they load in the embedded website engine and are opened in the
+  system browser (or Capacitor Browser surface on Android/iOS).
+- A Google `/signin/rejected` or `/v3/signin/rejected` URL is not reopened as
+  the same dead-end error page. Yayra creates a clean HTTPS `/ServiceLogin`
+  entry point and preserves only a bounded, credential-free HTTPS `continue`
+  destination.
+- The originating Yayra tab and history remain unchanged. Authorization URLs
+  are not echoed from the Electron main process to renderer IPC or logs.
 
-## Configuring Yayra with your Client ID
+The Google product remains signed in in the external browser that created the
+cookie. There is no provider-supported way to import that cookie into an
+Electron/Android embedded page. Consequently, a third-party website OAuth
+flow opened externally may finish in the external browser rather than signing
+in the untouched Yayra website tab. Yayra states this honestly in the handoff
+card instead of pretending that app OAuth tokens create a website session.
 
-Pick one:
+## Electron desktop: Yayra app identity
 
-- **Local development:** export both environment variables before launching
-  Electron:
-  ```bash
-  export YAYRA_GOOGLE_CLIENT_ID="123456789-abc...apps.googleusercontent.com"
-  export YAYRA_GOOGLE_CLIENT_SECRET="GOCSPX-..."
-  ```
-- **Packaged builds:** create `electron/google-auth.config.json` (already
-  gitignored — it will never be committed) before running
-  `npm run package:linux` / `package:win` / etc.:
-  ```json
-  { "clientId": "123456789-abc...apps.googleusercontent.com", "clientSecret": "GOCSPX-..." }
-  ```
-  This file is included by electron-builder's existing `electron/**/*` files
-  glob, so it travels with the built installer.
-- **Already-installed builds (no rebuild needed):** copy the same JSON file
-  into the app's per-user config directory and restart Yayra:
-  - Linux: `~/.config/yayra/google-auth.config.json`
-  - Windows: `%APPDATA%\yayra\google-auth.config.json`
-  - macOS: `~/Library/Application Support/yayra/google-auth.config.json`
+Desktop uses the native-app loopback pattern:
 
-  A machine-local file deliberately **wins** over whatever was baked into the
-  installer, so you can point an official build at your own OAuth client.
-- **CI releases (GitHub Actions):** the repo checkout in CI never contains
-  the gitignored file, so `release.yml` writes it from two repository
-  secrets before packaging the Linux and Windows desktop builds. Add them
-  under **GitHub repo → Settings → Secrets and variables → Actions**:
-  `YAYRA_GOOGLE_CLIENT_ID` and `YAYRA_GOOGLE_CLIENT_SECRET`. Every release
-  built after that ships with Sign in with Google working out of the box;
-  without them the step logs a warning and builds proceed unconfigured.
+1. The Electron main process generates PKCE and state.
+2. A one-shot HTTP listener binds only to `127.0.0.1` on an OS-assigned port.
+3. Google opens through `shell.openExternal`, which invokes the user's default
+   secure browser.
+4. Google redirects to the exact `http://127.0.0.1:<port>/callback` URI.
+5. The listener accepts only a bounded `GET /callback`, rejects duplicate or
+   malformed parameters, verifies state, and consumes the code once.
+6. The callback page is CSP-locked, `no-store`, `no-referrer`, and removes the
+   one-time code from browser history with `history.replaceState`.
+7. The main process exchanges the code with PKCE, fetches userinfo, and sends
+   only the sanitized profile over IPC.
+8. Token material is encrypted at rest with Electron `safeStorage`
+   (Keychain/libsecret/DPAPI). If OS-backed encryption is unavailable, tokens
+   are not written in plaintext.
 
-If either value is missing, the "Sign in with Google" button in Settings →
-Account will show a clear "not configured" error instead of failing deep
-inside the token exchange.
+There is no desktop `yayra://oauth-callback` handler and no bearer token in a
+URL. Loopback is the registered return channel for the Desktop OAuth client.
 
-### Troubleshooting
+Relevant files:
 
-- **`Couldn't sign in: token_exchange_failed:400:{"error":"invalid_request","error_description":"client_secret is missing."}`**
-  — you only set the Client ID. Set `YAYRA_GOOGLE_CLIENT_SECRET` too (see
-  above) and restart the app.
-- **`Couldn't sign in: fetch failed`** — the token/userinfo request itself
-  couldn't reach Google (not an auth error). Most common on Windows machines
-  behind a corporate proxy, VPN, or TLS-inspecting antivirus: Node's own
-  `fetch` doesn't automatically use the OS proxy/certificate store the way
-  your system browser does. Yayra's main process now uses Electron's
-  `net.fetch` (Chromium's own network stack) for these requests instead of
-  Node's `fetch`, which should resolve this on most machines; if it still
-  happens, it usually means outbound HTTPS to `oauth2.googleapis.com` /
-  `www.googleapis.com` is blocked entirely by that machine's firewall/proxy.
+- `electron/googleAuth.cjs` — PKCE, state, bounded loopback callback, token
+  exchange, and profile validation.
+- `electron/authBridge.cjs` — system-browser launch and profile-only IPC.
+- `electron/authStore.cjs` — OS-keychain-backed encrypted token persistence.
+- `electron/googleAuthConfig.cjs` — desktop client configuration.
+- `tests/google-oauth.test.mjs`, `tests/google-auth-bridge.test.mjs`, and
+  `tests/google-auth-store.test.mjs` — automated coverage.
 
----
+### Desktop Google Cloud setup
 
-# Web / PWA (`yayra.pages.dev`) — setup & architecture
+1. Create/select a Google Cloud project.
+2. Configure the OAuth consent screen. Request only `openid`, `email`, and
+   `profile`. Add test users while the app remains in Testing mode.
+3. Create an OAuth client of type **Desktop app**.
+4. Configure both values supplied for that client:
 
-Same feature, same protocol (Authorization Code + PKCE), different
-transport: a browser can't run a loopback redirect server, so Google
-redirects back to a real HTTPS page, `/auth/callback`, served by the same
-static deployment.
-
-## Design decisions (and why)
-
-- **Full-page redirect, not popup+postMessage.** Installed PWAs run in
-  `display: standalone` where `window.opener`/popup relationships are
-  unreliable, and popup blockers plus Safari/Brave tracking protections
-  break popup flows routinely; a redirect behaves identically in a tab and
-  an installed PWA, and avoids postMessage's origin-validation attack
-  surface entirely. The in-flight state (PKCE verifier, CSRF `state`,
-  return path) survives the round trip in `sessionStorage`.
-- **The token exchange happens in the Cloudflare Worker, not the browser.**
-  Google's token endpoint requires a `client_secret` for "Web application"
-  OAuth clients **even with PKCE** (same Google quirk as the Desktop-app
-  client type above), and a secret in browser-delivered JS is public by
-  definition. So the callback page sends only `{code, codeVerifier,
-  redirectUri}` to the update worker's `/auth/google/exchange` endpoint;
-  the Worker holds the secret (as a `wrangler secret`), does the exchange
-  AND the userinfo fetch server-side, and returns **only the profile**.
-- **Raw tokens never enter the browser at all.** Electron can encrypt
-  tokens at rest with the OS keychain (`safeStorage`); a browser has no
-  equivalent — anything it stores is readable by same-origin script. This
-  design sidesteps that trade-off: no refresh token is ever requested
-  (`access_type=online` semantics), the access token lives and dies inside
-  one Worker invocation, and the only thing persisted client-side
-  (localStorage) is the display profile the UI shows anyway. Consequence:
-  the web session is profile-only — which is all Yayra needs. The full
-  rationale is written into `src/services/googleAuthWeb.js`.
-
-Relevant source files:
-- `src/services/googleAuthWeb.js` — browser half (PKCE, redirect, state
-  round trip, bridge adapter). Tested in `tests/google-auth-web.test.mjs`.
-- `worker/update-worker.mjs` (`exchangeGoogleAuthCode`) — server half.
-  Tested in `tests/worker.test.mjs`.
-- `src/browser/authCallback.js` + `public/auth/callback/index.html` — the
-  callback page.
-- `src/config/googleAuthWeb.js` — build-injected config resolution.
-- `src/browser/main.js` — installs the bridge as `window.yayra.auth` (the
-  same surface `BrowserShell` already drives on desktop) when configured.
-
-## Creating the "Web application" OAuth Client ID (console steps)
-
-1. Same Google Cloud project and consent screen as the Desktop steps above.
-2. **APIs & Services → Credentials → Create Credentials → OAuth client ID**.
-3. For **Application type, choose "Web application"**. Name it e.g. "Yayra
-   Web".
-4. Under **Authorized JavaScript origins** add:
-   - `https://yayra.pages.dev`
-   - `http://localhost:4173` (the dev server, for local testing)
-5. Under **Authorized redirect URIs** add:
-   - `https://yayra.pages.dev/auth/callback`
-   - `http://localhost:4173/auth/callback`
-6. Copy the **Client ID** and the **Client Secret**. The secret is
-   genuinely confidential for this client type — it must ONLY ever be
-   configured on the Worker (next section), never in any web-delivered
-   file or committed anywhere.
-
-## Configuring the deployment
-
-Worker (holds the secret):
 ```bash
-npx wrangler secret put GOOGLE_WEB_CLIENT_ID  --config wrangler.worker.toml
+export YAYRA_GOOGLE_CLIENT_ID="123-...apps.googleusercontent.com"
+export YAYRA_GOOGLE_CLIENT_SECRET="GOCSPX-..."
+```
+
+For packaged builds, put the same values in the gitignored
+`electron/google-auth.config.json`:
+
+```json
+{ "clientId": "123-...apps.googleusercontent.com", "clientSecret": "GOCSPX-..." }
+```
+
+A Desktop client secret is not a confidentiality boundary—the installed app
+is a public client—but Google's token exchange for the configured client must
+receive the matching value. PKCE is the code-substitution defense.
+
+Machine-local overrides are also read from:
+
+- Linux: `~/.config/yayra/google-auth.config.json`
+- Windows: `%APPDATA%\yayra\google-auth.config.json`
+- macOS: `~/Library/Application Support/yayra/google-auth.config.json`
+
+CI release builds use the repository secrets `YAYRA_GOOGLE_CLIENT_ID` and
+`YAYRA_GOOGLE_CLIENT_SECRET`. Never commit either config file.
+
+## Web / PWA
+
+Web/PWA app identity uses a full-page redirect rather than a popup:
+
+1. `src/services/googleAuthWeb.js` generates PKCE/state and stores the pending
+   verifier, exact return path, and start time in per-tab `sessionStorage`.
+2. Google redirects only to the exact same-origin `/auth/callback` route.
+3. The callback consumes the pending transaction once, checks route, origin,
+   age, state, code bounds, and PKCE verifier shape.
+4. The browser sends the one-time code and verifier to the exact HTTPS Worker
+   route `/auth/google/exchange`.
+5. The Worker performs the token exchange and userinfo request, discards the
+   tokens, and returns only a bounded, sanitized profile.
+6. Only that display profile is stored in `localStorage`; no access or refresh
+   token reaches browser JavaScript.
+
+A Worker-side `/auth/google` kickoff is intentionally unnecessary: PKCE and
+state are generated in the initiating tab, where `sessionStorage` preserves
+standalone-PWA compatibility without a cross-site cookie dependency.
+
+### Web Google Cloud setup
+
+Create a **Web application** OAuth client with exact values:
+
+- Authorized JavaScript origins:
+  - `https://yayra.pages.dev`
+  - `http://localhost:4173`
+- Authorized redirect URIs:
+  - `https://yayra.pages.dev/auth/callback`
+  - `http://localhost:4173/auth/callback`
+
+Put the confidential Web client values only on the Worker:
+
+```bash
+npx wrangler secret put GOOGLE_WEB_CLIENT_ID --config wrangler.worker.toml
 npx wrangler secret put GOOGLE_WEB_CLIENT_SECRET --config wrangler.worker.toml
 ```
 
-`wrangler.worker.toml` also pins the exchange endpoint to the exact web
-callback origins `https://yayra.pages.dev` and `http://localhost:4173`.
-If you deploy Yayra on another origin, add that exact origin to the
-non-secret `GOOGLE_WEB_ALLOWED_ORIGINS` variable and register its matching
-`/auth/callback` URI with the same Google Web OAuth client.
+Inject the public client ID into the web build:
 
-Web build (public values only — injected into `<meta>` tags by
-`scripts/build-web.mjs`): either export before `npm run build:web`
 ```bash
-export YAYRA_GOOGLE_WEB_CLIENT_ID="123456789-web...apps.googleusercontent.com"
-# optional - defaults to the production worker URL:
-export YAYRA_GOOGLE_AUTH_EXCHANGE_URL="https://yayra-updates-api.g2code335.workers.dev/auth/google/exchange"
+export YAYRA_GOOGLE_WEB_CLIENT_ID="123-web.apps.googleusercontent.com"
+npm run build:web
 ```
-or create a gitignored `google-auth.web.config.json` at the repo root:
-```json
-{ "clientId": "123456789-web...apps.googleusercontent.com" }
-```
-When neither is set, the build injects empty values and Settings → Account
-shows the honest "not available on this build" message.
 
----
+`YAYRA_GOOGLE_AUTH_EXCHANGE_URL` may override the exchange endpoint, but the
+client accepts only HTTPS (or loopback HTTP in development) and the exact
+`/auth/google/exchange` path.
 
-# Android / iOS (Capacitor) — setup & architecture
+## Android / iOS (Capacitor)
 
-Same protocol again (Authorization Code + PKCE, RFC 8252 "OAuth 2.0 for
-Native Apps"), mobile transport:
+Mobile app identity follows RFC 8252's external-user-agent/custom-scheme
+pattern:
 
-1. The consent screen opens in the **system browser surface** —
-   SFSafariViewController (iOS) / Chrome Custom Tabs (Android) — via the
-   first-party `@capacitor/browser` plugin. Never the app's own WebView
-   (Google blocks that, and RFC 8252 §8.12 forbids it).
-2. Google redirects to the app's **custom URL scheme**
-   `com.yayra.app:/oauth2redirect` (RFC 8252 §7.1). The OS reopens the
-   app; the first-party `@capacitor/app` plugin surfaces the URL as an
-   `appUrlOpen` event. Yayra accepts only this exact scheme/path (not a
-   prefix or lookalike URL), rejects duplicate OAuth parameters, and checks
-   the returned state before either handling an error or exchanging a code.
-3. The one-shot code + PKCE verifier go to the **same Worker exchange
-   endpoint as the web flow** with `platform: 'android' | 'ios'`. These
-   Google client types have **no secret at all** (verified by package
-   name + SHA-1 / bundle ID), so a direct on-device exchange would also
-   be valid AppAuth-style — the Worker hop is kept deliberately so **raw
-   tokens never exist in the app's JS context** (UI and flow logic share
-   one WebView in Capacitor; the only way to keep tokens away from
-   UI-reachable code is to never let them arrive). Trade-off: mobile
-   sign-in needs the Worker reachable, which the app already requires
-   for update checks.
+1. `@capacitor/browser` opens Chrome Custom Tabs or the iOS secure browser
+   surface; the app WebView is never used for Google consent.
+2. Google returns a one-time code and state to the exact reverse-DNS callback
+   `com.yayra.app:/oauth2redirect`.
+3. `@capacitor/app` emits the deep link. Yayra rejects prefix lookalikes,
+   alternate authorities/paths, fragments, duplicate parameters, oversized
+   input, state mismatch, and every token-bearing callback.
+4. The code and PKCE verifier go to the Worker with an exact `android` or
+   `ios` platform value. The Worker returns only the profile.
+5. The pending flow times out, dismissing the browser reports cancellation,
+   and unrelated app deep links are ignored.
 
-**Plugin choice (researched 2026-10):** the once-standard
-`@byteowls/capacitor-oauth2` is unmaintained (last publish 2023,
-officially superseded), and its successor
-`@capacitor-community/generic-oauth2` currently supports only Capacitor 7
-while Yayra is on Capacitor 8. First-party `@capacitor/app` +
-`@capacitor/browser` are maintained in lockstep with Capacitor itself, and
-the OAuth logic they don't cover (PKCE/state/exchange) is code this repo
-already owns and tests on the other platforms.
+`scripts/ensure-capacitor-platform.mjs` injects the Android intent filter and
+iOS `CFBundleURLTypes` registration into generated projects.
 
-Relevant source files:
-- `src/services/googleAuthCapacitor.js` — the flow + bridge adapter.
-  Tested in `tests/google-auth-capacitor.test.mjs`.
-- `src/config/googleAuthCapacitor.js` — build-injected per-platform
-  client-ID resolution.
-- `worker/update-worker.mjs` — the shared exchange endpoint
-  (`platform` selector; secretless for native clients).
-- `scripts/ensure-capacitor-platform.mjs` — injects the native deep-link
-  plumbing (below) into the generated projects.
-- `src/browser/main.js` — installs the bridge on native platforms.
+Create Google OAuth clients with these identities:
 
-## Native project changes (automated — do not do these by hand)
+- Android client: package `com.yayra.app` plus every applicable signing SHA-1
+  (debug, release/upload, and Play App Signing).
+- iOS client: bundle ID `com.yayra.app`.
 
-`android/` and `ios/` are generated and gitignored, so
-`scripts/ensure-capacitor-platform.mjs` (already part of
-`npm run build:android` / `build:ios`) injects the deep-link registration
-idempotently every run:
+Configure public client IDs at build time and matching Worker bindings:
 
-- **Android** (`AndroidManifest.xml`): a `VIEW` + `BROWSABLE`
-  intent-filter on `MainActivity` for `@string/custom_url_scheme` (which
-  Capacitor already defines as `com.yayra.app`). No `autoVerify` — this is
-  a custom scheme, not an https App Link.
-- **iOS** (`Info.plist`): a `CFBundleURLTypes` entry registering the
-  `com.yayra.app` scheme.
-
-## Creating the "Android" and "iOS" OAuth Client IDs (console steps)
-
-Same project/consent screen as the Desktop steps. These client types issue
-**no client secret** — identity is proven by app signature instead.
-
-Android — **Credentials → Create Credentials → OAuth client ID →
-"Android"**:
-1. Package name: `com.yayra.app`.
-2. SHA-1 fingerprint: for local testing use the debug keystore
-   (`keytool -list -v -keystore ~/.android/debug.keystore -alias androiddebugkey -storepass android | grep SHA1`).
-   For production you need **two more Android clients or added
-   fingerprints**: your upload/release keystore's SHA-1 AND — if you use
-   Play App Signing (you should) — the **app signing key SHA-1 from Play
-   Console → Setup → App signing**, because that's what actually signs
-   what users install.
-3. No redirect URI is registered for Android clients; Google accepts the
-   package-name custom scheme automatically.
-
-iOS — **Create Credentials → OAuth client ID → "iOS"**:
-1. Bundle ID: `com.yayra.app`.
-2. (App Store ID / Team ID optional until store release.)
-3. No secret, no redirect registration — the custom scheme is derived
-   from the bundle ID.
-
-## Configuring the build
-
-The per-platform client IDs ship inside the app bundle by design (nothing
-secret). Injected by `scripts/build-web.mjs` into the `dist/` bundle that
-`cap sync` copies into the native projects — either:
 ```bash
-export YAYRA_GOOGLE_ANDROID_CLIENT_ID="123-android...apps.googleusercontent.com"
-export YAYRA_GOOGLE_IOS_CLIENT_ID="123-ios...apps.googleusercontent.com"
-```
-or add `androidClientId` / `iosClientId` fields to the gitignored
-`google-auth.web.config.json`. The Worker needs matching bindings (no
-secrets for these two):
-```bash
+export YAYRA_GOOGLE_ANDROID_CLIENT_ID="123-android.apps.googleusercontent.com"
+export YAYRA_GOOGLE_IOS_CLIENT_ID="123-ios.apps.googleusercontent.com"
 npx wrangler secret put GOOGLE_ANDROID_CLIENT_ID --config wrangler.worker.toml
-npx wrangler secret put GOOGLE_IOS_CLIENT_ID     --config wrangler.worker.toml
+npx wrangler secret put GOOGLE_IOS_CLIENT_ID --config wrangler.worker.toml
 ```
 
----
+Native client types have no confidential client secret.
 
-## Status by platform
+## Cloudflare Worker controls
 
-| Platform | Status |
+`worker/update-worker.mjs` exposes only `POST/OPTIONS
+/auth/google/exchange` for this flow. It enforces:
+
+- HTTPS Worker requests;
+- exact web and Capacitor CORS origin allowlists (never `*` on auth);
+- web Origin-to-redirect-origin binding;
+- exact callback routes and platform/client mapping;
+- JSON content type, a 16 KiB request cap, bounded code/redirect/verifier
+  fields, and rejection of unknown/token-shaped fields;
+- RFC 7636 verifier syntax and provider-enforced one-time code use;
+- global and auth-specific per-IP rate limits;
+- `no-store`, `no-referrer`, `nosniff`, and `Vary: Origin` responses;
+- profile schema/length validation and HTTPS-only profile pictures;
+- no token fields in any client response or log.
+
+The non-secret origin variables in `wrangler.worker.toml` are:
+
+```toml
+GOOGLE_WEB_ALLOWED_ORIGINS = "https://yayra.pages.dev,http://localhost:4173"
+GOOGLE_NATIVE_ALLOWED_ORIGINS = "https://localhost,http://localhost,capacitor://localhost"
+```
+
+Add a custom deployment only as an exact origin and register its exact
+`/auth/callback` URI with the same Google Web client.
+
+## Threat model summary
+
+| Threat | Control |
 | --- | --- |
-| Electron desktop (Linux/Windows) | **Implemented**; the live round trip against real Google servers has **not** been run by this agent (no GUI browser or registered Client ID in this sandbox) and must be verified by you on your own machine with your own Client ID. |
-| Web / PWA (`yayra.pages.dev`) | **Implemented** (full-page redirect + Worker-side exchange, see above). Fully unit-tested with mocks (`tests/google-auth-web.test.mjs`, `tests/worker.test.mjs`); the live round trip needs a human with a real "Web application" Client ID, the Worker secrets deployed, and a real browser — see verification steps below. |
-| Android / iOS (Capacitor) | **Implemented** (system browser + custom-scheme deep link + shared Worker exchange, see above). Fully unit-tested with mocks (`tests/google-auth-capacitor.test.mjs`); native deep-link injection verified against freshly generated Capacitor 8 projects in-sandbox. The live round trip needs a human with real "Android"/"iOS" Client IDs, Worker bindings deployed, and a real device/emulator — this sandbox can run neither a mobile emulator nor a consent screen. |
+| Embedded-browser rejection / credential phishing surface | Interactive Google auth uses the OS external user-agent. |
+| Login CSRF / callback injection | Random state, exact callback route/origin, duplicate rejection, single-use pending state. |
+| Authorization-code interception | PKCE S256; mobile uses a reverse-DNS app callback and platform-bound client. |
+| Deep-link credential leakage | Only code/state/error accepted; token parameters are rejected; no tokens in custom URLs. |
+| Open redirect / host confusion | Exact hosts/routes, URL credential rejection, bounded HTTPS continuation repair. |
+| Renderer token theft | Electron sends profile-only IPC; Web/Capacitor never receive raw tokens. |
+| Token theft at rest | Electron `safeStorage`; no plaintext fallback. Web/mobile persist profile only. |
+| Worker cross-origin abuse | Exact CORS allowlist, Origin/redirect binding, PKCE, one-time code, rate limit. |
+| XSS through profile fields | Profile schema/length validation plus HTML/attribute escaping at render time. |
+| Replay | Google code is one-time; pending client transaction is consumed and expires after 10 minutes. |
 
-## How to verify it actually works (you must do this)
+## Manual verification
+
+Live Google consent cannot be completed in headless CI. Before release, verify:
+
+### Desktop
+
+1. Configure the Desktop client and launch a packaged build on a real desktop.
+2. Settings → Account → Sign in with Google must open the OS default browser,
+   not an Electron window.
+3. Complete consent. The browser callback page should say to return to Yayra,
+   its address should become `/complete`, and Yayra should show the profile.
+4. Cancel, alter state, wait past timeout, and launch with no default browser;
+   each path must fail clearly without creating a session.
+5. In a normal tab, trigger Google OAuth and direct Google Account sign-in.
+   Confirm the source tab stays unchanged and the system browser opens once.
+6. Open a captured `/v3/signin/rejected?...continue=...` URL. Confirm Yayra
+   opens clean `/ServiceLogin` in the browser and preserves only a safe HTTPS
+   continuation.
 
 ### Web / PWA
 
-1. Create the "Web application" Client ID per the steps above; put the
-   secret on the Worker (`wrangler secret put ...`) and redeploy it
-   (`npm run deploy:cloudflare:worker`).
-2. Local first pass: `export YAYRA_GOOGLE_WEB_CLIENT_ID=...` then
-   `npm run dev`, open `http://localhost:4173`, Settings → Account →
-   "Sign in with Google". The page should redirect to Google's consent
-   screen, back to `/auth/callback`, then to where you started — now
-   showing your name/email/avatar.
-3. Production pass: build with the same env var, deploy to Pages, repeat
-   from `https://yayra.pages.dev` in a normal tab AND as an installed PWA.
-4. Negative paths worth 60 seconds: cancel on the consent screen (should
-   land on a clear "cancelled" message, not a blank page); press Back
-   after signing in (should NOT re-run the callback); sign out and reload
-   (stays signed out).
+1. Test both `http://localhost:4173` and `https://yayra.pages.dev`, including
+   an installed standalone PWA.
+2. Confirm callback state is single-use, stale transactions expire, Back does
+   not replay exchange, and cancellation shows a clear message.
+3. Confirm an unlisted Origin gets no auth CORS permission.
 
-### Android / iOS (Capacitor)
+### Android / iOS
 
-1. Create the "Android" and/or "iOS" Client IDs per the steps above; bind
-   `GOOGLE_ANDROID_CLIENT_ID` / `GOOGLE_IOS_CLIENT_ID` on the Worker and
-   redeploy it.
-2. Build with the matching env vars set
-   (`YAYRA_GOOGLE_ANDROID_CLIENT_ID=... npm run build:android`), install
-   on a real device/emulator whose signing cert SHA-1 matches the Android
-   client (debug keystore for a debug build!).
-3. Settings → Account → "Sign in with Google": a Custom Tab/Safari sheet
-   must open (NOT an in-app webview), and after consent the app must come
-   back to the foreground signed in.
-4. Negative paths: dismiss the sheet without finishing (expect a clear
-   "cancelled" state, not a stuck spinner — there is also a 5-minute
-   timeout); kill and relaunch the app (session persists until explicit
-   sign-out).
-5. If the redirect never returns to the app, verify the injected
-   intent-filter / CFBundleURLTypes survived your build (run
-   `node scripts/ensure-capacitor-platform.mjs android` / `ios` again and
-   grep for "YAYRA GOOGLE SIGN-IN").
+1. Build with the matching platform client ID and signing identity.
+2. Confirm app identity opens Custom Tabs/iOS browser and returns via
+   `com.yayra.app:/oauth2redirect`.
+3. Test wrong-state, prefix-confusable, duplicate, token-bearing, unrelated,
+   canceled, and timed-out callbacks.
+4. Navigate to Gmail/Google Account sign-in from a native website tab. Confirm
+   the WebView cancels the interactive route and the secure browser surface
+   opens, while the original Yayra tab/history stays unchanged.
 
-### Electron desktop
-
-1. Create your Client ID per the steps above and set it via the environment
-   variable (fastest for a first test).
-2. Run the desktop app (`npm run build:web && npx electron .` or your usual
-   dev launch command) on a machine with a real display.
-3. Open Settings → Account → "Sign in with Google".
-4. Your default system browser should open to Google's consent screen. Sign
-   in and approve.
-5. Your browser tab should show "Signed in to Yayra — you can close this tab"
-   and Yayra's Settings → Account should now show your name/email.
-6. Confirm "Sign out" clears it, and relaunching Yayra without signing in
-   again still remembers you were signed in (session persistence) until you
-   explicitly sign out.
+Automated coverage is in `tests/google-oauth.test.mjs`,
+`tests/google-auth-bridge.test.mjs`, `tests/google-auth-web.test.mjs`,
+`tests/google-auth-capacitor.test.mjs`, `tests/electron-webview-bridge.test.mjs`,
+`tests/browser-shell-capacitor-handoff.test.mjs`,
+`tests/android-inapp-google.test.mjs`, and `tests/worker.test.mjs`.

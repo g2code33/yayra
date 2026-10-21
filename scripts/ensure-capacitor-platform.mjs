@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { cp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
+import { updateIosProjectVersion } from './lib/ios-project.mjs';
 
 const platform = process.argv[2];
 if (!['android', 'ios'].includes(platform)) {
@@ -79,6 +80,16 @@ async function injectIosUrlScheme() {
   console.log('injected Google sign-in URL scheme into Info.plist');
 }
 
+async function syncIosVersion() {
+  const projectPath = path.join(root, 'ios/App/App.xcodeproj/project.pbxproj');
+  if (!existsSync(projectPath)) return;
+
+  const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
+  const result = updateIosProjectVersion(await readFile(projectPath, 'utf8'), pkg.version);
+  await writeFile(projectPath, result.project);
+  console.log(`synced iOS project version ${pkg.version} (${result.buildNumber})`);
+}
+
 // --- System-wide floating bubble (SYSTEM_ALERT_WINDOW overlay) -----------
 // The bubble must float over EVERY opened app - a real OS-level overlay
 // (same mechanism as Messenger chat heads), not a <div> inside Yayra's own
@@ -147,9 +158,10 @@ async function installAndroidOverlayNative() {
     <!-- ${OVERLAY_MARKER}: injected by scripts/ensure-capacitor-platform.mjs.
          SYSTEM_ALERT_WINDOW = draw the bubble over every other app (the user
          grants it on the system "Display over other apps" page, reached via
-         YayraOverlay.requestPermission()). The FGS + notification permissions
-         keep the user-controlled bubble service alive and visible per
-         Android 13-15 policy. -->
+         YayraOverlay.requestPermission()). RECORD_AUDIO supports Google voice
+         search; the FGS + notification permissions keep the user-controlled
+         bubble service alive and visible per Android 13-15 policy. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
@@ -173,6 +185,16 @@ async function installAndroidOverlayNative() {
       manifest = manifest.replace(/(\n\s*<\/application>)/, `\n${service}$1`);
       await writeFile(manifestPath, manifest);
       console.log('injected floating-bubble permissions + service into AndroidManifest.xml');
+    }
+    // Existing generated projects already contain OVERLAY_MARKER, so new
+    // voice-search builds must backfill RECORD_AUDIO independently.
+    if (!manifest.includes('android.permission.RECORD_AUDIO')) {
+      manifest = manifest.replace(
+        /(\n\s*<application)/,
+        '\n    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n$1'
+      );
+      await writeFile(manifestPath, manifest);
+      console.log('injected Google voice-search audio permission into AndroidManifest.xml');
     }
   }
 
@@ -249,6 +271,7 @@ if (platform === 'android') {
 }
 if (platform === 'ios') {
   await injectIosUrlScheme();
+  await syncIosVersion();
   const src = path.join(root, 'native-assets/ios/AppIcon.appiconset');
   const dest = path.join(root, 'ios/App/App/Assets.xcassets/AppIcon.appiconset');
   if (existsSync(src) && existsSync(path.join(root, 'ios'))) {

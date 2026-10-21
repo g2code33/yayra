@@ -63,6 +63,9 @@ export const DEFAULT_SCOPES = ['openid', 'email', 'profile'];
 export const CALLBACK_PATH = '/auth/callback';
 export const PENDING_KEY = 'yayra:google-auth:pending';
 export const PROFILE_KEY = 'yayra:google-account';
+export const PENDING_MAX_AGE_MS = 10 * 60 * 1000;
+const MAX_CALLBACK_QUERY_LENGTH = 8192;
+const MAX_EXCHANGE_RESPONSE_BYTES = 64 * 1024;
 
 function base64urlFromBytes(bytes) {
   let binary = '';
@@ -101,7 +104,7 @@ function validatedWebOrigin(rawOrigin) {
 }
 
 function safeReturnToPath(value, origin) {
-  if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//') || value.includes('\\')) return '/';
+  if (typeof value !== 'string' || value.length > 2048 || !value.startsWith('/') || value.startsWith('//') || value.includes('\\')) return '/';
   try {
     const parsed = new URL(value, origin);
     if (parsed.origin !== origin || parsed.username || parsed.password) return '/';
@@ -109,6 +112,85 @@ function safeReturnToPath(value, origin) {
   } catch {
     return '/';
   }
+}
+
+export function validatedExchangeUrl(value) {
+  if (typeof value !== 'string' || value.length > 2048) throw new Error('invalid_exchange_url');
+  try {
+    const parsed = new URL(value);
+    const localHttp = parsed.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname);
+    if ((parsed.protocol !== 'https:' && !localHttp)
+      || parsed.username || parsed.password || parsed.search || parsed.hash
+      || parsed.pathname !== '/auth/google/exchange') throw new Error('invalid_exchange_url');
+    return parsed.toString();
+  } catch {
+    throw new Error('invalid_exchange_url');
+  }
+}
+
+export async function readBoundedExchangeResponse(response, maxBytes = MAX_EXCHANGE_RESPONSE_BYTES) {
+  const rawLength = response?.headers?.get?.('content-length');
+  if (rawLength !== null && rawLength !== undefined && rawLength !== '') {
+    const declaredLength = Number(rawLength);
+    if (!Number.isSafeInteger(declaredLength) || declaredLength < 0 || declaredLength > maxBytes) {
+      throw new Error('exchange_response_too_large');
+    }
+  }
+  const reader = response?.body?.getReader?.();
+  if (reader) {
+    const chunks = [];
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value || []);
+      total += chunk.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch { /* best effort */ }
+        throw new Error('exchange_response_too_large');
+      }
+      chunks.push(chunk);
+    }
+    const combined = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      combined.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return new TextDecoder().decode(combined);
+  }
+  let text = '';
+  try { text = await response.text(); } catch { return ''; }
+  if (new TextEncoder().encode(text).byteLength > maxBytes) throw new Error('exchange_response_too_large');
+  return text;
+}
+
+export function safeExchangeErrorCode(responseText) {
+  try {
+    const parsed = JSON.parse(String(responseText || ''));
+    if (typeof parsed?.error === 'string' && /^[A-Za-z0-9_:-]{1,96}$/.test(parsed.error)) return parsed.error;
+  } catch { /* never expose an arbitrary upstream response body */ }
+  return 'upstream_error';
+}
+
+export function sanitizeGoogleProfile(value) {
+  if (!value || typeof value !== 'object') return null;
+  const sub = typeof value.sub === 'string' && /^[A-Za-z0-9_-]{1,255}$/.test(value.sub) ? value.sub : null;
+  const email = typeof value.email === 'string' && value.email.length <= 254 && /^[^\s@]+@[^\s@]+$/.test(value.email)
+    ? value.email
+    : null;
+  if (!sub || !email) return null;
+  const name = typeof value.name === 'string'
+    ? value.name.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 200)
+    : null;
+  let picture = null;
+  if (typeof value.picture === 'string' && value.picture.length <= 2048) {
+    try {
+      const parsed = new URL(value.picture);
+      if (parsed.protocol === 'https:' && !parsed.username && !parsed.password) picture = parsed.toString();
+    } catch { /* optional image is dropped */ }
+  }
+  return { sub, name, email, picture };
 }
 
 /**
@@ -119,6 +201,13 @@ function safeReturnToPath(value, origin) {
  * browser; the one-shot code is all this flow needs.
  */
 export function buildAuthorizationUrl({ clientId, redirectUri, state, codeChallenge, scopes = DEFAULT_SCOPES }) {
+  if (typeof clientId !== 'string' || clientId.length > 255
+    || !/^[A-Za-z0-9._-]+\.apps\.googleusercontent\.com$/.test(clientId)) throw new Error('invalid_client_id');
+  if (typeof redirectUri !== 'string' || !redirectUri || redirectUri.length > 2048) throw new Error('invalid_redirect_uri');
+  if (typeof state !== 'string' || !/^[A-Za-z0-9_-]{16,256}$/.test(state)) throw new Error('invalid_state');
+  if (typeof codeChallenge !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(codeChallenge)) throw new Error('invalid_code_challenge');
+  if (!Array.isArray(scopes) || scopes.length !== DEFAULT_SCOPES.length
+    || scopes.some((scope, index) => scope !== DEFAULT_SCOPES[index])) throw new Error('invalid_scopes');
   const url = new URL(GOOGLE_AUTH_ENDPOINT);
   url.searchParams.set('client_id', clientId);
   url.searchParams.set('redirect_uri', redirectUri);
@@ -162,15 +251,22 @@ export async function beginSignIn({
 
 /** Parses and validates Google's callback query parameters. */
 export function parseCallbackParams(search) {
-  const params = new URLSearchParams(String(search || '').startsWith('?') ? String(search).slice(1) : String(search || ''));
+  const raw = String(search || '');
+  if (raw.length > MAX_CALLBACK_QUERY_LENGTH) return { ok: false, error: 'invalid_callback' };
+  const params = new URLSearchParams(raw.startsWith('?') ? raw.slice(1) : raw);
   const errors = params.getAll('error');
   const codes = params.getAll('code');
   const states = params.getAll('state');
   if (errors.length > 1 || codes.length > 1 || states.length > 1) return { ok: false, error: 'invalid_callback' };
   const state = states[0];
-  if (errors[0]) return { ok: false, error: errors[0], ...(state ? { state } : {}) };
+  if (state && !/^[A-Za-z0-9_-]{1,256}$/.test(state)) return { ok: false, error: 'invalid_callback' };
+  if (errors[0]) {
+    if (!/^[A-Za-z0-9_]{1,64}$/.test(errors[0])) return { ok: false, error: 'invalid_callback' };
+    return { ok: false, error: errors[0], ...(state ? { state } : {}) };
+  }
   const code = codes[0];
   if (!code || !state) return { ok: false, error: 'missing_code_or_state', ...(state ? { state } : {}) };
+  if (code.length > 4096 || /[\u0000-\u0020\u007f]/.test(code)) return { ok: false, error: 'invalid_callback' };
   return { ok: true, code, state };
 }
 
@@ -187,10 +283,12 @@ export async function completeSignIn({
   pathname = CALLBACK_PATH,
   exchangeUrl,
   sessionStorage,
-  fetchImpl = globalThis.fetch
+  fetchImpl = globalThis.fetch,
+  now = () => Date.now()
 }) {
   if (pathname !== CALLBACK_PATH) throw new Error('invalid_callback');
   const safeOrigin = validatedWebOrigin(origin);
+  const safeExchangeUrl = validatedExchangeUrl(exchangeUrl);
   const pendingRaw = sessionStorage.getItem(PENDING_KEY);
   // Single-use: consume the pending attempt before anything can throw, so a
   // replayed/bookmarked callback URL can never complete a second time.
@@ -202,10 +300,18 @@ export async function completeSignIn({
   } catch {
     throw new Error('corrupt_pending_sign_in');
   }
-  if (!pending || typeof pending.state !== 'string' || !pending.state
+  if (!pending || typeof pending.state !== 'string'
+    || !/^[A-Za-z0-9_-]{8,256}$/.test(pending.state)
     || typeof pending.codeVerifier !== 'string'
-    || !/^[A-Za-z0-9._~-]{43,128}$/.test(pending.codeVerifier)) {
+    || !/^[A-Za-z0-9._~-]{43,128}$/.test(pending.codeVerifier)
+    || typeof pending.startedAt !== 'string') {
     throw new Error('corrupt_pending_sign_in');
+  }
+  const startedAt = Date.parse(pending.startedAt);
+  const currentTime = Number(now());
+  if (!Number.isFinite(startedAt) || !Number.isFinite(currentTime)
+    || startedAt > currentTime + 60_000 || currentTime - startedAt > PENDING_MAX_AGE_MS) {
+    throw new Error('expired_pending_sign_in');
   }
 
   const parsed = parseCallbackParams(search);
@@ -214,44 +320,50 @@ export async function completeSignIn({
   if (parsed.state !== pending.state) throw new Error('state_mismatch');
   if (!parsed.ok) throw new Error(parsed.error);
 
-  const response = await fetchImpl(exchangeUrl, {
+  const response = await fetchImpl(safeExchangeUrl, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify({
       code: parsed.code,
       codeVerifier: pending.codeVerifier,
       redirectUri: `${safeOrigin}${CALLBACK_PATH}`
     })
   });
+  const responseText = await readBoundedExchangeResponse(response);
   if (!response.ok) {
-    let detail = '';
-    try { detail = await response.text(); } catch { /* best effort */ }
-    throw new Error(`exchange_failed:${response.status}${detail ? `:${detail.slice(0, 200)}` : ''}`);
+    throw new Error(`exchange_failed:${response.status}:${safeExchangeErrorCode(responseText)}`);
   }
-  const body = await response.json();
-  if (!body || !body.profile || !body.profile.email) throw new Error('exchange_malformed_response');
+  let body;
+  try { body = JSON.parse(responseText); } catch { throw new Error('exchange_malformed_response'); }
+  const profile = sanitizeGoogleProfile(body?.profile);
+  if (!profile) throw new Error('exchange_malformed_response');
   // Belt-and-braces: even if a future worker regression leaked token fields,
   // never let them past this seam. Profile only - same contract as the
   // Electron bridge (electron/authBridge.cjs).
-  const { sub, name, email, picture } = body.profile;
   return {
-    profile: { sub, name, email, picture },
+    profile,
     returnTo: safeReturnToPath(pending.returnTo, safeOrigin)
   };
 }
 
 /** Profile-only persistence (see the security trade-off note at the top). */
 export function saveProfile(localStorage, profile) {
-  localStorage.setItem(PROFILE_KEY, JSON.stringify({ profile, savedAt: new Date().toISOString() }));
+  const cleanProfile = sanitizeGoogleProfile(profile);
+  if (!cleanProfile) throw new Error('invalid_profile');
+  localStorage.setItem(PROFILE_KEY, JSON.stringify({ profile: cleanProfile, savedAt: new Date().toISOString() }));
 }
 
 export function loadProfile(localStorage) {
   const raw = localStorage.getItem(PROFILE_KEY);
-  if (!raw) return null;
+  if (!raw || raw.length > 16 * 1024) return null;
   try {
     const parsed = JSON.parse(raw);
-    if (!parsed || !parsed.profile || !parsed.profile.email) return null;
-    return parsed;
+    const profile = sanitizeGoogleProfile(parsed?.profile);
+    if (!profile) return null;
+    const savedAt = typeof parsed.savedAt === 'string' && Number.isFinite(Date.parse(parsed.savedAt))
+      ? parsed.savedAt
+      : null;
+    return { profile, savedAt };
   } catch {
     return null;
   }

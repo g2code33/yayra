@@ -14,6 +14,22 @@ const expected = (await listFiles(dist))
 if (JSON.stringify(precache) !== JSON.stringify(expected)) {
   fail(`precache mismatch\nexpected=${JSON.stringify(expected, null, 2)}\nactual=${JSON.stringify(precache, null, 2)}`);
 }
+// The integrated document readers are a lazy ESM graph. Pin every offline
+// engine explicitly so a copy/filter change cannot ship a shell whose Open
+// document action lands on a startup error only after installation.
+const documentAssets = [
+  ['./packages/shared-ui/src/vendor/pdfjs/pdf.mjs', 100_000],
+  ['./packages/shared-ui/src/vendor/pdfjs/pdf.worker.mjs', 100_000],
+  ['./packages/shared-ui/src/vendor/documents/pptxRenderer.mjs', 150_000],
+  ['./packages/shared-ui/src/vendor/documents/docxPreview.mjs', 200_000],
+  ['./packages/shared-ui/src/vendor/documents/xlsx.mjs', 700_000],
+  ['./packages/shared-ui/src/vendor/documents/manifest.json', 100]
+];
+for (const [asset, minimumBytes] of documentAssets) {
+  if (!precache.includes(asset)) fail(`document reader asset missing from build/precache: ${asset}`);
+  const info = await stat(path.join(dist, asset.slice(2)));
+  if (info.size < minimumBytes) fail(`document reader asset is unexpectedly small: ${asset} (${info.size} bytes)`);
+}
 const html = await readFile(path.join(dist, 'index.html'), 'utf8');
 const refs = [...html.matchAll(/(?:src|href)="([^"]+)"/g)].map((match) => match[1]);
 for (const ref of refs) {

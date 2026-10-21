@@ -42,6 +42,12 @@ const FILE_NAME = 'yayra-device-passkey.json';
 const PIN_MAX_ATTEMPTS = 5;
 const PIN_LOCK_MS = 60 * 1000;
 const SYSTEM_AUTH_TIMEOUT_MS = 90 * 1000;
+// A successful Yayra-account verification can authorize exactly one pending
+// website WebAuthn ceremony. The opaque grant never contains a PIN, private
+// key or challenge, is bound to the requesting shell WebContents + tab/RP,
+// and is consumed once in the main process.
+const WEBSITE_GRANT_TTL_MS = 30 * 1000;
+const MAX_WEBSITE_GRANTS = 32;
 
 function createPasskeyBridge({
   ipcMain,
@@ -60,6 +66,72 @@ function createPasskeyBridge({
   logger = console
 }) {
   const filePath = path.join(userDataDir, FILE_NAME);
+  const websiteGrants = new Map();
+
+  function normalizeWebsiteRequest(value) {
+    if (!value || typeof value !== 'object') return null;
+    const tabId = String(value.tabId || '').slice(0, 128);
+    const requestId = String(value.requestId || '').slice(0, 160);
+    const rpId = String(value.rpId || '').trim().toLowerCase().slice(0, 253);
+    const profileId = String(value.profileId || 'default').slice(0, 128);
+    const action = value.action === 'create' ? 'create' : value.action === 'get' ? 'get' : '';
+    if (!/^[a-z0-9_-]+$/i.test(tabId)
+      || !/^yayra-wa-[a-z0-9-]+$/i.test(requestId)
+      || !/^[a-z0-9.-]+$/i.test(rpId)
+      || !/^[a-z0-9_-]+$/i.test(profileId)
+      || !action) return null;
+    return { tabId, requestId, rpId, profileId, action };
+  }
+
+  function pruneWebsiteGrants() {
+    const now = Date.now();
+    for (const [token, grant] of websiteGrants) {
+      if (!grant || grant.expiresAt <= now) websiteGrants.delete(token);
+    }
+    while (websiteGrants.size >= MAX_WEBSITE_GRANTS) {
+      const oldest = websiteGrants.keys().next().value;
+      if (!oldest) break;
+      websiteGrants.delete(oldest);
+    }
+  }
+
+  function withWebsiteGrant(event, websiteRequest, result) {
+    if (!result?.ok) return result;
+    const request = normalizeWebsiteRequest(websiteRequest);
+    const senderId = Number(event?.sender?.id);
+    if (!request || !Number.isSafeInteger(senderId) || senderId < 0) return result;
+    pruneWebsiteGrants();
+    const token = Buffer.from(randomBytesImpl(32)).toString('base64url');
+    const expiresAt = Date.now() + WEBSITE_GRANT_TTL_MS;
+    websiteGrants.set(token, { ...request, senderId, expiresAt });
+    return { ...result, authorizationToken: token, authorizationExpiresAt: expiresAt };
+  }
+
+  /**
+   * Main-process-only, one-shot grant consumption. Supplying a token on the
+   * website continuation IPC is not enough: every bound field must match the
+   * real pending request owned by the same shell WebContents.
+   */
+  function consumeWebsiteGrant({ token, event, tabId, requestId, rpId, profileId, action } = {}) {
+    pruneWebsiteGrants();
+    const safeToken = typeof token === 'string' && token.length <= 128 ? token : '';
+    const grant = safeToken ? websiteGrants.get(safeToken) : null;
+    if (safeToken) websiteGrants.delete(safeToken); // one attempt, success or failure
+    if (!grant || grant.expiresAt <= Date.now()) return { ok: false, reason: 'yayra-authorization-expired' };
+    const actual = normalizeWebsiteRequest({ tabId, requestId, rpId, profileId, action });
+    const senderId = Number(event?.sender?.id);
+    if (!actual
+      || !Number.isSafeInteger(senderId)
+      || grant.senderId !== senderId
+      || grant.tabId !== actual.tabId
+      || grant.requestId !== actual.requestId
+      || grant.rpId !== actual.rpId
+      || grant.profileId !== actual.profileId
+      || grant.action !== actual.action) {
+      return { ok: false, reason: 'yayra-authorization-mismatch' };
+    }
+    return { ok: true, method: 'yayra-passkey', expiresAt: grant.expiresAt };
+  }
 
   function encryptionAvailable() {
     try {
@@ -293,7 +365,12 @@ function createPasskeyBridge({
     return { ok: true, passkey: { credentialId: record.credentialId, label: record.label, createdAt: record.createdAt, method: record.method } };
   }
 
-  async function handleRegister(_event, { label = 'Yayra user', method: wantMethod = 'device', pin = null } = {}) {
+  async function handleRegister(event, {
+    label = 'Yayra user',
+    method: wantMethod = 'device',
+    pin = null,
+    websiteRequest = null
+  } = {}) {
     if (wantMethod === 'pin') {
       // 6-digit PIN fallback: for devices with no fingerprint/Face ID,
       // no security key and no usable OS keychain. Stored only as a
@@ -301,7 +378,7 @@ function createPasskeyBridge({
       if (!validPin(pin)) return { ok: false, reason: 'pin-invalid' };
       try {
         const pinSalt = randomBytesImpl(16).toString('hex');
-        return persistWithReadBack({
+        const result = persistWithReadBack({
           credentialId: `device-${Date.now()}-${randomBytesImpl(6).toString('hex')}`,
           label: String(label),
           createdAt: Date.now(),
@@ -311,6 +388,7 @@ function createPasskeyBridge({
           pinAttempts: 0,
           pinLockUntil: 0
         });
+        return withWebsiteGrant(event, websiteRequest, result);
       } catch (err) {
         logger?.error?.(`[yayra:passkey] PIN register failed: ${err?.message || err}`);
         return { ok: false, reason: 'device-storage-failed' };
@@ -340,26 +418,30 @@ function createPasskeyBridge({
       if (encryptionAvailable()) {
         const secret = randomBytesImpl(32).toString('base64');
         const encrypted = safeStorageImpl.encryptString(secret);
-        return persistWithReadBack({
+        const result = persistWithReadBack({
           ...base,
           secretHash: crypto.createHash('sha256').update(secret).digest('hex'),
           encryptedSecret: Buffer.from(encrypted).toString('base64')
         });
+        return withWebsiteGrant(event, websiteRequest, result);
       }
       // No keychain, but a real system-password prompt exists (verified
       // above): the record carries no secret - every verify re-runs the
       // live OS authentication, which is the actual proof.
-      return persistWithReadBack(base);
+      return withWebsiteGrant(event, websiteRequest, persistWithReadBack(base));
     } catch (err) {
       logger?.error?.(`[yayra:passkey] register failed: ${err?.message || err}`);
       return { ok: false, reason: 'keychain-unavailable' };
     }
   }
 
-  async function handleVerify(_event, { pin = null } = {}) {
+  async function handleVerify(event, { pin = null, websiteRequest = null } = {}) {
     const record = readRecord();
     if (!record) return { ok: false, reason: 'no-passkey-registered' };
-    if (record.method === 'pin') return verifyPin(record, pin);
+    if (record.method === 'pin') {
+      return withWebsiteGrant(event, websiteRequest, verifyPin(record, pin));
+    }
+    const verified = (result = { ok: true }) => withWebsiteGrant(event, websiteRequest, result);
 
     // macOS: Touch ID prompt where the hardware has it.
     const gate = await promptTouchIdIfAvailable('unlock your Yayra vault');
@@ -378,20 +460,20 @@ function createPasskeyBridge({
     if (!record.encryptedSecret) {
       // System-auth-only record (registered without a keychain): the
       // live prompt above is the whole ceremony.
-      if (systemProved || gate.prompted) return { ok: true };
+      if (systemProved || gate.prompted) return verified();
       return { ok: false, reason: systemAuthAvailable() ? 'verification-failed' : 'system-auth-unavailable' };
     }
 
     if (!encryptionAvailable()) {
       // Keychain gone since registration (e.g. keyring service removed).
       // A successful live system prompt still proves the user.
-      if (systemProved) return { ok: true };
+      if (systemProved) return verified();
       return { ok: false, reason: 'keychain-unavailable' };
     }
     try {
       const secret = safeStorageImpl.decryptString(Buffer.from(record.encryptedSecret, 'base64'));
       const matches = crypto.createHash('sha256').update(secret).digest('hex') === record.secretHash;
-      if (matches) return { ok: true };
+      if (matches) return verified();
       // Decrypt succeeded but the hash does not line up: the record was
       // tampered with - fail regardless of the live prompt.
       return { ok: false, reason: 'verification-failed' };
@@ -400,7 +482,7 @@ function createPasskeyBridge({
       // The OS keyring could not decrypt (changed/reset keyring) - but a
       // live system-password prompt that the user just passed is stronger
       // proof than the stale ciphertext, so honour it.
-      if (systemProved) return { ok: true };
+      if (systemProved) return verified();
       return { ok: false, reason: 'verification-failed' };
     }
   }
@@ -426,6 +508,7 @@ function createPasskeyBridge({
 
   async function handleRemove() {
     try {
+      websiteGrants.clear();
       if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
       try { if (fs.existsSync(backupPath)) fs.unlinkSync(backupPath); } catch { /* best effort */ }
       return { ok: true };
@@ -447,7 +530,9 @@ function createPasskeyBridge({
   return {
     handleStatus, handleRegister, handleVerify, handleRemove,
     handlePhoneStart, handlePhoneStatus, handlePhoneCancel,
-    _filePath: filePath
+    consumeWebsiteGrant,
+    _filePath: filePath,
+    _websiteGrants: websiteGrants
   };
 }
 

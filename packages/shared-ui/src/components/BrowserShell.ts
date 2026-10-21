@@ -2,10 +2,22 @@
  * Yayra Floating Browser - Mainstream Browser-First Shell (TypeScript Definitions)
  */
 
+export interface BrowserTabGroupState {
+  name: string;
+  color?: string;
+}
+
+export interface CreateNewTabOptions {
+  group?: BrowserTabGroupState | null;
+  render?: boolean;
+  afterTabId?: string | null;
+}
+
 export interface BrowserTabState {
   id: string;
   title: string;
   url: string;
+  group?: BrowserTabGroupState | null;
   isSecure?: boolean;
   canGoBack?: boolean;
   canGoForward?: boolean;
@@ -19,6 +31,7 @@ export interface BrowserShellOptions {
   platform?: 'windows' | 'linux' | 'android' | 'ios' | 'desktop' | 'web' | 'pwa';
   isMobile?: boolean;
   initialUrl?: string;
+  initialPrivate?: boolean;
   tabs?: BrowserTabState[];
   activeTabId?: string;
   navigationController?: any;
@@ -42,11 +55,12 @@ export declare class BrowserShell {
   initialize(): Promise<void>;
   render(container?: HTMLElement | null): HTMLElement | null;
   getActiveTab(): BrowserTabState;
-  createNewTab(isPrivate?: boolean): void;
+  createNewTab(isPrivate?: boolean, options?: CreateNewTabOptions): BrowserTabState;
   selectTab(tabId: string): void;
   closeTab(tabId: string): void;
   reopenLastClosedTab(): void;
   reorderTabs(fromIdx: number, toIdx: number): void;
+  detachTabToWindow(tabId: string): Promise<boolean>;
   navigateActiveTab(rawInput: string): void;
   goBack(): void;
   goForward(): void;

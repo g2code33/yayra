@@ -112,7 +112,7 @@ export class DefaultSecurityPolicy implements ISecurityPolicy {
   }
 
   public enforceContentSecurityPolicy(origin: string): string {
-    return "default-src 'self' yayra: https:; img-src 'self' data: blob: https:; script-src 'self' 'unsafe-inline' https:; style-src 'self' 'unsafe-inline' https:; frame-ancestors 'none'; object-src 'none'; base-uri 'self';";
+    return "default-src 'self' yayra: https:; img-src 'self' data: blob: https:; media-src 'self' blob: yayra:; script-src 'self' 'unsafe-inline' https:; style-src 'self' 'unsafe-inline' https:; frame-ancestors 'none'; object-src 'none'; base-uri 'self';";
   }
 
   public sanitizeDownloadFilename(suggestedName: string): string {

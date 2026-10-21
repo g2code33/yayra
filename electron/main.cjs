@@ -18,18 +18,38 @@ const { signInWithGoogle } = require('./googleAuth.cjs');
 const { resolveGoogleClientId, resolveGoogleClientSecret } = require('./googleAuthConfig.cjs');
 const { createDownloadsStore } = require('./downloadsStore.cjs');
 const { createDownloadsBridge } = require('./downloadsBridge.cjs');
+const { createDocumentLibrary } = require('./documentLibrary.cjs');
 const { createPasskeyBridge } = require('./passkeyBridge.cjs');
+const { configureWebsiteWebAuthn } = require('./websiteWebAuthn.cjs');
+const { createWebsitePasskeyProvider } = require('./websitePasskeyProvider.cjs');
+const { configureTrustedMediaPermissions } = require('./trustedMediaPermissions.cjs');
+const { uploadGoogleLensImage, searchGoogleLensImageUrl, requestGoogleLensWithElectronNet } = require('./googleFeatures.cjs');
 const { createPhoneApproval } = require('./phoneApproval.cjs');
 const { createOverlayBridge } = require('./overlayWindow.cjs');
 const { createOverlayStore } = require('./overlayStore.cjs');
 const { createScreenRecorder } = require('./screenRecorder.cjs');
 const { createTrayController } = require('./tray.cjs');
 const { applyVaapiPolicy } = require('./vaapiProbe.cjs');
+const { createWindowDragController } = require('./windowDrag.cjs');
+const { popupMenuWithRecovery, closeNativeMenuForWindow } = require('./nativeMenuGuard.cjs');
+const { buildMediaCompatibilityScript, installMediaCompatibility } = require('./mediaCompatibility.cjs');
 
 const CUSTOM_SCHEME = 'yayra';
+// v1.0.70 briefly used this app-controlled Google auth partition. The
+// noncompliant window path is gone, but Clear browsing data still includes
+// the legacy partition so upgrades can remove its old cookies/storage.
+const LEGACY_GOOGLE_AUTH_PARTITION = 'persist:yayra-google-auth';
+const CHROME_INPUT_RECOVERY_CHANNEL = 'yayra:chrome-input-recover';
+// Keep local-document IPC bounded before any file is read into memory. This
+// mirrors MAX_DOCUMENT_BYTES in the browser workspace (CommonJS cannot import
+// that browser ESM module during Electron startup).
+const MAX_DOCUMENT_BYTES = 300 * 1024 * 1024;
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 let mainWindow;
 let downloadsBridge = null;
+// Trusted local-file catalog. It alone owns source paths; renderer code only
+// ever receives opaque ids plus display metadata or bytes for one chosen id.
+let documentLibrary = null;
 // Extra per-profile shell windows (Chrome-style: one window per profile,
 // the previous window stays). Tracked for cleanup only.
 const profileWindows = new Set();
@@ -37,7 +57,31 @@ let overlayBridge = null;
 let webviewBridge = null;
 let globalHotkeys = null;
 let trayController = null;
+let windowDragController = null;
 let lastLoadError = null;
+
+function ensureDocumentLibrary() {
+  if (!documentLibrary) {
+    documentLibrary = createDocumentLibrary({
+      fs,
+      path,
+      crypto,
+      shell,
+      userDataDir: app.getPath('userData'),
+      maxViewBytes: MAX_DOCUMENT_BYTES
+    });
+  }
+  return documentLibrary;
+}
+
+function normalizeHttpUrl(value) {
+  try {
+    const parsed = new URL(String(value || ''));
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.toString() : null;
+  } catch {
+    return null;
+  }
+}
 
 // Boot launches (login items / XDG autostart) pass --yayra-autostart:
 // start the floating bubble + system tray ONLY, without popping the main
@@ -250,8 +294,8 @@ if (relaunchingForX11) {
         return;
       }
     } catch { /* healing is best-effort - normal focusing below */ }
-    // A PDF was opened WITH Yayra from the desktop while it is already
-    // running: hand its bytes to the shell's document viewer.
+    // A local document was opened WITH Yayra while it is already running:
+    // hand its unchanged bytes to the matching in-shell viewer.
     const pdfFile = parsePdfFileArg(argv || []);
     if (pdfFile) {
       if (!mainWindow || mainWindow.isDestroyed()) createWindow();
@@ -322,6 +366,11 @@ function createAppModeWindow(url) {
   try {
     win.webContents.setUserAgent(buildBrowserUserAgent({ platform: process.platform, chromeVersion: process.versions.chrome }));
   } catch { /* default UA still works */ }
+  installMediaCompatibility(win.webContents.session);
+  win.webContents.on('dom-ready', () => {
+    try { win.webContents.executeJavaScript(buildMediaCompatibilityScript(), true).catch(() => {}); }
+    catch { /* closing or an older Electron surface */ }
+  });
   win.webContents.setWindowOpenHandler(({ url: target }) => {
     try { if (/^https?:\/\//i.test(target)) shell.openExternal(target); } catch { /* best effort */ }
     return { action: 'deny' };
@@ -337,14 +386,24 @@ function createAppModeWindow(url) {
   return win;
 }
 
-const pendingPdfFiles = []; // queued until the shell renderer is listening
+const pendingPdfFiles = []; // legacy name: local documents queued until the renderer listens
 
 function deliverPdfFile(filePath) {
   try {
     const stat = fs.statSync(filePath);
-    if (!stat.isFile() || stat.size > 150 * 1024 * 1024) return false;
+    if (!stat.isFile()) return false;
+    // Remember the explicit OS "Open with Yayra" action even when the file is
+    // too large for the in-app 300 MB viewer. The hub can still reveal it or
+    // hand the original path to its system application later.
+    const libraryEntry = ensureDocumentLibrary().recordPathSync(filePath);
+    if (stat.size > MAX_DOCUMENT_BYTES) return false;
     const data = fs.readFileSync(filePath);
-    const payload = { name: path.basename(filePath), size: stat.size, data };
+    const payload = {
+      name: path.basename(filePath),
+      size: stat.size,
+      data,
+      libraryId: libraryEntry?.id || null
+    };
     const rendererReady = mainWindow && !mainWindow.isDestroyed()
       && (typeof mainWindow.webContents.isLoadingMainFrame !== 'function' || !mainWindow.webContents.isLoadingMainFrame());
     if (rendererReady) {
@@ -357,7 +416,7 @@ function deliverPdfFile(filePath) {
     }
     return true;
   } catch (err) {
-    console.error('[yayra] pdf open-with delivery failed', err);
+    console.error('[yayra] document open-with delivery failed', err);
     return false;
   }
 }
@@ -462,6 +521,25 @@ app.whenReady().then(async () => {
   if (relaunchingForX11) return;
   if (!isPrimaryInstance) return;
 
+  // Website WebAuthn is Chromium-owned and separate from Yayra's internal
+  // vault-unlock key. Roaming security keys are available without setup;
+  // on macOS, enable Touch ID only when the exact access group is present in
+  // the signed app entitlements (the helper refuses invented/default groups).
+  configureWebsiteWebAuthn({ app });
+
+  // The internal voice-search surface may request AUDIO only. Keep arbitrary
+  // website origins denied and preserve the app-generated recorder window;
+  // macOS still owns and displays its OS-level microphone consent prompt.
+  configureTrustedMediaPermissions({
+    defaultSession: session.defaultSession,
+    systemPreferences,
+    recorderPreloadPath: path.join(__dirname, 'recorderPreload.cjs'),
+    platform: process.platform,
+    dialog,
+    getWindowForWebContents: (wc) => BrowserWindow.fromWebContents(wc),
+    logger: console
+  });
+
   // One glance at the terminal must answer "which backend is this
   // instance on?" - it decides whether the bubble can move and overlay.
   if (process.platform === 'linux') {
@@ -491,7 +569,25 @@ app.whenReady().then(async () => {
     if (!file.startsWith(DIST_DIR) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) return new Response('not found', { status: 404 });
     const type = mimeType(file);
     if (/\.m?js$/.test(file) && !/javascript/.test(type)) return new Response('refused wrong MIME type', { status: 415 });
-    return net.fetch(pathToFileURL(file).toString());
+
+    // Do not leave module MIME types up to the host OS's file association
+    // database. In particular, Linux installations can return .mjs files as
+    // application/octet-stream through net.fetch(file://…), and Chromium's
+    // strict module loader then rejects the lazily imported PDF.js engine.
+    // Preserve net.fetch's streaming body/status while making every bundled
+    // asset's Content-Type deterministic under yayra:// (including the
+    // module worker used by PDF.js).
+    const assetResponse = await net.fetch(pathToFileURL(file).toString());
+    const headers = new Headers(assetResponse.headers);
+    headers.set('content-type', type);
+    headers.set('x-content-type-options', 'nosniff');
+    return new Response(assetResponse.body, {
+      // net.fetch(file:) normally reports 200; guard the Fetch API's
+      // internal status 0 as Response() only accepts 200–599.
+      status: assetResponse.status >= 200 && assetResponse.status <= 599 ? assetResponse.status : 200,
+      statusText: assetResponse.status >= 200 ? assetResponse.statusText : '',
+      headers
+    });
   });
 
   // ALL IPC surfaces are registered exactly once here (never inside
@@ -502,9 +598,9 @@ app.whenReady().then(async () => {
   const isSmokeStartup = process.env.YAYRA_SMOKE === '1' || process.env.IBROWSE_SMOKE === '1';
   // Launched from an installed site-app shortcut: only the site's own
   // app window opens - no browser window, like chrome --app=<url>.
-  // Launched via the desktop's "Open with > yayra" on a PDF (the Linux
-  // desktop entry may pass a file:// URI while Windows passes a path): queue
-  // it - createWindow()'s did-finish-load flush delivers it to the viewer.
+  // Launched via desktop "Open with > yayra" on a local document (Linux may
+  // pass a file:// URI while Windows passes a path): queue it until the shell
+  // has loaded, then route it by sniffed bytes in the renderer.
   const coldPdfFile = parsePdfFileArg(process.argv);
   if (coldPdfFile && !isSmokeStartup) deliverPdfFile(coldPdfFile);
 
@@ -641,6 +737,8 @@ app.whenReady().then(async () => {
 
 app.on('will-quit', () => {
   try { globalHotkeys?.detach(); } catch { /* exiting */ }
+  try { windowDragController?.destroy(); } catch { /* exiting */ }
+  windowDragController = null;
   try { globalShortcut.unregisterAll(); } catch { /* exiting */ }
 });
 
@@ -677,6 +775,17 @@ app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) creat
 function registerIpcBridges() {
   registerDesktopUpdateHandlers({ getWindow: () => mainWindow });
 
+  ensureDocumentLibrary();
+
+  // Keep every pixel of the custom top chrome renderer-interactive. Native
+  // CSS drag regions can hold a compositor input grab (most visibly on
+  // Linux), leaving tabs and caption buttons looking frozen. The dedicated
+  // dotted handle now streams pointer coordinates through this coalesced
+  // manual drag controller instead.
+  if (!windowDragController) {
+    windowDragController = createWindowDragController({ ipcMain, BrowserWindow });
+  }
+
   // Window controls for the frameless main window (the OS title bar and
   // menu block are gone - see createWindow()). Resolved per-sender so the
   // same channels work for any shell window that renders the controls.
@@ -706,6 +815,55 @@ function registerIpcBridges() {
     return true;
   });
 
+  // Electron renderer fetches are CORS-constrained. Send the user-selected
+  // file (or its public URL) from the trusted main process straight to
+  // Google's official Lens endpoints and return only a completed result URL.
+  // No Yayra backend/storage sees the image. Empty Google upload-picker
+  // redirects are rejected so the renderer can retain the selection + retry.
+  ipcMain.handle('yayra:google-lens-upload', async (event, payload = {}) => {
+    if (!senderWindow(event)) return { ok: false, reason: 'untrusted-sender' };
+    const tabId = String(payload.tabId || '');
+    if (payload.isPrivate && !/^[a-zA-Z0-9_-]{1,120}$/.test(tabId)) {
+      return { ok: false, reason: 'invalid-private-tab' };
+    }
+    const profileId = String(payload.profileId || 'default');
+    const partition = payload.isPrivate
+      ? `incognito-${tabId}`
+      : profileId === 'default'
+        ? 'persist:yayra-webview'
+        : `persist:yayra-profile-${profileId.replace(/[^a-zA-Z0-9_-]/g, '')}`;
+    // Use the same Chromium Session as the destination tab. Google cookies
+    // set while accepting the image are therefore present when the returned
+    // result URL is opened; main-process defaultSession cookies are not.
+    const tabSession = session.fromPartition(partition);
+    const common = {
+      // ClientRequest exposes Google's exact redirect destination. Electron
+      // documents net.fetch Response.url as incorrect, so it cannot reliably
+      // identify the completed Lens result after following that redirect.
+      requestTransport: (url, options) => requestGoogleLensWithElectronNet({
+        createRequest: (requestOptions) => net.request({ ...requestOptions, session: tabSession }),
+        url,
+        options
+      }),
+      language: payload.language,
+      startedAt: payload.startedAt,
+      viewportWidth: payload.viewportWidth,
+      viewportHeight: payload.viewportHeight,
+      userAgent: buildBrowserUserAgent()
+    };
+    if (payload.imageUrl) {
+      return searchGoogleLensImageUrl({ ...common, imageUrl: payload.imageUrl });
+    }
+    return uploadGoogleLensImage({
+      ...common,
+      data: payload.data,
+      name: payload.name,
+      type: payload.type,
+      width: payload.width,
+      height: payload.height
+    });
+  });
+
   // Menu > More tools > Performance / Task manager: REAL process metrics
   // (no invented numbers). Summarized here so the renderer gets plain data.
   ipcMain.handle('yayra:app-metrics', () => {
@@ -713,13 +871,16 @@ function registerIpcBridges() {
       const metrics = app.getAppMetrics() || [];
       return {
         ok: true,
+        sampledAt: Date.now(),
         processes: metrics.map((m) => ({
           type: m.type || 'unknown',
           label: m.name || m.serviceName || m.type || 'process',
           pid: m.pid ?? null,
           cpu: m.cpu && Number.isFinite(m.cpu.percentCPUUsage) ? m.cpu.percentCPUUsage : null,
-          memoryMB: m.memory && Number.isFinite(m.memory.workingSetSize)
-            ? Math.round(m.memory.workingSetSize / 1024)
+          // Electron reports workingSetSize in bytes. Convert it to MiB;
+          // the renderer labels the same binary unit explicitly.
+          memoryMiB: m.memory && Number.isFinite(m.memory.workingSetSize)
+            ? Math.round((m.memory.workingSetSize / (1024 * 1024)) * 10) / 10
             : null
         }))
       };
@@ -735,7 +896,11 @@ function registerIpcBridges() {
   // live profile/incognito partition. Returns the real byte count freed.
   ipcMain.handle('yayra:clear-browsing-data', async (_event, { cache = true, cookies = false } = {}) => {
     try {
-      const sessions = new Set([session.defaultSession, session.fromPartition('persist:yayra-webview')]);
+      const sessions = new Set([
+        session.defaultSession,
+        session.fromPartition('persist:yayra-webview'),
+        session.fromPartition(LEGACY_GOOGLE_AUTH_PARTITION)
+      ]);
       for (const wc of (typeof webContents.getAllWebContents === 'function' ? webContents.getAllWebContents() : [])) {
         try { if (wc.session) sessions.add(wc.session); } catch { /* destroyed */ }
       }
@@ -861,17 +1026,19 @@ function registerIpcBridges() {
     }
   });
 
-  // DOCUMENT WORKSPACE (Phase 1: PDF - docs/DOCUMENT_WORKSPACE.md):
-  // opens ONE local PDF chosen in the native picker and transfers ONLY its
-  // bytes to the renderer. The file path never crosses the IPC boundary,
-  // nothing else on disk is reachable, and the size is capped. No state is
-  // kept in the main process - the renderer holds the bytes in memory for
-  // the tab's lifetime (local-first, no backend).
+  // LOCAL DOCUMENT WORKSPACE: every explicitly selected file is recorded in
+  // the trusted main-process catalog. Viewable formats transfer capped bytes
+  // to the bundled renderer; every other type is handed, unchanged, to the
+  // operating system. Source paths never cross IPC.
   ipcMain.handle('yayra:doc-open', async () => {
     try {
       const picked = await dialog.showOpenDialog({
         properties: ['openFile'],
-        filters: [{ name: 'PDF documents', extensions: ['pdf'] }]
+        filters: [
+          { name: 'All files', extensions: ['*'] },
+          { name: 'Documents and presentations', extensions: ['pdf', 'pptx', 'pptm', 'ppt', 'docx', 'doc', 'xlsx', 'xlsm', 'xls', 'csv'] },
+          { name: 'Images and text', extensions: ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'avif', 'svg', 'txt', 'md', 'markdown', 'log', 'json', 'xml', 'yaml', 'yml'] }
+        ]
       });
       if (picked.canceled || !picked.filePaths || picked.filePaths.length === 0) {
         return { ok: false, canceled: true };
@@ -879,29 +1046,84 @@ function registerIpcBridges() {
       const filePath = picked.filePaths[0];
       const stat = await fs.promises.stat(filePath);
       if (!stat.isFile()) return { ok: false, reason: 'not-a-file' };
-      if (stat.size > 150 * 1024 * 1024) return { ok: false, reason: 'file-too-large' };
+      const entry = await documentLibrary.recordPath(filePath);
+      if (!documentLibrary.canOpenInYayra(filePath)) {
+        const error = await shell.openPath(filePath);
+        return error
+          ? { ok: false, reason: String(error), libraryId: entry.id, entry }
+          : { ok: true, action: 'system', libraryId: entry.id, entry };
+      }
+      if (stat.size > MAX_DOCUMENT_BYTES) {
+        return { ok: false, reason: 'file-too-large', libraryId: entry.id, entry };
+      }
       const data = await fs.promises.readFile(filePath);
-      return { ok: true, name: path.basename(filePath), size: stat.size, data };
+      return {
+        ok: true,
+        action: 'yayra',
+        name: path.basename(filePath),
+        size: stat.size,
+        data,
+        libraryId: entry.id,
+        entry
+      };
     } catch (err) {
       console.error('[yayra] doc-open failed', err);
-      return { ok: false, reason: 'read-failed' };
+      return { ok: false, reason: err && err.code === 'EACCES' ? 'permission-denied' : 'read-failed' };
     }
   });
 
-  // DOCUMENT WORKSPACE: "Open with desktop app" - the in-viewer escape
-  // hatch for users who want their OS pdf reader (Acrobat, Evince,
-  // Edge...). The bytes come FROM the renderer (they are the same bytes
-  // the viewer holds); a sanitized temp file is written and opened with
-  // the OS default handler. Nothing else on disk is touched.
-  ipcMain.handle('yayra:doc-open-externally', async (_event, { name, data } = {}) => {
+  // Opaque-id document hub operations. The library resolves ids to paths in
+  // this trusted process and re-checks existence/permissions on every action.
+  ipcMain.handle('yayra:doc-library-list', async () => {
+    try { return { ok: true, entries: await documentLibrary.list() }; }
+    catch (err) {
+      console.error('[yayra] document library list failed', err);
+      return { ok: false, reason: 'read-failed', entries: [] };
+    }
+  });
+  ipcMain.handle('yayra:doc-library-open', async (_event, { id, external = false } = {}) => {
+    try { return await documentLibrary.open(id, { external: Boolean(external) }); }
+    catch (err) {
+      console.error('[yayra] document library open failed', err);
+      return { ok: false, reason: 'open-failed' };
+    }
+  });
+  ipcMain.handle('yayra:doc-library-show', async (_event, { id } = {}) => {
+    try { return await documentLibrary.showInFolder(id); }
+    catch { return { ok: false, reason: 'show-failed' }; }
+  });
+  ipcMain.handle('yayra:doc-library-locate', async (_event, { id } = {}) => {
     try {
+      const picked = await dialog.showOpenDialog({
+        title: 'Locate moved document',
+        properties: ['openFile'],
+        filters: [{ name: 'All files', extensions: ['*'] }]
+      });
+      if (picked.canceled || !picked.filePaths?.[0]) return { ok: false, canceled: true };
+      return await documentLibrary.relink(id, picked.filePaths[0]);
+    } catch { return { ok: false, reason: 'locate-failed' }; }
+  });
+  ipcMain.handle('yayra:doc-library-remove', (_event, { id } = {}) => documentLibrary.remove(id));
+  ipcMain.handle('yayra:doc-library-clear', () => documentLibrary.clear());
+  ipcMain.handle('yayra:doc-library-clear-missing', () => documentLibrary.clearMissing());
+  ipcMain.handle('yayra:doc-library-prune', (_event, { olderThanDays } = {}) => documentLibrary.prune({ olderThanDays }));
+
+  // DOCUMENT WORKSPACE: "Open with desktop app" / "Open original" escape
+  // hatch. The unchanged bytes come FROM the renderer; a sanitized temporary
+  // file is written and opened with the OS handler for its real extension.
+  // Nothing else on disk is touched.
+  ipcMain.handle('yayra:doc-open-externally', async (_event, { name, data, libraryId } = {}) => {
+    try {
+      // Prefer the original source file when this tab came from the trusted
+      // catalog. This preserves its real location/name and avoids a temp copy.
+      if (libraryId) return await documentLibrary.open(libraryId, { external: true });
       if (!data) return { ok: false, reason: 'no-data' };
-      const safeName = String(name || 'document.pdf').replace(/[\\/:*?"<>|]+/g, '-').slice(0, 80) || 'document.pdf';
+      const safeName = String(name || 'document.bin').replace(/[\\/:*?"<>|]+/g, '-').slice(0, 120) || 'document.bin';
       const dir = path.join(app.getPath('temp'), 'yayra-docs');
       fs.mkdirSync(dir, { recursive: true });
       const filePath = path.join(dir, `${Date.now().toString(36)}-${safeName}`);
       const bytes = data.byteLength !== undefined ? Buffer.from(data) : Buffer.from(new Uint8Array(0));
-      if (bytes.length === 0 || bytes.length > 150 * 1024 * 1024) return { ok: false, reason: 'bad-size' };
+      if (bytes.length === 0 || bytes.length > MAX_DOCUMENT_BYTES) return { ok: false, reason: 'bad-size' };
       fs.writeFileSync(filePath, bytes);
       const result = await shell.openPath(filePath);
       if (result !== '') return { ok: false, reason: String(result) };
@@ -912,7 +1134,37 @@ function registerIpcBridges() {
     }
   });
 
-  // Menu > Save and share > Create shortcut...: a REAL shortcut file on
+  // Visible viewer Download button: save the exact source bytes through the
+  // native Save dialog. The renderer never sends a source path and this
+  // bridge never converts/re-encodes the document or image.
+  ipcMain.handle('yayra:doc-save-copy', async (event, { name, data } = {}) => {
+    try {
+      if (!data) return { ok: false, reason: 'no-data' };
+      const bytes = data.byteLength !== undefined ? Buffer.from(data) : Buffer.from(new Uint8Array(0));
+      if (bytes.length === 0 || bytes.length > MAX_DOCUMENT_BYTES) return { ok: false, reason: 'bad-size' };
+      const safeName = String(name || 'document.bin').replace(/[\\/:*?"<>|]+/g, '-').slice(0, 120) || 'document.bin';
+      const extension = path.extname(safeName).slice(1).replace(/[^a-z0-9]/gi, '');
+      const options = {
+        title: 'Download original file',
+        defaultPath: path.join(app.getPath('downloads'), safeName),
+        ...(extension ? { filters: [{ name: 'Original file', extensions: [extension] }] } : {})
+      };
+      const owner = typeof BrowserWindow.fromWebContents === 'function'
+        ? BrowserWindow.fromWebContents(event?.sender)
+        : null;
+      const picked = owner
+        ? await dialog.showSaveDialog(owner, options)
+        : await dialog.showSaveDialog(options);
+      if (picked.canceled || !picked.filePath) return { ok: false, canceled: true };
+      await fs.promises.writeFile(picked.filePath, bytes);
+      return { ok: true, name: path.basename(picked.filePath) };
+    } catch (err) {
+      console.error('[yayra] doc-save-copy failed', err);
+      return { ok: false, reason: err?.code === 'EACCES' ? 'permission-denied' : 'write-failed' };
+    }
+  });
+
+  // Menu > Save and share > Create desktop shortcut...: a REAL shortcut file on
   // the user's desktop that opens the page in the default browser
   // (.desktop on Linux, .url on Windows, .webloc on macOS).
   ipcMain.handle('yayra:create-shortcut', (_event, { url, title } = {}) => {
@@ -943,6 +1195,38 @@ function registerIpcBridges() {
     }
   });
 
+  // Device passkey for the desktop shell. Besides guarding the Yayra vault,
+  // a successful PIN/Touch ID/system-lock verification can mint a one-shot,
+  // main-process-only grant for one exact website WebAuthn request. The grant
+  // authorizes use of (but never replaces) that RP-scoped website credential.
+  const devicePasskeyBridge = createPasskeyBridge({
+    ipcMain,
+    fs,
+    path,
+    userDataDir: app.getPath('userData'),
+    safeStorageImpl: safeStorage,
+    systemPreferencesImpl: systemPreferences,
+    phoneApproval: createPhoneApproval({
+      httpImpl: http,
+      osImpl: os,
+      randomBytesImpl: (n) => crypto.randomBytes(n)
+    })
+  });
+
+  // Linux has no Chromium platform-passkey UI in Electron: website
+  // navigator.credentials.create/get calls otherwise wait silently. Supply a
+  // profile-scoped CTAP2 authenticator only when private credentials can be
+  // strongly encrypted. Each release still requires a verified Yayra grant
+  // above, or the PolicyKit fallback when the user explicitly chooses it.
+  const websitePasskeyProvider = createWebsitePasskeyProvider({
+    fsImpl: fs,
+    pathImpl: path,
+    userDataDir: app.getPath('userData'),
+    safeStorageImpl: safeStorage,
+    platform: process.platform,
+    logger: console
+  });
+
   // Native website-rendering engine bridge (replaces <iframe>-based rendering
   // so real sites with X-Frame-Options/frame-ancestors - Google, GitHub,
   // etc. - actually load). See electron/webviewBridge.cjs for the full
@@ -959,12 +1243,15 @@ function registerIpcBridges() {
     getWindowForWebContents: (wc) => BrowserWindow.fromWebContents(wc),
     // Chrome-style password capture/fill inside real pages (sandboxed
     // preload, nothing exposed to the page) - see autofillPreload.cjs.
-    autofillPreloadPath: path.join(__dirname, 'autofillPreload.cjs')
+    autofillPreloadPath: path.join(__dirname, 'autofillPreload.cjs'),
+    websitePasskeyProvider,
+    consumeWebsitePasskeyGrant: devicePasskeyBridge.consumeWebsiteGrant
   });
 
-  // "Sign in with Google" for Yayra's own app-level identity. See
-  // electron/googleAuth.cjs + electron/authBridge.cjs for the full
-  // architecture rationale (RFC 8252 loopback + PKCE, system-browser-only).
+  // "Sign in with Google" for Yayra's own app-level identity. The system
+  // browser is the RFC 8252 external user-agent; a one-shot 127.0.0.1 loopback
+  // callback returns only the code/state to this main process. See
+  // electron/googleAuth.cjs + electron/authBridge.cjs for the full rationale.
   const authStore = createAuthStore({
     fs,
     safeStorageImpl: safeStorage,
@@ -995,15 +1282,18 @@ function registerIpcBridges() {
   // happen in the shared "persist:yayra-webview" session that regular
   // (non-private) tabs use, plus Yayra's own windows, and lets the user pick
   // where new downloads are saved.
+  // Legacy channel name retained: it now transfers any supported downloaded
+  // document to the unified viewer, still as capped bytes with no path.
   ipcMain.handle('yayra:downloads-open-pdf', async (_event, { id } = {}) => {
     try {
       const item = (downloadsStore.load().items || []).find((it) => it.id === id);
       if (!item || !item.path) return { ok: false, reason: 'not-found' };
       const stat = await fs.promises.stat(item.path);
       if (!stat.isFile()) return { ok: false, reason: 'not-a-file' };
-      if (stat.size > 150 * 1024 * 1024) return { ok: false, reason: 'file-too-large' };
+      const entry = await documentLibrary.recordPath(item.path);
+      if (stat.size > MAX_DOCUMENT_BYTES) return { ok: false, reason: 'file-too-large', libraryId: entry.id, entry };
       const data = await fs.promises.readFile(item.path);
-      return { ok: true, name: path.basename(item.path), size: stat.size, data };
+      return { ok: true, name: path.basename(item.path), size: stat.size, data, libraryId: entry.id, entry };
     } catch (err) {
       console.error('[yayra] downloads-open-pdf failed', err);
       return { ok: false, reason: 'read-failed' };
@@ -1026,40 +1316,24 @@ function registerIpcBridges() {
     getMainWindow: () => mainWindow
   });
 
-  // Device passkey for the desktop shell: Chromium refuses real WebAuthn
-  // on the custom yayra:// scheme (no valid RP domain), so the desktop
-  // gets an OS-keychain-bound credential via safeStorage (+ a real Touch
-  // ID prompt on supporting Macs). See electron/passkeyBridge.cjs.
-  createPasskeyBridge({
-    ipcMain,
-    fs,
-    path,
-    userDataDir: app.getPath('userData'),
-    safeStorageImpl: safeStorage,
-    systemPreferencesImpl: systemPreferences,
-    // Fallback #3 for devices with no biometrics/keychain: approve the
-    // vault unlock from a phone by scanning a one-time LAN QR code.
-    phoneApproval: createPhoneApproval({
-      httpImpl: http,
-      osImpl: os,
-      randomBytesImpl: (n) => crypto.randomBytes(n)
-    })
-  });
 
   // Chrome-style profiles: "Add profile" / switching opens a NEW Yayra
   // window for that profile while the current window stays on its own.
   // Each profile window boots with ?profile=<id> so the renderer binds to
   // the right identity, and its web-content partition joins download
   // tracking the moment the window exists.
-  ipcMain.handle('yayra:open-profile-window', (_event, { profileId } = {}) => {
+  ipcMain.handle('yayra:open-profile-window', async (_event, { profileId, url, isPrivate = false } = {}) => {
     const id = String(profileId || 'default');
+    const initialUrl = normalizeHttpUrl(url);
     try {
       if (id !== 'default') {
         const partition = `persist:yayra-profile-${id.replace(/[^a-zA-Z0-9_-]/g, '')}`;
         downloadsBridge?.attachSession?.(session.fromPartition(partition));
       }
-      const win = createProfileWindow(id);
-      return { ok: Boolean(win) };
+      const win = await createProfileWindow(id, initialUrl, { isPrivate: Boolean(isPrivate) });
+      return initialUrl
+        ? { ok: Boolean(win), url: initialUrl, isPrivate: Boolean(isPrivate) }
+        : { ok: Boolean(win) };
     } catch (err) {
       console.error(`[yayra] failed to open profile window: ${err?.message || err}`);
       return { ok: false, error: String(err?.message || err) };
@@ -1081,13 +1355,112 @@ function registerIpcBridges() {
 }
 
 /**
+ * Website pages live in separate WebContentsViews. A stalled shell renderer
+ * therefore freezes only tabs/address/caption controls while the page below
+ * can keep moving - the exact split-freeze this guard repairs. It applies to
+ * both the primary shell and every independent profile window.
+ */
+function installShellFreezeRecovery(win, label = 'shell') {
+  const contents = win.webContents;
+  let crashWindowStarted = 0;
+  let crashReloads = 0;
+  let unresponsiveTimer = null;
+  let recoveryWindowStarted = 0;
+  let recoveryReloads = 0;
+  const clearUnresponsiveTimer = () => {
+    if (unresponsiveTimer) clearTimeout(unresponsiveTimer);
+    unresponsiveTimer = null;
+  };
+  const signalChromeInputRecovery = (reason, { closeMenu = false } = {}) => {
+    try { windowDragController?.cancelForWebContents?.(contents); } catch { /* no active drag */ }
+    if (closeMenu) {
+      try { closeNativeMenuForWindow(win, reason); } catch { /* no native popup */ }
+    }
+    try {
+      if (!contents.isDestroyed?.()) contents.send(CHROME_INPUT_RECOVERY_CHANNEL, { reason });
+    } catch { /* renderer/window raced shutdown */ }
+  };
+  const onWindowFocus = () => {
+    // A radial overlay is a separate transparent always-on-top window. If it
+    // was left expanded over Yayra, focusing the browser deterministically
+    // shrinks it before it can intercept the custom title/tab row.
+    try { overlayBridge?.closeRadialMenu?.(); } catch { /* overlay absent */ }
+    signalChromeInputRecovery('window-focus', { closeMenu: true });
+  };
+  const onWindowBlur = () => signalChromeInputRecovery('window-blur', { closeMenu: true });
+  const onWindowHide = () => signalChromeInputRecovery('window-hide', { closeMenu: true });
+  const onWindowMinimize = () => signalChromeInputRecovery('window-minimize', { closeMenu: true });
+  win.on?.('focus', onWindowFocus);
+  win.on?.('blur', onWindowBlur);
+  win.on?.('hide', onWindowHide);
+  win.on?.('minimize', onWindowMinimize);
+  const onRenderGone = (_event, details) => {
+    const reason = details && details.reason;
+    signalChromeInputRecovery(`renderer-${reason || 'gone'}`, { closeMenu: true });
+    if (reason !== 'crashed' && reason !== 'oom' && reason !== 'killed') return;
+    const now = Date.now();
+    if (now - crashWindowStarted > 60000) {
+      crashWindowStarted = now;
+      crashReloads = 0;
+    }
+    crashReloads += 1;
+    console.error(`[yayra] ${label} renderer gone (${reason}) - reload #${crashReloads}`);
+    if (crashReloads > 5) {
+      console.error(`[yayra] ${label} renderer is crash-looping - not reloading again automatically`);
+      return;
+    }
+    try { if (!win.isDestroyed()) win.webContents.reload(); } catch { /* already closing */ }
+  };
+  const onUnresponsive = () => {
+    signalChromeInputRecovery('renderer-unresponsive', { closeMenu: true });
+    console.warn(`[yayra] ${label} renderer reported unresponsive; recovery grace period started`);
+    if (unresponsiveTimer) return;
+    unresponsiveTimer = setTimeout(() => {
+      unresponsiveTimer = null;
+      if (win.isDestroyed() || win.webContents.isDestroyed?.()) return;
+      const now = Date.now();
+      if (now - recoveryWindowStarted > 60000) {
+        recoveryWindowStarted = now;
+        recoveryReloads = 0;
+      }
+      recoveryReloads += 1;
+      if (recoveryReloads > 3) {
+        console.error(`[yayra] ${label} renderer remains unresponsive but recovery is rate-limited`);
+        return;
+      }
+      console.error(`[yayra] ${label} renderer stayed unresponsive; reloading chrome (${recoveryReloads}/3)`);
+      try { win.webContents.reload(); } catch { /* window raced shutdown */ }
+    }, 6000);
+    unresponsiveTimer?.unref?.();
+  };
+  const onResponsive = () => {
+    clearUnresponsiveTimer();
+    console.log(`[yayra] ${label} renderer responsive again`);
+  };
+  contents.on('render-process-gone', onRenderGone);
+  contents.on('unresponsive', onUnresponsive);
+  contents.on('responsive', onResponsive);
+  return () => {
+    clearUnresponsiveTimer();
+    try { closeNativeMenuForWindow(win, 'shell-recovery-destroy'); } catch { /* none */ }
+    try { win.removeListener?.('focus', onWindowFocus); } catch { /* destroyed */ }
+    try { win.removeListener?.('blur', onWindowBlur); } catch { /* destroyed */ }
+    try { win.removeListener?.('hide', onWindowHide); } catch { /* destroyed */ }
+    try { win.removeListener?.('minimize', onWindowMinimize); } catch { /* destroyed */ }
+    try { contents.removeListener?.('render-process-gone', onRenderGone); } catch { /* destroyed */ }
+    try { contents.removeListener?.('unresponsive', onUnresponsive); } catch { /* destroyed */ }
+    try { contents.removeListener?.('responsive', onResponsive); } catch { /* destroyed */ }
+  };
+}
+
+/**
  * A SECOND, independent shell window bound to a specific browser profile
  * (Chrome's "open this profile in its own window" model). The existing
  * window keeps its profile and tabs; this one boots with ?profile=<id>
  * so the renderer binds to the requested identity and its tabs get that
  * profile's own session partition (see electron/webviewBridge.cjs).
  */
-function createProfileWindow(profileId) {
+async function createProfileWindow(profileId, initialUrl = null, { isPrivate = false } = {}) {
   const win = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -1097,21 +1470,35 @@ function createProfileWindow(profileId) {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: true,
+      // This renderer owns only browser chrome. Never freeze its timers/rAF
+      // while a native page surface remains active in a separate renderer.
+      backgroundThrottling: false
     }
   });
   profileWindows.add(win);
+  const clearShellRecovery = installShellFreezeRecovery(win, 'profile shell');
   win.webContents.on('context-menu', (_event, params) => {
     if (win.isDestroyed()) return;
     const template = buildContextMenuTemplate({ params, wc: win.webContents, tabId: null, send: () => {}, clipboard });
-    Menu.buildFromTemplate(template).popup({ window: win });
+    popupMenuWithRecovery({ menu: Menu.buildFromTemplate(template), window: win });
   });
   const winContents = win.webContents;
   win.on('closed', () => {
+    clearShellRecovery();
     if (webviewBridge) webviewBridge.destroyForWebContents(winContents);
     profileWindows.delete(win);
   });
-  win.loadURL(`${CUSTOM_SCHEME}://app/index.html?profile=${encodeURIComponent(profileId)}`);
+  const boot = new URLSearchParams({ profile: String(profileId || 'default') });
+  const bootUrl = normalizeHttpUrl(initialUrl);
+  if (bootUrl) boot.set('page', bootUrl);
+  if (isPrivate) boot.set('private', '1');
+  try {
+    await win.loadURL(`${CUSTOM_SCHEME}://app/index.html?${boot.toString()}`);
+  } catch (error) {
+    try { if (!win.isDestroyed()) win.destroy(); } catch { /* already closed */ }
+    throw error;
+  }
   return win;
 }
 
@@ -1125,11 +1512,11 @@ function createWindow() {
     width: 1200,
     height: 800,
     // No OS title bar ("yayra" text) and no File/Edit/View/Window menu
-    // block: Yayra draws its OWN top chrome - the tab strip doubles as the
-    // draggable title bar, shows the brand wordmark image, and renders
-    // real minimize/maximize/close buttons via the windowControls IPC
-    // bridge (see registerIpcBridges + BrowserShell.renderDesktopLayout).
-    // On macOS the native traffic lights are kept, inset over our chrome.
+    // block: Yayra draws its OWN top chrome, with a renderer-owned manual
+    // drag handle and real minimize/maximize/close buttons via the
+    // windowControls IPC bridge (see registerIpcBridges + BrowserShell).
+    // No part of the tab strip enters a native input-grab region. On macOS
+    // the native traffic lights are kept, inset.
     ...(process.platform === 'darwin' ? { titleBarStyle: 'hiddenInset' } : { frame: false }),
     // Dark surface behind EVERYTHING. Electron's default window background
     // is white, and every time the native page view hides/moves (menu
@@ -1143,7 +1530,11 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: true,
+      // Native pages run in their own WebContentsViews; the shell renderer
+      // is the tabs/address/window-control UI and must never be timer-frozen
+      // while those pages continue painting underneath it.
+      backgroundThrottling: false
     }
   });
 
@@ -1169,36 +1560,12 @@ function createWindow() {
       send: () => {},
       clipboard
     });
-    Menu.buildFromTemplate(template).popup({ window: win });
+    popupMenuWithRecovery({ menu: Menu.buildFromTemplate(template), window: win });
   });
 
-  // PRODUCTION FREEZE GUARDS: a renderer crash must never leave a dead
-  // white window that looks like a frozen app - reload it automatically,
-  // rate-limited so a genuine crash-loop can never spin the CPU.
-  let rendererReloads = 0;
-  let rendererReloadWindowStarted = 0;
-  win.webContents.on('render-process-gone', (_event, details) => {
-    const reason = details && details.reason;
-    if (reason !== 'crashed' && reason !== 'oom' && reason !== 'killed') return;
-    const now = Date.now();
-    if (now - rendererReloadWindowStarted > 60000) {
-      rendererReloadWindowStarted = now;
-      rendererReloads = 0;
-    }
-    rendererReloads += 1;
-    console.error(`[yayra] renderer gone (${reason}) - reload #${rendererReloads}`);
-    if (rendererReloads > 5) {
-      console.error('[yayra] renderer is crash-looping - not reloading again automatically');
-      return;
-    }
-    try { if (!win.isDestroyed()) win.webContents.reload(); } catch { /* already closing */ }
-  });
-  win.webContents.on('unresponsive', () => {
-    console.warn('[yayra] renderer reported unresponsive (busy page) - window stays alive');
-  });
-  win.webContents.on('responsive', () => {
-    console.log('[yayra] renderer responsive again');
-  });
+  // PRODUCTION FREEZE GUARDS: a crash or genuinely stuck chrome renderer
+  // must not leave a dead title/tab strip over still-live website content.
+  const clearShellRecovery = installShellFreezeRecovery(win, 'main shell');
 
   // Closing the main window only tears down ITS tab views; the floating
   // bubble/mini window (and their views) stay alive independently. The
@@ -1206,6 +1573,7 @@ function createWindow() {
   // refuses property access after destruction.
   const winContents = win.webContents;
   win.on('closed', () => {
+    clearShellRecovery();
     if (webviewBridge) webviewBridge.destroyForWebContents(winContents);
     if (mainWindow === win) mainWindow = null;
   });
@@ -1220,16 +1588,77 @@ function createWindow() {
   win.loadURL(loadTarget);
   if (process.env.YAYRA_SMOKE === '1' || process.env.IBROWSE_SMOKE === '1') {
     winContents.once('did-finish-load', async () => {
-      const result = await winContents.executeJavaScript('({ title: document.title, hasRoot: Boolean(document.getElementById("app")), headerControl: Boolean(document.getElementById("update-button") || document.getElementById("top-header")) })');
-      console.log(`[yayra-smoke] ${JSON.stringify(result)}`);
+      // Exercise the lazy PDF.js ESM + module worker through the exact
+      // yayra:// protocol used by installed apps. A DOM-only smoke could
+      // pass while .mjs was served as octet-stream and every PDF failed.
+      const result = await winContents.executeJavaScript(`(async () => {
+        const output = {
+          title: document.title,
+          hasRoot: Boolean(document.getElementById('app')),
+          headerControl: Boolean(document.getElementById('update-button') || document.getElementById('top-header')),
+          hasPdfEngine: false,
+          pdfPages: 0,
+          pdfError: null
+        };
+        // The second smoke launch deliberately forces a bad shell URL and
+        // only verifies file:// recovery. Parse the PDF once, on the normal
+        // yayra:// launch, so fallback behavior cannot mask module health.
+        if (${isBadLoad ? 'false' : 'true'}) {
+          try {
+            const engine = await window.__yayraShell?._pdfjsModule?.();
+            output.hasPdfEngine = typeof engine?.getDocument === 'function';
+            if (output.hasPdfEngine) {
+              const encoded = 'JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCAzMDAgMTQ0XSAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSA0IDAgUiA+PiA+PiAvQ29udGVudHMgNSAwIFIgPj4KZW5kb2JqCjQgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iago1IDAgb2JqCjw8IC9MZW5ndGggNDUgPj4Kc3RyZWFtCkJUIC9GMSAxOCBUZiAzMCA3MCBUZCAoWWF5cmEgUERGIHNtb2tlKSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCnhyZWYKMCA2CjAwMDAwMDAwMDAgNjU1MzUgZiAKMDAwMDAwMDAwOSAwMDAwMCBuIAowMDAwMDAwMDU4IDAwMDAwIG4gCjAwMDAwMDAxMTUgMDAwMDAgbiAKMDAwMDAwMDI0MSAwMDAwMCBuIAowMDAwMDAwMzExIDAwMDAwIG4gCnRyYWlsZXIKPDwgL1NpemUgNiAvUm9vdCAxIDAgUiA+PgpzdGFydHhyZWYKNDA2CiUlRU9GCg==';
+              const raw = atob(encoded);
+              const data = Uint8Array.from(raw, (char) => char.charCodeAt(0));
+              const task = engine.getDocument({ data });
+              const pdf = await task.promise;
+              output.pdfPages = pdf?.numPages || 0;
+              await pdf?.destroy?.();
+            }
+          } catch (error) {
+            output.pdfError = String(error?.message || error);
+          }
+        }
+        return output;
+      })()`);
+      const smokeResult = {
+        ...result,
+        fallbackUsed: Boolean(lastLoadError),
+        loadError: lastLoadError
+      };
+      writeSmokeReport(smokeResult);
+      console.log(`[yayra-smoke] ${JSON.stringify(smokeResult)}`);
       app.quit();
     });
     setTimeout(() => {
+      const timeoutResult = {
+        timeout: true,
+        fallbackUsed: Boolean(lastLoadError),
+        loadError: lastLoadError
+      };
+      writeSmokeReport(timeoutResult);
       console.error('[yayra-smoke] timeout waiting for renderer paint');
       app.exit(1);
     }, 15000).unref();
   }
   return mainWindow;
+}
+
+/**
+ * GUI-subsystem Windows executables are not guaranteed to expose stdout to
+ * their parent. Write an explicit machine-readable result as well as logging
+ * it so the packaged smoke gate measures the renderer/PDF result, not console
+ * plumbing.
+ */
+function writeSmokeReport(payload) {
+  const reportPath = String(process.env.YAYRA_SMOKE_REPORT || '').trim();
+  if (!reportPath) return;
+  try {
+    fs.writeFileSync(reportPath, `${JSON.stringify(payload)}\n`, { encoding: 'utf8', mode: 0o600 });
+  } catch (error) {
+    console.error(`[yayra-smoke] could not write report: ${error?.message || error}`);
+  }
 }
 
 function safeAssetPath(rawPath) {
@@ -1250,12 +1679,24 @@ function safeAssetPath(rawPath) {
 }
 
 function mimeType(file) {
-  if (file.endsWith('.html')) return 'text/html';
-  if (file.endsWith('.js') || file.endsWith('.mjs')) return 'text/javascript';
-  if (file.endsWith('.css')) return 'text/css';
-  if (file.endsWith('.json')) return 'application/json';
-  if (file.endsWith('.webmanifest')) return 'application/manifest+json';
-  if (file.endsWith('.png')) return 'image/png';
-  if (file.endsWith('.ico')) return 'image/x-icon';
+  const lower = String(file || '').toLowerCase();
+  if (lower.endsWith('.html')) return 'text/html; charset=utf-8';
+  if (lower.endsWith('.js') || lower.endsWith('.mjs')) return 'text/javascript; charset=utf-8';
+  if (lower.endsWith('.css')) return 'text/css; charset=utf-8';
+  if (lower.endsWith('.json') || lower.endsWith('.map')) return 'application/json; charset=utf-8';
+  if (lower.endsWith('.webmanifest')) return 'application/manifest+json; charset=utf-8';
+  if (lower.endsWith('.svg')) return 'image/svg+xml';
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  if (lower.endsWith('.gif')) return 'image/gif';
+  if (lower.endsWith('.ico')) return 'image/x-icon';
+  if (lower.endsWith('.woff2')) return 'font/woff2';
+  if (lower.endsWith('.woff')) return 'font/woff';
+  if (lower.endsWith('.ttf')) return 'font/ttf';
+  if (lower.endsWith('.otf')) return 'font/otf';
+  if (lower.endsWith('.pfb')) return 'application/x-font-type1';
+  if (lower.endsWith('.pdf')) return 'application/pdf';
+  if (lower.endsWith('.wasm')) return 'application/wasm';
   return 'application/octet-stream';
 }

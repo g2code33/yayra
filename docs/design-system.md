@@ -120,6 +120,7 @@ The Main Dashboard is an integrated single-screen control hub featuring:
   - Floating orb bounds snapping to left/right screen edges with screen-edge padding.
   - Bottom-oriented navigation actions in mobile viewports.
 - **Windows & Linux (Desktop)**:
-  - Titlebar drag regions (`-webkit-app-region: drag`) and interactive caption buttons (`no-drag`).
+  - Renderer-owned main tab/titlebar chrome with pointer/IPC window movement; no native `-webkit-app-region: drag` input grabs in that strip, so tabs and caption buttons remain interactive.
+  - Horizontal tab dragging reorders freely. A deliberate drag below the strip detaches an HTTP(S) site into a new Yayra window; the tab context menu exposes the same action without a pointer gesture. Internal/document tabs remain in-window because their live state is not transferable.
   - Dual desktop floating mode configuration (Circle-first compact orb vs Pinned floating window).
   - Full keyboard shortcuts (`Enter` to submit URL, `Alt+Left`/`Alt+Right` for navigation, `Ctrl+R` reload, `Escape` to dismiss dialogs).

@@ -118,14 +118,21 @@ if (root) {
     windowProfileId = new URLSearchParams(window.location.search).get('profile') || null;
   } catch { /* no usable location (tests) */ }
   // Deep-link boot param: the bubble's radial menu / right-click actions
-  // open the mini shell straight on an internal page (?page=yayra://ai)
-  // or an external assistant (?page=https://chatgpt.com - the restored
-  // v1.0.2 wheel entries) - see electron/overlayWindow.cjs openMiniPanelAt.
-  // Only yayra:// and https:// are accepted; anything else is ignored.
+  // open the mini shell straight on an internal page (?page=yayra://ai),
+  // an external assistant, or a tab dragged down into its own Yayra window.
+  // Browser pages may be HTTP(S); every other external scheme is ignored.
   let bootPage = null;
+  let bootPrivate = false;
   try {
-    const rawPage = new URLSearchParams(window.location.search).get('page');
-    if (rawPage && (rawPage.startsWith('yayra://') || rawPage.startsWith('https://'))) bootPage = rawPage;
+    const bootParams = new URLSearchParams(window.location.search);
+    const rawPage = bootParams.get('page');
+    if (rawPage?.startsWith('yayra://')) {
+      bootPage = rawPage;
+    } else if (rawPage) {
+      const parsed = new URL(rawPage);
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') bootPage = parsed.toString();
+    }
+    bootPrivate = bootParams.get('private') === '1';
   } catch { /* no usable location (tests) */ }
   const browserShell = new BrowserShell({
     container: root,
@@ -142,7 +149,8 @@ if (root) {
     // bubble use wipes the "Continue with these tabs?" offer.
     isMiniShell,
     updateService: service,
-    initialUrl: bootPage || 'yayra://newtab'
+    initialUrl: bootPage || 'yayra://newtab',
+    initialPrivate: bootPrivate
   });
   browserShell.initialize().then(() => {
     browserShell.render(root);

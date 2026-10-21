@@ -1,193 +1,225 @@
-# Yayra Document Workspace — Phase 1 (PDF)
+# Yayra document workspace
 
-> Status: **Phase 1 implemented and tested** (local PDF viewing integrated into
-> the existing browser shell). This document is the audit, the engine
-> evaluation, the architecture, and the roadmap for Word / Excel / PowerPoint.
+Yayra opens local files in first-class `yayra://doc/<id>` tabs without
+uploading them to a converter or navigating the active website away. The
+implementation adapts the proven offline viewer architecture from
+`g2code33/pharmaTRACK_PERFECT_new` under its MIT license (see
+`LICENSE.reference-pharmatrack`).
 
-## 1. Architecture audit (what exists, what was reused)
+The toolbar **Documents** button opens `yayra://documents`, an indexed library
+of every local file explicitly opened through Yayra. It sits directly beside
+**Downloads**.
 
-Verified against the actual code, not just docs:
+## Supported formats and honest all-file routing
 
-| Area | Reality found | Reused for the workspace |
-| --- | --- | --- |
-| Renderer entry | `public/index.html` → `src/browser/main.js`; the shell boots `BrowserShell` (`packages/shared-ui/src/components/BrowserShell.js`) into `#app`; `?shell=mini` boots the floating mini window with the SAME bundle | Yes — documents work in the main window and the mini window for free |
-| Tab system | `state.tabs` (`{id,url,title,…}`) + `createNewTab/selectTab/closeTab`; tab strip, tab context menu, session restore | Yes — a document IS a tab (`yayra://doc/<id>`), closed via the normal `closeTab` |
-| Navigation / omnibox | `navigateActiveTab` → `interpretUrl`; `yayra://` internal pages are DOM-rendered | Yes — the internal-page routing gained one branch (`yayra://doc/`) that renders the document viewer; web/native paths are untouched |
-| Browser engines | Desktop: native `WebContentsView` per tab (`electron/webviewBridge.cjs`); web/PWA/Android: pooled sandboxed iframes | Not used for documents — the viewer is pure DOM/canvas, isolated from both |
-| Downloads | `electron/downloadsBridge.cjs` (list/open/show) + in-shell dropdown | Phase 6 integration point (open a downloaded PDF) |
-| IPC + security | `contextIsolation: true`, `nodeIntegration: false`, `sandbox: true` (verified in `electron/main.cjs`); preload exposes namespaced bridges; `ipcMain.handle` registry in `registerIpcBridges()` | Yes — same model: one new namespaced bridge, arguments validated, bytes-only responses |
-| Android | Capacitor WebView + first-party plugins (`packages/floating-android`); `input[type=file]` maps to the system picker | Yes — the web file-input path IS the Android path |
-| Persistence | `packages/persistence` (history/bookmarks/settings); rolling last-session snapshot already filters to `https?://` tabs | Yes — document tabs are automatically excluded (bytes are in-memory only) |
-| Tests | `node --test` suites (~760), dom-shim, per-feature contract suites | Yes — new `tests/document-workspace.test.mjs` (12 tests) |
-| Existing PDF/doc support | **None** (no pdfjs, no document UI, no local-file opening; `file://` never resolved) | This phase adds it |
+| Kind | Extensions | Bundled engine | Main capabilities | Explicit limitations |
+| --- | --- | --- | --- | --- |
+| PDF | `.pdf` | PDF.js | Continuous pages, selectable text, progressive/windowed painting, page jump, find, thumbnails, outline, fit/zoom, rotation, night mode, print/download, and a dedicated full-screen page show | Image-only scans have no searchable text without OCR |
+| PowerPoint | `.pptx`, `.pptm` | Native OOXML slide renderer | Slide dimensions, full master→layout→slide placeholder geometry, backgrounds/themes, text/runs/bullets, Office Math equations, compatibility-wrapped shapes, embedded and cropped images, playable embedded videos with poster frames and native controls, tables/merged cells, speaker notes with a native text-colour picker, thumbnails, navigation, find, fit/zoom, unchanged download, full-deck print and dedicated slideshow | Does not execute macros, transitions, animations or OLE; linked-only videos stay offline and use their poster frame; unsupported codecs use the browser fallback; charts/SmartArt may use static or explanatory fallbacks |
+| Word | `.docx` | `docx-preview` | Paged visual layout, styles, tables, headers/footers, notes, find, zoom, download and print | No macro execution, OLE, or tracked-change balloons |
+| Spreadsheet | `.xlsx`, `.xlsm`, `.xls`, `.csv` | SheetJS Community Edition | Worksheet tabs, cells, formatted values, merged cells, dimensions, formula/result display, find, bounded row windows, download and current-sheet print | Does not reproduce charts, conditional formatting or frozen panes |
+| Image | `.jpg`, `.jpeg`, `.png`, `.webp`, `.gif`, `.bmp`, `.avif`, `.svg` | Browser decoder | Internal display, zoom, rotation, unchanged download and print; animation where the browser supports it | SVG is sanitised before display |
+| Text | `.txt`, `.md`, `.markdown`, `.log`, `.json`, `.xml`, `.yaml`, `.yml` | Safe text renderer | Bounded plain-text display, find, zoom, night mode, download and print | Markup is displayed literally and never executed |
+| Legacy Office | `.doc`, `.ppt` | Honest fallback | Open/download the unchanged original through an installed desktop application | No safe bundled binary-Office renderer |
+| Every other file | Any extension | System application / unchanged-file fallback | Remembered in Documents; reopened with the operating-system handler on desktop | Unknown bytes are never interpreted as trusted display content |
 
-**Deliberate non-duplications:** no new tab manager, no new persistence layer, no
-parallel engine abstraction — the workspace plugs into the existing systems.
+Recognized but corrupt or password-protected documents transition to an
+actionable error state; they do not remain on an endless loading indicator.
+The unchanged original always remains available. Selecting or dropping an
+unknown format creates an honest fallback instead of silently excluding it.
 
-## 2. Engine evaluation and comparison matrix
+## Documents hub
 
-Licensing verified from authoritative sources (npm/GitHub/official docs), Oct 2026:
+`yayra://documents` provides:
 
-- **PDF.js** — Apache-2.0 (npm `pdfjs-dist`; current line 6.4.299). We vendor
-  the battle-tested **4.10.38** build (identical display API; upgrade is a
-  drop-in — see §7).
-- **ONLYOFFICE** — **AGPL-3.0** with additional Section-7 conditions; Community
-  Document Server capped at ~20 concurrent users; Enterprise/Developer are
-  paid. Embedding it would make Yayra subject to AGPL copyleft or a commercial
-  license. Not selected.
-- **Collabora Online** — **MPL-2.0** (file-level copyleft, fully open).
-  Architecturally a separate service/process (LibreOffice core); heavyweight
-  for an offline-first browser.
-- **Univer** (`dream-num/univer`) — **Apache-2.0**, actively maintained
-  (sheets core + UI). The leading candidate for Phase 4 (Excel).
-- **SheetJS Community Edition** — **Apache-2.0**, but styling/charts are NOT
-  in the CE — data round-trip only (confirmed by CE license page + community
-  reports). Candidate for XLSX data import alongside Univer.
-- **docx-preview / mammoth** — DOCX→HTML renderers (layout-ish / semantic).
-  License labels to be re-verified from their repositories at adoption time
-  (Phase 3) before any dependency is added — no claim is made now.
+- search by filename, extension, or family;
+- opening-date filters for today, 7 days, 30 days, one year, or any time;
+- type filters for PDF, presentation, document, spreadsheet, image, text,
+  archive, and other files;
+- file-size filters for under 1 MB, 1–10 MB, 10–100 MB, 100–300 MB, and
+  files over the internal-viewer limit;
+- independent ascending/descending sorting by opening date, name, type, size,
+  or opening frequency;
+- direct **Open**, **Desktop app**, and **Show in folder** actions;
+- explicit missing/moved-file state plus **Locate…** relinking;
+- removal of one row, all unavailable rows, or all history without deleting
+  original files; and
+- truthful browser/PWA session-only behavior where durable filesystem access
+  is unavailable.
 
-| Format | Candidate | View | Edit | Offline | Win | Linux | Android | License | Runtime deps | Packaging/maintenance | Known limits |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| PDF | **PDF.js (selected)** | ✅ canvas render, zoom, text search | ➖ (annotation = Phase 2) | ✅ vendored | ✅ | ✅ | ✅ | Apache-2.0 | none (ESM + worker) | low (2 vendored files) | non-embedded fonts degrade without `standardFontDataUrl`; encrypted PDFs = honest error in Phase 1 |
-| DOC/DOCX | docx-preview / mammoth (view) | partial (no full fidelity) | ❌ | ✅ | ✅ | ✅ | ✅ | TBD (verify at adoption) | none | medium | layout fidelity is inherently approximate |
-| DOC/DOCX | ONLYOFFICE | ✅ | ✅ | server/DS based | ✅ | ✅ | ➖ | **AGPL-3.0 / paid** | Document Server | high + legal review | 20-user cap; copyleft |
-| XLS/XLSX | Univer | ✅ | ✅ (formulas) | ✅ | ✅ | ✅ | ✅ | Apache-2.0 | bundle (large) | medium | young ecosystem; chart support maturing |
-| XLS/XLSX | SheetJS CE | data only | data only | ✅ | ✅ | ✅ | ✅ | Apache-2.0 | none | low | no styling/charts in CE |
-| PPT/PPTX | (no credible OSS browser editor today) | via conversion only | ❌ | n/a | n/a | n/a | n/a | n/a | n/a | high | see Phase 5 plan |
-| Any | Collabora Online / LibreOfficeKit | ✅ high fidelity | ✅ | process-local or local service | ✅ | ✅ | ❌ (practical) | MPL-2.0 | LibreOffice runtime (~hundreds of MB) | high | separate process; heavy packaging |
+**Settings > Documents** controls the default sort field/direction plus type,
+date, and size filters, history retention, missing-file visibility, presentation
+fullscreen, presentation-control auto-hide, and history management. Retention and Clear delete catalog metadata
+only. They never delete, move, rename, rewrite, or upload source files.
 
-**Conclusion for Phase 1:** PDF.js is the only engine that is permissive
-(Apache-2.0), offline, dependency-free, and cross-platform (Windows x64,
-Debian x64, Android) in one shot. Office formats get the phased plan in §7 —
-with licensing verified BEFORE any dependency lands.
+## Trusted catalog and path isolation
 
-## 3. Workspace architecture (as implemented)
+`electron/documentLibrary.cjs` owns the persistent desktop catalog in
+Electron's trusted main process. Each source gets a random opaque `local-*` id.
+The on-disk main-process record includes the canonical source path and safe
+metadata. Renderer-facing records contain only:
 
-```
-Browser tab (existing system)
-  └── url = yayra://doc/<docId>          ← a first-class internal page
-        └── renderDocumentViewer()       ← toolbar + canvas host + status
-              └── createPdfViewer({ pdfjs, state })   ← engine INJECTED
-                    └── vendor/pdfjs/pdf.mjs (+ pdf.worker.mjs)  ← Apache-2.0
+- opaque id;
+- basename, extension, and file family;
+- size and modified/opened timestamps;
+- opening count and current availability; and
+- whether the bundled viewer can handle it.
 
-DocumentStore (renderer, in-memory)      ← bytes only; no paths, no disk
-  └── addDocumentTab({ name, bytes })    ← new tab; browsing tabs untouched
+No source path crosses IPC or enters ordinary renderer tab/localStorage state.
+Every reopen resolves the opaque id in the main process, stats the source again,
+rechecks permissions and the 300 MB internal-viewer ceiling, and then does one
+of two things:
 
-Electron main: yayra:doc-open            ← native picker; validates .pdf,
-  caps 150 MB; returns { name, size, data }   ← the PATH NEVER crosses IPC
-Web/PWA/Android: <input type="file">     ← FileReader → same DocumentStore
-```
+1. transfers the explicitly requested supported file's bytes to the bundled
+   viewer; or
+2. asks the OS to open the original path for an unsupported format or explicit
+   **Desktop app** action.
 
-Key decisions:
+The picker records a file before routing it, including supported files over the
+internal-viewer ceiling. OS **Open with Yayra** and Downloads **Open in Yayra**
+also record their source. Web/Android picker and drag-and-drop entries appear in
+a session catalog; if the browser can no longer access the bytes, the row says
+so and asks the user to choose the source again rather than pretending durable
+access exists.
 
-- **Documents are tabs** (`yayra://doc/<id>`), so the entire existing tab UX
-  (switch, close, context menu, title, favicon glyph) works unchanged. The
-  routing branch runs BEFORE any web-frame/native-engine path — a document can
-  never navigate a browsing tab away from its site.
-- **Capability registry, honestly reported** (`DOCUMENT_ENGINES.pdf.capabilities`):
-  view/search/zoom/pageNavigation = true; annotate/edit/save/export/print =
-  false in Phase 1. The UI renders NO placeholder buttons for unsupported ops.
-- **Security:** renderer gets bytes, never paths; the file is the one the user
-  picked in the native dialog (or the file input); `contextIsolation`,
-  `nodeIntegration: false`, `sandbox: true` unchanged; document rendering is
-  DOM/canvas — separate from untrusted remote webpage execution; the session
-  snapshot excludes document tabs.
-- **Engine injection:** `createPdfViewer` takes the pdfjs module as a
-  parameter (vendored build in production, deterministic fake in tests).
-- **Local-first:** no account, no backend, no cloud, works fully offline.
+`DocumentStore` still keeps active original `ArrayBuffer`/`Uint8Array` values in
+renderer memory. It stores only an optional opaque catalog id, never a path.
+Document tabs remain excluded from browser-session persistence; closing the
+final session-only tab releases its bytes and marks that session row unavailable.
 
-## 4. Files changed (Phase 1)
+## Routing and trust model
 
-| File | Why |
-| --- | --- |
-| `packages/shared-ui/src/vendor/pdfjs/{pdf.mjs,pdf.worker.mjs,LICENSE}` | Vendored PDF.js 4.10.38 (Apache-2.0) — offline rendering on all platforms |
-| `packages/shared-ui/src/services/documentWorkspace.js` | NEW: capability registry, `classifyDocument`, `DocumentStore`, `createPdfViewer` (engine-injected) |
-| `packages/shared-ui/src/components/BrowserShell.js` | Document tabs: routing branch, `openDocument`/`_openDocumentFileInput`/`addDocumentTab`/`renderDocumentViewer`/`_pdfjsModule`, drawer entry, doc favicon |
-| `packages/shared-ui/src/icons/icons.js` | `document` glyph |
-| `electron/main.cjs` | `yayra:doc-open` handler (native picker, validated, size-capped, bytes-only) |
-| `electron/preload.cjs` | `window.yayra.documents.openPdf` bridge |
-| `tests/document-workspace.test.mjs` | NEW: 12 tests (registry honesty, store, viewer nav/zoom/search/errors, tab integration, close, session exclusion, security pins) |
-| `docs/DOCUMENT_WORKSPACE.md` | This document |
-| (+ P68 batch, separate concern) offline prompting + install-as-app name editing / site-logo work | See commit messages |
+Internal rendering does not trust a filename suffix alone:
 
-## 5. Tests and results (executed, not assumed)
+1. Known byte signatures win (`%PDF-`, PNG/JPEG/GIF/BMP/WebP/AVIF and SVG).
+2. OOXML ZIP entry names distinguish `ppt/presentation.xml`,
+   `word/document.xml`, and `xl/workbook.xml` using bounded prefix/tail scans.
+3. A declared MIME type can identify extensionless browser-selected files.
+4. The filename extension is the final fallback.
+5. If none match, the route is `unsupported`; bytes are not rendered as HTML,
+   script, media, or another trusted document family.
 
-- `node --test tests/document-workspace.test.mjs` → **12/12 pass**
-  (registry honesty; store semantics; viewer load/page-clamp/zoom-clamp/search
-  with match-jump; damaged-file vs password error states; own-tab integration
-  with NO iframe/native-slot; close returns to browsing; session snapshot
-  exclusion; drawer entry; IPC bytes-only security pins; https-only session
-  pin).
-- Full gate `npm test`, `npm run lint`, `npm run typecheck`, `npm run build:web`
-  — results reported in the session summary that accompanies this phase; the
-  known sandbox-only `.deb` packaging test failure is an environment limitation
-  (no native packaging tool in the sandbox; passes in real CI).
+## Download and print
 
-## 6. Known limitations (Phase 1, stated honestly)
+Every bundled viewer has a visible **Download** button that writes the exact
+source bytes—never a screenshot, conversion, or reconstructed copy. Electron
+uses a native Save dialog with the shared 300 MB IPC guard; web/PWA uses a local
+Blob download. `Ctrl+S` invokes the same document path. **Desktop app** remains
+a separate action because opening a temporary/original file is not downloading
+it.
 
-- PDFs only; Word/Excel/PowerPoint are roadmap (§7) — the UI says so. Thumbnails are capped at the first 60 pages (large documents stay fast).
-- Encrypted PDFs show an honest "password-protected" state (unlocking = Phase 2).
-- Non-embedded fonts render with fallbacks (bundling `standardFontDataUrl` +
-  cmaps is vendored and wired - DONE).
-- Document bytes live in memory for the tab's lifetime; closing the tab (or
-  restarting) drops them — reopening is one menu click. No annotations, no
-  printing, no export yet — no buttons pretend otherwise.
-- Extremely large PDFs (>150 MB) are refused by the picker contract.
-- Text search is exact-string, case-insensitive; no regex/diacritics folding.
+Every viewable format also has a visible **Print** button and `Ctrl+P` support.
+PDF materialises every evicted page for the print snapshot. PowerPoint lazily
+materialises every slide into a temporary print-only deck, reports progress,
+then releases that DOM immediately after the print dialog. DOCX prints its
+paged layout; images, text and spreadsheets print their current rendered view.
 
-## 7. Phased plan (roadmap, not implemented)
+## PDF and PowerPoint presentation mode
 
-- **Phase 2 — DELIVERED viewer upgrade:** rotation, night reading mode, outline/TOC sidebar, page thumbnails, fit-width/fit-page, direct page jumps, search match list, full keyboard control (←/→, +/−, 0, R, N, F, Home/End, Ctrl+F), standard font + CJK cmap packaging, open-from-downloads (right-click "Open in Yayra"), OS "Open with > yayra" registration, drag & drop, and the "Desktop app" escape hatch. **Remaining Phase 2:** annotation layer (PDF.js annotation editor /
-  `saveDocument`), printing (Electron `webContents.print`), font/cmap data
-  packaging, virtualized page rendering for very large files, recent-documents
-  list (in `packages/persistence`), open-from-downloads.
-- **Phase 3 — Word:** DOCX **viewing** via a verified-license renderer
-  (docx-preview or mammoth; license re-verified from the repository before
-  adoption); honest "formatting may differ" notice; editing only after the
-  engine decision below.
-- **Phase 4 — Excel:** Univer (Apache-2.0) for viewing + editing with
-  formulas; SheetJS CE for robust XLSX/XLS data import; explicit limits
-  documented (no CE styling/charts round-trip).
-- **Phase 5 — PowerPoint:** no credible OSS browser editor exists today;
-  evaluate (a) LibreOfficeKit/Collabora (MPL-2.0) headless conversion to PDF
-  for high-fidelity viewing on desktop, and (b) Univer Slides as it matures.
-  Fidelity vs packaging cost must be measured before committing.
-- **Phase 6 — Unified workspace:** cross-navigation (browser ↔ documents),
-  recent documents + file management, cross-platform polish, OPTIONAL sync
-  (never mandatory).
-- **Editing engines (Word/PPT):** before any ONLYOFFICE adoption, the AGPL-3.0
-  obligations (source disclosure / commercial license cost) must be accepted
-  explicitly by the project owner — documented, not assumed.
+PPTX/PPTM tabs expose a top-row **Present** action that always starts at slide
+1, while the lower controls expose **From current slide** beside the selected
+slide number. PDF similarly exposes **From current page**. `F5` starts from page
+or slide 1 and `Shift+F5` starts from the current page or slide. For PowerPoint,
+**Desktop app** and **Close presentation** remain in the accessible three-dot
+menu; Download and Print are visible direct actions rather than hidden menu
+items.
 
-## 8. Licensing and redistribution
+Presentation mode is a dedicated full-window black projector surface, not CSS
+enlargement or a screenshot of the ordinary viewer. It:
 
-- PDF.js is Apache-2.0; its license file ships beside the vendored build
-  (`packages/shared-ui/src/vendor/pdfjs/LICENSE`). Apache-2.0 permits
-  redistribution in Yayra's commercial packages with attribution retained.
-- No other document dependency was added in this phase. Every future engine
-  must pass the §2 matrix (license verified from the primary source, offline
-  capability, platform coverage, packaging cost) before adoption.
+- requests true browser/Electron fullscreen with hidden navigation UI and
+  remains usable as a full-window show if permission is denied;
+- moves the existing live viewer controller into the projector, avoiding a
+  reload or lossy conversion;
+- switches PDF.js from continuous reading to exactly one proportionally fitted
+  page, re-fits pages whose proportions differ, and keeps its selectable text
+  layer/live canvas;
+- keeps the existing PowerPoint slide DOM, embedded video controls, and lazy
+  media alive;
+- restores the prior viewer mount, current page/slide, zoom mode, reading
+  position, focus, and PowerPoint notes state on exit;
+- has auto-hiding previous/next, number jump, black screen, laser, pen,
+  page/slide navigator, help, fullscreen, and exit controls;
+- supports swipe, click, and throttled wheel navigation while leaving keyboard
+  and pointer events on embedded PowerPoint video/audio controls alone;
+- provides black (`B` or `.`) and white (`W` or `,`) screens;
+- supports laser (`Ctrl+L`), pen (`Ctrl+P`), arrow (`Ctrl+A`), hidden pointer
+  (`Ctrl+H`), and clear ink (`E`);
+- supports page/slide overview (`G` or `-`) and in-show shortcut help (`F1`);
+  and
+- owns the comprehensive presentation navigation set: `F5`, `Shift+F5`,
+  arrows, `N`, `P`, `H`, Space, Enter, Backspace, Page Up/Down, Home/End,
+  number+Enter, and Escape.
 
-## 9. Testing the feature (per platform)
+PowerPoint shows start with speaker notes hidden and allow Notes to be toggled
+with the control, `S`, `Alt+F5`, or `Ctrl+Shift+N`; PDF shows do not invent a
+notes feature. The pen layer is separate from document content, clears on
+page/slide changes, and never alters the original. A show never executes macros,
+transitions, scripts, OLE objects, or linked media.
 
-**Windows (x64):** install the app → open any website (verify it stays put) →
-menu (⋮) → **Open document... (PDF)** → pick a PDF → it opens in its own tab
-with page arrows, zoom −/+, and "Find in document" (try a word you can see;
-matches jump pages). Close via the ✕ button — you are back on your site,
-still loaded. Try a corrupted file (rename a .txt to .pdf) → honest error
-card, no crash.
+## Offline and packaging contract
 
-**Debian/Linux (x64):** same flow in the .deb or AppImage. Also verify the
-document tab never triggers the native page surface (no flicker of a site
-behind the document) and that the mini window (bubble → yayra mini) can open
-documents too.
+All document engines are local assets:
 
-**Android:** build the APK (`npm run build:android`) → menu → Open document →
-the system file picker appears → PDF renders in the viewer; search + zoom work
-offline (airplane mode). Also verify the file input path never exposes a path
-in any UI.
+- `packages/shared-ui/src/vendor/pdfjs/`
+- `packages/shared-ui/src/vendor/documents/`
 
-**All platforms:** with the internet disconnected, documents still open and
-search (local-first); a PDF tab + a website tab coexist; switching between
-them never reloads the site.
+`npm run build:document-vendors` deterministically bundles attributed sources
+from `scripts/vendor-src/` and writes a hash manifest plus license files.
+`prebuild:web` runs it automatically. PWA precache and Electron `app.asar`
+verification require every lazy engine, the PDF worker, fonts/CMaps, and the
+generated manifest. Document bytes are never sent to a conversion service.
+
+## Performance and lifecycle
+
+The PDF controller creates lightweight page placeholders for continuous
+scrolling but paints only the current page and two neighbours on each side.
+Canvas pixels and text layers more than eight pages away are evicted. Page
+sizes are measured after the first visible window has painted, and text/search
+indexes are cached lazily. In presentation mode, non-current page shells are
+hidden and a page is re-fitted only when its dimensions require it.
+Zoom/rotation cancels obsolete tasks. Closing a tab
+cancels loads/listeners, destroys PDF.js resources, clears canvases/text layers,
+and releases references.
+
+PPTX follows the same first-content-first rule: presentation structure opens
+before media, and pictures, video posters, and clips are materialised
+slide-by-slide. Markup-compatibility (`mc:AlternateContent`) branches are
+resolved once at both shape and text-run level; identity groups remain
+traversable; and native Office Math (OMML) is converted locally into semantic
+MathML with a plain-text search/copy equivalent. Placeholder position, size,
+anchor, and text style flow through master → layout → slide, including footer
+slide numbers that carry no transform of their own. Video controls stay inside
+the slide, never load a linked external file, and own their keyboard shortcuts
+while focused. Search indexes lazily. The validated six-digit notes colour
+updates only note text, defaults to black on a fixed cream card, and persists
+per profile without rebuilding slide media. Spreadsheet rendering limits each
+visible row window to 300 rows.
+
+## User entry points
+
+- Toolbar: **Documents**
+- Drawer: **Open document**
+- Desktop native all-file picker (or standard web/Android file input)
+- Drag and drop anywhere in Yayra
+- Downloads context menu: **Open in Yayra** for internally viewable formats
+- Desktop OS file association / **Open with Yayra**
+
+Every internally handled file receives its own ordinary Yayra tab and
+participates in normal tab switching and closing, but never enters the web
+frame/native website engine path.
+
+## Validation
+
+The automated suite covers catalog persistence, opaque-id/path isolation,
+all-file routing, availability checks, relinking, retention, non-destructive
+clear, filtering/sorting source contracts, the shared 300 MB guard, byte/MIME/
+filename routing, realistic PowerPoint fixtures, compatibility-wrapped body
+content, OMML fractions/scripts, master-inherited lower-right slide numbers,
+embedded-video fidelity and keyboard ownership, notes colour, complete shared
+presentation shortcuts,
+true-fullscreen/overflow wiring, live PDF projector mounting and restoration,
+variable-proportion PDF page fitting, DOCX/spreadsheet rendering, SVG
+sanitisation, safe text, continuous PDF windowing/search/thumbnails/outline, corrupt-file
+errors, original-file fallback, IPC, associations, packaging, and lifecycle
+cleanup.

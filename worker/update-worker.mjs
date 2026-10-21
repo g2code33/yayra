@@ -13,6 +13,9 @@ const DEFAULT_MANIFEST = {
 const WINDOW_MS = 60_000;
 const LIMIT = 120;
 const buckets = new Map();
+const AUTH_LIMIT = 20;
+const AUTH_MAX_BODY_BYTES = 16 * 1024;
+const authBuckets = new Map();
 
 // --- /api/ai : Yayra's managed AI, backed by a POOL of NVIDIA keys -------
 // NVIDIA's NIM endpoint is OpenAI-compatible; the Worker holds MANY API
@@ -38,15 +41,24 @@ export default {
       return new Response('not found', { status: 404 });
     }
 
-    const headers = baseHeaders();
+    const isGoogleExchange = url.pathname === '/auth/google/exchange';
+    const authOrigin = isGoogleExchange ? authorizeGoogleExchangeOrigin(request, env) : null;
+    const headers = isGoogleExchange ? googleAuthHeaders(authOrigin) : baseHeaders();
+    if (isGoogleExchange && authOrigin === false) {
+      return new Response(JSON.stringify({ error: 'origin_not_allowed' }), { status: 403, headers });
+    }
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers });
     const ip = request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || 'unknown';
-    if (!take(ip, Date.now())) return new Response('rate limited', { status: 429, headers });
+    const now = Date.now();
+    if (!take(ip, now)) return new Response('rate limited', { status: 429, headers });
+    if (isGoogleExchange && !takeFrom(authBuckets, ip, now, WINDOW_MS, AUTH_LIMIT)) {
+      return new Response(JSON.stringify({ error: 'rate_limited' }), { status: 429, headers });
+    }
 
     if (url.pathname === '/api/suggestions') return proxySuggestions(request, url, headers, ctx);
     if (url.pathname === '/api/latest-release') return proxyLatestRelease(request, headers, env, ctx);
     if (url.pathname === '/api/ai') return answerWithNvidiaPool(request, headers, env, ip);
-    if (url.pathname === '/auth/google/exchange') return exchangeGoogleAuthCode(request, headers, env);
+    if (isGoogleExchange) return exchangeGoogleAuthCode(request, headers, env, authOrigin);
     return serveManifest(request, env, headers);
   }
 };
@@ -267,7 +279,15 @@ async function proxySuggestions(request, url, headers, ctx) {
   const query = (url.searchParams.get('q') || '').trim().slice(0, 200);
   if (!query) return new Response(JSON.stringify(['', []]), { status: 200, headers });
   const upstreamUrl = `https://suggestqueries.google.com/complete/search?client=firefox&hl=en&q=${encodeURIComponent(query)}`;
-  return proxyJson(upstreamUrl, headers, {}, ctx, 'public, max-age=60');
+  const upstream = await proxyJson(upstreamUrl, headers, {}, ctx, 'public, max-age=60');
+  if (upstream.ok) return upstream;
+  // Suggestions are optional. Return the same empty payload shape on an
+  // upstream outage instead of leaking a noisy 502 into every address-bar
+  // keystroke; the client still has profile-local suggestions to show.
+  return new Response(JSON.stringify([query, []]), {
+    status: 200,
+    headers: { ...headers, 'cache-control': 'no-store', 'x-yayra-suggestions': 'fallback' }
+  });
 }
 
 /**
@@ -373,6 +393,57 @@ function resolveGoogleClient(env, platform) {
 }
 
 const DEFAULT_GOOGLE_WEB_ALLOWED_ORIGINS = ['https://yayra.pages.dev', 'http://localhost:4173'];
+const DEFAULT_GOOGLE_NATIVE_ALLOWED_ORIGINS = ['https://localhost', 'http://localhost', 'capacitor://localhost'];
+
+function configuredGoogleWebOrigins(env = {}) {
+  return typeof env.GOOGLE_WEB_ALLOWED_ORIGINS === 'string'
+    ? env.GOOGLE_WEB_ALLOWED_ORIGINS.split(',').map((origin) => origin.trim()).filter(Boolean)
+    : DEFAULT_GOOGLE_WEB_ALLOWED_ORIGINS;
+}
+
+function configuredGoogleNativeOrigins(env = {}) {
+  return typeof env.GOOGLE_NATIVE_ALLOWED_ORIGINS === 'string'
+    ? env.GOOGLE_NATIVE_ALLOWED_ORIGINS.split(',').map((origin) => origin.trim()).filter(Boolean)
+    : DEFAULT_GOOGLE_NATIVE_ALLOWED_ORIGINS;
+}
+
+function configuredGoogleAuthOrigins(env = {}) {
+  return new Set([...configuredGoogleWebOrigins(env), ...configuredGoogleNativeOrigins(env)]);
+}
+
+/**
+ * CORS for the code-exchange seam is exact-origin, never `*`. Requests made
+ * by native HTTP stacks can legitimately omit Origin; browser/WebView calls
+ * must present one of the explicitly configured web or Capacitor origins.
+ */
+function authorizeGoogleExchangeOrigin(request, env = {}) {
+  const rawOrigin = request.headers.get('origin');
+  if (!rawOrigin) return null;
+  if (rawOrigin === 'null' || rawOrigin.length > 256) return false;
+  let normalized;
+  try {
+    const parsed = new URL(rawOrigin);
+    if (parsed.origin !== rawOrigin || parsed.username || parsed.password) return false;
+    normalized = parsed.origin;
+  } catch {
+    return false;
+  }
+  return configuredGoogleAuthOrigins(env).has(normalized) ? normalized : false;
+}
+
+function googleAuthHeaders(allowedOrigin) {
+  return {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store, max-age=0',
+    pragma: 'no-cache',
+    'referrer-policy': 'no-referrer',
+    'x-content-type-options': 'nosniff',
+    'access-control-allow-methods': 'POST, OPTIONS',
+    'access-control-allow-headers': 'Content-Type',
+    vary: 'Origin',
+    ...(typeof allowedOrigin === 'string' ? { 'access-control-allow-origin': allowedOrigin } : {})
+  };
+}
 
 function isAcceptableRedirectUri(redirectUri, platform, env = {}) {
   let redirect;
@@ -391,25 +462,38 @@ function isAcceptableRedirectUri(redirectUri, platform, env = {}) {
       && redirect.pathname === '/oauth2redirect';
   }
   if (redirect.pathname !== '/auth/callback') return false;
-  const configuredOrigins = typeof env.GOOGLE_WEB_ALLOWED_ORIGINS === 'string'
-    ? env.GOOGLE_WEB_ALLOWED_ORIGINS.split(',').map((origin) => origin.trim()).filter(Boolean)
-    : DEFAULT_GOOGLE_WEB_ALLOWED_ORIGINS;
-  return configuredOrigins.includes(redirect.origin);
+  return configuredGoogleWebOrigins(env).includes(redirect.origin);
 }
 
-async function exchangeGoogleAuthCode(request, headers, env) {
+async function exchangeGoogleAuthCode(request, headers, env, authorizedOrigin = null) {
   if (request.method !== 'POST') return new Response(JSON.stringify({ error: 'method not allowed' }), { status: 405, headers });
+  const contentType = request.headers.get('content-type') || '';
+  if (!/^application\/json(?:\s*;|$)/i.test(contentType)) {
+    return new Response(JSON.stringify({ error: 'unsupported_media_type' }), { status: 415, headers });
+  }
+  const contentLength = Number(request.headers.get('content-length'));
+  if (Number.isFinite(contentLength) && contentLength > AUTH_MAX_BODY_BYTES) {
+    return new Response(JSON.stringify({ error: 'request_too_large' }), { status: 413, headers });
+  }
 
   let body;
   try {
-    body = await request.json();
+    const rawBody = await request.text();
+    if (new TextEncoder().encode(rawBody).byteLength > AUTH_MAX_BODY_BYTES) {
+      return new Response(JSON.stringify({ error: 'request_too_large' }), { status: 413, headers });
+    }
+    body = JSON.parse(rawBody);
   } catch {
     return new Response(JSON.stringify({ error: 'invalid_json' }), { status: 400, headers });
   }
-  const code = typeof body?.code === 'string' ? body.code : '';
-  const codeVerifier = typeof body?.codeVerifier === 'string' ? body.codeVerifier : '';
-  const redirectUri = typeof body?.redirectUri === 'string' ? body.redirectUri : '';
-  const platform = typeof body?.platform === 'string' ? body.platform : 'web';
+  if (!body || typeof body !== 'object' || Array.isArray(body)
+    || Object.keys(body).some((key) => !['code', 'codeVerifier', 'redirectUri', 'platform'].includes(key))) {
+    return new Response(JSON.stringify({ error: 'invalid_request' }), { status: 400, headers });
+  }
+  const code = typeof body.code === 'string' ? body.code : '';
+  const codeVerifier = typeof body.codeVerifier === 'string' ? body.codeVerifier : '';
+  const redirectUri = typeof body.redirectUri === 'string' ? body.redirectUri : '';
+  const platform = typeof body.platform === 'string' ? body.platform : 'web';
   if (!['web', 'android', 'ios'].includes(platform)) {
     return new Response(JSON.stringify({ error: 'invalid_platform' }), { status: 400, headers });
   }
@@ -420,6 +504,9 @@ async function exchangeGoogleAuthCode(request, headers, env) {
   if (!code || !codeVerifier || !redirectUri) {
     return new Response(JSON.stringify({ error: 'missing_fields' }), { status: 400, headers });
   }
+  if (code.length > 4096 || /[\u0000-\u0020\u007f]/.test(code) || redirectUri.length > 2048) {
+    return new Response(JSON.stringify({ error: 'invalid_request' }), { status: 400, headers });
+  }
   // RFC 7636 code_verifier: 43-128 unreserved characters. The clients
   // generate a 43-character base64url verifier; reject malformed requests
   // before forwarding anything to Google.
@@ -428,6 +515,17 @@ async function exchangeGoogleAuthCode(request, headers, env) {
   }
   if (!isAcceptableRedirectUri(redirectUri, platform, env)) {
     return new Response(JSON.stringify({ error: 'invalid_redirect_uri' }), { status: 400, headers });
+  }
+  if (platform === 'web' && authorizedOrigin) {
+    let redirectOrigin = '';
+    try { redirectOrigin = new URL(redirectUri).origin; } catch { /* rejected above */ }
+    if (redirectOrigin !== authorizedOrigin) {
+      return new Response(JSON.stringify({ error: 'origin_redirect_mismatch' }), { status: 403, headers });
+    }
+  }
+  if ((platform === 'android' || platform === 'ios') && authorizedOrigin
+    && !configuredGoogleNativeOrigins(env).includes(authorizedOrigin)) {
+    return new Response(JSON.stringify({ error: 'origin_platform_mismatch' }), { status: 403, headers });
   }
 
   const tokenParams = new URLSearchParams({
@@ -447,30 +545,55 @@ async function exchangeGoogleAuthCode(request, headers, env) {
     body: tokenParams.toString()
   });
   if (!tokenResponse.ok) {
-    // Pass Google's OAuth error code through (useful: invalid_grant =
-    // expired/reused code) but never echo request contents back.
+    // Pass only Google's bounded OAuth error CODE through (useful:
+    // invalid_grant = expired/reused code). Never echo an arbitrary response
+    // body into client JSON or Worker logs.
     let detail = 'token_exchange_failed';
-    try { detail = (await tokenResponse.json())?.error || detail; } catch { /* keep generic */ }
+    try {
+      const candidate = (await tokenResponse.json())?.error;
+      if (typeof candidate === 'string' && /^[A-Za-z0-9_:-]{1,96}$/.test(candidate)) detail = candidate;
+    } catch { /* keep generic */ }
     console.log(`[auth] google exchange failed status=${tokenResponse.status} error=${detail}`);
     return new Response(JSON.stringify({ error: detail }), { status: 502, headers });
   }
   const tokens = await tokenResponse.json();
-  if (!tokens?.access_token) {
+  const accessToken = typeof tokens?.access_token === 'string'
+    && tokens.access_token.length > 0
+    && tokens.access_token.length <= 8192
+    && !/[\u0000-\u0020\u007f]/.test(tokens.access_token)
+    ? tokens.access_token
+    : null;
+  if (!accessToken) {
     return new Response(JSON.stringify({ error: 'token_exchange_malformed' }), { status: 502, headers });
   }
 
   const userinfoResponse = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-    headers: { Authorization: `Bearer ${tokens.access_token}` }
+    headers: { Authorization: `Bearer ${accessToken}` }
   });
   if (!userinfoResponse.ok) {
     console.log(`[auth] google userinfo failed status=${userinfoResponse.status}`);
     return new Response(JSON.stringify({ error: 'userinfo_failed' }), { status: 502, headers });
   }
   const userinfo = await userinfoResponse.json();
+  const sub = typeof userinfo?.sub === 'string' && /^[A-Za-z0-9_-]{1,255}$/.test(userinfo.sub) ? userinfo.sub : null;
+  const email = typeof userinfo?.email === 'string' && userinfo.email.length <= 254 && /^[^\s@]+@[^\s@]+$/.test(userinfo.email)
+    ? userinfo.email
+    : null;
+  if (!sub || !email) {
+    return new Response(JSON.stringify({ error: 'userinfo_malformed' }), { status: 502, headers });
+  }
+  const name = typeof userinfo.name === 'string' ? userinfo.name.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 200) : null;
+  let picture = null;
+  if (typeof userinfo.picture === 'string' && userinfo.picture.length <= 2048) {
+    try {
+      const parsedPicture = new URL(userinfo.picture);
+      if (parsedPicture.protocol === 'https:' && !parsedPicture.username && !parsedPicture.password) picture = parsedPicture.toString();
+    } catch { /* optional profile image is dropped */ }
+  }
   // Profile only. Explicitly reconstruct the object so no token-ish field
   // can ever ride along, and drop the tokens on the floor right here.
-  const profile = { sub: userinfo.sub, name: userinfo.name, email: userinfo.email, picture: userinfo.picture };
-  return new Response(JSON.stringify({ profile }), { status: 200, headers: { ...headers, 'cache-control': 'no-store' } });
+  const profile = { sub, name, email, picture };
+  return new Response(JSON.stringify({ profile }), { status: 200, headers });
 }
 
 function readManifest(env) {
@@ -487,7 +610,9 @@ function baseHeaders() {
     'access-control-allow-origin': '*',
     'access-control-allow-methods': 'GET, HEAD, POST, OPTIONS',
     'access-control-allow-headers': 'Accept, Content-Type',
-    'content-type': 'application/json; charset=utf-8'
+    'content-type': 'application/json; charset=utf-8',
+    'referrer-policy': 'no-referrer',
+    'x-content-type-options': 'nosniff'
   };
 }
 

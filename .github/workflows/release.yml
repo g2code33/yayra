@@ -107,7 +107,18 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          npx --yes wrangler@4 pages deploy dist --project-name "$CLOUDFLARE_PROJECT_NAME" --branch main --commit-dirty=true
+          # A publishing run creates its final update manifest only after all
+          # native artifacts exist. Deploying here and again in `publish`
+          # made Wrangler hit /pages/assets/check-missing twice within minutes
+          # and Cloudflare throttled the release with code 971. Defer the
+          # single atomic deployment to the publish job; web-only preview
+          # dispatches still deploy from this job.
+          if [ "${{ github.event_name }}" = "push" ] || [ "${{ inputs.publish }}" = "true" ]; then
+            echo "Cloudflare deployment deferred until the final release manifest is ready."
+            echo "manifest_url=https://yayra-updates-api.g2code335.workers.dev/updates/manifest.json" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          node scripts/deploy-cloudflare-pages.mjs dist
           node scripts/deploy-cloudflare-worker.mjs
           echo "manifest_url=https://yayra-updates-api.g2code335.workers.dev/updates/manifest.json" >> "$GITHUB_OUTPUT"
 
@@ -167,6 +178,14 @@ jobs:
           fi
       - run: npm run package:linux
       - run: npm run verify:packaging
+      - name: Prepare Chromium sandbox helper for packaged diagnostic
+        run: |
+          test -f release/linux-unpacked/chrome-sandbox
+          sudo chown root:root release/linux-unpacked/chrome-sandbox
+          sudo chmod 4755 release/linux-unpacked/chrome-sandbox
+      - name: Diagnose packaged Linux shell and PDF.js worker
+        continue-on-error: true
+        run: npm run smoke:desktop
       - name: Sign Linux packages and AppImage
         if: steps.signing.outputs.signed == 'true'
         env:
@@ -250,6 +269,10 @@ jobs:
             echo "::warning:: YAYRA_GOOGLE_CLIENT_ID / YAYRA_GOOGLE_CLIENT_SECRET repo secrets not set - installed builds will show 'Google sign-in isn't configured' until users drop google-auth.config.json into their yayra config directory."
           fi
       - run: npm run package:win
+      - run: npm run verify:packaging
+      - name: Diagnose packaged Windows shell and PDF.js worker
+        continue-on-error: true
+        run: npm run smoke:desktop
       - name: Sign Windows executables with the configured PFX
         shell: pwsh
         env:
@@ -501,10 +524,10 @@ jobs:
           APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
         run: |
           if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
-            xcodebuild -workspace ios/App/App.xcworkspace -scheme App -configuration Release -destination generic/platform=iOS DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Automatic -allowProvisioningUpdates -authenticationKeyPath "$APPLE_AUTH_KEY_PATH" -authenticationKeyID "$APP_STORE_CONNECT_KEY_ID" -authenticationKeyIssuerID "$APP_STORE_CONNECT_ISSUER_ID" -archivePath build/yayra.xcarchive archive
+            xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Release -destination generic/platform=iOS DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Automatic -allowProvisioningUpdates -authenticationKeyPath "$APPLE_AUTH_KEY_PATH" -authenticationKeyID "$APP_STORE_CONNECT_KEY_ID" -authenticationKeyIssuerID "$APP_STORE_CONNECT_ISSUER_ID" -archivePath build/yayra.xcarchive archive
             xcodebuild -exportArchive -archivePath build/yayra.xcarchive -exportPath build/ios-export -exportOptionsPlist ios/exportOptions.plist -allowProvisioningUpdates -authenticationKeyPath "$APPLE_AUTH_KEY_PATH" -authenticationKeyID "$APP_STORE_CONNECT_KEY_ID" -authenticationKeyIssuerID "$APP_STORE_CONNECT_ISSUER_ID"
           else
-            xcodebuild -workspace ios/App/App.xcworkspace -scheme App -configuration Release -destination generic/platform=iOS CODE_SIGNING_ALLOWED=NO archive -archivePath build/yayra.xcarchive
+            xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Release -destination generic/platform=iOS CODE_SIGNING_ALLOWED=NO archive -archivePath build/yayra.xcarchive
           fi
       - id: artifact
         shell: bash
@@ -579,7 +602,7 @@ jobs:
             echo "::warning:: Final Cloudflare manifest deployment skipped: configure the Cloudflare secrets"
             exit 0
           fi
-          npx --yes wrangler@4 pages deploy dist --project-name "$CLOUDFLARE_PROJECT_NAME" --branch main --commit-dirty=true
+          node scripts/deploy-cloudflare-pages.mjs dist
           node scripts/deploy-cloudflare-worker.mjs
       - name: Verify live release and manifest contract
         env:

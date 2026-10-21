@@ -46,6 +46,19 @@ test('update worker proxies browser-safe suggestions and release metadata with C
 // optional GITHUB_TOKEN binding raises that to the authenticated 5,000/hour
 // quota instead; this proves the header is actually attached when present,
 // and that we still work (just unauthenticated) when it isn't configured.
+test('suggestions endpoint degrades to a valid empty payload when Google suggestions are unavailable', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('upstream unavailable', { status: 503 });
+  try {
+    const response = await worker.fetch(new Request('https://yayra-updates-api.g2code335.workers.dev/api/suggestions?q=long%20query'), {});
+    assert.equal(response.status, 200, 'optional suggestion failure is not exposed as a repeated browser 502');
+    assert.deepEqual(await response.json(), ['long query', []]);
+    assert.equal(response.headers.get('x-yayra-suggestions'), 'fallback');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('update worker attaches GITHUB_TOKEN as a Bearer header when bound, and omits it when not configured', async () => {
   const originalFetch = globalThis.fetch;
   const seenHeaders = [];
@@ -105,10 +118,16 @@ const EXCHANGE_URL = 'https://yayra-updates-api.g2code335.workers.dev/auth/googl
 const AUTH_ENV = { GOOGLE_WEB_CLIENT_ID: 'web-id.apps.googleusercontent.com', GOOGLE_WEB_CLIENT_SECRET: 'server-side-secret' };
 const VALID_CODE_VERIFIER = 'A'.repeat(43);
 
-function exchangeRequest(body, method = 'POST') {
+let exchangeRequestSequence = 0;
+function exchangeRequest(body, method = 'POST', extraHeaders = {}) {
+  exchangeRequestSequence += 1;
   return new Request(EXCHANGE_URL, {
     method,
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'cf-connecting-ip': `198.51.100.${(exchangeRequestSequence % 200) + 1}`,
+      ...extraHeaders
+    },
     body: method === 'POST' ? JSON.stringify(body) : undefined
   });
 }
@@ -126,7 +145,15 @@ test('auth exchange only accepts POST and rejects malformed bodies before touchi
     const get = await worker.fetch(new Request(EXCHANGE_URL), AUTH_ENV);
     assert.equal(get.status, 405);
 
-    const badJson = await worker.fetch(new Request(EXCHANGE_URL, { method: 'POST', body: 'not json' }), AUTH_ENV);
+    const unsupported = await worker.fetch(new Request(EXCHANGE_URL, { method: 'POST', body: 'not json' }), AUTH_ENV);
+    assert.equal(unsupported.status, 415);
+    assert.equal((await unsupported.json()).error, 'unsupported_media_type');
+
+    const badJson = await worker.fetch(new Request(EXCHANGE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: 'not json'
+    }), AUTH_ENV);
     assert.equal(badJson.status, 400);
     assert.equal((await badJson.json()).error, 'invalid_json');
 
@@ -154,6 +181,40 @@ test('auth exchange only accepts POST and rejects malformed bodies before touchi
   }
 });
 
+test('auth exchange CORS is exact-origin and binds web Origin to the callback origin', async () => {
+  const body = { code: 'c', codeVerifier: VALID_CODE_VERIFIER, redirectUri: 'https://yayra.pages.dev/auth/callback' };
+  const denied = await worker.fetch(exchangeRequest(body, 'POST', { Origin: 'https://attacker.example' }), AUTH_ENV);
+  assert.equal(denied.status, 403);
+  assert.equal(denied.headers.get('access-control-allow-origin'), null);
+
+  const mismatch = await worker.fetch(exchangeRequest(
+    { ...body, redirectUri: 'http://localhost:4173/auth/callback' },
+    'POST',
+    { Origin: 'https://yayra.pages.dev' }
+  ), AUTH_ENV);
+  assert.equal(mismatch.status, 403);
+  assert.equal((await mismatch.json()).error, 'origin_redirect_mismatch');
+
+  const preflight = await worker.fetch(new Request(EXCHANGE_URL, {
+    method: 'OPTIONS',
+    headers: { Origin: 'https://yayra.pages.dev', 'Access-Control-Request-Method': 'POST' }
+  }), AUTH_ENV);
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get('access-control-allow-origin'), 'https://yayra.pages.dev');
+  assert.equal(preflight.headers.get('vary'), 'Origin');
+  assert.equal(preflight.headers.get('access-control-allow-credentials'), null, 'the exchange uses no cookies');
+});
+
+test('auth exchange rejects oversized, unknown, and token-shaped request fields before Google', async () => {
+  const base = { code: 'c', codeVerifier: VALID_CODE_VERIFIER, redirectUri: 'https://yayra.pages.dev/auth/callback' };
+  const unknown = await worker.fetch(exchangeRequest({ ...base, access_token: 'must-not-be-accepted' }), AUTH_ENV);
+  assert.equal(unknown.status, 400);
+  assert.equal((await unknown.json()).error, 'invalid_request');
+  const huge = await worker.fetch(exchangeRequest({ ...base, code: 'A'.repeat(17 * 1024) }), AUTH_ENV);
+  assert.equal(huge.status, 413);
+  assert.equal((await huge.json()).error, 'request_too_large');
+});
+
 test('auth exchange attaches the client secret server-side, forwards PKCE verifier, and returns ONLY the profile', async () => {
   const originalFetch = globalThis.fetch;
   const upstream = [];
@@ -167,8 +228,8 @@ test('auth exchange attaches the client secret server-side, forwards PKCE verifi
   try {
     const response = await worker.fetch(exchangeRequest({ code: 'one-shot-code', codeVerifier: VALID_CODE_VERIFIER, redirectUri: 'https://yayra.pages.dev/auth/callback' }), AUTH_ENV);
     assert.equal(response.status, 200);
-    assert.equal(response.headers.get('access-control-allow-origin'), '*');
-    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.equal(response.headers.get('access-control-allow-origin'), null, 'non-browser native/server requests do not receive wildcard CORS');
+    assert.equal(response.headers.get('cache-control'), 'no-store, max-age=0');
 
     const tokenCall = upstream.find((u) => u.target.includes('/token'));
     const params = new URLSearchParams(tokenCall.options.body);
@@ -197,7 +258,7 @@ test('auth exchange serves Android/iOS clients WITHOUT a secret and accepts only
   globalThis.fetch = async (target, options) => {
     upstream.push({ target: String(target), options });
     if (String(target).includes('/token')) return new Response(JSON.stringify({ access_token: 'ya29.mobile' }), { status: 200 });
-    return new Response(JSON.stringify({ sub: '9', name: 'Kofi', email: 'kofi@example.com', picture: 'p' }), { status: 200 });
+    return new Response(JSON.stringify({ sub: '9', name: 'Kofi', email: 'kofi@example.com', picture: 'https://lh3.googleusercontent.com/a/p' }), { status: 200 });
   };
   const env = { GOOGLE_ANDROID_CLIENT_ID: 'android-id.apps.googleusercontent.com' };
   try {
@@ -207,7 +268,7 @@ test('auth exchange serves Android/iOS clients WITHOUT a secret and accepts only
     assert.equal(params.get('client_id'), 'android-id.apps.googleusercontent.com');
     assert.equal(params.get('client_secret'), null, 'native clients have no secret - Google rejects one it never issued');
     assert.equal(params.get('redirect_uri'), 'com.yayra.app:/oauth2redirect');
-    assert.deepEqual(await response.json(), { profile: { sub: '9', name: 'Kofi', email: 'kofi@example.com', picture: 'p' } });
+    assert.deepEqual(await response.json(), { profile: { sub: '9', name: 'Kofi', email: 'kofi@example.com', picture: 'https://lh3.googleusercontent.com/a/p' } });
 
     // The same request without the matching platform binding is honestly unconfigured.
     const unconfigured = await worker.fetch(exchangeRequest({ code: 'c', codeVerifier: VALID_CODE_VERIFIER, redirectUri: 'com.yayra.app:/oauth2redirect', platform: 'ios' }), env);
@@ -240,6 +301,28 @@ test('auth exchange passes Google OAuth error codes through without echoing requ
     const body = await response.json();
     assert.equal(body.error, 'invalid_grant');
     assert.equal(JSON.stringify(body).includes('reused-code'), false);
+
+    globalThis.fetch = async () => new Response(JSON.stringify({ error: 'bad\nheader', error_description: 'access_token=do-not-echo' }), { status: 400 });
+    const hostile = await worker.fetch(exchangeRequest({ code: 'another-code', codeVerifier: VALID_CODE_VERIFIER, redirectUri: 'http://localhost:4173/auth/callback' }), AUTH_ENV);
+    assert.equal(hostile.status, 502);
+    assert.deepEqual(await hostile.json(), { error: 'token_exchange_failed' });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('auth exchange rejects malformed or oversized access tokens before userinfo', async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ access_token: `bad token ${'x'.repeat(9000)}` }), { status: 200 });
+  };
+  try {
+    const response = await worker.fetch(exchangeRequest({ code: 'fresh-code', codeVerifier: VALID_CODE_VERIFIER, redirectUri: 'http://localhost:4173/auth/callback' }), AUTH_ENV);
+    assert.equal(response.status, 502);
+    assert.deepEqual(await response.json(), { error: 'token_exchange_malformed' });
+    assert.equal(calls, 1, 'userinfo is never called with a malformed bearer credential');
   } finally {
     globalThis.fetch = originalFetch;
   }

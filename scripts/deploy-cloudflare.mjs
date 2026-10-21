@@ -13,12 +13,10 @@ const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 const build = spawnSync(npm, ['run', 'build:web'], { stdio: 'inherit', env: process.env });
 if (build.status !== 0) process.exit(build.status ?? 1);
 
-const deploy = spawnSync(npm, [
-  'exec', '--yes', '--', 'wrangler@4', 'pages', 'deploy', 'dist',
-  '--project-name', process.env.CLOUDFLARE_PROJECT_NAME,
-  '--branch', 'main',
-  '--commit-dirty=true'
-], { stdio: 'inherit', env: process.env });
+const deploy = spawnSync(process.execPath, ['scripts/deploy-cloudflare-pages.mjs', 'dist'], {
+  stdio: 'inherit',
+  env: process.env
+});
 if (deploy.status !== 0) process.exit(deploy.status ?? 1);
 
 const worker = spawnSync(process.execPath, ['scripts/deploy-cloudflare-worker.mjs'], {

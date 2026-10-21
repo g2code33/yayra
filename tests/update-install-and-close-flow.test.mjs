@@ -35,14 +35,24 @@ function withLocalStorage(fn) {
 }
 
 function installUpdatesBridge({ downloads = [], installs = [] } = {}) {
+  let eventListener = null;
   globalThis.window.yayra = globalThis.window.yayra || {};
   globalThis.window.yayra.updates = {
     check: async () => ({ status: 'checking' }),
     download: async (payload) => { downloads.push(payload); return { status: 'staged', path: '/tmp/yayra-new.deb' }; },
     install: async (payload) => { installs.push(payload); return { status: 'install_started', method: 'os-installer' }; },
-    onEvent: () => () => {}
+    onEvent: (callback) => {
+      eventListener = callback;
+      return () => { if (eventListener === callback) eventListener = null; };
+    }
   };
-  return { downloads, installs, uninstall: () => { delete globalThis.window.yayra; } };
+  return {
+    downloads,
+    installs,
+    emit: (payload) => eventListener?.(payload),
+    hasListener: () => Boolean(eventListener),
+    uninstall: () => { eventListener = null; delete globalThis.window.yayra; }
+  };
 }
 
 async function makeShell(opts = {}) {
@@ -148,6 +158,72 @@ test('settings: a scheduled next-launch install is visible and cancellable', asy
   } finally {
     bridge.uninstall();
     cleanup();
+  }
+});
+
+test('desktop update progress stays live in Settings, the toolbar, and the menu without a refresh or full render', async () => {
+  const bridge = installUpdatesBridge();
+  let shell;
+  try {
+    const made = await makeShell();
+    shell = made.shell;
+    const { container } = made;
+    shell.state.updateState = {
+      ...shell.state.updateState,
+      status: 'downloading',
+      installedVersion: '1.0.52',
+      availableVersion: '1.0.53',
+      progressPercent: 31,
+      progressReceivedBytes: 31 * 1024 * 1024
+    };
+    shell.state.settingsActiveCategory = 'updates';
+    shell.state.activeSettingsCategory = 'updates';
+    shell.openInternalPage('yayra://settings');
+    shell.state.isSideDrawerOpen = true;
+    shell.render(container);
+
+    assert.equal(bridge.hasListener(), true, 'the shell subscribes to native update events');
+    const settingsLabel = container.querySelector('.fb-update-progress-settings');
+    const toolbarLabel = container.querySelector('.fb-update-progress-toolbar');
+    const menuLabel = container.querySelector('.fb-update-progress-compact');
+    const progress = container.querySelector('.fb-update-live-progress');
+    const fill = container.querySelector('.fb-update-live-progress-fill');
+    assert.ok(settingsLabel && toolbarLabel && menuLabel && progress && fill,
+      'every visible update surface exposes a live progress target');
+    assert.match(settingsLabel.textContent, /v1\.0\.53… 31%/);
+    assert.match(toolbarLabel.textContent, /31%/);
+    assert.match(menuLabel.textContent, /31%/);
+    assert.equal(container.querySelector('.fb-up-check').hasAttribute('disabled'), true,
+      'a second update check cannot overwrite an active download state');
+    await shell.checkForUpdates(true);
+    assert.equal(shell.state.updateState.status, 'downloading');
+
+    const rootBeforeProgress = shell.rootElement;
+    bridge.emit({
+      type: 'download-progress',
+      version: '1.0.53',
+      received: 47 * 1024 * 1024,
+      total: 100 * 1024 * 1024,
+      percent: 47
+    });
+
+    assert.equal(shell.rootElement, rootBeforeProgress, 'progress is painted surgically; the page is not refreshed or rebuilt');
+    assert.equal(shell.state.updateState.progressPercent, 47);
+    assert.match(settingsLabel.textContent, /v1\.0\.53… 47%/, 'Settings advances immediately');
+    assert.match(toolbarLabel.textContent, /47%/, 'every website toolbar advances immediately');
+    assert.match(menuLabel.textContent, /47%/, 'open Yayra menu advances immediately');
+    assert.equal(progress.getAttribute('aria-valuenow'), '47');
+    assert.equal(fill.style.width, '47%', 'the visible bar advances with the same event');
+
+    // An unrelated render must retain the newest event value, not jump back
+    // to the percentage that happened to be present when Settings opened.
+    shell.render(container);
+    assert.match(container.querySelector('.fb-update-progress-settings').textContent, /47%/);
+    assert.match(container.querySelector('.fb-update-progress-toolbar').textContent, /47%/);
+  } finally {
+    shell?.destroy();
+    assert.equal(bridge.hasListener(), false, 'destroy releases the native event subscription');
+    bridge.uninstall();
   }
 });
 

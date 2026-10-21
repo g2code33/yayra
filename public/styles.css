@@ -35,6 +35,20 @@ textarea { display: block; min-height: 6rem; width: min(100%, 42rem); }
 #toast { margin-top: 1rem; min-height: 1.5rem; }
 @media (prefers-color-scheme: dark) { body { background: #020617; color: #e2e8f0; } section, .sheet-card, .mobile-update-sheet.preview, .update-menu { background: #0f172a; color: #e2e8f0; border-color: #334155; } }
 
+/* The legacy update-page stylesheet above styles every bare <section>.
+   BrowserShell also uses semantic sections inside its own fully-themed
+   popovers (including the white Google + menu), so neutralize only that
+   inherited page-card chrome. :where() keeps this reset deliberately weak:
+   component class rules in design-system.css still win normally. */
+:where(#app .fb-browser-shell) section {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  border: 0;
+  border-radius: 0;
+}
+
 /* The shared browser shell owns the viewport. Override the legacy page
    scaffold above so the production PWA does not render as a centered 960px
    card with a large blank gutter on desktop. */

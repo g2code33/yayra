@@ -10,12 +10,12 @@ import { BrowserShell } from '../packages/shared-ui/src/components/BrowserShell.
  * Android/iOS (Capacitor) run the whole app - including BrowserShell.js -
  * inside ONE system WebView. A nested <iframe> inside that WebView is
  * subject to the exact same X-Frame-Options/frame-ancestors restrictions a
- * desktop browser tab would see, and Google/Apple/Microsoft refuse to
- * complete sign-in inside ANY embedded webview on mobile too - not just
- * Electron. These tests cover the Capacitor-side handoff, which mirrors the
- * Electron main-process handoff in electron/webviewBridge.cjs without
- * requiring a real Android/iOS runtime (unavailable in this environment -
- * see the test names for what is and is not exercised).
+ * desktop browser tab would see. Google explicitly restricts OAuth
+ * authorization in embedded user agents; ordinary account pages are not
+ * automatically classified as OAuth, while Apple/Microsoft keep their
+ * existing handoff behavior. These tests cover the Capacitor-side routing
+ * without requiring a real Android/iOS runtime (unavailable in this
+ * environment - see the test names for what is and is not exercised).
  */
 
 function installFakeCapacitorBrowser() {
@@ -51,56 +51,81 @@ test('capacitorBrowser getter: absent when Capacitor is present but running in a
   }
 });
 
-test('isSystemBrowserAuthHost: matches provider sign-in URL paths, not ordinary Google account browsing', async () => {
+test('isSystemBrowserAuthHost: matches OAuth and interactive Google sign-in, but leaves account/product pages alone', async () => {
   const container = document.createElement('div');
   const shell = new BrowserShell({ container, platform: 'android', isMobile: true });
   await shell.initialize();
 
-  assert.equal(shell.isSystemBrowserAuthHost('https://accounts.google.com/signin'), true);
+  assert.equal(shell.isSystemBrowserAuthHost('https://accounts.google.com/'), false);
+  assert.equal(shell.isSystemBrowserAuthHost('https://accounts.google.com/ManageAccount'), false);
+  assert.equal(shell.isSystemBrowserAuthHost('https://accounts.google.com/signin/v2/identifier'), true);
+  assert.equal(shell.isSystemBrowserAuthHost('https://accounts.google.com/v3/signin/rejected'), true);
+  assert.equal(shell.isSystemBrowserAuthHost('https://accounts.google.com/ServiceLogin'), true);
   assert.equal(shell.isSystemBrowserAuthHost('https://accounts.google.com/o/oauth2/v2/auth?client_id=x'), true);
+  assert.equal(shell.isSystemBrowserAuthHost('https://accounts.google.com/signin/oauth?client_id=x'), true);
   assert.equal(shell.isSystemBrowserAuthHost('https://appleid.apple.com/auth'), true);
   assert.equal(shell.isSystemBrowserAuthHost('https://sub.login.microsoftonline.com/'), true);
   assert.equal(shell.isSystemBrowserAuthHost('https://www.google.com/search?q=ghana'), false);
-  assert.equal(shell.isSystemBrowserAuthHost('https://accounts.google.com/ManageAccount'), false);
   assert.equal(shell.isSystemBrowserAuthHost('https://myaccount.google.com/security'), false);
-  assert.equal(shell.isSystemBrowserAuthHost('http://accounts.google.com/signin'), true);
+  assert.equal(shell.isSystemBrowserAuthHost('http://accounts.google.com/signin/v2/identifier'), true);
+  assert.equal(shell.isSystemBrowserAuthHost('http://accounts.google.com/o/oauth2/v2/auth'), true);
 });
 
-test('Capacitor: HTTP Google sign-in is upgraded to HTTPS before it opens externally', async () => {
+test('Capacitor: HTTP Google OAuth authorization is upgraded before it opens externally', async () => {
   const { opened, uninstall } = installFakeCapacitorBrowser();
   try {
     const container = document.createElement('div');
     const shell = new BrowserShell({ container, platform: 'android', isMobile: true });
     await shell.initialize();
-    shell.navigateActiveTab('http://accounts.google.com/signin');
+    shell.navigateActiveTab('http://accounts.google.com/o/oauth2/v2/auth?client_id=x');
     await Promise.resolve();
     await Promise.resolve();
-    assert.deepEqual(opened, ['https://accounts.google.com/signin']);
+    assert.deepEqual(opened, ['https://accounts.google.com/o/oauth2/v2/auth?client_id=x']);
   } finally {
     uninstall();
   }
 });
 
-test('Capacitor (Android/iOS): navigating to a sign-in host opens the native in-app browser instead of an embedded iframe', async () => {
+test('Capacitor: Google embedded-browser rejection is reopened as a clean HTTPS ServiceLogin URL', async () => {
+  const { opened, uninstall } = installFakeCapacitorBrowser();
+  try {
+    const container = document.createElement('div');
+    const shell = new BrowserShell({ container, platform: 'android', isMobile: true });
+    await shell.initialize();
+    const rejected = new URL('https://accounts.google.com/v3/signin/rejected');
+    rejected.searchParams.set('continue', 'https://mail.google.com/mail/u/0/#inbox');
+    shell.navigateActiveTab(rejected.toString());
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(opened.length, 1);
+    const repaired = new URL(opened[0]);
+    assert.equal(repaired.pathname, '/ServiceLogin');
+    assert.equal(repaired.searchParams.get('continue'), 'https://mail.google.com/mail/u/0/');
+  } finally {
+    uninstall();
+  }
+});
+
+test('Capacitor (Android/iOS): explicit Google OAuth navigation opens the native in-app browser instead of an embedded iframe', async () => {
   const { opened, uninstall } = installFakeCapacitorBrowser();
   try {
     const container = document.createElement('div');
     const shell = new BrowserShell({ container, platform: 'android', isMobile: true });
     await shell.initialize();
 
-    shell.navigateActiveTab('https://accounts.google.com/signin/v2/identifier');
+    shell.navigateActiveTab('https://accounts.google.com/o/oauth2/v2/auth?client_id=x');
     const el = shell.rootElement;
 
-    assert.equal(el.querySelector('iframe'), null, 'sign-in is never embedded in an iframe on Capacitor either');
+    assert.equal(el.querySelector('iframe'), null, 'the OAuth authorization request is never embedded in an iframe');
     // Allow the openExternally() promise microtask to resolve.
     await Promise.resolve();
     await Promise.resolve();
-    assert.deepEqual(opened, ['https://accounts.google.com/signin/v2/identifier']);
+    assert.deepEqual(opened, ['https://accounts.google.com/o/oauth2/v2/auth?client_id=x']);
 
     shell.render();
     shell.render();
     await Promise.resolve();
-    assert.deepEqual(opened, ['https://accounts.google.com/signin/v2/identifier'], 'chrome re-renders do not reopen the same provider login');
+    assert.deepEqual(opened, ['https://accounts.google.com/o/oauth2/v2/auth?client_id=x'], 'chrome re-renders do not reopen the same OAuth request');
   } finally {
     uninstall();
   }
@@ -162,7 +187,7 @@ test('Capacitor (Android/iOS): a frame-hostile NON-search site (google.com homep
   }
 });
 
-test('Plain web/PWA (no Capacitor, no Electron): sign-in host handoff falls back to window.open', async () => {
+test('Plain web/PWA (no Capacitor, no Electron): Google OAuth handoff falls back to window.open', async () => {
   delete globalThis.window.Capacitor;
   const originalOpen = window.open;
   const openedUrls = [];
@@ -172,11 +197,11 @@ test('Plain web/PWA (no Capacitor, no Electron): sign-in host handoff falls back
     const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
     await shell.initialize();
 
-    shell.navigateActiveTab('https://accounts.google.com/signin');
+    shell.navigateActiveTab('https://accounts.google.com/o/oauth2/v2/auth?client_id=x');
     await Promise.resolve();
     await Promise.resolve();
 
-    assert.deepEqual(openedUrls, ['https://accounts.google.com/signin']);
+    assert.deepEqual(openedUrls, ['https://accounts.google.com/o/oauth2/v2/auth?client_id=x']);
   } finally {
     window.open = originalOpen;
   }

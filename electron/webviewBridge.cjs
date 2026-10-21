@@ -1,5 +1,8 @@
 'use strict';
 
+const { popupMenuWithRecovery } = require('./nativeMenuGuard.cjs');
+const { buildMediaCompatibilityScript, installMediaCompatibility } = require('./mediaCompatibility.cjs');
+
 /**
  * Yayra Floating Browser - Native Web Content Engine Bridge (Electron main process)
  *
@@ -29,44 +32,76 @@
  * untouched; the renderer just tells this bridge where on screen to position
  * a transparent native layer for the active tab's real content.
  *
- * GOOGLE / IDENTITY PROVIDER SIGN-IN
- * -----------------------------------
- * Google (and several other identity providers) actively detect and refuse
- * to complete sign-in inside embedded browser surfaces as an anti-phishing
- * measure - see https://developers.google.com/identity/protocols/oauth2/policies#embedded-webviews.
- * An earlier version of this file tried presenting a desktop-Chrome identity
- * string (see `buildBrowserUserAgent()` below) specifically to get Google
- * sign-in itself to complete embedded. That did not work: Google also
- * inspects Client Hints (`navigator.userAgentData`, `Sec-CH-UA*` headers),
- * which a simple User-Agent string override does not change, and multiple
- * independent reports confirm Google has been actively closing this
- * loophole even for full Client Hints spoofing. Chasing that further is a
- * fragile, ever-escalating fight against Google's own anti-phishing system
- * for uncertain payoff, so Google sign-in is back on the system-browser
- * handoff path here, same as Apple/Microsoft, per Google's own
- * recommendation and RFC 8252 ("OAuth 2.0 for Native Apps").
+ * GOOGLE / IDENTITY PROVIDER AUTHENTICATION
+ * -----------------------------------------
+ * Google's OAuth policy and RFC 8252 prohibit authorization requests in an
+ * embedded user agent (see
+ * https://developers.google.com/identity/protocols/oauth2/policies#embedded-webviews).
+ * A separate Electron BrowserWindow is still controlled by the app, so it is
+ * not the OS external user-agent required by that policy. Yayra therefore
+ * cancels recognized OAuth and interactive Google Account sign-in routes
+ * before they enter a WebContentsView and opens them in the user's default
+ * secure browser. The source Yayra tab and its profile remain unchanged;
+ * browser cookies are never copied or imported.
  *
- * `buildBrowserUserAgent()` is kept and still applied to every tab, but only
- * for ordinary general-purpose site compatibility (many sites show "upgrade
- * your browser" nags or misrender for a Electron/x.y.z identity string) -
- * not as an attempt to defeat any site's anti-phishing/anti-automation
- * checks, which remain in effect and are handled by the handoff below.
+ * This classifier is deliberately route-scoped on the exact
+ * accounts.google.com host. Ordinary Google Search, Gmail content, account
+ * management, logout, and other product navigation are not hijacked. Apple
+ * and Microsoft retain the same external-browser handoff. App-level Yayra
+ * identity has a separate Authorization Code + PKCE loop and returns through
+ * its registered callback; arbitrary website sessions do not.
  */
 
-// Identity-provider endpoints that must be completed in the user's default
-// system browser instead of the embedded WebContentsView. Google is
-// deliberately path-scoped: accounts.google.com also serves ordinary account
-// pages, while OAuth/sign-in endpoints must never be embedded. Keep the
-// matching path policy in sync with BrowserShell.isSystemBrowserAuthHost().
+// Identity-provider endpoints that cannot safely complete in an embedded
+// page. Keep these exact predicates in sync with BrowserShell and Android.
 const SYSTEM_BROWSER_AUTH_HOSTS = Object.freeze([
   'accounts.google.com',
   'appleid.apple.com',
   'login.live.com',
   'login.microsoftonline.com'
 ]);
-const GOOGLE_SIGN_IN_PATH = /^\/(?:o\/oauth2(?:\/|$)|oauth2(?:\/|$)|signin(?:\/|$)|servicelogin(?:\/|$)|accountchooser(?:\/|$)|v\d+\/signin(?:\/|$)|gsi\/select(?:\/|$))/i;
+const GOOGLE_OAUTH_PATH = /^\/(?:o\/oauth2(?:\/|$)|oauth2(?:\/|$)|signin\/oauth(?:\/|$)|gsi\/select(?:\/|$))/i;
+const GOOGLE_INTERACTIVE_SIGNIN_PATH = /^\/(?:signin\/(?:v2|challenge|identifier|rejected)(?:\/|$)|v3\/signin(?:\/|$)|ServiceLogin(?:\/|$)|InteractiveLogin(?:\/|$)|AccountChooser(?:\/|$)|AddSession(?:\/|$))/i;
+const GOOGLE_REJECTED_SIGNIN_PATH = /^\/(?:signin\/rejected|v3\/signin\/rejected)(?:\/|$)/i;
+const MAX_AUTH_HANDOFF_URL_LENGTH = 8192;
 
 const WEBVIEW_EVENT_CHANNEL = 'yayra:webview-event';
+const PAGE_UNRESPONSIVE_RELOAD_DELAY_MS = 15_000;
+const PAGE_UNRESPONSIVE_RELOAD_COOLDOWN_MS = 60_000;
+const EMAIL_FIELD_FOCUSED_CHANNEL = 'yayra:email-field-focused';
+const EMAIL_ADDRESS_CAPTURED_CHANNEL = 'yayra:email-address-captured';
+const EMAIL_SUGGESTIONS_CHANNEL = 'yayra:email-suggestions';
+// Main-world WebAuthn observer -> isolated page preload -> this bridge.
+// Payloads contain only RP/action/status metadata, never challenges, user
+// handles, credential IDs, authenticator data, or signatures.
+const SITE_PASSKEY_REQUEST_CHANNEL = 'yayra:site-passkey-request';
+// Trusted main -> isolated preload -> capability-gated main-world observer.
+// This arms/cancels the native call without exposing ceremony data to chrome.
+const SITE_PASSKEY_CONTROL_CHANNEL = 'yayra:site-passkey-control';
+// Once Yayra has released a verified native request, it should settle almost
+// immediately. This bound is deliberately shorter than the provider's UP/UV
+// window; a broken Chromium/site exchange is aborted instead of leaving
+// “Completing passkey” on screen forever.
+const SITE_PASSKEY_COMPLETION_TIMEOUT_MS = 20_000;
+
+function sanitizeEmailAddress(value) {
+  const email = String(value || '').trim();
+  if (!email || email.length > 254 || /\s/.test(email)) return null;
+  const at = email.indexOf('@');
+  if (at <= 0 || at !== email.lastIndexOf('@') || at >= email.length - 1) return null;
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  if (local.length > 64 || !domain.includes('.') || domain.startsWith('.') || domain.endsWith('.') || domain.includes('..')) return null;
+  if (domain.split('.').some((label) => !label || label.length > 63)) return null;
+  return email;
+}
+
+function isHttpUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch { return false; }
+}
 
 // Sentinel pseudo-scheme the in-page WebAuthn helper uses to ask the main
 // process to open the CURRENT page in the user's default system browser
@@ -91,6 +126,23 @@ function decodeOpenExternalRequest(url) {
 }
 
 const POINTER_STYLE_ID = 'yayra-custom-pointer-theme';
+const POINTER_TEXT_CURSOR_ATTRIBUTE = 'data-yayra-selectable-text';
+const POINTER_TEXT_CURSOR_STATE = '__yayraSelectableTextCursorState';
+const TEXT_SELECTION_ACTIONS_STATE = '__yayraTextSelectionActionsState';
+
+// Keep the Yayra shell and native website views aligned. Many sites put the
+// actual hovered target (an SVG, icon, or text span) inside the control, so
+// buildPointerThemeCss applies the hand cursor to both each control and all of
+// its descendants.
+const POINTER_INTERACTIVE_SELECTORS = Object.freeze([
+  'a', 'area[href]', 'button',
+  'input[type="button"]', 'input[type="submit"]', 'input[type="reset"]', 'input[type="image"]',
+  'input[type="checkbox"]', 'input[type="radio"]', 'input[type="range"]', 'input[type="file"]', 'input[type="color"]',
+  'select', 'option', 'summary', 'label',
+  '[role="button"]', '[role="link"]', '[role="tab"]', '[role="menuitem"]', '[role="menuitemcheckbox"]', '[role="menuitemradio"]',
+  '[role="combobox"]', '[role="listbox"]', '[role="option"]', '[role="checkbox"]', '[role="radio"]', '[role="switch"]', '[role="slider"]', '[role="treeitem"]', '[role="gridcell"]',
+  '[aria-haspopup]', '[onclick]', '[tabindex]:not([tabindex="-1"])'
+]);
 
 /** Builds the same custom cursor rules for a native website view as the UI uses. */
 function buildPointerThemeCss(theme, size = 'normal') {
@@ -108,11 +160,20 @@ function buildPointerThemeCss(theme, size = 'normal') {
   const handHotspot = `${Math.round(9 * scale)} ${Math.round(2 * scale)}`;
   const arrowCursor = `url("data:image/svg+xml,${encodeURIComponent(arrowSvg)}") ${arrowHotspot}, auto`;
   const handCursor = `url("data:image/svg+xml,${encodeURIComponent(handSvg)}") ${handHotspot}, pointer`;
+  const interactiveSelector = `:where(${POINTER_INTERACTIVE_SELECTORS.join(', ')})`;
+  // :not(html) gives the hand rule the same specificity as body * in the
+  // arrow rule, allowing it to win by source order without overpowering the
+  // native I-beam rules on text inputs.
+  const handTargetSelector = `${interactiveSelector}:not(html)`;
 
   return [
     `html, body, body * { cursor: ${arrowCursor} !important; }`,
-    `button, a, [role="button"], [role="tab"], [role="menuitem"], select, summary, input[type="button"], input[type="submit"], input[type="reset"] { cursor: ${handCursor} !important; }`,
-    `input:not([type]), input[type="text"], input[type="search"], input[type="url"], input[type="email"], input[type="password"], input[type="number"], textarea, [contenteditable="true"], [role="textbox"] { cursor: text !important; }`
+    `${handTargetSelector}, ${handTargetSelector} * { cursor: ${handCursor} !important; }`,
+    `input:not([type]), input[type="text"], input[type="search"], input[type="url"], input[type="email"], input[type="tel"], input[type="password"], input[type="number"], input[type="date"], input[type="time"], input[type="datetime-local"], input[type="month"], input[type="week"], textarea, [contenteditable]:not([contenteditable="false"]), [role="textbox"] { cursor: text !important; }`,
+    // The pointer-move helper marks only selectable, non-interactive text
+    // under the actual hit point. Use the native I-beam and preserve normal
+    // drag selection, even when a site styles its content with user-select:none.
+    `[${POINTER_TEXT_CURSOR_ATTRIBUTE}="true"] { cursor: text !important; user-select: text !important; -webkit-user-select: text !important; }`
   ].join('\n');
 }
 
@@ -155,6 +216,378 @@ function buildPointerThemeScript(theme, size = 'normal') {
 }
 
 /**
+ * Custom arrows normally hide Chromium's context-sensitive I-beam. This
+ * page-local helper restores it only when the hit-tested point is over real
+ * selectable text outside an interactive control. Pointerdown marks the text
+ * synchronously so native drag-to-select starts with user-select enabled.
+ */
+function buildPointerTextCursorScript(theme) {
+  const enabled = theme === 'yayra' || theme === 'high-visibility';
+  const stateKey = JSON.stringify(POINTER_TEXT_CURSOR_STATE);
+  const attribute = JSON.stringify(POINTER_TEXT_CURSOR_ATTRIBUTE);
+  if (!enabled) {
+    return `(function () { try { window[${stateKey}]?.cleanup?.(); } catch (_err) {} })();`;
+  }
+  const interactiveSelector = JSON.stringify(POINTER_INTERACTIVE_SELECTORS.join(', '));
+  return `(function () {
+    try {
+      var stateKey = ${stateKey};
+      var attribute = ${attribute};
+      var interactiveSelector = ${interactiveSelector};
+      try { window[stateKey]?.cleanup?.(); } catch (_err) {}
+      var current = null;
+      var pending = false;
+      var scheduledFrame = null;
+      var latestPoint = null;
+      var clear = function () {
+        if (current) { try { current.removeAttribute(attribute); } catch (_err) {} }
+        current = null;
+      };
+      var isInteractive = function (target) {
+        var element = target && target.nodeType === 1 ? target : target && target.parentElement;
+        try {
+          while (element) {
+            if (element.closest && element.closest(interactiveSelector)) return true;
+            var root = element.getRootNode && element.getRootNode();
+            element = root && root.host ? root.host : null;
+          }
+        } catch (_err) { return false; }
+        return false;
+      };
+      var textElementAt = function (x, y) {
+        var range = null;
+        try {
+          if (typeof document.caretRangeFromPoint === 'function') {
+            range = document.caretRangeFromPoint(x, y);
+          } else if (typeof document.caretPositionFromPoint === 'function') {
+            var position = document.caretPositionFromPoint(x, y);
+            if (position && position.offsetNode) {
+              range = document.createRange();
+              range.setStart(position.offsetNode, position.offset);
+              range.collapse(true);
+            }
+          }
+        } catch (_err) { range = null; }
+        var node = range && range.startContainer;
+        if (!node || node.nodeType !== 3 || !String(node.nodeValue || '').trim()) return null;
+        var element = node.parentElement;
+        if (!element || isInteractive(element)) return null;
+        try {
+          var check = document.createRange();
+          check.selectNodeContents(node);
+          var rects = check.getClientRects();
+          var hit = false;
+          for (var i = 0; i < rects.length; i += 1) {
+            var rect = rects[i];
+            if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) { hit = true; break; }
+          }
+          if (!hit) return null;
+        } catch (_err) { return null; }
+        return element;
+      };
+      var update = function (point) {
+        var next = textElementAt(point.x, point.y);
+        if (next === current) return;
+        clear();
+        if (next) {
+          try { next.setAttribute(attribute, 'true'); current = next; } catch (_err) {}
+        }
+      };
+      var onMove = function (event) {
+        if (!event) { clear(); return; }
+        // Touch has no visible cursor, but pointerdown must still opt the text
+        // into user-select before the native long-press/highlight gesture.
+        if (event.pointerType === 'touch' && event.type !== 'pointerdown') return;
+        if (isInteractive(event.target)) { latestPoint = null; clear(); return; }
+        latestPoint = { x: event.clientX, y: event.clientY };
+        if (event.type === 'pointerdown') { update(latestPoint); return; }
+        if (pending) return;
+        pending = true;
+        var run = function () {
+          pending = false;
+          scheduledFrame = null;
+          var point = latestPoint;
+          latestPoint = null;
+          if (point) update(point);
+        };
+        if (typeof window.requestAnimationFrame === 'function') scheduledFrame = window.requestAnimationFrame(run);
+        else scheduledFrame = setTimeout(run, 16);
+      };
+      var onPointerOut = function (event) { if (!event.relatedTarget) clear(); };
+      var cleanup = function () {
+        if (scheduledFrame !== null) {
+          if (typeof window.cancelAnimationFrame === 'function') window.cancelAnimationFrame(scheduledFrame);
+          else clearTimeout(scheduledFrame);
+          scheduledFrame = null;
+        }
+        pending = false;
+        latestPoint = null;
+        document.removeEventListener('pointermove', onMove, true);
+        document.removeEventListener('mousemove', onMove, true);
+        document.removeEventListener('pointerdown', onMove, true);
+        document.removeEventListener('pointerout', onPointerOut, true);
+        window.removeEventListener('blur', clear, true);
+        clear();
+        try { delete window[stateKey]; } catch (_err) { window[stateKey] = null; }
+      };
+      document.addEventListener('pointermove', onMove, true);
+      document.addEventListener('mousemove', onMove, true);
+      document.addEventListener('pointerdown', onMove, true);
+      document.addEventListener('pointerout', onPointerOut, true);
+      window.addEventListener('blur', clear, true);
+      window[stateKey] = { cleanup: cleanup };
+    } catch (_err) { /* cursor enhancement is best-effort; never block page interaction */ }
+  })();`;
+}
+
+/**
+ * Builds a self-contained, page-local text-selection toolbar for native
+ * website surfaces. Selection text never crosses IPC: Copy/Cut stay in the
+ * guest page, and Search/Ask AI leave only after an explicit button click via
+ * the existing new-window routing. Password fields and unbounded selections
+ * are deliberately excluded.
+ */
+function buildTextSelectionActionsScript() {
+  const stateKey = JSON.stringify(TEXT_SELECTION_ACTIONS_STATE);
+  return `(function () {
+    try {
+      var stateKey = ${stateKey};
+      try { window[stateKey]?.cleanup?.(); } catch (_err) {}
+      var toolbar = null;
+      var toolbarSnapshot = null;
+      var pointerSelecting = false;
+      var updateHandle = null;
+      var dismissedSignature = '';
+      var nodeIds = typeof WeakMap === 'function' ? new WeakMap() : null;
+      var nextNodeId = 0;
+      var MAX_COPY = 100000;
+      var MAX_QUERY = 2000;
+      var listeners = [];
+      var nodeId = function (node) {
+        if (!node || !nodeIds) return '0';
+        var current = nodeIds.get(node);
+        if (!current) { current = String(++nextNodeId); nodeIds.set(node, current); }
+        return current;
+      };
+      var bind = function (target, type, listener, options) {
+        if (!target || typeof target.addEventListener !== 'function') return;
+        target.addEventListener(type, listener, options);
+        listeners.push([target, type, listener, options]);
+      };
+      var selectedField = function () {
+        var field = document.activeElement;
+        if (!field || (field.tagName !== 'INPUT' && field.tagName !== 'TEXTAREA') || field.disabled || field.readOnly) return null;
+        var type = String(field.type || field.getAttribute('type') || 'text').toLowerCase();
+        if (field.tagName === 'INPUT' && ['password','hidden','checkbox','radio','button','submit','reset','file','image','range','color'].indexOf(type) >= 0) return null;
+        return typeof field.selectionStart === 'number' && typeof field.selectionEnd === 'number' ? field : null;
+      };
+      var readSnapshot = function () {
+        var field = selectedField();
+        if (field && field.selectionEnd > field.selectionStart) {
+          var fieldText = String(field.value || '').slice(field.selectionStart, field.selectionEnd);
+          if (!fieldText.trim() || fieldText.length > MAX_COPY) return null;
+          return {
+            kind: 'field', text: fieldText, editable: true, field: field,
+            start: field.selectionStart, end: field.selectionEnd,
+            rect: field.getBoundingClientRect()
+          };
+        }
+        var selection = null;
+        try { selection = window.getSelection(); } catch (_err) { selection = null; }
+        if (!selection || selection.isCollapsed || selection.rangeCount < 1) return null;
+        var text = String(selection || '');
+        if (!text.trim() || text.length > MAX_COPY) return null;
+        var range;
+        try { range = selection.getRangeAt(selection.rangeCount - 1); } catch (_err) { return null; }
+        var element = range.commonAncestorContainer;
+        if (element && element.nodeType !== 1) element = element.parentElement || element.parentNode;
+        if (toolbar && toolbar.contains(element)) return null;
+        var editableRoot = null;
+        try { editableRoot = element && element.closest ? element.closest('[contenteditable]:not([contenteditable="false"])') : null; } catch (_err) {}
+        if (!editableRoot && element && element.isContentEditable) editableRoot = element;
+        var rect = null;
+        try {
+          rect = range.getBoundingClientRect();
+          if ((!rect || (!rect.width && !rect.height)) && range.getClientRects) rect = range.getClientRects()[0] || rect;
+        } catch (_err) {}
+        return {
+          kind: 'range', text: text, editable: Boolean(editableRoot), editableRoot: editableRoot,
+          range: range, rect: rect,
+          anchorNode: selection.anchorNode, anchorOffset: selection.anchorOffset,
+          focusNode: selection.focusNode, focusOffset: selection.focusOffset
+        };
+      };
+      var signature = function (snapshot) {
+        if (!snapshot) return '';
+        if (snapshot.kind === 'field') return 'f:' + nodeId(snapshot.field) + ':' + snapshot.start + ':' + snapshot.end + ':' + snapshot.text;
+        return 'r:' + nodeId(snapshot.anchorNode) + ':' + snapshot.anchorOffset + ':' + nodeId(snapshot.focusNode) + ':' + snapshot.focusOffset + ':' + snapshot.text;
+      };
+      var hide = function (remember) {
+        var snapshot = toolbarSnapshot || readSnapshot();
+        if (remember && snapshot) dismissedSignature = signature(snapshot);
+        try { toolbar?.remove(); } catch (_err) {}
+        toolbar = null;
+        toolbarSnapshot = null;
+      };
+      var important = function (element, rules) {
+        Object.keys(rules).forEach(function (name) {
+          try { element.style.setProperty(name, rules[name], 'important'); } catch (_err) {}
+        });
+      };
+      var copyText = async function (snapshot) {
+        try { if (document.execCommand && document.execCommand('copy')) return true; } catch (_err) {}
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(snapshot.text);
+            return true;
+          }
+        } catch (_err) {}
+        return false;
+      };
+      var cutText = async function (snapshot) {
+        try { if (document.execCommand && document.execCommand('cut')) return true; } catch (_err) {}
+        if (!(await copyText(snapshot))) return false;
+        if (snapshot.kind === 'field') {
+          if (typeof snapshot.field.setRangeText === 'function') snapshot.field.setRangeText('', snapshot.start, snapshot.end, 'end');
+          else snapshot.field.value = String(snapshot.field.value || '').slice(0, snapshot.start) + String(snapshot.field.value || '').slice(snapshot.end);
+          try { snapshot.field.dispatchEvent(new Event('input', { bubbles: true, inputType: 'deleteByCut' })); } catch (_err) {}
+        } else {
+          try { snapshot.range.deleteContents(); } catch (_err) {}
+          try { snapshot.editableRoot?.dispatchEvent(new Event('input', { bubbles: true, inputType: 'deleteByCut' })); } catch (_err) {}
+        }
+        return true;
+      };
+      var pasteText = async function (snapshot) {
+        var text = '';
+        try {
+          if (!navigator.clipboard || !navigator.clipboard.readText) return false;
+          text = await navigator.clipboard.readText();
+        } catch (_err) { return false; }
+        if (!text) return false;
+        if (snapshot.kind === 'field') {
+          if (typeof snapshot.field.setRangeText === 'function') snapshot.field.setRangeText(text, snapshot.start, snapshot.end, 'end');
+          else snapshot.field.value = String(snapshot.field.value || '').slice(0, snapshot.start) + text + String(snapshot.field.value || '').slice(snapshot.end);
+          try { snapshot.field.dispatchEvent(new Event('input', { bubbles: true, inputType: 'insertFromPaste', data: text })); } catch (_err) {}
+        } else {
+          try {
+            snapshot.range.deleteContents();
+            var node = document.createTextNode(text);
+            snapshot.range.insertNode(node);
+            snapshot.range.setStartAfter(node);
+            snapshot.range.collapse(true);
+          } catch (_err) { return false; }
+          try { snapshot.editableRoot?.dispatchEvent(new Event('input', { bubbles: true, inputType: 'insertFromPaste', data: text })); } catch (_err) {}
+        }
+        return true;
+      };
+      var openAction = function (url) {
+        try { window.open(url, '_blank', 'noopener,noreferrer'); } catch (_err) {}
+      };
+      var addButton = function (parent, label, action) {
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = label;
+        button.setAttribute('aria-label', label);
+        important(button, {
+          appearance: 'none', border: '0', 'border-radius': '7px', background: 'transparent', color: '#f8fafc',
+          cursor: 'pointer', padding: '6px 10px', 'min-height': '30px', 'white-space': 'nowrap',
+          font: '600 12px/1.2 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif'
+        });
+        button.addEventListener('pointerdown', function (event) { event.preventDefault(); event.stopPropagation(); });
+        button.addEventListener('mouseenter', function () { button.style.setProperty('background', 'rgba(255,255,255,.13)', 'important'); });
+        button.addEventListener('mouseleave', function () { button.style.setProperty('background', 'transparent', 'important'); });
+        button.addEventListener('click', function (event) {
+          event.preventDefault(); event.stopPropagation();
+          dismissedSignature = signature(toolbarSnapshot);
+          hide(true);
+          try { Promise.resolve(action()).catch(function () {}); } catch (_err) {}
+        });
+        parent.appendChild(button);
+      };
+      var show = function (snapshot) {
+        if (!snapshot || signature(snapshot) === dismissedSignature) return;
+        if (toolbarSnapshot && signature(toolbarSnapshot) === signature(snapshot) && toolbar && toolbar.isConnected) return;
+        hide(false);
+        var bar = document.createElement('div');
+        bar.id = 'yayra-text-selection-actions';
+        bar.setAttribute('role', 'toolbar');
+        bar.setAttribute('aria-label', 'Text selection actions');
+        important(bar, {
+          position: 'fixed', display: 'inline-flex', 'align-items': 'center', gap: '3px', 'z-index': '2147483647',
+          padding: '4px', 'min-height': '38px', 'max-width': 'calc(100vw - 16px)', overflow: 'auto',
+          border: '1px solid rgba(255,255,255,.18)', 'border-radius': '11px', background: 'rgba(24,26,33,.98)',
+          color: '#f8fafc', 'box-shadow': '0 10px 32px rgba(0,0,0,.44)', 'user-select': 'none',
+          '-webkit-user-select': 'none', 'white-space': 'nowrap', margin: '0', 'box-sizing': 'border-box'
+        });
+        bar.addEventListener('pointerdown', function (event) { event.preventDefault(); event.stopPropagation(); });
+        toolbar = bar;
+        toolbarSnapshot = snapshot;
+        addButton(bar, 'Copy', function () { return copyText(snapshot); });
+        if (snapshot.editable) {
+          addButton(bar, 'Cut', function () { return cutText(snapshot); });
+          addButton(bar, 'Paste', function () { return pasteText(snapshot); });
+        }
+        if (snapshot.text.length <= MAX_QUERY) {
+          addButton(bar, 'Search', function () { openAction('https://www.google.com/search?q=' + encodeURIComponent(snapshot.text.trim())); });
+          addButton(bar, 'Ask Yayra AI', function () { openAction('yayra://ai?q=' + encodeURIComponent(snapshot.text.trim())); });
+        }
+        (document.body || document.documentElement).appendChild(bar);
+        var rect = snapshot.rect || {};
+        var width = bar.offsetWidth || Math.min(390, window.innerWidth - 16);
+        var height = bar.offsetHeight || 42;
+        var center = Number.isFinite(rect.left) && Number.isFinite(rect.right) ? (rect.left + rect.right) / 2 : window.innerWidth / 2;
+        var left = Math.max(8, Math.min(window.innerWidth - width - 8, center - width / 2));
+        var top = (Number.isFinite(rect.top) ? rect.top : window.innerHeight / 2) - height - 10;
+        if (top < 8) top = Math.min(window.innerHeight - height - 8, (Number(rect.bottom) || 8) + 10);
+        bar.style.setProperty('left', Math.round(Math.max(8, left)) + 'px', 'important');
+        bar.style.setProperty('top', Math.round(Math.max(8, top)) + 'px', 'important');
+      };
+      var update = function () {
+        updateHandle = null;
+        var snapshot = readSnapshot();
+        if (!snapshot) { dismissedSignature = ''; hide(false); return; }
+        show(snapshot);
+      };
+      var schedule = function () {
+        if (pointerSelecting || updateHandle !== null) return;
+        if (typeof window.requestAnimationFrame === 'function') updateHandle = window.requestAnimationFrame(update);
+        else updateHandle = setTimeout(update, 0);
+      };
+      var onPointerDown = function (event) {
+        if (toolbar && (event.target === toolbar || toolbar.contains(event.target))) return;
+        hide(true);
+        pointerSelecting = true;
+      };
+      var onPointerUp = function () { pointerSelecting = false; schedule(); };
+      var onSelectionChange = function () { schedule(); };
+      var onKeyDown = function (event) { if (event.key === 'Escape') hide(true); };
+      var onScroll = function () { hide(true); };
+      var cleanup = function () {
+        if (updateHandle !== null) {
+          try { window.cancelAnimationFrame?.(updateHandle); } catch (_err) {}
+          try { clearTimeout(updateHandle); } catch (_err) {}
+        }
+        updateHandle = null;
+        listeners.forEach(function (entry) { try { entry[0].removeEventListener(entry[1], entry[2], entry[3]); } catch (_err) {} });
+        listeners = [];
+        hide(false);
+        try { delete window[stateKey]; } catch (_err) { window[stateKey] = null; }
+      };
+      bind(document, 'pointerdown', onPointerDown, true);
+      bind(document, 'pointerup', onPointerUp, true);
+      bind(document, 'pointercancel', onPointerUp, true);
+      bind(document, 'selectionchange', onSelectionChange, true);
+      bind(document, 'select', onSelectionChange, true);
+      bind(document, 'keyup', onSelectionChange, true);
+      bind(document, 'keydown', onKeyDown, true);
+      bind(window, 'scroll', onScroll, true);
+      bind(window, 'blur', function () { hide(true); }, true);
+      window[stateKey] = { cleanup: cleanup };
+    } catch (_err) { /* selection actions are progressive enhancement */ }
+  })();`;
+}
+
+/**
  * Main-world script injected into every page-rendering WebContentsView on
  * dom-ready (executeJavaScript - a preload CANNOT do this job, because
  * with contextIsolation the page calls its OWN navigator.credentials, not
@@ -169,85 +602,370 @@ function buildPointerThemeScript(theme, size = 'normal') {
  * just awaits navigator.credentials.get() while showing "Waiting for
  * input from browser interaction..." with no way out.
  *
- * This watchdog wraps navigator.credentials.get/create for publicKey
- * requests only. If a request is still unsettled after ~6s it shows a
- * small in-page banner explaining what works (USB key / picking another
- * 2FA method on the page) and offering to reopen the page in the user's
- * real browser. The banner removes itself the moment the request settles
- * either way, so working flows (Windows Hello, a touched USB key) never
- * see it. Password-manager credentials.get() calls (no publicKey) are
- * untouched.
+ * This observer wraps navigator.credentials.get/create for publicKey
+ * requests only. Every genuine request is identified by relying-party ID and
+ * reported (metadata only) to Yayra chrome. If the ceremony is not instantly
+ * completed, an in-page helper explains the active device/security-key path
+ * and provides a one-click system-browser fallback for phone/synced passkeys.
+ * Success removes it immediately; an honest failure remains briefly with the
+ * fallback instead of leaving the user at a dead spinner. Passive conditional
+ * mediation stays silent, and password-manager credentials.get() calls (no
+ * publicKey) are untouched.
  */
 function buildWebAuthnWatchdogScript() {
   return `(function () {
   if (window.__yayraWebauthnWatchdog) return;
   window.__yayraWebauthnWatchdog = true;
   if (!window.PublicKeyCredential || !navigator.credentials) return;
-  var WAIT_MS = window.__yayraWebauthnWaitMs || 6000;
+  var WAIT_MS = Number(window.__yayraWebauthnWaitMs) > 0 ? Number(window.__yayraWebauthnWaitMs) : 350;
+  var LONG_WAIT_MS = Number(window.__yayraWebauthnLongWaitMs) > WAIT_MS ? Number(window.__yayraWebauthnLongWaitMs) : 8000;
   var banner = null;
-  var pending = 0;
-  var timer = null;
+  var bannerMessage = null;
+  var currentRequest = null;
+  var pending = Object.create(null);
+  var sequence = 0;
+  var platformAuthenticator = null;
+  var linuxSession = /Linux/i.test(String(navigator.userAgent || navigator.platform || ''));
+
+  function requestCount() { return Object.keys(pending).length; }
+  function safeRpId(options) {
+    var value = '';
+    try {
+      value = options.publicKey.rpId || (options.publicKey.rp && options.publicKey.rp.id) || '';
+      if (!value && window.location && window.location.hostname) value = window.location.hostname;
+    } catch (_err) { value = ''; }
+    value = String(value || '').trim().toLowerCase();
+    return value && value.length <= 253 && /^[a-z0-9.-]+$/.test(value) ? value : 'this site';
+  }
+  function requestMeta(action, options) {
+    var selection = options && options.publicKey && options.publicKey.authenticatorSelection;
+    var attachment = selection && selection.authenticatorAttachment;
+    return {
+      requestId: 'yayra-wa-' + Date.now().toString(36) + '-' + (++sequence),
+      action: action,
+      rpId: safeRpId(options),
+      conditional: Boolean(options && options.mediation === 'conditional'),
+      attachment: attachment === 'platform' || attachment === 'cross-platform' ? attachment : 'any',
+      dismissed: false,
+      timer: null,
+      longTimer: null
+    };
+  }
+  function notify(phase, meta, success, errorName) {
+    if (typeof window.postMessage !== 'function') return;
+    try {
+      window.postMessage({
+        source: 'yayra-site-passkey',
+        version: 1,
+        phase: phase,
+        requestId: meta.requestId,
+        action: meta.action,
+        rpId: meta.rpId,
+        conditional: meta.conditional,
+        attachment: meta.attachment,
+        success: typeof success === 'boolean' ? success : undefined,
+        errorName: errorName ? String(errorName).slice(0, 64) : undefined
+      }, '*');
+    } catch (_err) { /* notification is an enhancement; WebAuthn keeps running */ }
+  }
   function removeBanner() {
     if (!banner) return;
     if (banner.remove) banner.remove();
     else if (banner.parentNode) banner.parentNode.removeChild(banner);
     banner = null;
+    bannerMessage = null;
+    currentRequest = null;
   }
-  function showBanner() {
-    if (banner || !document.body) return;
-    banner = document.createElement('div');
-    banner.id = 'yayra-webauthn-helper';
-    banner.setAttribute('style', 'position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:2147483647;max-width:540px;background:#111827;color:#e5e7eb;border:1px solid rgba(255,255,255,0.18);border-radius:12px;padding:14px 16px;font:13px/1.5 system-ui,sans-serif;box-shadow:0 12px 40px rgba(0,0,0,0.55);');
-    var msg = document.createElement('div');
-    msg.textContent = 'Still waiting for a passkey. If you have a USB security key, plug it in and touch it now. Passkeys saved on a phone or synced in another browser are not available inside the desktop app - choose a different option on this page (such as an authenticator code), or finish this step in your regular browser.';
-    var row = document.createElement('div');
-    row.setAttribute('style', 'margin-top:10px;display:flex;gap:8px;justify-content:flex-end;');
-    var openBtn = document.createElement('button');
-    openBtn.id = 'yayra-webauthn-open-external';
-    openBtn.textContent = 'Open in my browser';
-    openBtn.setAttribute('style', 'border:none;border-radius:8px;padding:6px 12px;background:#3b82f6;color:#fff;cursor:pointer;font:600 12px system-ui,sans-serif;');
-    openBtn.addEventListener('click', function () {
-      window.open('yayra-openexternal://' + encodeURIComponent(window.location.href));
-    });
-    var dismissBtn = document.createElement('button');
-    dismissBtn.id = 'yayra-webauthn-dismiss';
-    dismissBtn.textContent = 'Dismiss';
-    dismissBtn.setAttribute('style', 'border:none;border-radius:8px;padding:6px 12px;background:rgba(255,255,255,0.12);color:#e5e7eb;cursor:pointer;font:600 12px system-ui,sans-serif;');
-    dismissBtn.addEventListener('click', removeBanner);
-    row.appendChild(openBtn);
-    row.appendChild(dismissBtn);
-    banner.appendChild(msg);
-    banner.appendChild(row);
-    document.body.appendChild(banner);
+  function description(meta, state, errorName) {
+    var site = meta.rpId === 'this site' ? 'This site' : meta.rpId;
+    var verb = meta.action === 'create' ? 'create a new passkey' : 'use a passkey';
+    if (state === 'failed') {
+      return 'Yayra recognized the passkey request from ' + site + ', but the authenticator did not complete it' +
+        (errorName ? ' (' + errorName + ')' : '') + '. Try your device prompt or a USB/NFC security key, or open this page in your system browser for a phone or synced passkey.';
+    }
+    var text = site + ' is asking to ' + verb + '. The secure Chromium WebAuthn request is active in Yayra. ';
+    if (platformAuthenticator === true) {
+      text += linuxSession
+        ? 'Use the passkey action in Yayra’s address bar. Yayra will verify with your configured PIN, Touch ID, or system-lock method, or offer the exact-page fallback when this profile has no matching local credential.'
+        : 'Complete the Windows Hello or Touch ID prompt, or use a security key.';
+    } else if (platformAuthenticator === false) {
+      text += 'A built-in device authenticator is not exposed in this session; a compatible USB/NFC security key can still work when no unsupported PIN prompt is needed. Phone and synced passkeys can be used by opening this page in your system browser.';
+    } else {
+      text += 'Complete your device prompt or insert and touch your security key.';
+    }
+    if (state === 'waiting') text += ' Yayra is still waiting without blocking the page.';
+    return text;
   }
-  function watch(original) {
+  function renderBanner(meta, state, errorName) {
+    if (!meta || meta.dismissed || !document.body) return;
+    currentRequest = meta;
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'yayra-webauthn-helper';
+      banner.setAttribute('role', 'status');
+      banner.setAttribute('aria-live', 'polite');
+      banner.setAttribute('style', 'position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:2147483647;width:min(560px,calc(100vw - 32px));box-sizing:border-box;background:#111827;color:#e5e7eb;border:1px solid rgba(255,255,255,0.18);border-radius:12px;padding:14px 16px;font:13px/1.5 system-ui,sans-serif;box-shadow:0 12px 40px rgba(0,0,0,0.55);');
+      var heading = document.createElement('strong');
+      heading.textContent = 'Passkey request active';
+      heading.setAttribute('style', 'display:block;margin-bottom:4px;color:#f8fafc;font-size:13px;');
+      bannerMessage = document.createElement('div');
+      bannerMessage.id = 'yayra-webauthn-message';
+      var row = document.createElement('div');
+      row.setAttribute('style', 'margin-top:10px;display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;');
+      var openBtn = document.createElement('button');
+      openBtn.id = 'yayra-webauthn-open-external';
+      openBtn.textContent = 'Use system browser';
+      openBtn.setAttribute('style', 'border:none;border-radius:8px;padding:6px 12px;background:#3b82f6;color:#fff;cursor:pointer;font:600 12px system-ui,sans-serif;');
+      openBtn.addEventListener('click', function () {
+        window.open('yayra-openexternal://' + encodeURIComponent(window.location.href));
+      });
+      var dismissBtn = document.createElement('button');
+      dismissBtn.id = 'yayra-webauthn-dismiss';
+      dismissBtn.textContent = 'Continue here';
+      dismissBtn.setAttribute('style', 'border:none;border-radius:8px;padding:6px 12px;background:rgba(255,255,255,0.12);color:#e5e7eb;cursor:pointer;font:600 12px system-ui,sans-serif;');
+      dismissBtn.addEventListener('click', function () {
+        if (currentRequest) currentRequest.dismissed = true;
+        removeBanner();
+      });
+      row.appendChild(openBtn);
+      row.appendChild(dismissBtn);
+      banner.appendChild(heading);
+      banner.appendChild(bannerMessage);
+      banner.appendChild(row);
+      document.body.appendChild(banner);
+    }
+    if (bannerMessage) bannerMessage.textContent = description(meta, state, errorName);
+  }
+  function scheduleHelper(meta) {
+    if (meta.conditional) return;
+    meta.timer = setTimeout(function () {
+      meta.timer = null;
+      if (pending[meta.requestId]) renderBanner(meta, 'active');
+    }, WAIT_MS);
+    if (meta.timer && typeof meta.timer.unref === 'function') meta.timer.unref();
+    meta.longTimer = setTimeout(function () {
+      meta.longTimer = null;
+      if (pending[meta.requestId]) renderBanner(meta, 'waiting');
+    }, LONG_WAIT_MS);
+    if (meta.longTimer && typeof meta.longTimer.unref === 'function') meta.longTimer.unref();
+  }
+  function scheduleFailureRemoval(meta) {
+    var timer = setTimeout(function () { if (currentRequest === meta) removeBanner(); }, 15000);
+    if (timer && typeof timer.unref === 'function') timer.unref();
+  }
+  function settle(meta, success, error, alreadyReported) {
+    if (!pending[meta.requestId]) return;
+    if (meta.timer) clearTimeout(meta.timer);
+    if (meta.longTimer) clearTimeout(meta.longTimer);
+    delete pending[meta.requestId];
+    var errorName = typeof error === 'string' ? error : (error && error.name ? String(error.name) : '');
+    if (!alreadyReported) notify('settled', meta, success, errorName);
+    if (!success && !meta.conditional && !meta.dismissed) {
+      renderBanner(meta, 'failed', errorName);
+      scheduleFailureRemoval(meta);
+    } else if (requestCount() === 0) {
+      removeBanner();
+    }
+  }
+  function watch(original, action) {
     return function (options) {
-      var result = original.apply(navigator.credentials, arguments);
-      if (!options || !options.publicKey || !result || typeof result.then !== 'function') return result;
-      pending += 1;
-      if (!timer) {
-        timer = setTimeout(function () {
-          timer = null;
-          if (pending > 0) showBanner();
-        }, WAIT_MS);
-      }
-      var settle = function () {
-        pending = pending > 0 ? pending - 1 : 0;
-        if (pending === 0) {
-          if (timer) { clearTimeout(timer); timer = null; }
-          removeBanner();
+      if (!options || !options.publicKey) return original.apply(navigator.credentials, arguments);
+      var meta = requestMeta(action, options);
+      notify('started', meta);
+      var result;
+      try {
+        result = original.apply(navigator.credentials, arguments);
+      } catch (error) {
+        notify('settled', meta, false, error && error.name);
+        if (!meta.conditional) {
+          renderBanner(meta, 'failed', error && error.name);
+          scheduleFailureRemoval(meta);
         }
-      };
-      result.then(settle, settle);
+        throw error;
+      }
+      if (!result || typeof result.then !== 'function') {
+        notify('settled', meta, false, 'InvalidStateError');
+        return result;
+      }
+      pending[meta.requestId] = meta;
+      scheduleHelper(meta);
+      result.then(function () { settle(meta, true); }, function (error) { settle(meta, false, error); });
       return result;
     };
   }
-  try {
-    navigator.credentials.get = watch(navigator.credentials.get.bind(navigator.credentials));
-    navigator.credentials.create = watch(navigator.credentials.create.bind(navigator.credentials));
-  } catch (_err) {
-    // Site froze the credentials container - leave it untouched.
+  function install(name, action) {
+    var original = navigator.credentials[name];
+    if (typeof original !== 'function') return;
+    var wrapped = watch(original, action);
+    try {
+      Object.defineProperty(navigator.credentials, name, { configurable: true, writable: true, value: wrapped });
+    } catch (_err) {
+      try { navigator.credentials[name] = wrapped; } catch (_ignored) { /* frozen by site/embedder */ }
+    }
   }
+  try {
+    var capability = window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable;
+    if (typeof capability === 'function') {
+      Promise.resolve(capability.call(window.PublicKeyCredential)).then(function (available) {
+        platformAuthenticator = Boolean(available);
+        if (currentRequest && bannerMessage) bannerMessage.textContent = description(currentRequest, 'active');
+      }, function () { platformAuthenticator = false; });
+    }
+  } catch (_err) { platformAuthenticator = null; }
+
+  // Electron 44+ installs a tiny main-world observer from the isolated preload
+  // at document start. Subscribe to it so even requests made before dom-ready
+  // are recognized, while this script remains the helper-UI owner. Older
+  // Electron/test hosts fall back to wrapping the native methods here.
+  var earlyObserver = window.__yayraSitePasskeyObserver;
+  var subscribed = false;
+  if (earlyObserver && earlyObserver.version === 1 && typeof earlyObserver.subscribe === 'function') {
+    try {
+      earlyObserver.subscribe(function (event) {
+        if (!event || typeof event.requestId !== 'string' || !/^yayra-wa-[a-z0-9-]{1,80}$/i.test(event.requestId)) return;
+        if (event.phase === 'started') {
+          if (pending[event.requestId]) return;
+          var meta = {
+            requestId: event.requestId,
+            action: event.action === 'create' ? 'create' : 'get',
+            rpId: typeof event.rpId === 'string' ? event.rpId : 'this site',
+            conditional: Boolean(event.conditional),
+            attachment: event.attachment === 'platform' || event.attachment === 'cross-platform' ? event.attachment : 'any',
+            dismissed: false,
+            timer: null,
+            longTimer: null
+          };
+          pending[meta.requestId] = meta;
+          scheduleHelper(meta);
+          return;
+        }
+        if (event.phase === 'settled' && pending[event.requestId]) {
+          settle(pending[event.requestId], event.success === true, String(event.errorName || ''), true);
+        }
+      });
+      subscribed = true;
+    } catch (_err) { subscribed = false; }
+  }
+  if (!subscribed || (earlyObserver.methods && earlyObserver.methods.get === false)) install('get', 'get');
+  if (!subscribed || (earlyObserver.methods && earlyObserver.methods.create === false)) install('create', 'create');
+})();`;
+}
+
+/**
+ * Google Search can finish its document load while an AI Overview is still
+ * displaying its standalone "Thinking" status. That request is page-level
+ * activity (not WebContents.isLoading()), so the browser's ordinary loading
+ * watchdog cannot see it. Watch only Google Search results, and only reload
+ * after the visible status remains continuous for the configured timeout.
+ *
+ * A per-query sessionStorage cooldown makes this a single recovery attempt,
+ * not a reload loop. It stores only a short hash of the query URL, never the
+ * query itself. If storage is unavailable, the watchdog opts out rather than
+ * risk a reload loop.
+ */
+function buildGoogleSearchThinkingWatchdogScript({
+  timeoutMs = 120_000,
+  pollIntervalMs = 5_000,
+  reloadCooldownMs = 30 * 60_000
+} = {}) {
+  const safeDelay = (value, fallback) => {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) && numeric > 0 ? Math.floor(numeric) : fallback;
+  };
+  const config = {
+    timeoutMs: safeDelay(timeoutMs, 120_000),
+    pollIntervalMs: safeDelay(pollIntervalMs, 5_000),
+    reloadCooldownMs: safeDelay(reloadCooldownMs, 30 * 60_000)
+  };
+  return `(function () {
+  if (window.__yayraGoogleSearchThinkingWatchdog) return;
+  window.__yayraGoogleSearchThinkingWatchdog = true;
+  var initialHost = String(window.location && window.location.hostname || '').toLowerCase();
+  var googleHost = /^(?:www\\.)?google\\.[a-z]{2,}(?:\\.[a-z]{2,})?$/.test(initialHost);
+  if (!googleHost) return;
+
+  var WAIT_MS = ${config.timeoutMs};
+  var POLL_MS = ${config.pollIntervalMs};
+  var COOLDOWN_MS = ${config.reloadCooldownMs};
+  var storage;
+  try {
+    storage = window.sessionStorage;
+    if (!storage || typeof storage.getItem !== 'function' || typeof storage.setItem !== 'function') return;
+    var probe = '__yayra_google_thinking_probe';
+    storage.setItem(probe, '1');
+    storage.removeItem(probe);
+  } catch (_err) {
+    return;
+  }
+
+  function isGoogleSearch() {
+    var location = window.location || {};
+    var host = String(location.hostname || '').toLowerCase();
+    return /^(?:www\\.)?google\\.[a-z]{2,}(?:\\.[a-z]{2,})?$/.test(host)
+      && /^\\/search\\/?$/.test(String(location.pathname || ''));
+  }
+  function hash(value) {
+    var result = 2166136261;
+    for (var i = 0; i < value.length; i += 1) {
+      result ^= value.charCodeAt(i);
+      result = Math.imul(result, 16777619);
+    }
+    return (result >>> 0).toString(36);
+  }
+  function hasStandaloneThinkingStatus() {
+    var text = document.body && typeof document.body.innerText === 'string' ? document.body.innerText : '';
+    return /(?:^|\\n)\\s*Thinking(?:\\s*(?:\\.{3}|…))?\\s*(?:\\n|$)/i.test(text);
+  }
+  function recentlyReloaded(key, now) {
+    try {
+      var raw = storage.getItem(key);
+      if (raw === null) return false;
+      var last = Number(raw);
+      return !Number.isFinite(last) || now - last < COOLDOWN_MS;
+    } catch (_err) {
+      return true;
+    }
+  }
+
+  var thinkingSince = 0;
+  var observedUrl = String(window.location.href || '');
+  window.setInterval(function () {
+    try {
+      var location = window.location || {};
+      var currentUrl = String(location.href || '');
+      if (currentUrl !== observedUrl) {
+        observedUrl = currentUrl;
+        thinkingSince = 0;
+      }
+      if (!isGoogleSearch() || document.visibilityState === 'hidden' || !hasStandaloneThinkingStatus()) {
+        thinkingSince = 0;
+        return;
+      }
+
+      var now = Date.now();
+      if (!thinkingSince) {
+        thinkingSince = now;
+        return;
+      }
+      if (now - thinkingSince < WAIT_MS) return;
+
+      var searchUrl = String(location.pathname || '') + String(location.search || '');
+      var markerKey = '__yayra_google_thinking_reload_' + hash(searchUrl);
+      if (recentlyReloaded(markerKey, now)) {
+        thinkingSince = 0;
+        return;
+      }
+      try { storage.setItem(markerKey, String(now)); }
+      catch (_err) { thinkingSince = 0; return; }
+
+      // Normal reload: preserve the current tab, URL, profile and cookies.
+      // This intentionally does not clear site data or cache.
+      thinkingSince = 0;
+      if (location && typeof location.reload === 'function') location.reload();
+    } catch (_err) {
+      thinkingSince = 0;
+    }
+  }, POLL_MS);
 })();`;
 }
 
@@ -288,31 +1006,86 @@ function reloadActionForInput(input = {}) {
   return null;
 }
 
+function parseBoundedAuthUrl(rawUrl) {
+  if (typeof rawUrl !== 'string' || rawUrl.length === 0 || rawUrl.length > MAX_AUTH_HANDOFF_URL_LENGTH) return null;
+  try {
+    const parsed = new URL(rawUrl);
+    if ((parsed.protocol !== 'https:' && parsed.protocol !== 'http:') || parsed.username || parsed.password) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function isGoogleOAuthAuthorizationUrl(rawUrl) {
+  const parsed = parseBoundedAuthUrl(rawUrl);
+  return Boolean(parsed
+    && parsed.hostname.toLowerCase() === 'accounts.google.com'
+    && GOOGLE_OAUTH_PATH.test(parsed.pathname));
+}
+
+/**
+ * Exact Google identity routes that require an external user-agent. This is
+ * intentionally narrower than accounts.google.com as a whole: ManageAccount,
+ * logout, and product/account browsing remain ordinary web navigation.
+ */
+function isGoogleInteractiveAuthenticationUrl(rawUrl) {
+  const parsed = parseBoundedAuthUrl(rawUrl);
+  return Boolean(parsed
+    && parsed.hostname.toLowerCase() === 'accounts.google.com'
+    && (GOOGLE_OAUTH_PATH.test(parsed.pathname) || GOOGLE_INTERACTIVE_SIGNIN_PATH.test(parsed.pathname)));
+}
+
 function requiresSystemBrowserAuth(rawUrl, hosts = SYSTEM_BROWSER_AUTH_HOSTS) {
-  let parsed;
-  try { parsed = new URL(rawUrl); } catch { return false; }
-  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+  const parsed = parseBoundedAuthUrl(rawUrl);
+  if (!parsed) return false;
 
   const hostname = parsed.hostname.toLowerCase();
   return hosts.some((host) => {
     const normalizedHost = String(host).toLowerCase();
     if (normalizedHost === 'accounts.google.com') {
-      return hostname === normalizedHost && GOOGLE_SIGN_IN_PATH.test(parsed.pathname);
+      return hostname === normalizedHost && isGoogleInteractiveAuthenticationUrl(rawUrl);
     }
     return hostname === normalizedHost || hostname.endsWith(`.${normalizedHost}`);
   });
 }
 
-function secureSystemBrowserAuthUrl(rawUrl, hosts = SYSTEM_BROWSER_AUTH_HOSTS) {
-  if (!requiresSystemBrowserAuth(rawUrl, hosts)) return rawUrl;
+function safeGoogleContinueUrl(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 4096) return null;
   try {
-    const parsed = new URL(rawUrl);
-    if (parsed.protocol !== 'http:') return rawUrl;
-    parsed.protocol = 'https:';
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password) return null;
+    parsed.hash = '';
     return parsed.toString();
   } catch {
-    return rawUrl;
+    return null;
   }
+}
+
+/**
+ * Upgrades provider handoffs to HTTPS. Google's embedded-user-agent rejection
+ * URL is not useful when reopened as-is, so convert only that exact route to
+ * a fresh ServiceLogin entry point and preserve a bounded HTTPS continuation.
+ * No code, access token, refresh token, or custom-scheme value is synthesized.
+ */
+function secureSystemBrowserAuthUrl(rawUrl, hosts = SYSTEM_BROWSER_AUTH_HOSTS) {
+  if (!requiresSystemBrowserAuth(rawUrl, hosts)) return rawUrl;
+  const parsed = parseBoundedAuthUrl(rawUrl);
+  if (!parsed) return rawUrl;
+  parsed.protocol = 'https:';
+
+  if (parsed.hostname.toLowerCase() === 'accounts.google.com'
+    && GOOGLE_REJECTED_SIGNIN_PATH.test(parsed.pathname)) {
+    const clean = new URL('https://accounts.google.com/ServiceLogin');
+    const continueUrl = safeGoogleContinueUrl(parsed.searchParams.get('continue'));
+    if (continueUrl) clean.searchParams.set('continue', continueUrl);
+    const language = parsed.searchParams.get('hl');
+    if (language && /^[A-Za-z]{2,3}(?:-[A-Za-z]{2,4})?$/.test(language)) clean.searchParams.set('hl', language);
+    return clean.toString();
+  }
+
+  parsed.hash = '';
+  return parsed.toString();
 }
 
 /**
@@ -438,6 +1211,22 @@ function sanitizeBounds(bounds) {
   };
 }
 
+// Native WebContentsViews are sibling OS surfaces above the renderer. Even
+// if a stale ResizeObserver reports y=0 during a re-render, a website must
+// never be allowed to own the custom title/tab row's hit-testing area.
+const MIN_NATIVE_PAGE_Y = 36;
+function sanitizePageBounds(bounds) {
+  const clean = sanitizeBounds(bounds);
+  // Preserve the zero rectangle used by setVisible(false).
+  if (clean.width === 0 || clean.height === 0 || clean.y >= MIN_NATIVE_PAGE_Y) return clean;
+  const covered = MIN_NATIVE_PAGE_Y - clean.y;
+  return {
+    ...clean,
+    y: MIN_NATIVE_PAGE_Y,
+    height: Math.max(0, clean.height - covered)
+  };
+}
+
 /**
  * Creates and wires the IPC surface used by the renderer's native-engine
  * bridge (see BrowserShell.js's `createWebContentFrame`). Dependency-injected
@@ -450,6 +1239,9 @@ function createWebviewBridge({
   ipcMain,
   shell,
   getMainWindow,
+  // Recognized provider authorization and interactive sign-in routes always
+  // use the OS external user-agent. A BrowserWindow is still app-controlled
+  // and does not satisfy RFC 8252 / Google's embedded-user-agent policy.
   authHosts = SYSTEM_BROWSER_AUTH_HOSTS,
   // Resolves the BrowserWindow that owns a given webContents, so views
   // created by the floating mini-shell window attach to THAT window instead
@@ -466,11 +1258,20 @@ function createWebviewBridge({
   // dialog. Optional: without it savePage reports { ok:false }.
   dialog = null,
   // Absolute path to electron/autofillPreload.cjs. When provided, every
-  // page view gets Chrome-style password capture/fill hooks (sandboxed,
-  // context-isolated, nothing exposed to the page). Optional so existing
-  // tests without it keep working.
+  // page view gets sandboxed password capture/fill and email suggestion hooks
+  // (context-isolated, nothing exposed to the page). Optional for test hosts.
   autofillPreloadPath = null,
-  logger = console
+  // Optional Linux software platform authenticator. It uses Chromium's real
+  // WebAuthn machinery, encrypted per-profile credentials, and an explicit
+  // browser-chrome confirmation before releasing user presence.
+  websitePasskeyProvider = null,
+  // Main-process one-shot grant consumer from passkeyBridge.cjs. Renderer
+  // booleans are never trusted as user verification.
+  consumeWebsitePasskeyGrant = null,
+  sitePasskeyCompletionTimeoutMs = SITE_PASSKEY_COMPLETION_TIMEOUT_MS,
+  logger = console,
+  pageUnresponsiveReloadDelayMs = PAGE_UNRESPONSIVE_RELOAD_DELAY_MS,
+  pageUnresponsiveReloadCooldownMs = PAGE_UNRESPONSIVE_RELOAD_COOLDOWN_MS
 }) {
   // key -> { view, lastUrl, tabId, hostWc, hostWin }
   // key namespaces the renderer-chosen tabId by the webContents that asked
@@ -478,6 +1279,131 @@ function createWebviewBridge({
   // BrowserShell instance whose generated ids ("tab-1", "tab-2", ...) would
   // otherwise collide and steal each other's native views.
   const views = new Map();
+  // One discoverable-credential chooser per persistent/private Session.
+  // Without this Electron cancels navigator.credentials.get() whenever an
+  // authenticator returns accounts, making valid site passkeys look broken.
+  const webAuthnSessionListeners = new WeakMap();
+  // Per-shell-window policy. WeakMap keeps the preference scoped to the
+  // renderer that owns the native views without retaining destroyed windows.
+  const backgroundThrottlingByHost = new WeakMap();
+
+  function cancelPageUnresponsiveReload(entry) {
+    if (!entry) return;
+    entry.pageUnresponsive = false;
+    if (entry.pageUnresponsiveReloadTimer !== null) {
+      clearTimeout(entry.pageUnresponsiveReloadTimer);
+      entry.pageUnresponsiveReloadTimer = null;
+    }
+  }
+
+  function websitePasskeyInfo(entry, request = null) {
+    if (!websitePasskeyProvider || typeof websitePasskeyProvider.describe !== 'function') {
+      return { mode: 'native', available: false, reason: 'native-platform-authenticator' };
+    }
+    try {
+      const describe = request && typeof websitePasskeyProvider.describeRequest === 'function'
+        ? websitePasskeyProvider.describeRequest
+        : websitePasskeyProvider.describe;
+      const info = describe({
+        webContents: entry?.view?.webContents,
+        profileId: entry?.profileId,
+        isPrivate: entry?.isPrivate,
+        action: request?.action,
+        rpId: request?.rpId
+      }) || {};
+      const mode = info.mode === 'local' || info.mode === 'external' ? info.mode : 'native';
+      return {
+        mode,
+        available: mode === 'local' && info.available === true,
+        reason: typeof info.reason === 'string' ? info.reason.slice(0, 120) : '',
+        ...(Number.isSafeInteger(info.credentialCount) ? { credentialCount: info.credentialCount } : {})
+      };
+    } catch {
+      return { mode: 'external', available: false, reason: 'provider-unavailable' };
+    }
+  }
+
+  function clearSitePasskeyCompletionTimer(request) {
+    if (!request?.completionTimer) return;
+    clearTimeout(request.completionTimer);
+    request.completionTimer = null;
+  }
+
+  function controlSitePasskeyRequest(entry, requestId, command) {
+    const request = entry?.sitePasskeyRequests?.get(requestId);
+    if (!request?.controlled || !['hold', 'release', 'cancel'].includes(command)) return false;
+    const wc = entry?.view?.webContents;
+    if (!wc || wc.isDestroyed?.() || typeof wc.send !== 'function') return false;
+    try {
+      wc.send(SITE_PASSKEY_CONTROL_CHANNEL, { requestId, command });
+      request.controlState = command;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function armSitePasskeyCompletionTimer(entry, request) {
+    clearSitePasskeyCompletionTimer(request);
+    const delay = Math.max(100, Number(sitePasskeyCompletionTimeoutMs) || SITE_PASSKEY_COMPLETION_TIMEOUT_MS);
+    request.completionTimer = setTimeout(async () => {
+      const active = entry?.sitePasskeyRequests?.get(request.requestId);
+      if (active !== request) return;
+      request.completionTimer = null;
+      // Publish the terminal reason before aborting the page promise; the
+      // AbortError settlement can otherwise arrive first and erase the active
+      // request before chrome has a chance to render the timeout.
+      sendTo(entry, 'webauthn-provider-state', {
+        requestId: request.requestId,
+        state: 'declined',
+        reason: 'ceremony-timeout'
+      });
+      finishPendingPasskeySelection(entry, request.requestId, false);
+      controlSitePasskeyRequest(entry, request.requestId, 'cancel');
+      try {
+        await websitePasskeyProvider?.settle?.({
+          webContents: entry.view?.webContents,
+          requestId: request.requestId
+        });
+      } catch { /* provider is already detached */ }
+    }, delay);
+    request.completionTimer?.unref?.();
+  }
+
+  function finishPendingPasskeySelection(entry, requestId, approved) {
+    const pending = entry?.pendingSitePasskeySelections?.get(requestId);
+    if (!pending) return false;
+    entry.pendingSitePasskeySelections.delete(requestId);
+    try {
+      if (approved) pending.approve();
+      else pending.cancel();
+    } catch { /* Electron invalidated the chooser callback */ }
+    return true;
+  }
+
+  function cancelSitePasskeyRequests(entry, errorName = 'AbortError') {
+    if (!entry?.sitePasskeyRequests?.size) return;
+    for (const [requestId, meta] of entry.sitePasskeyRequests) {
+      clearSitePasskeyCompletionTimer(meta);
+      finishPendingPasskeySelection(entry, requestId, false);
+      if (meta.controlled && meta.controlState !== 'cancel') controlSitePasskeyRequest(entry, requestId, 'cancel');
+      try {
+        websitePasskeyProvider?.settle?.({ webContents: entry.view?.webContents, requestId });
+      } catch { /* provider is already detached */ }
+      sendTo(entry, 'webauthn-request', {
+        phase: 'settled',
+        requestId,
+        action: meta.action,
+        rpId: meta.rpId,
+        conditional: meta.conditional,
+        attachment: meta.attachment,
+        provider: meta.provider,
+        success: false,
+        errorName
+      });
+    }
+    entry.sitePasskeyRequests.clear();
+  }
 
   function viewKey(event, tabId) {
     const senderId = event && event.sender && typeof event.sender.id === 'number' ? event.sender.id : null;
@@ -506,6 +1432,214 @@ function createWebviewBridge({
     win.webContents.send(WEBVIEW_EVENT_CHANNEL, message);
   }
 
+  function providerForAuthUrl(rawUrl) {
+    const parsed = parseBoundedAuthUrl(rawUrl);
+    const host = parsed?.hostname?.toLowerCase() || '';
+    if (host === 'accounts.google.com') return 'google';
+    if (host === 'appleid.apple.com') return 'apple';
+    if (host === 'login.live.com' || host === 'login.microsoftonline.com' || host.endsWith('.login.microsoftonline.com')) return 'microsoft';
+    return 'identity-provider';
+  }
+
+  /**
+   * Open a recognized auth URL in the OS external user-agent. Only provider
+   * metadata crosses IPC afterwards; the authorization URL (which can contain
+   * state and a PKCE challenge) is not echoed to renderer code or logs.
+   */
+  async function openAuthInSystemBrowser(entry, rawUrl, reason = 'navigation') {
+    if (!entry || !requiresSystemBrowserAuth(rawUrl, authHosts)) return false;
+    const externalUrl = secureSystemBrowserAuthUrl(rawUrl, authHosts);
+    const provider = providerForAuthUrl(externalUrl);
+    try {
+      await shell.openExternal(externalUrl);
+      sendTo(entry, 'system-browser-handoff', { provider, reason });
+      return true;
+    } catch (error) {
+      logger.error?.(`[yayra:webview] failed to open ${provider} authentication in the system browser: ${error?.message || error}`);
+      sendTo(entry, 'system-browser-handoff-failed', { provider, reason });
+      return false;
+    }
+  }
+
+  function entryForWebAuthnFrame(ses, frame) {
+    let target = null;
+    try { target = frame?.top || frame || null; } catch { return null; }
+    if (!target) return null;
+    for (const entry of views.values()) {
+      const wc = entry.view?.webContents;
+      if (!wc || wc.session !== ses) continue;
+      try {
+        if (wc.mainFrame === target || wc.mainFrame?.framesInSubtree?.includes?.(target)) return entry;
+      } catch { /* frame navigated while the chooser opened */ }
+    }
+    return null;
+  }
+
+  function passkeyAccountLabel(account, index) {
+    const clean = (value) => String(value || '')
+      .replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/gi, '')
+      .trim()
+      .slice(0, 96);
+    const displayName = clean(account?.displayName);
+    const name = clean(account?.name);
+    if (displayName && name && displayName !== name) return `${displayName} (${name})`;
+    return displayName || name || `Passkey ${index + 1}`;
+  }
+
+  function installWebAuthnAccountChooser(ses) {
+    if (!ses || typeof ses.on !== 'function' || webAuthnSessionListeners.has(ses)) return;
+    const listener = (_event, details = {}, callback) => {
+      let completed = false;
+      let entry = null;
+      let requestId = '';
+      let requestMeta = null;
+      let chooserTimer = null;
+      const finish = (credentialId = undefined) => {
+        if (completed) return;
+        if (chooserTimer) clearTimeout(chooserTimer);
+        chooserTimer = null;
+        const selectedId = typeof credentialId === 'string' ? credentialId : undefined;
+        // Conditional mediation must run far enough for Chromium to discover
+        // resident accounts before Yayra can show a chooser. Once an account
+        // is picked, however, do not return it to Chromium while the virtual
+        // authenticator still reports no presence: that CTAP command would be
+        // left pending and cannot be revived by toggling presence later.
+        if (selectedId && entry && requestId && websitePasskeyInfo(entry, requestMeta).mode === 'local') {
+          completed = true;
+          // Explicit requests are already Yayra-verified before Chromium can
+          // discover resident accounts. Return the user's chosen credential
+          // immediately and restart the short completion watchdog. Conditional
+          // autofill discovers accounts before verification, so it remains
+          // deferred behind the trusted toolbar action below.
+          if (requestMeta?.userVerified) {
+            try { callback(selectedId); } catch { /* request expired */ }
+            armSitePasskeyCompletionTimer(entry, requestMeta);
+            return;
+          }
+          entry.pendingSitePasskeySelections ||= new Map();
+          finishPendingPasskeySelection(entry, requestId, false);
+          let finalized = false;
+          const complete = (approved) => {
+            if (finalized) return;
+            finalized = true;
+            try { callback(approved ? selectedId : undefined); } catch { /* request expired */ }
+          };
+          entry.pendingSitePasskeySelections.set(requestId, {
+            approve: () => complete(true),
+            cancel: () => complete(false)
+          });
+          return;
+        }
+        completed = true;
+        try { callback(selectedId); } catch { /* request expired */ }
+        if (entry && requestMeta?.userVerified) armSitePasskeyCompletionTimer(entry, requestMeta);
+      };
+      const accounts = (Array.isArray(details.accounts) ? details.accounts : [])
+        .filter((account) => typeof account?.credentialId === 'string'
+          && account.credentialId.length > 0 && account.credentialId.length <= 4096);
+      if (!accounts.length) { finish(); return; }
+
+      const rawRelyingPartyId = typeof details.relyingPartyId === 'string'
+        ? details.relyingPartyId.trim().toLowerCase()
+        : '';
+      const relyingPartyId = rawRelyingPartyId.length <= 253 && /^[a-z0-9.-]+$/i.test(rawRelyingPartyId)
+        ? rawRelyingPartyId
+        : 'this site';
+      entry = entryForWebAuthnFrame(ses, details.frame);
+      // Electron documents a null frame after navigation/destruction. Do not
+      // attach an account chooser to an unrelated tab/window in that race.
+      if (!entry) { finish(); return; }
+      for (const [candidateId, meta] of entry.sitePasskeyRequests || []) {
+        if (meta?.action !== 'get' || meta.rpId !== relyingPartyId) continue;
+        // Prefer the conditional request that caused account discovery, but
+        // retain explicit get() metadata too so its account-sheet delay can be
+        // bounded and its already-completed Yayra verification reused.
+        if (!requestMeta || meta.conditional === true) {
+          requestId = candidateId;
+          requestMeta = meta;
+        }
+        if (meta.conditional === true) break;
+      }
+      if (requestMeta?.conditional) {
+        requestMeta.conditional = false;
+      }
+      if (requestMeta?.userVerified) clearSitePasskeyCompletionTimer(requestMeta);
+      sendTo(entry, 'webauthn-account-selection', {
+        relyingPartyId,
+        accountCount: accounts.length,
+        ...(requestId ? { requestId } : {})
+      });
+      const owner = entry.hostWin && !entry.hostWin.isDestroyed?.() ? entry.hostWin : getMainWindow();
+      chooserTimer = setTimeout(() => finish(), 55_000);
+      chooserTimer?.unref?.();
+
+      // Match a mainstream browser's account sheet. The WebAuthn operation
+      // remains pending until one callback is made, so every error/cancel
+      // path below funnels through finish() exactly once.
+      if (dialog && typeof dialog.showMessageBox === 'function' && accounts.length <= 8) {
+        const labels = accounts.map(passkeyAccountLabel);
+        const cancelId = labels.length;
+        const options = {
+          type: 'question',
+          title: 'Choose a passkey',
+          message: `Choose a passkey for ${relyingPartyId}`,
+          detail: 'The site requested a discoverable passkey. Yayra will send only your selected credential to the site’s secure WebAuthn ceremony.',
+          buttons: [...labels, 'Cancel'],
+          defaultId: 0,
+          cancelId,
+          noLink: true
+        };
+        let prompt;
+        try {
+          prompt = owner && !owner.isDestroyed?.()
+            ? dialog.showMessageBox(owner, options)
+            : dialog.showMessageBox(options);
+        } catch (err) {
+          logger.warn?.(`[yayra:webauthn] account chooser failed: ${err?.message || err}`);
+          finish();
+          return;
+        }
+        Promise.resolve(prompt).then((result) => {
+          const index = Number(result?.response);
+          finish(Number.isInteger(index) && index >= 0 && index < accounts.length
+            ? accounts[index].credentialId
+            : undefined);
+        }, () => finish());
+        return;
+      }
+
+      if (Menu && typeof Menu.buildFromTemplate === 'function') {
+        try {
+          const template = [
+            { label: `Choose a passkey for ${relyingPartyId}`, enabled: false },
+            { type: 'separator' },
+            ...accounts.map((account, index) => ({
+              label: passkeyAccountLabel(account, index),
+              click: () => finish(account.credentialId)
+            })),
+            { type: 'separator' },
+            { label: 'Cancel', click: () => finish() }
+          ];
+          const menu = Menu.buildFromTemplate(template);
+          popupMenuWithRecovery({
+            menu,
+            window: owner && !owner.isDestroyed?.() ? owner : null,
+            callback: () => finish()
+          });
+          return;
+        } catch (err) {
+          logger.warn?.(`[yayra:webauthn] account menu failed: ${err?.message || err}`);
+        }
+      }
+
+      // A single unambiguous account remains usable in stripped-down hosts
+      // without dialog/Menu implementations. Never guess among many users.
+      finish(accounts.length === 1 ? accounts[0].credentialId : undefined);
+    };
+    webAuthnSessionListeners.set(ses, listener);
+    ses.on('select-webauthn-account', listener);
+  }
+
   function navState(webContents) {
     return {
       canGoBack: historyCanGoBack(webContents),
@@ -525,6 +1659,42 @@ function createWebviewBridge({
     } catch { /* a navigated frame may have already discarded its style */ }
   }
 
+  function pageFrames(webContents) {
+    const frames = [];
+    const seen = new Set();
+    try {
+      const mainFrame = webContents?.mainFrame;
+      if (mainFrame) {
+        frames.push(mainFrame);
+        seen.add(mainFrame);
+      }
+      const subtree = mainFrame?.framesInSubtree;
+      if (subtree && typeof subtree[Symbol.iterator] === 'function') {
+        for (const frame of subtree) {
+          if (frame && !seen.has(frame)) {
+            frames.push(frame);
+            seen.add(frame);
+          }
+        }
+      }
+    } catch { /* about:blank or a tearing-down frame */ }
+    if (!frames.length && webContents) frames.push(webContents);
+    return frames;
+  }
+
+  function installTextSelectionActions(entry) {
+    const wc = entry?.view?.webContents;
+    if (!wc) return;
+    const script = buildTextSelectionActionsScript();
+    for (const frame of pageFrames(wc)) {
+      if (!frame || typeof frame.executeJavaScript !== 'function') continue;
+      try {
+        const result = frame.executeJavaScript(script, true);
+        if (result && typeof result.catch === 'function') result.catch(() => {});
+      } catch { /* progressive enhancement: native Ctrl+C still works */ }
+    }
+  }
+
   function executePointerThemeFallback(frames, theme, size) {
     const script = buildPointerThemeScript(theme, size);
     for (const frame of frames) {
@@ -536,29 +1706,22 @@ function createWebviewBridge({
     }
   }
 
+  function executePointerTextCursorFallback(frames, theme) {
+    const script = buildPointerTextCursorScript(theme);
+    for (const frame of frames) {
+      if (!frame || typeof frame.executeJavaScript !== 'function') continue;
+      try {
+        const result = frame.executeJavaScript(script, true);
+        if (result && typeof result.catch === 'function') result.catch(() => {});
+      } catch { /* keep cursor enhancement best-effort */ }
+    }
+  }
+
   function applyPointerThemeToPage(entry) {
     const wc = entry && entry.view && entry.view.webContents;
     if (!wc) return;
 
-    const frames = [];
-    const seen = new Set();
-    try {
-      const mainFrame = wc.mainFrame;
-      if (mainFrame) {
-        frames.push(mainFrame);
-        seen.add(mainFrame);
-      }
-      const subtree = mainFrame && mainFrame.framesInSubtree;
-      if (subtree && typeof subtree[Symbol.iterator] === 'function') {
-        for (const frame of subtree) {
-          if (frame && !seen.has(frame)) {
-            frames.push(frame);
-            seen.add(frame);
-          }
-        }
-      }
-    } catch { /* an about:blank or tearing-down frame may not be traversable */ }
-    if (!frames.length) frames.push(wc);
+    const frames = pageFrames(wc);
 
     const theme = entry.pointerTheme === 'yayra' || entry.pointerTheme === 'high-visibility'
       ? entry.pointerTheme
@@ -566,6 +1729,10 @@ function createWebviewBridge({
     const size = entry.pointerSize === 'large' || entry.pointerSize === 'xlarge'
       ? entry.pointerSize
       : 'normal';
+    // CSS alone cannot distinguish a text node from blank space in a div.
+    // Use Chromium's caret hit-test in every frame to apply an I-beam only
+    // over selectable non-interactive text, including cross-origin frames.
+    executePointerTextCursorFallback(frames, theme);
     const revision = (entry.pointerCssRevision || 0) + 1;
     entry.pointerCssRevision = revision;
     const installed = entry.pointerCssEntries || new Map();
@@ -640,14 +1807,24 @@ function createWebviewBridge({
     // executeJavaScript.
     wc.on('dom-ready', () => {
       if (entry.pointerTheme !== 'system') applyPointerThemeToPage(entry);
+      installTextSelectionActions(entry);
       if (typeof wc.executeJavaScript === 'function') {
-        wc.executeJavaScript(buildWebAuthnWatchdogScript(), true).catch(() => {});
+        const watchdogs = [
+          buildWebAuthnWatchdogScript(),
+          buildGoogleSearchThinkingWatchdogScript(),
+          // Match Firefox-grade media resilience: recover Cloudinary format
+          // mismatches and retire decorative broken-image glyphs without
+          // changing meaningful image alt text or the site's chosen design.
+          buildMediaCompatibilityScript()
+        ].join('\n');
+        wc.executeJavaScript(watchdogs, true).catch(() => {});
       }
     });
     // Apply the selected pointer to cross-origin child frames as each one
     // finishes loading; a main-frame style cannot cross an iframe boundary.
     wc.on('did-frame-finish-load', () => {
       if (entry.pointerTheme !== 'system') applyPointerThemeToPage(entry);
+      installTextSelectionActions(entry);
     });
     // Reload shortcuts pressed while the PAGE has focus (which is most
     // of the time): the guest WebContents swallows keystrokes, so
@@ -665,8 +1842,67 @@ function createWebviewBridge({
         wc.reload();
       }
     });
-    wc.on('did-start-loading', () => sendTo(entry, 'loading-start'));
+    wc.on('unresponsive', () => {
+      const newlyUnresponsive = !entry.pageUnresponsive;
+      entry.pageUnresponsive = true;
+      if (entry.pageUnresponsiveReloadTimer !== null) {
+        if (newlyUnresponsive) sendTo(entry, 'page-unresponsive', { url: wc.getURL?.() || entry.lastUrl || '', recoveryScheduled: true });
+        return;
+      }
+      const lastReload = entry.lastPageUnresponsiveReloadAt || 0;
+      const recoveryScheduled = !(lastReload && Date.now() - lastReload < pageUnresponsiveReloadCooldownMs);
+      if (newlyUnresponsive) {
+        sendTo(entry, 'page-unresponsive', { url: wc.getURL?.() || entry.lastUrl || '', recoveryScheduled });
+      }
+      if (!recoveryScheduled) return;
+
+      // The shell remains usable while an individual site renderer hangs.
+      // Give Chromium a short chance to recover itself before reloading only
+      // that tab. This is delayed and rate-limited to avoid disrupting slow
+      // but healthy pages or creating a reload loop.
+      entry.pageUnresponsiveReloadTimer = setTimeout(() => {
+        entry.pageUnresponsiveReloadTimer = null;
+        if (!entry.pageUnresponsive || wc.isDestroyed?.()) return;
+        const now = Date.now();
+        if (entry.lastPageUnresponsiveReloadAt && now - entry.lastPageUnresponsiveReloadAt < pageUnresponsiveReloadCooldownMs) return;
+        entry.lastPageUnresponsiveReloadAt = now;
+        logger.warn?.(`[yayra:webview] page renderer unresponsive in tab ${entry.tabId}; reloading that page`);
+        sendTo(entry, 'page-recovery-start', { url: wc.getURL?.() || entry.lastUrl || '', reason: 'unresponsive-page' });
+        try { wc.reload(); }
+        catch (err) {
+          logger.error?.(`[yayra:webview] failed to recover unresponsive tab ${entry.tabId}`, err);
+          sendTo(entry, 'page-recovery-failed', { url: wc.getURL?.() || entry.lastUrl || '' });
+        }
+      }, pageUnresponsiveReloadDelayMs);
+      entry.pageUnresponsiveReloadTimer?.unref?.();
+    });
+    wc.on('responsive', () => {
+      const wasUnresponsive = entry.pageUnresponsive;
+      cancelPageUnresponsiveReload(entry);
+      if (wasUnresponsive) sendTo(entry, 'page-responsive', { url: wc.getURL?.() || entry.lastUrl || '' });
+    });
+    wc.on('did-start-loading', () => {
+      // Each top-level loading generation must prove itself independently.
+      // Electron can emit did-finish-load for its own network error document
+      // after did-fail-load, so the failure listener below latches that state.
+      entry.mainFrameFailed = false;
+      // A user-initiated reload/navigation is already the recovery action.
+      const wasUnresponsive = entry.pageUnresponsive;
+      cancelPageUnresponsiveReload(entry);
+      cancelSitePasskeyRequests(entry, 'AbortError');
+      if (wasUnresponsive) sendTo(entry, 'page-recovery-start', { url: wc.getURL?.() || entry.lastUrl || '', reason: 'navigation' });
+      sendTo(entry, 'loading-start');
+    });
     wc.on('did-stop-loading', () => sendTo(entry, 'loading-stop'));
+    // did-stop-loading also follows failed navigations, so it cannot prove a
+    // recovery succeeded. Electron may additionally finish Chromium's own
+    // error document after did-fail-load; only an unfailed loading generation
+    // is a positive main-frame signal that can retire recovery UI.
+    wc.on('did-finish-load', () => {
+      if (entry.mainFrameFailed) return;
+      const url = wc.getURL?.() || entry.lastUrl || entry.requestedUrl || '';
+      sendTo(entry, 'load-succeeded', { url });
+    });
     const handoffAuthNavigation = (...args) => {
       const event = args[0];
       // Electron 44 exposes navigation details on the event (or as a details
@@ -680,13 +1916,12 @@ function createWebviewBridge({
       if (!isMainFrame || !requiresSystemBrowserAuth(url, authHosts)) return;
 
       event?.preventDefault?.();
-      const externalUrl = secureSystemBrowserAuthUrl(url, authHosts);
-      Promise.resolve(shell.openExternal(externalUrl)).catch((err) => logger.error('[yayra:webview] failed to open external auth url', err));
       // Prevent the canceled navigation from leaving a stale loading spinner
       // in the original tab. No URL/history event is emitted: the in-app page
-      // stays where it was before the provider redirect.
+      // stays where it was before the provider redirect. The external browser
+      // owns the complete interactive provider flow.
       sendTo(entry, 'loading-stop');
-      sendTo(entry, 'system-browser-handoff', { url: externalUrl, sourceUrl: entry.lastUrl || null, reason: 'navigation' });
+      void openAuthInSystemBrowser(entry, url, 'navigation');
     };
     wc.on('will-navigate', handoffAuthNavigation);
     wc.on('will-redirect', handoffAuthNavigation);
@@ -707,6 +1942,7 @@ function createWebviewBridge({
       // one (e.g. the user typed a new URL before the previous one settled)
       // and is not a real failure worth surfacing.
       if (!isMainFrame || errorCode === -3) return;
+      entry.mainFrameFailed = true;
       sendTo(entry, 'fail-load', { errorCode, errorDescription, url: validatedUrl });
     });
     // Chrome-equivalent native right-click menu. A WebContentsView (unlike
@@ -724,7 +1960,7 @@ function createWebviewBridge({
       });
       const win = (entry.hostWin && !entry.hostWin.isDestroyed?.()) ? entry.hostWin : getMainWindow();
       if (!win || win.isDestroyed()) return;
-      Menu.buildFromTemplate(template).popup({ window: win });
+      popupMenuWithRecovery({ menu: Menu.buildFromTemplate(template), window: win });
     });
     wc.setWindowOpenHandler(({ url }) => {
       // In-page WebAuthn helper asking to reopen this page in the user's
@@ -736,9 +1972,7 @@ function createWebviewBridge({
         return { action: 'deny' };
       }
       if (requiresSystemBrowserAuth(url, authHosts)) {
-        const externalUrl = secureSystemBrowserAuthUrl(url, authHosts);
-        shell.openExternal(externalUrl).catch((err) => logger.error('[yayra:webview] failed to open external auth url', err));
-        sendTo(entry, 'system-browser-handoff', { url: externalUrl });
+        void openAuthInSystemBrowser(entry, url, 'popup');
         return { action: 'deny' };
       }
       // Let the renderer decide (usually: open as a new Yayra tab).
@@ -771,6 +2005,11 @@ function createWebviewBridge({
     if (typeof view.webContents.setUserAgent === 'function') {
       view.webContents.setUserAgent(buildBrowserUserAgent());
     }
+    // Install before loadURL/cache lookup. Cloudinary f_auto/raw HEIC images
+    // are served as WebP when this machine's embedded Chromium codec set
+    // differs from Firefox's, rather than leaving a white backdrop and the
+    // browser's broken-image glyph in the corner.
+    installMediaCompatibility(view.webContents.session, logger);
     // Pre-paint background: Chromium's default surface is WHITE, which
     // flashes whenever a view is created/hidden/resized inside Yayra's
     // dark chrome. Pages paint their own background the moment they
@@ -779,6 +2018,7 @@ function createWebviewBridge({
       try { view.setBackgroundColor('#101218'); } catch { /* older electron */ }
     }
     const entry = {
+      key,
       view,
       lastUrl: null,
       tabId,
@@ -786,15 +2026,35 @@ function createWebviewBridge({
       hostWin,
       isPrivate: Boolean(isPrivate),
       profileId: String(profileId || 'default'),
+      requestedUrl: null,
+      mainFrameFailed: false,
       pointerTheme: 'system',
-      pointerSize: 'normal'
+      pointerSize: 'normal',
+      pageUnresponsive: false,
+      pageUnresponsiveReloadTimer: null,
+      lastPageUnresponsiveReloadAt: 0
     };
     views.set(key, entry);
+    if (websitePasskeyProvider && typeof websitePasskeyProvider.attach === 'function') {
+      try {
+        entry.websitePasskeyReady = Promise.resolve(websitePasskeyProvider.attach({
+          webContents: view.webContents,
+          profileId: entry.profileId,
+          isPrivate: entry.isPrivate
+        })).catch((error) => {
+          logger.warn?.(`[yayra:site-passkeys] provider attach failed: ${error?.message || error}`);
+          return { ok: false, reason: 'provider-unavailable' };
+        });
+      } catch (error) {
+        logger.warn?.(`[yayra:site-passkeys] provider attach failed: ${error?.message || error}`);
+      }
+    }
+    installWebAuthnAccountChooser(view.webContents.session);
     attachListeners(key, entry);
     return entry;
   }
 
-  function ensureView(key, tabId, url, {
+  async function ensureView(key, tabId, url, {
     isPrivate = false,
     hostWc = null,
     hostWin = null,
@@ -806,10 +2066,11 @@ function createWebviewBridge({
     if (!win || win.isDestroyed() || !tabId || !url) return { handedOffToSystemBrowser: false };
 
     if (requiresSystemBrowserAuth(url, authHosts)) {
-      const externalUrl = secureSystemBrowserAuthUrl(url, authHosts);
-      shell.openExternal(externalUrl).catch((err) => logger.error('[yayra:webview] failed to open external auth url', err));
-      sendTo({ tabId, hostWc }, 'system-browser-handoff', { url: externalUrl });
-      return { handedOffToSystemBrowser: true };
+      // No native website view is needed merely to launch the provider. Use a
+      // minimal entry-shaped target so the completion event returns only to
+      // the shell window that requested this tab.
+      const handedOff = await openAuthInSystemBrowser({ tabId, hostWc }, url, 'direct-navigation');
+      return { handedOffToSystemBrowser: handedOff };
     }
 
     let entry = views.get(key);
@@ -821,6 +2082,17 @@ function createWebviewBridge({
     }
     if (!entry) {
       entry = createView(key, tabId, isPrivate, hostWc, win, profileId);
+      const configuredBackgroundThrottling = hostWc ? backgroundThrottlingByHost.get(hostWc) : undefined;
+      // Live-sites is fail-open: even if the renderer's startup preference
+      // IPC raced or an older preload never sent it, background pages keep
+      // timers/media/sockets active instead of silently freezing. A user can
+      // still explicitly enable throttling from Performance settings.
+      const backgroundThrottling = typeof configuredBackgroundThrottling === 'boolean'
+        ? configuredBackgroundThrottling
+        : false;
+      if (typeof entry.view.webContents.setBackgroundThrottling === 'function') {
+        try { entry.view.webContents.setBackgroundThrottling(backgroundThrottling); } catch { /* unsupported Electron host */ }
+      }
       win.contentView.addChildView(entry.view);
     }
 
@@ -831,11 +2103,29 @@ function createWebviewBridge({
     entry.pointerSize = nextPointerSize;
     if (pointerChanged && entry.lastUrl) applyPointerThemeToPage(entry);
 
+    // The virtual authenticator must exist before any page JavaScript runs.
+    // Loading first creates a race where an early navigator.credentials call
+    // enters Chromium's silent Linux path and remains stuck even though the
+    // provider finishes attaching a few milliseconds later. Keep only the
+    // newest URL when rapid navigation arrives while initialization waits.
+    entry.requestedUrl = url;
+    if (entry.websitePasskeyReady) await entry.websitePasskeyReady;
+    if (entry.requestedUrl !== url) return { handedOffToSystemBrowser: false };
+
     if (entry.lastUrl !== url) {
       entry.lastUrl = url;
+      entry.mainFrameFailed = false;
       entry.view.webContents.loadURL(url).catch((err) => {
-        logger.error(`[yayra:webview] failed to load ${url}`, err);
-        sendTo(entry, 'fail-load', { errorCode: -2, errorDescription: String((err && err.message) || err), url });
+        const description = String((err && err.message) || err || 'load failed');
+        // Electron rejects a superseded loadURL() with ERR_ABORTED when the
+        // user navigates again before it settles. This is expected control
+        // flow, not a failed final navigation; did-fail-load also filters -3.
+        if (/ERR_ABORTED\s*\(-3\)|net::ERR_ABORTED/i.test(description)) return;
+        entry.mainFrameFailed = true;
+        let host = '';
+        try { host = new URL(url).host; } catch { /* never log full user query text */ }
+        logger.error(`[yayra:webview] failed to load ${host || 'page'} (loadURL rejected)`);
+        sendTo(entry, 'fail-load', { errorCode: -2, errorDescription: description.slice(0, 240), url });
       });
     }
     return { handedOffToSystemBrowser: false };
@@ -860,7 +2150,9 @@ function createWebviewBridge({
   }
 
   function setBounds(key, bounds) {
-    withView(key, (view) => view.setBounds(sanitizeBounds(bounds)));
+    // Main-process enforcement: renderer mistakes/races can shrink the page,
+    // but can never place a native website surface over the tab/caption row.
+    withView(key, (view) => view.setBounds(sanitizePageBounds(bounds)));
   }
 
   /**
@@ -956,6 +2248,34 @@ function createWebviewBridge({
     withView(key, (view) => view.webContents.reload());
   }
 
+  function retryFailedUrl(key, url) {
+    const entry = views.get(key);
+    const wc = entry?.view?.webContents;
+    let target = null;
+    try {
+      const parsed = new URL(String(url || ''));
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') target = parsed.toString();
+    } catch { /* invalid recovery target */ }
+    if (!wc || wc.isDestroyed?.() || !target) return { ok: false, reason: 'invalid-target' };
+    // A failed navigation is not guaranteed to become webContents.getURL().
+    // Explicitly load the renderer-retained target instead of asking reload()
+    // to guess between the last committed document and Chromium's error page.
+    entry.requestedUrl = target;
+    entry.lastUrl = target;
+    entry.mainFrameFailed = false;
+    Promise.resolve(wc.loadURL(target)).catch((error) => {
+      const description = String(error?.message || error || 'load failed');
+      if (/ERR_ABORTED\s*\(-3\)|net::ERR_ABORTED/i.test(description)) return;
+      entry.mainFrameFailed = true;
+      sendTo(entry, 'fail-load', {
+        errorCode: -2,
+        errorDescription: description.slice(0, 240),
+        url: target
+      });
+    });
+    return { ok: true, url: target };
+  }
+
   /**
    * Chrome's Ctrl+Shift+R / Ctrl+F5: genuinely drop this site's cached
    * data (HTTP-cache bypass on the reload itself + compiled code caches
@@ -1004,6 +2324,8 @@ function createWebviewBridge({
   function destroyView(key) {
     const entry = views.get(key);
     if (!entry) return;
+    cancelPageUnresponsiveReload(entry);
+    cancelSitePasskeyRequests(entry, 'AbortError');
     const win = (entry.hostWin && !entry.hostWin.isDestroyed?.()) ? entry.hostWin : getMainWindow();
     if (win && !win.isDestroyed()) {
       try {
@@ -1012,12 +2334,17 @@ function createWebviewBridge({
         logger.error(`[yayra:webview] failed to detach view for ${key}`, err);
       }
     }
+    try { websitePasskeyProvider?.detach?.(entry.view.webContents); } catch { /* view is closing */ }
     if (!entry.view.webContents.isDestroyed()) entry.view.webContents.close();
     views.delete(key);
   }
 
   function destroyAll() {
     for (const key of Array.from(views.keys())) destroyView(key);
+    for (const [ses, listener] of webAuthnSessionListeners) {
+      try { ses.removeListener?.('select-webauthn-account', listener); } catch { /* app is quitting */ }
+    }
+    webAuthnSessionListeners.clear();
   }
 
   // Destroys only the views owned by one shell window (used when the main
@@ -1034,6 +2361,154 @@ function createWebviewBridge({
     const { hostWc, hostWin } = resolveHost(event);
     return ensureView(viewKey(event, tabId), tabId, url, { isPrivate, hostWc, hostWin, profileId, pointerTheme, pointerSize });
   });
+  ipcMain.handle('yayra:webview-continue-passkey', async (event, {
+    tabId,
+    requestId,
+    external = false,
+    authorizationToken = ''
+  } = {}) => {
+    const entry = views.get(viewKey(event, tabId));
+    const id = typeof requestId === 'string' && /^yayra-wa-[a-z0-9-]{1,80}$/i.test(requestId)
+      ? requestId
+      : null;
+    const request = id ? entry?.sitePasskeyRequests?.get(id) : null;
+    if (!entry || !request || request.conditional) return { ok: false, reason: 'request-ended' };
+
+    const provider = websitePasskeyInfo(entry, request);
+    const localCeremony = request.provider?.mode === 'local' && provider.mode === 'local';
+    if (external || !localCeremony) {
+      const currentUrl = String(entry.view?.webContents?.getURL?.() || entry.lastUrl || '');
+      if (!isHttpUrl(currentUrl)) return { ok: false, reason: 'invalid-url' };
+      try {
+        await shell.openExternal(currentUrl);
+        // A locally gated ceremony has not entered Chromium yet. Once the
+        // same page is handed to the system browser, cancel that dormant
+        // promise (and any deferred account callback) instead of leaving a
+        // fake active indicator behind in Yayra.
+        clearSitePasskeyCompletionTimer(request);
+        finishPendingPasskeySelection(entry, id, false);
+        if (request.controlled && request.controlState !== 'cancel') controlSitePasskeyRequest(entry, id, 'cancel');
+        sendTo(entry, 'system-browser-handoff', { url: currentUrl, reason: 'passkey' });
+        return { ok: true, handedOff: true };
+      } catch (error) {
+        return { ok: false, reason: String(error?.message || 'open-failed').slice(0, 120) };
+      }
+    }
+
+    let userVerification = null;
+    const token = typeof authorizationToken === 'string' && authorizationToken.length <= 128
+      ? authorizationToken
+      : '';
+    if (token) {
+      let grant;
+      try {
+        grant = typeof consumeWebsitePasskeyGrant === 'function'
+          ? consumeWebsitePasskeyGrant({
+            token,
+            event,
+            tabId: entry.tabId,
+            requestId: id,
+            rpId: request.rpId,
+            profileId: entry.profileId || 'default',
+            action: request.action
+          })
+          : { ok: false, reason: 'yayra-authorization-unavailable' };
+      } catch {
+        grant = { ok: false, reason: 'yayra-authorization-unavailable' };
+      }
+      if (!grant?.ok) {
+        const reason = grant?.reason || 'yayra-authorization-expired';
+        sendTo(entry, 'webauthn-provider-state', { requestId: id, state: 'declined', reason });
+        return { ok: false, reason, canUseSystemBrowser: true };
+      }
+      userVerification = { verified: true, method: 'yayra-passkey' };
+    }
+
+    sendTo(entry, 'webauthn-provider-state', { requestId: id, state: 'prompting' });
+    let result;
+    try {
+      result = await websitePasskeyProvider.confirm({
+        webContents: entry.view.webContents,
+        requestId: id,
+        action: request.action,
+        rpId: request.rpId,
+        userVerification,
+        isStillActive: () => entry.sitePasskeyRequests?.has(id) === true
+      });
+    } catch (error) {
+      result = { ok: false, reason: String(error?.message || 'provider-unavailable').slice(0, 120) };
+    }
+    if (result?.ok) {
+      // PIN/PolicyKit/browser-chrome interaction can move focus away from the
+      // site. WebAuthn rejects an unfocused top-level document, so restore both
+      // the owning window and requesting view before entering the native API.
+      try {
+        entry.hostWin?.show?.();
+        entry.hostWin?.focus?.();
+        entry.view?.webContents?.focus?.();
+      } catch { /* view closed while the prompt was up */ }
+      // Presence is armed *before* the untouched native WebAuthn operation is
+      // started. Chromium's virtual CTAP device does not replay a transaction
+      // that already returned "no touch", which was the reason GitHub reached
+      // Yayra's “Completing passkey” state and then ended in NotAllowedError.
+      request.userVerified = true;
+      const continued = finishPendingPasskeySelection(entry, id, true)
+        || (request.controlState === 'hold' && controlSitePasskeyRequest(entry, id, 'release'));
+      if (!continued) {
+        request.userVerified = false;
+        try { await websitePasskeyProvider?.settle?.({ webContents: entry.view?.webContents, requestId: id }); } catch { /* fail closed */ }
+        result = { ok: false, reason: 'request-gate-unavailable' };
+      } else {
+        armSitePasskeyCompletionTimer(entry, request);
+      }
+    }
+    sendTo(entry, 'webauthn-provider-state', {
+      requestId: id,
+      state: result?.ok ? 'approved' : 'declined',
+      reason: result?.ok ? '' : String(result?.reason || 'provider-unavailable').slice(0, 120),
+      verification: result?.ok && result?.verification === 'yayra-passkey' ? 'yayra-passkey' : 'system-auth'
+    });
+    return result?.ok
+      ? {
+        ok: true,
+        prompted: Boolean(result.prompted),
+        verification: result.verification === 'yayra-passkey' ? 'yayra-passkey' : 'system-auth',
+        ...(Number(result.presenceExpiresInMs) > 0
+          ? { presenceExpiresInMs: Math.min(60000, Number(result.presenceExpiresInMs)) }
+          : {})
+      }
+      : { ok: false, reason: result?.reason || 'provider-unavailable', canUseSystemBrowser: true };
+  });
+  ipcMain.handle('yayra:webview-set-background-throttling', (event, { enabled } = {}) => {
+    const sender = event?.sender;
+    if (!sender || typeof enabled !== 'boolean') return { ok: false, reason: 'invalid-request', updated: 0 };
+    backgroundThrottlingByHost.set(sender, enabled);
+    let updated = 0;
+    for (const entry of views.values()) {
+      if (entry.hostWc !== sender) continue;
+      const wc = entry.view?.webContents;
+      if (!wc || wc.isDestroyed?.() || typeof wc.setBackgroundThrottling !== 'function') continue;
+      try { wc.setBackgroundThrottling(enabled); updated += 1; } catch { /* report only successful updates */ }
+    }
+    return { ok: true, enabled, updated };
+  });
+  ipcMain.handle('yayra:webview-list-task-tabs', (event) => {
+    const sender = event?.sender;
+    if (!sender) return { ok: false, reason: 'unavailable', tabs: [] };
+    const tabs = [];
+    for (const entry of views.values()) {
+      if (entry.hostWc !== sender) continue;
+      const wc = entry.view?.webContents;
+      if (!wc || wc.isDestroyed?.()) continue;
+      let pid = null;
+      try {
+        const rawPid = wc.getOSProcessId?.();
+        if (Number.isInteger(rawPid) && rawPid > 0) pid = rawPid;
+      } catch { /* renderer may be tearing down */ }
+      tabs.push({ tabId: String(entry.tabId), pid });
+    }
+    return { ok: true, tabs };
+  });
   ipcMain.handle('yayra:webview-set-pointer-theme', (event, { tabId, theme, size } = {}) => setPointerTheme(viewKey(event, tabId), theme, size));
   ipcMain.handle('yayra:webview-set-bounds', (event, { tabId, bounds } = {}) => setBounds(viewKey(event, tabId), bounds));
   ipcMain.handle('yayra:webview-set-visible', (event, { tabId, visible, capture } = {}) => setVisible(viewKey(event, tabId), visible, { capture }));
@@ -1041,6 +2516,7 @@ function createWebviewBridge({
   ipcMain.handle('yayra:webview-go-back', (event, { tabId } = {}) => goBack(viewKey(event, tabId)));
   ipcMain.handle('yayra:webview-go-forward', (event, { tabId } = {}) => goForward(viewKey(event, tabId)));
   ipcMain.handle('yayra:webview-reload', (event, { tabId } = {}) => reload(viewKey(event, tabId)));
+  ipcMain.handle('yayra:webview-retry', (event, { tabId, url } = {}) => retryFailedUrl(viewKey(event, tabId), url));
   ipcMain.handle('yayra:webview-hard-reload', (event, { tabId } = {}) => hardReload(viewKey(event, tabId)));
   ipcMain.handle('yayra:webview-clear-site-cache', (event, { tabId } = {}) => clearSiteCache(viewKey(event, tabId)));
   ipcMain.handle('yayra:webview-stop', (event, { tabId } = {}) => stop(viewKey(event, tabId)));
@@ -1133,21 +2609,95 @@ function createWebviewBridge({
     const wc = entry && entry.view && entry.view.webContents;
     if (!wc || typeof wc.executeJavaScript !== 'function') return { ok: false, reason: 'no-native-page' };
     const script = `(() => {
-      const root = document.querySelector('article') || document.querySelector('main') || document.body;
-      if (!root) return { title: document.title, url: location.href, blocks: [] };
-      const nodes = root.querySelectorAll('h1, h2, h3, p, li');
-      const blocks = [];
-      for (const el of nodes) {
-        const text = (el.innerText || '').trim();
-        if (text.length < 2) continue;
-        blocks.push({ tag: el.tagName.toLowerCase(), text: text.slice(0, 4000) });
-        if (blocks.length >= 400) break;
+      const title = String(document.title || '').trim();
+      const url = String(location.href || '');
+      const siteName = document.querySelector('meta[property="og:site_name"]')?.content || location.hostname || '';
+      const hiddenByReader = (el) => {
+        if (!el || el.hidden || el.getAttribute('aria-hidden') === 'true') return true;
+        try {
+          const style = getComputedStyle(el);
+          return style.display === 'none' || style.visibility === 'hidden';
+        } catch { return false; }
+      };
+      const candidates = Array.from(document.querySelectorAll('article, main, [role="main"], [itemprop="articleBody"], .article-body, .post-content, .entry-content'));
+      let root = null;
+      let rootScore = 0;
+      for (const candidate of candidates.slice(0, 40)) {
+        const text = String(candidate.innerText || '').trim();
+        const score = text.length + (candidate.matches('article,[itemprop="articleBody"]') ? 400 : 0);
+        if (score > rootScore) { root = candidate; rootScore = score; }
       }
-      return { title: document.title, url: location.href, blocks };
+      root = root || document.body;
+      if (!root) return { title, url, siteName, language: '', wordCount: 0, blocks: [] };
+      const excluded = 'script, style, noscript, nav, header, footer, aside, form, button, input, select, textarea, [hidden], [aria-hidden="true"], [role="navigation"], [role="contentinfo"], [role="complementary"], .advertisement, .advert, .ads, .cookie-banner';
+      const safeHref = (raw) => {
+        try {
+          const resolved = new URL(raw, url);
+          return resolved.protocol === 'http:' || resolved.protocol === 'https:' ? resolved.href : '';
+        } catch { return ''; }
+      };
+      const segmentsFor = (el) => {
+        const segments = [];
+        try {
+          const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+          let node;
+          while ((node = walker.nextNode()) && segments.length < 240) {
+            const text = String(node.nodeValue || '');
+            if (!text.trim()) { if (segments.length) segments[segments.length - 1].text += text; continue; }
+            const anchor = node.parentElement?.closest('a');
+            segments.push({ text, href: anchor ? safeHref(anchor.getAttribute('href') || anchor.href || '') : '' });
+          }
+        } catch { /* text fallback is returned below */ }
+        return segments;
+      };
+      const nodes = root.querySelectorAll('h1, h2, h3, h4, p, li, blockquote, pre, figure, img');
+      const blocks = [];
+      let wordCount = 0;
+      for (const el of nodes) {
+        if (blocks.length >= 600 || hiddenByReader(el) || el.closest(excluded)) continue;
+        const tag = el.tagName.toLowerCase();
+        if (tag === 'img' && el.closest('figure')) continue;
+        if (tag === 'p' && el.closest('li')) continue;
+        let text = String(el.innerText || el.alt || '').trim();
+        if (tag === 'img') {
+          const src = safeHref(el.currentSrc || el.src || el.getAttribute('src') || '');
+          const alt = String(el.alt || '').trim();
+          if (src) blocks.push({ tag: 'img', type: 'image', src, alt, text: alt });
+          continue;
+        }
+        if (tag === 'figure') {
+          const image = el.querySelector('img');
+          const src = image ? safeHref(image.currentSrc || image.src || image.getAttribute('src') || '') : '';
+          const caption = String(el.querySelector('figcaption')?.innerText || image?.alt || '').trim();
+          if (src) { blocks.push({ tag: 'figure', type: 'figure', src, alt: String(image?.alt || ''), text: caption }); continue; }
+        }
+        if (text.length < 2) continue;
+        text = text.slice(0, 5000);
+        const segments = segmentsFor(el);
+        const type = tag === 'blockquote' ? 'quote' : tag === 'pre' ? 'code' : tag === 'li' ? 'list-item' : 'text';
+        blocks.push({ tag, type, level: /^h[1-4]$/.test(tag) ? Number(tag.slice(1)) : undefined, text, segments });
+        wordCount += text.split(/\\s+/).filter(Boolean).length;
+      }
+      return {
+        title, url, siteName,
+        language: String(document.documentElement?.lang || ''),
+        wordCount,
+        readingMinutes: Math.max(1, Math.ceil(wordCount / 220)),
+        blocks
+      };
     })()`;
     try {
       const result = await wc.executeJavaScript(script, true);
-      return { ok: true, title: result?.title || '', url: result?.url || '', blocks: Array.isArray(result?.blocks) ? result.blocks : [] };
+      return {
+        ok: true,
+        title: result?.title || '',
+        url: result?.url || '',
+        siteName: result?.siteName || '',
+        language: result?.language || '',
+        wordCount: Number.isFinite(result?.wordCount) ? result.wordCount : 0,
+        readingMinutes: Number.isFinite(result?.readingMinutes) ? result.readingMinutes : null,
+        blocks: Array.isArray(result?.blocks) ? result.blocks : []
+      };
     } catch (err) {
       logger.error?.('[yayra:webview] reader extract failed', err);
       return { ok: false, reason: 'failed' };
@@ -1178,11 +2728,11 @@ function createWebviewBridge({
     }
   });
 
-  // ---- Chrome-style password capture / autofill routing -------------
-  // The autofill preload inside a page view sends on these channels; the
-  // sender is the VIEW's webContents, so locate its entry and forward to
-  // the shell window that owns the tab. Private tabs never forward
-  // captures (the vault refuses them anyway - defense in depth).
+  // ---- Chrome-style password autofill + email recall routing ---------
+  // The isolated page preload sends on these channels; the sender is the
+  // VIEW's webContents, so locate its entry and forward to the shell window
+  // that owns the tab. Private tabs never forward captures or receive saved
+  // email suggestions (defense in depth).
   function entryForViewSender(event) {
     const sender = event && event.sender;
     if (!sender) return null;
@@ -1205,6 +2755,100 @@ function createWebviewBridge({
       if (!entry || entry.isPrivate) return;
       sendTo(entry, 'autofill-form-detected', { url: String(payload.url || entry.lastUrl || '') });
     });
+    ipcMain.on(EMAIL_FIELD_FOCUSED_CHANNEL, (event, payload = {}) => {
+      const entry = entryForViewSender(event);
+      if (!entry || entry.isPrivate) return;
+      const url = String(payload?.url || entry.lastUrl || '');
+      if (!isHttpUrl(url)) return;
+      const currentUrl = entry.view?.webContents?.getURL?.() || entry.lastUrl || '';
+      if (isHttpUrl(currentUrl)) {
+        try { if (new URL(currentUrl).origin !== new URL(url).origin) return; } catch { return; }
+      }
+      sendTo(entry, 'email-field-focused', { url });
+    });
+    ipcMain.on(EMAIL_ADDRESS_CAPTURED_CHANNEL, (event, payload = {}) => {
+      const entry = entryForViewSender(event);
+      if (!entry || entry.isPrivate) return;
+      const email = sanitizeEmailAddress(payload?.email);
+      const url = String(payload?.url || entry.lastUrl || '');
+      if (!email || !isHttpUrl(url)) return;
+      sendTo(entry, 'email-address-captured', { email, url });
+    });
+    ipcMain.on(SITE_PASSKEY_REQUEST_CHANNEL, (event, payload = {}) => {
+      const entry = entryForViewSender(event);
+      if (!entry) return;
+      const phase = payload.phase === 'started' || payload.phase === 'settled' ? payload.phase : null;
+      const action = payload.action === 'create' || payload.action === 'get' ? payload.action : null;
+      const requestId = typeof payload.requestId === 'string' && /^yayra-wa-[a-z0-9-]{1,80}$/i.test(payload.requestId)
+        ? payload.requestId
+        : null;
+      const rpId = typeof payload.rpId === 'string' && payload.rpId.length <= 253
+        && /^[a-z0-9.-]+$/i.test(payload.rpId)
+        ? payload.rpId.toLowerCase()
+        : null;
+      if (!phase || !action || !requestId || !rpId) return;
+
+      let page;
+      try { page = new URL(entry.view?.webContents?.getURL?.() || entry.lastUrl || ''); } catch { return; }
+      const trustworthy = page.protocol === 'https:'
+        || ((page.protocol === 'http:' || page.protocol === 'https:')
+          && /^(?:localhost|127(?:\.\d{1,3}){3}|\[?::1\]?)$/i.test(page.hostname));
+      const host = page.hostname.toLowerCase();
+      if (!trustworthy || (rpId !== host && !host.endsWith(`.${rpId}`))) return;
+
+      entry.sitePasskeyRequests ||= new Map();
+      let requestMeta = {
+        requestId,
+        action,
+        rpId,
+        conditional: Boolean(payload.conditional),
+        attachment: payload.attachment === 'platform' || payload.attachment === 'cross-platform'
+          ? payload.attachment
+          : 'any',
+        controlled: payload.controlled === true,
+        controlState: 'none',
+        userVerified: false,
+        completionTimer: null
+      };
+      if (phase === 'started') {
+        if (entry.sitePasskeyRequests.size >= 8 || entry.sitePasskeyRequests.has(requestId)) return;
+        requestMeta.provider = websitePasskeyInfo(entry, requestMeta);
+        // The local software authenticator is safe only when the preload can
+        // start native WebAuthn *after* approval. An older observer that has
+        // already entered CTAP cannot be repaired by toggling virtual touch,
+        // so expose the honest system-browser fallback instead.
+        if (requestMeta.provider.mode === 'local' && !requestMeta.controlled) {
+          requestMeta.provider = { mode: 'external', available: false, reason: 'request-gate-unavailable' };
+        }
+        entry.sitePasskeyRequests.set(requestId, requestMeta);
+        if (requestMeta.controlled) {
+          const shouldHold = requestMeta.provider.mode !== 'native' && !requestMeta.conditional;
+          controlSitePasskeyRequest(entry, requestId, shouldHold ? 'hold' : 'release');
+        }
+      } else {
+        requestMeta = entry.sitePasskeyRequests.get(requestId);
+        if (!requestMeta) return;
+        entry.sitePasskeyRequests.delete(requestId);
+        clearSitePasskeyCompletionTimer(requestMeta);
+        finishPendingPasskeySelection(entry, requestId, false);
+        try {
+          websitePasskeyProvider?.settle?.({ webContents: entry.view?.webContents, requestId });
+        } catch { /* provider is already detached */ }
+      }
+      sendTo(entry, 'webauthn-request', {
+        phase,
+        requestId,
+        action: requestMeta.action,
+        rpId: requestMeta.rpId,
+        conditional: requestMeta.conditional,
+        attachment: requestMeta.attachment,
+        provider: requestMeta.provider,
+        success: phase === 'settled' ? payload.success === true : undefined,
+        errorName: typeof payload.errorName === 'string' && /^[A-Za-z]+Error$/.test(payload.errorName)
+          ? payload.errorName.slice(0, 64)
+          : ''
+      });
+    });
   }
 
   ipcMain.handle('yayra:webview-fill-credentials', (event, { tabId, username, password } = {}) => {
@@ -1221,6 +2865,28 @@ function createWebviewBridge({
     }
   });
 
+  ipcMain.handle('yayra:webview-suggest-email-addresses', (event, { tabId, emails } = {}) => {
+    const entry = views.get(viewKey(event, tabId));
+    if (!entry || entry.isPrivate) return { suggested: false, count: 0 };
+    const seen = new Set();
+    const safeEmails = (Array.isArray(emails) ? emails : [])
+      .map(sanitizeEmailAddress)
+      .filter((email) => {
+        if (!email) return false;
+        const key = email.toLocaleLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .slice(0, 25);
+    try {
+      entry.view.webContents.send(EMAIL_SUGGESTIONS_CHANNEL, { emails: safeEmails });
+      return { suggested: true, count: safeEmails.length };
+    } catch {
+      return { suggested: false, count: 0 };
+    }
+  });
+
   return {
     destroyAll,
     destroyForWebContents,
@@ -1231,15 +2897,23 @@ function createWebviewBridge({
 
 module.exports = {
   WEBVIEW_EVENT_CHANNEL,
+  SITE_PASSKEY_REQUEST_CHANNEL,
   SYSTEM_BROWSER_AUTH_HOSTS,
   OPEN_EXTERNAL_SCHEME,
+  isGoogleOAuthAuthorizationUrl,
+  isGoogleInteractiveAuthenticationUrl,
   requiresSystemBrowserAuth,
   secureSystemBrowserAuthUrl,
   decodeOpenExternalRequest,
   buildWebAuthnWatchdogScript,
+  buildGoogleSearchThinkingWatchdogScript,
   buildPointerThemeCss,
   buildPointerThemeScript,
+  buildPointerTextCursorScript,
+  buildTextSelectionActionsScript,
   sanitizeBounds,
+  sanitizePageBounds,
+  MIN_NATIVE_PAGE_Y,
   buildBrowserUserAgent,
   buildContextMenuTemplate,
   reloadActionForInput,

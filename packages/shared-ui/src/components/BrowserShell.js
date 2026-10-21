@@ -18,7 +18,19 @@
 
 import { Icons } from '../icons/icons.js';
 import qrcode from '../vendor/qrcode.js';
-import { classifyDocument, DocumentStore, createPdfViewer, createDocumentViewerState, DOCUMENT_ENGINES } from '../services/documentWorkspace.js';
+import {
+  classifyDocument,
+  createDocumentViewerState,
+  createPdfViewer,
+  createViewerForKind,
+  DEFAULT_PPTX_NOTES_COLOR,
+  normalizePptxNotesColor,
+  resolveDocumentSlideshowShortcut,
+  DOCUMENT_ENGINES,
+  DocumentStore,
+  MAX_DOCUMENT_BYTES,
+  routeDocument
+} from '../services/documentWorkspace.js';
 import { PasswordManager } from '../../../persistence/src/PasswordManager.js';
 import { PasskeyService } from '../services/passkeyService.js';
 import { ProfileService } from '../services/profileService.js';
@@ -27,12 +39,17 @@ import {
   createHistoryRepo,
   createBookmarksRepo,
   createSettingsRepo,
+  createEmailAddressesRepo,
+  DEFAULT_BOOKMARK_GROUPS,
+  DEFAULT_BOOKMARK_GROUP_ID,
   createWheelRepo,
   createShortcutsRepo,
   createSessionRepo
 } from '../services/profileStorage.js';
 import { YayraAiService, AI_DEFAULTS, describeAiReason } from '../services/aiService.js';
 import { ExtensionManager, BUILT_IN_EXTENSIONS } from '../../../browser-contract/src/extensions/ExtensionManager.js';
+
+const MAX_DOCUMENT_SIZE_MB = Math.floor(MAX_DOCUMENT_BYTES / (1024 * 1024));
 
 /**
  * =========================================================================
@@ -70,6 +87,21 @@ function escapeAttr(value) {
     .replace(/>/g, '&gt;');
 }
 
+function escapeHtml(value) {
+  return escapeAttr(value).replace(/'/g, '&#39;');
+}
+
+function safeHttpsImageUrl(value) {
+  if (typeof value !== 'string' || value.length > 2048) return null;
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password) return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
 // Human wording for PasskeyService failure reasons.
 function describePasskeyReason(reason) {
   switch (reason) {
@@ -87,6 +119,10 @@ function describePasskeyReason(reason) {
     case 'pin-locked': return 'too many wrong PIN attempts - PIN entry is locked for a minute';
     case 'verification-cancelled': return 'the verification was cancelled';
     case 'system-auth-unavailable': return 'the system password prompt is unavailable on this device';
+    case 'no-local-credential': return 'Yayra has no saved website passkey for this site/profile';
+    case 'yayra-authorization-expired': return 'the Yayra verification expired - verify again';
+    case 'yayra-authorization-mismatch': return 'the Yayra verification did not match this website request';
+    case 'ceremony-timeout': return 'the website did not finish the passkey request in time';
     case 'no-lan': return 'phone approval needs your PC to be on a Wi-Fi/LAN network the phone can reach';
     default: return reason || 'unknown error';
   }
@@ -117,10 +153,30 @@ const FRAME_EMBEDDING_BLOCKED_HOSTS = [
   'bing.com'
 ];
 
-// Keep in sync with GOOGLE_SIGN_IN_PATH in electron/webviewBridge.cjs.
-// accounts.google.com has account pages as well as OAuth/sign-in endpoints,
-// so host matching alone would send ordinary account browsing outside Yayra.
-const GOOGLE_SIGN_IN_PATH = /^\/(?:o\/oauth2(?:\/|$)|oauth2(?:\/|$)|signin(?:\/|$)|servicelogin(?:\/|$)|accountchooser(?:\/|$)|v\d+\/signin(?:\/|$)|gsi\/select(?:\/|$))/i;
+// Keep in sync with the exact Google predicates in electron/webviewBridge.cjs
+// and YayraTabWebviewManager.kt. OAuth plus interactive account sign-in routes
+// require an OS external user-agent; account management, logout, Search, Gmail
+// content, and other product routes are intentionally not broad-matched.
+const GOOGLE_OAUTH_PATH = /^\/(?:o\/oauth2(?:\/|$)|oauth2(?:\/|$)|signin\/oauth(?:\/|$)|gsi\/select(?:\/|$))/i;
+const GOOGLE_INTERACTIVE_SIGNIN_PATH = /^\/(?:signin\/(?:v2|challenge|identifier|rejected)(?:\/|$)|v3\/signin(?:\/|$)|ServiceLogin(?:\/|$)|InteractiveLogin(?:\/|$)|AccountChooser(?:\/|$)|AddSession(?:\/|$))/i;
+const GOOGLE_REJECTED_SIGNIN_PATH = /^\/(?:signin\/rejected|v3\/signin\/rejected)(?:\/|$)/i;
+const MAX_AUTH_HANDOFF_URL_LENGTH = 8192;
+
+// Custom pointer themes replace Chromium's context-aware cursors, so Yayra
+// hit-tests real text nodes and restores the native I-beam only over readable,
+// selectable text. Interactive labels intentionally keep the hand cursor.
+const TEXT_POINTER_INTERACTIVE_SELECTOR = [
+  'a', 'area[href]', 'button',
+  'input[type="button"]', 'input[type="submit"]', 'input[type="reset"]', 'input[type="image"]',
+  'input[type="checkbox"]', 'input[type="radio"]', 'input[type="range"]', 'input[type="file"]', 'input[type="color"]',
+  'select', 'option', 'summary', 'label',
+  '[role="button"]', '[role="link"]', '[role="tab"]', '[role="menuitem"]', '[role="menuitemcheckbox"]', '[role="menuitemradio"]',
+  '[role="combobox"]', '[role="listbox"]', '[role="option"]', '[role="checkbox"]', '[role="radio"]', '[role="switch"]', '[role="slider"]', '[role="treeitem"]', '[role="gridcell"]',
+  '[aria-haspopup]', '[onclick]', '[tabindex]:not([tabindex="-1"])',
+  '.fb-selection-actions'
+].join(', ');
+const MAX_SELECTION_ACTION_TEXT = 100_000;
+const MAX_SELECTION_SEARCH_TEXT = 2_000;
 
 export class BrowserShell {
   static FRAME_EMBEDDING_BLOCKED_HOSTS = FRAME_EMBEDDING_BLOCKED_HOSTS;
@@ -134,6 +190,7 @@ export class BrowserShell {
     this.navigationController = options.navigationController || null;
     this.historyRepo = options.historyRepo || null;
     this.bookmarksRepo = options.bookmarksRepo || null;
+    this.emailAddressesRepo = options.emailAddressesRepo || null;
     this.downloadsRepo = options.downloadsRepo || null;
     this.settingsRepo = options.settingsRepo || null;
     this.privacyManager = options.privacyManager || null;
@@ -174,6 +231,7 @@ export class BrowserShell {
       this.profileStorage = scoped;
       if (!this.historyRepo) this.historyRepo = createHistoryRepo(scoped);
       if (!this.bookmarksRepo) this.bookmarksRepo = createBookmarksRepo(scoped);
+      if (!this.emailAddressesRepo) this.emailAddressesRepo = createEmailAddressesRepo(scoped);
       if (!this.settingsRepo) this.settingsRepo = createSettingsRepo(scoped);
       if (!this.storageAdapter) this.storageAdapter = scoped;
       this.wheelRepo = options.wheelRepo || createWheelRepo(scoped);
@@ -186,6 +244,10 @@ export class BrowserShell {
       this.sessionRepo = options.sessionRepo || null;
     }
 
+    if (!this.emailAddressesRepo && this.storageAdapter
+      && typeof this.storageAdapter.get === 'function' && typeof this.storageAdapter.set === 'function') {
+      this.emailAddressesRepo = createEmailAddressesRepo(this.storageAdapter);
+    }
     this.passwordManager = options.passwordManager || new PasswordManager(this.storageAdapter);
     this.extensionManager = options.extensionManager || new ExtensionManager(this.storageAdapter);
     // Passkey for the Yayra account: biometric/PIN gate for revealing
@@ -219,7 +281,7 @@ export class BrowserShell {
             canGoBack: false,
             canGoForward: false,
             isLoading: false,
-            isPrivate: false,
+            isPrivate: Boolean(options.initialPrivate),
             favicon: null
           }
         ];
@@ -248,6 +310,8 @@ export class BrowserShell {
       isMobile: options.isMobile !== undefined ? options.isMobile : this.checkMobileViewport(),
       urlInputValue: initialTabs[0]?.url || 'yayra://newtab',
       activeModal: null, // 'menu', 'tab-switcher', 'sponsored-manager', etc.
+      tabSwitcherSearchQuery: '',
+      tabSwitcherRecentlyClosedExpanded: false,
       isSideDrawerOpen: false,
       isSecurityDropdownOpen: false,
       isRadialLauncherOpen: false,
@@ -265,6 +329,15 @@ export class BrowserShell {
       closedTabsHistory: [],
       historyItems: [],
       bookmarksItems: [],
+      bookmarkGroups: DEFAULT_BOOKMARK_GROUPS.map((group) => ({ ...group })),
+      bookmarkDefaultGroupId: DEFAULT_BOOKMARK_GROUP_ID,
+      bookmarksActiveGroupId: DEFAULT_BOOKMARK_GROUP_ID,
+      // Profile-scoped email addresses saved from submitted web forms.
+      rememberedEmails: [],
+      // Full previous-session snapshot, kept separately from the compact
+      // five-item Continue prompt so a group click can reopen every member
+      // recorded in that session.
+      tabGroupRestoreTabs: [],
       // Chrome-style new tab: the user's own pinned shortcut tiles and
       // the previous session's not-manually-closed tabs ("Continue with
       // these tabs").
@@ -277,6 +350,16 @@ export class BrowserShell {
       // than showing fake placeholder downloads.
       downloadsItems: [],
       downloadRoot: null,
+      // Trusted desktop document catalog metadata. Source paths never enter
+      // this state; web/PWA session entries use a separate `session-*` id.
+      documentsItems: [],
+      documentsLoading: false,
+      documentsSearchQuery: '',
+      documentsTypeFilter: 'all',
+      documentsDateFilter: 'all',
+      documentsSizeFilter: 'all',
+      documentsSort: 'opened',
+      documentsSortDirection: 'desc',
       // System-wide floating overlay bubble (see electron/overlayWindow.cjs).
       // These mirror the Electron-side defaults so the UI shows sane values
       // even before overlayBridge.getSettings() resolves.
@@ -323,6 +406,42 @@ export class BrowserShell {
         theme: 'dark',
         colorTheme: 'blue',
         searchEngine: 'google', // Requirement 13: Default search engine is Google
+        tabSwitcherView: 'grid', // 'grid' keeps the existing preview cards; 'list' is the compact Chrome-style tab search
+        performanceIssueAlerts: true,
+        // Live-sites mode is the default: background tabs keep timers,
+        // media, sockets and real-time page updates active. The legacy
+        // throttling field stays synchronized for stored-settings/backward
+        // compatibility, but the positive keepSitesLive setting owns UI.
+        keepSitesLive: true,
+        backgroundTabThrottling: false,
+        dimInactiveTabs: true,
+        tabHoverCards: true,
+        reduceMotionForPerformance: false,
+        readerTheme: 'dark',
+        readerFont: 'serif',
+        readerFontSize: 19,
+        readerLineHeight: '1.75',
+        readerLetterSpacing: '0',
+        readerLayout: 'comfortable',
+        readerLinks: true,
+        readerImages: true,
+        readerVoiceHighlight: true,
+        readerPinned: true,
+        readerSpeechRate: 1,
+        readerVoice: '',
+        // Per-profile preferences for documents and presentation mode. The
+        // desktop catalog itself is app-wide and path-isolated in Electron;
+        // these fields control only how this profile presents/manages it.
+        pptxNotesColor: DEFAULT_PPTX_NOTES_COLOR,
+        pptxSlideshowFullscreen: true,
+        pptxSlideshowAutoHideControls: true,
+        documentsDefaultSort: 'opened',
+        documentsDefaultSortDirection: 'desc',
+        documentsDefaultType: 'all',
+        documentsDefaultDate: 'all',
+        documentsDefaultSize: 'all',
+        documentsShowMissing: true,
+        documentsRetentionDays: 0,
         floatingEnabledByDefault: true,
         startFloatingOnLaunch: true,
         alwaysOnTop: true,
@@ -409,10 +528,28 @@ export class BrowserShell {
     this.omniboxInput = null;
     this.viewportElement = null;
     this.bubbleOverlay = null;
+    // Renderer-owned top-chrome input must have one deterministic lifecycle.
+    // Every tab/window drag registers its synchronous cancel function here;
+    // render/focus/blur/lost mouse-up recovery drains the set before stale
+    // pointer capture can strand the tab strip. Initialized eagerly (rather
+    // than lazily inside a gesture) so native recovery IPC can safely arrive
+    // at any point in startup.
+    this._activePointerCleanups = new Set();
+    this._topChromeRecoveryBindings = [];
+    this._topChromeRecoveryInstalled = false;
+    this._unsubscribeTopChromeRecovery = null;
     // Persistent web-frame layer (web/PWA): survives re-renders so embedded
     // pages never reload when the chrome re-renders. See ensureWebFrameLayer().
     this.webFrameLayer = null;
     this.webFrames = new Map();
+    // A failed website is tab-scoped recovery state, never a replacement
+    // URL. The address/history stay untouched while the live native/iframe
+    // surface is hidden behind an informative browser-style error page.
+    // Timers live on each record so navigation/tab close can cancel every
+    // stale retry generation synchronously.
+    this._siteFailures = new Map();
+    this._connectivityListeners = null;
+    this._destroyed = false;
     // Strictly-increasing mount counter: pooled-frame LRU ordering must be
     // deterministic BY CONSTRUCTION - wall-clock Date.now() can tie or jitter
     // under load, which made eviction order (rarely) non-deterministic.
@@ -425,11 +562,26 @@ export class BrowserShell {
 
     this.boundResizeHandler = () => this.handleViewportResize();
     this.boundKeyHandler = (e) => this.handleGlobalKeyDown(e);
+    // Selection UX is body-mounted so it survives ordinary shell renders long
+    // enough for Copy/Cut/Search/Ask AI to receive the user's click. Every
+    // listener and marker has an explicit destroy path below.
+    this._selectionToolbar = null;
+    this._selectionToolbarSnapshot = null;
+    this._selectionActionBindings = [];
+    this._selectionActionsInstalled = false;
+    this._selectionUpdateFrame = null;
+    this._dismissedSelectionSignature = null;
+    this._selectableTextCursorElement = null;
     this._bookmarkCheckId = 0;
     // PRODUCTION SHIELD: one stray exception in any handler must never
     // look like a frozen app - errors are logged (rate-limited) and the
     // UI loop keeps running (see installGlobalErrorShield).
     this.installGlobalErrorShield();
+    // Install before the first render: if the OS drops pointer-up/focus while
+    // the shell is booting, the first usable frame must already own all
+    // fallback cleanup paths. Electron also sends the same recovery signal
+    // from the main process on native focus/blur/minimize transitions.
+    this.installTopChromeInputRecovery();
 
     // Native website-rendering engine bridge (Electron desktop only - see
     // electron/webviewBridge.cjs). Subscribed once here, not per-render,
@@ -437,9 +589,14 @@ export class BrowserShell {
     // frequent full-DOM re-renders.
     this._nativeWebviewTabIds = new Set();
     // A handoff belongs to a tab and its auth URL, not to the whole shell.
-    // Keeping it here prevents chrome re-renders from reopening the system
-    // browser while the original tab URL/history remain intact.
+    // Keeping it here prevents chrome re-renders from reopening the provider
+    // surface while the original tab URL/history remain intact.
     this._systemBrowserHandoffs = new Map();
+    // Voice Search and Lens are Google features, but their pages/results
+    // must remain in Yayra's own site engine. This tab-scoped marker also
+    // suppresses web/PWA window.open fallbacks so these controls can never
+    // launch the user's external browser.
+    this._inAppOnlyGoogleTabs = new Set();
     this._nativeWebviewResizeObservers = new Map();
     this._lastAppliedNativePointerConfig = null;
     this._lastAppliedAndroidPointerConfig = null;
@@ -573,9 +730,9 @@ export class BrowserShell {
   // window.yayra.windowControls (electron/preload.cjs): real minimize/
   // maximize/close for the frameless Electron main window. The OS title
   // bar (which just said "yayra") and the File/Edit/View/Window menu block
-  // are removed - Yayra's own tab strip is the title bar, so it shows the
-  // brand wordmark image and these controls instead. Absent on web/PWA,
-  // where the browser provides the window chrome.
+  // are removed - Yayra renders its own tab strip and window controls, with
+  // a small renderer-owned pointer/IPC drag handle (never a native app drag
+  // region). Absent on web/PWA, where the browser provides window chrome.
   get windowControls() {
     if (typeof window === 'undefined') return null;
     const bridge = (window.yayra && window.yayra.windowControls) || (window.ibrowse && window.ibrowse.windowControls) || null;
@@ -621,6 +778,9 @@ export class BrowserShell {
       // A body-mounted install confirmation is outside render(), but it must
       // still keep the desktop native page surface out of the way.
       Boolean(typeof document !== 'undefined' && document.getElementById('yayra-install-app-overlay')) ||
+      // Text prompts are body-mounted so they can sit above the renderer
+      // tree; on desktop they also need the native page surface hidden.
+      Boolean(typeof document !== 'undefined' && document.querySelector('.fb-text-prompt-overlay')) ||
       // The update prompt cards ("Update available - now or later?" and
       // "Update downloaded - install when?") were missing for the SAME
       // reason: with a real site open the native page surface painted
@@ -703,10 +863,11 @@ export class BrowserShell {
   // whole app (including this file) inside ONE Capacitor WebView. That outer
   // WebView is still a real Chromium/WebKit engine and enforces the exact
   // same X-Frame-Options / frame-ancestors restrictions against any nested
-  // <iframe> as a desktop browser would, and Google/Apple/Microsoft apply
-  // the same embedded-webview sign-in block there too. Only active when
-  // actually running as a packaged native app (`Capacitor.isNativePlatform()`),
-  // never for the plain web/PWA build, where window.Capacitor is absent.
+  // <iframe> as a desktop browser would. The native browser surface is used
+  // for explicit OAuth/interactive sign-in handoffs and for sites that cannot
+  // be framed. Account management and ordinary product routes remain distinct.
+  // Only active when actually running as a packaged native app
+  // (`Capacitor.isNativePlatform()`), never in the plain web/PWA build.
   get capacitorBrowser() {
     if (typeof window === 'undefined') return null;
     const capacitor = window.Capacitor;
@@ -735,8 +896,9 @@ export class BrowserShell {
   // own activity window - the Android equivalent of the desktop
   // WebContentsView engine. A top-level WebView navigation has no
   // iframe/X-Frame-Options restrictions, so frame-hostile sites (Google,
-  // YouTube, X, Facebook, ...) genuinely render IN the app instead of
-  // being handed off to Chrome Custom Tabs ("open in other app").
+  // YouTube, X, Facebook, ...) can render IN the app instead of being
+  // handed off to Chrome Custom Tabs. Matching Google OAuth and interactive
+  // account sign-in routes are intercepted for the OS user-agent instead.
   get capacitorTabWeb() {
     if (typeof window === 'undefined') return null;
     const capacitor = window.Capacitor;
@@ -856,9 +1018,9 @@ export class BrowserShell {
     }
   }
 
-  // Keep in sync with SYSTEM_BROWSER_AUTH_HOSTS and GOOGLE_SIGN_IN_PATH in
-  // electron/webviewBridge.cjs. Duplicated rather than imported because that
-  // module is CommonJS/Electron-only and this file ships in web/PWA/Capacitor.
+  // Keep in sync with SYSTEM_BROWSER_AUTH_HOSTS and Google route predicates
+  // in electron/webviewBridge.cjs. Duplicated rather than imported because
+  // that module is CommonJS/Electron-only and this ships to web/Capacitor.
   static SYSTEM_BROWSER_AUTH_HOSTS = ['accounts.google.com', 'appleid.apple.com', 'login.live.com', 'login.microsoftonline.com'];
 
   // Chrome-style keep-alive: loaded pages are never reloaded in the
@@ -867,20 +1029,68 @@ export class BrowserShell {
   // a lid on memory on low-end Android devices.
   static MAX_POOLED_FRAMES = 8;
 
-  isSystemBrowserAuthHost(url) {
+  _parseBoundedAuthUrl(url) {
+    if (typeof url !== 'string' || !url || url.length > MAX_AUTH_HANDOFF_URL_LENGTH) return null;
     try {
       const parsed = new URL(url);
-      if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
-      const hostname = parsed.hostname.toLowerCase();
-      return BrowserShell.SYSTEM_BROWSER_AUTH_HOSTS.some((host) => {
-        if (host === 'accounts.google.com') {
-          return hostname === host && GOOGLE_SIGN_IN_PATH.test(parsed.pathname);
-        }
-        return hostname === host || hostname.endsWith(`.${host}`);
-      });
+      if ((parsed.protocol !== 'https:' && parsed.protocol !== 'http:') || parsed.username || parsed.password) return null;
+      return parsed;
     } catch (_err) {
-      return false;
+      return null;
     }
+  }
+
+  isSystemBrowserAuthHost(url) {
+    const parsed = this._parseBoundedAuthUrl(url);
+    if (!parsed) return false;
+    const hostname = parsed.hostname.toLowerCase();
+    return BrowserShell.SYSTEM_BROWSER_AUTH_HOSTS.some((host) => {
+      if (host === 'accounts.google.com') {
+        return hostname === host
+          && (GOOGLE_OAUTH_PATH.test(parsed.pathname) || GOOGLE_INTERACTIVE_SIGNIN_PATH.test(parsed.pathname));
+      }
+      return hostname === host || hostname.endsWith(`.${host}`);
+    });
+  }
+
+  isGoogleOAuthAuthorizationUrl(url) {
+    const parsed = this._parseBoundedAuthUrl(url);
+    return Boolean(parsed
+      && parsed.hostname.toLowerCase() === 'accounts.google.com'
+      && GOOGLE_OAUTH_PATH.test(parsed.pathname));
+  }
+
+  isGoogleInteractiveAuthenticationUrl(url) {
+    const parsed = this._parseBoundedAuthUrl(url);
+    return Boolean(parsed
+      && parsed.hostname.toLowerCase() === 'accounts.google.com'
+      && (GOOGLE_OAUTH_PATH.test(parsed.pathname) || GOOGLE_INTERACTIVE_SIGNIN_PATH.test(parsed.pathname)));
+  }
+
+  secureSystemBrowserAuthUrl(url) {
+    if (!this.isSystemBrowserAuthHost(url)) return url;
+    const parsed = this._parseBoundedAuthUrl(url);
+    if (!parsed) return url;
+    parsed.protocol = 'https:';
+    if (parsed.hostname.toLowerCase() === 'accounts.google.com'
+      && GOOGLE_REJECTED_SIGNIN_PATH.test(parsed.pathname)) {
+      const clean = new URL('https://accounts.google.com/ServiceLogin');
+      const continueValue = parsed.searchParams.get('continue');
+      if (continueValue && continueValue.length <= 4096) {
+        try {
+          const destination = new URL(continueValue);
+          if (destination.protocol === 'https:' && !destination.username && !destination.password) {
+            destination.hash = '';
+            clean.searchParams.set('continue', destination.toString());
+          }
+        } catch { /* untrusted continuation is discarded */ }
+      }
+      const language = parsed.searchParams.get('hl');
+      if (language && /^[A-Za-z]{2,3}(?:-[A-Za-z]{2,4})?$/.test(language)) clean.searchParams.set('hl', language);
+      return clean.toString();
+    }
+    parsed.hash = '';
+    return parsed.toString();
   }
 
   // Opens a URL using the best available system-level surface: Capacitor's
@@ -889,16 +1099,9 @@ export class BrowserShell {
   // handoff (shell.openExternal, see electron/webviewBridge.cjs) and never
   // reaches this method for auth hosts.
   async openExternally(url) {
-    let externalUrl = url;
-    if (this.isSystemBrowserAuthHost(url)) {
-      try {
-        const parsed = new URL(url);
-        if (parsed.protocol === 'http:') {
-          parsed.protocol = 'https:';
-          externalUrl = parsed.toString();
-        }
-      } catch { /* the classifier already rejects malformed URLs */ }
-    }
+    const externalUrl = this.isSystemBrowserAuthHost(url)
+      ? this.secureSystemBrowserAuthUrl(url)
+      : url;
     const capacitorBrowser = this.capacitorBrowser;
     if (capacitorBrowser && typeof capacitorBrowser.open === 'function') {
       try {
@@ -942,6 +1145,10 @@ export class BrowserShell {
     this._armConnectivityAwareness();
     // Local document workspace (Phase 1: PDF) - in-memory, local-first.
     this.documentStore = new DocumentStore();
+    // Keep one PDF.js controller per document tab. The shell rebuilds its DOM
+    // on tab switches/resizes; the controller is reattached instead of
+    // reparsing the same bytes or leaving a spinner on a stale DOM node.
+    this._documentViewerSessions = new Map();
     // Android native tab webview engine bookkeeping (tab id -> engine).
     this._androidTabWebIds = new Set();
     this._androidTabWebResizeObservers = new Map();
@@ -976,9 +1183,10 @@ export class BrowserShell {
     try {
       const docBridge = this.systemBridge && this.systemBridge.documents;
       if (docBridge && typeof docBridge.onOpenPdfFile === 'function') {
-        this._unsubscribeOpenPdfFile = docBridge.onOpenPdfFile(({ name, data } = {}) => {
+        this._unsubscribeOpenPdfFile = docBridge.onOpenPdfFile(({ name, data, libraryId } = {}) => {
           if (!data) return;
-          this.addDocumentTab({ name: name || 'document.pdf', bytes: data });
+          this.addDocumentTab({ name: name || 'document.pdf', bytes: data, libraryId });
+          void this.refreshDocumentLibrary({ render: false });
         });
       }
     } catch { /* optional bridge */ }
@@ -999,6 +1207,64 @@ export class BrowserShell {
         console.warn('Failed to load settings in BrowserShell:', err);
       }
     }
+    // Stored settings are user-editable local data. A malformed or legacy
+    // colour must degrade to the readable black default before any native
+    // colour input or notes element receives it.
+    this.state.settings.pptxNotesColor = normalizePptxNotesColor(
+      this.state.settings.pptxNotesColor
+    );
+    // Normalize legacy combined sort values (recent/oldest/largest/smallest)
+    // into independent field + direction controls. This keeps upgraded
+    // profiles behaving the same while allowing every sort to run both ways.
+    const storedDocumentSort = String(this.state.settings.documentsDefaultSort || 'opened');
+    const documentSortAliases = {
+      recent: 'opened', oldest: 'opened', largest: 'size', smallest: 'size'
+    };
+    this.state.documentsSort = ['opened', 'name', 'type', 'size', 'frequent'].includes(documentSortAliases[storedDocumentSort] || storedDocumentSort)
+      ? (documentSortAliases[storedDocumentSort] || storedDocumentSort)
+      : 'opened';
+    this.state.documentsSortDirection = ['oldest', 'smallest'].includes(storedDocumentSort)
+      ? 'asc'
+      : (this.state.settings.documentsDefaultSortDirection === 'asc' ? 'asc' : 'desc');
+    this.state.settings.documentsDefaultSort = this.state.documentsSort;
+    this.state.settings.documentsDefaultSortDirection = this.state.documentsSortDirection;
+    const savedDocumentType = String(this.state.settings.documentsDefaultType || 'all');
+    const savedDocumentDate = String(this.state.settings.documentsDefaultDate || 'all');
+    const savedDocumentSize = String(this.state.settings.documentsDefaultSize || 'all');
+    this.state.documentsTypeFilter = ['all', 'pdf', 'presentation', 'document', 'spreadsheet', 'image', 'text', 'archive', 'other'].includes(savedDocumentType)
+      ? savedDocumentType : 'all';
+    this.state.documentsDateFilter = ['all', 'today', 'week', 'month', 'year'].includes(savedDocumentDate)
+      ? savedDocumentDate : 'all';
+    this.state.documentsSizeFilter = ['all', 'under-1mb', '1mb-10mb', '10mb-100mb', '100mb-300mb', 'over-300mb'].includes(savedDocumentSize)
+      ? savedDocumentSize : 'all';
+    this.state.settings.documentsDefaultType = this.state.documentsTypeFilter;
+    this.state.settings.documentsDefaultDate = this.state.documentsDateFilter;
+    this.state.settings.documentsDefaultSize = this.state.documentsSizeFilter;
+    // Load safe catalog metadata in the background. Apply the user's
+    // retention policy first; pruning removes catalog rows only, never files.
+    const documentsRetentionDays = Math.max(0, Number(this.state.settings.documentsRetentionDays) || 0);
+    if (documentsRetentionDays > 0 && typeof this.systemBridge?.documents?.prune === 'function') {
+      Promise.resolve(this.systemBridge.documents.prune(documentsRetentionDays))
+        .then(() => this.refreshDocumentLibrary({ render: false }))
+        .catch(() => this.refreshDocumentLibrary({ render: false }));
+    } else {
+      void this.refreshDocumentLibrary({ render: false });
+    }
+    // v1 live-sites policy: old profiles may carry the previous default
+    // `backgroundTabThrottling:true`, but they have no keepSitesLive key.
+    // The new positive setting defaults to true, so existing installs also
+    // become live immediately after upgrading rather than needing a manual
+    // preference reset. Keep the legacy field synchronized for older code.
+    this.state.settings.backgroundTabThrottling = this.state.settings.keepSitesLive === false;
+
+    // Apply the saved live-sites policy to this window's native pages. The
+    // main process remembers it for views created later in this window.
+    try {
+      const webview = this.nativeWebview;
+      if (typeof webview?.setBackgroundThrottling === 'function') {
+        await webview.setBackgroundThrottling(this.state.settings.keepSitesLive === false);
+      }
+    } catch { /* the web/PWA build has no native webview policy bridge */ }
 
     if (this.historyRepo && typeof this.historyRepo.getEntries === 'function') {
       try {
@@ -1010,9 +1276,14 @@ export class BrowserShell {
 
     if (this.bookmarksRepo && typeof this.bookmarksRepo.getAllBookmarks === 'function') {
       try {
-        this.state.bookmarksItems = await this.bookmarksRepo.getAllBookmarks();
+        await this.refreshBookmarksState();
       } catch (err) {
         console.warn('Failed to load bookmarks in BrowserShell:', err);
+      }
+    }
+    if (this.emailAddressesRepo && typeof this.emailAddressesRepo.getAllEmails === 'function') {
+      try { await this.refreshEmailAddressesState(); } catch (err) {
+        console.warn('Failed to load saved email addresses in BrowserShell:', err);
       }
     }
 
@@ -1032,7 +1303,9 @@ export class BrowserShell {
       try {
         const prev = await this.sessionRepo.getLastSession();
         const openNow = new Set(this.state.tabs.map((t) => t.url));
-        this.state.continueTabs = (prev.tabs || []).filter((t) => !openNow.has(t.url)).slice(0, 5);
+        const previousTabs = (prev.tabs || []).filter((t) => !t?.isPrivate && /^https?:\/\//i.test(t?.url || ''));
+        this.state.tabGroupRestoreTabs = previousTabs;
+        this.state.continueTabs = previousTabs.filter((t) => !openNow.has(t.url)).slice(0, 5);
         // Identifies THIS snapshot so "No thanks" dismisses exactly it
         // (a future session's tabs will prompt again).
         this.state.continueSavedAt = prev.savedAt || null;
@@ -1149,6 +1422,10 @@ export class BrowserShell {
       window.addEventListener('resize', this.boundResizeHandler);
       window.addEventListener('keydown', this.boundKeyHandler);
     }
+    // Restore the native I-beam over real text and expose a lightweight
+    // action bar whenever the user highlights text. Native website surfaces
+    // install the equivalent page-local enhancement in their own engine.
+    this.installTextInteractionEnhancements();
 
     // First open on a NEW version (i.e. right after an update installed):
     // celebrate with the quick Yayra-orb animation + the freshly
@@ -1257,6 +1534,24 @@ export class BrowserShell {
   }
 
   render(container = null) {
+    // A render can replace the selected node. Never leave a body-mounted
+    // selection action bar pointing at a detached range.
+    this.dismissSelectionToolbar({ rememberSelection: false });
+    // Replacing the strip while a pointer is captured used to leave global
+    // reorder/window-drag listeners attached to a detached element. Revoke
+    // every gesture first and retire body-mounted lightweight menus: a render
+    // is a hard input-generation boundary, never a reason to keep capture.
+    this.recoverTopChromeInput('renderer re-render', { closeTransientMenus: true });
+    // Keep the live native page invariant explicit at the render boundary.
+    // A second truth-check below runs after an aged splash is retired.
+    try { this.healStuckPageSurface(); } catch { /* best-effort heal */ }
+    if (this._tabHoverTimer) clearTimeout(this._tabHoverTimer);
+    this._tabHoverTimer = null;
+    this._activeTabHoverCard?.remove?.();
+    this._activeTabHoverCard = null;
+    // The old strip is about to detach. Desktop rendering assigns the fresh
+    // one before overlays are built; mobile layout intentionally leaves null.
+    this.tabStripElement = null;
     // Global theme tokens must reach body-mounted dialogs too, not just
     // the shell node that render() rebuilds. Pointer preference follows the
     // same lifecycle and is also forwarded to the native website surfaces.
@@ -1304,13 +1599,21 @@ export class BrowserShell {
     } else {
       target.innerHTML = '';
     }
+    // The first truth-check above deliberately runs before teardown so real
+    // overlays remain protected. Check once more now: an omnibox dropdown in
+    // the old render tree has just been detached, so a flag it left behind is
+    // stale and must not turn the destination page into a frozen screenshot.
+    try { this.healStuckPageSurface(); } catch { /* best-effort heal */ }
+
     const activeTab = this.getActiveTab();
+    const activeTabWasLoading = Boolean(activeTab?.isLoading);
     const isPrivate = activeTab?.isPrivate;
 
     const shell = document.createElement('div');
     shell.className = `fb-browser-shell ${this.state.isMobile ? 'fb-mobile-layout' : 'fb-desktop-layout'} ${isPrivate ? 'fb-incognito-mode' : ''}`;
     shell.setAttribute('data-theme', this.resolveEffectiveTheme());
     shell.setAttribute('data-color-theme', this.state.settings.colorTheme || 'blue');
+    shell.setAttribute('data-reduced-motion', this.state.settings.reduceMotionForPerformance ? 'true' : 'false');
     shell.setAttribute('data-floating-mode', this.state.desktopFloatingMode);
 
     // Apply frame transparency
@@ -1411,6 +1714,13 @@ export class BrowserShell {
     target.appendChild(shell);
     this.rootElement = shell;
 
+    // A pooled frame can begin a real navigation while this render is being
+    // assembled. Reconcile only when that state actually changed; ordinary
+    // renders leave favicons/controls untouched and avoid needless churn.
+    if (activeTab && Boolean(activeTab.isLoading) !== activeTabWasLoading) {
+      this.refreshLoadingUi(activeTab.id);
+    }
+
     // Maintain persistent assistive bubble in the DOM
     this.ensurePersistentAssistiveBubble();
 
@@ -1499,6 +1809,7 @@ export class BrowserShell {
       iframe.setAttribute('allow', 'fullscreen');
       frame = { host, iframe, url: null, tabId: tab.id, blockedFallbackShown: false };
       iframe.addEventListener('load', () => {
+        this._siteRecoverySucceeded(tab.id, frame.url || tab.url);
         this.updateTabLoading(tab.id, false);
         // Same best-effort blocked-framing net as createWebContentFrame():
         // a site that refuses framing never actually replaces the frame's
@@ -1517,6 +1828,18 @@ export class BrowserShell {
           }
         }, 450);
       });
+      iframe.addEventListener('error', () => {
+        // Network/frame failures must settle the chrome immediately too;
+        // leaving an eternal loader forces users to guess and refresh.
+        this._recordSiteFailure(tab.id, {
+          url: frame.url || tab.url,
+          errorDescription: this._onLine() ? 'net::ERR_CONNECTION_FAILED' : 'net::ERR_INTERNET_DISCONNECTED',
+          offline: !this._onLine(),
+          source: 'pooled-web-frame'
+        });
+        this.updateTabLoading(tab.id, false);
+        if (tab.id === this.state.activeTabId) this.requestRender();
+      });
       host.appendChild(iframe);
       layer.appendChild(host);
       this.webFrames.set(tab.id, frame);
@@ -1529,6 +1852,10 @@ export class BrowserShell {
       frame.blockedFallbackShown = false;
       const stale = frame.host.querySelector ? frame.host.querySelector('.fb-frame-blocked-fallback') : null;
       if (stale) stale.remove();
+      // This includes memory-saver rehydration: loading begins because a
+      // real iframe navigation begins, not because chrome happened to
+      // re-render. The matching load/error event settles it live.
+      this.updateTabLoading(tab.id, true);
       frame.iframe.src = tab.url;
     }
     frame.lastMountedAt = ++this._pooledFrameEpoch; // monotonic: eviction order is always exact mount order
@@ -1578,6 +1905,7 @@ export class BrowserShell {
       activeId &&
       this.webFrames &&
       this.webFrames.has(activeId) &&
+      !this._siteFailureFor(activeId) &&
       !this.state.isMinimizedToBubble &&
       (slot.isConnected !== false)
     );
@@ -1603,6 +1931,529 @@ export class BrowserShell {
     }
   }
 
+  /**
+   * Cancel every renderer-owned pointer gesture synchronously.
+   *
+   * Pointer capture is deliberately treated as leased state, never as an
+   * assumption that pointerup will arrive. A renderer re-render, OS focus
+   * transition, mouseup fallback, native drag end, watchdog or Electron's
+   * main-process recovery signal can all revoke the lease. Each registered
+   * cancel function releases capture, removes global listeners/markers and,
+   * for window movement, ends the matching IPC session.
+   */
+  cancelActivePointerGestures(reason = 'recovery') {
+    const active = [...(this._activePointerCleanups || [])];
+    for (const cancelPointerGesture of active) {
+      try { cancelPointerGesture({ type: 'yayra-input-recovery', reason }); } catch { /* gesture already ended */ }
+    }
+    this._activePointerCleanups?.clear?.();
+    return active.length;
+  }
+
+  /**
+   * Remove only provably stale lightweight chrome blockers.
+   *
+   * The tab context menu is body-mounted while the ordinary dropdown scrims
+   * live inside the shell. If a re-render/focus loss separates the body menu
+   * from its scrim, the remaining transparent full-screen button intercepts
+   * the tab strip while the native website surface below can stay usable —
+   * exactly the reported "only the complete top row is frozen" split. The
+   * pair now has a shared dismiss hook, birth stamp and strict invariant:
+   * both exist, visibly, for at most one render/focus lifetime, or both go.
+   */
+  healTopChromeInputBlockers({ closeTransientMenus = false } = {}) {
+    if (typeof document === 'undefined' || !document.body) return false;
+    let healed = false;
+    try {
+      const menu = document.body.querySelector?.('.fb-tab-context-menu') || null;
+      const contextScrims = Array.from(document.body.querySelectorAll?.('.fb-dropdown-scrim') || [])
+        .filter((el) => el?.dataset?.tabCtx === 'true' || el?.parentElement === document.body);
+      const scrim = contextScrims.find((el) => el?.dataset?.tabCtx === 'true') || contextScrims[0] || null;
+      const bornAt = Number(menu?.dataset?.shownAt || scrim?.dataset?.shownAt || 0);
+      const expired = bornAt > 0 && Date.now() - bornAt > 30000;
+      const hiddenMenu = Boolean(menu && (menu.hidden === true || menu.getAttribute?.('aria-hidden') === 'true'));
+      const brokenPair = Boolean(menu) !== Boolean(scrim);
+      if ((menu || scrim) && (closeTransientMenus || expired || hiddenMenu || brokenPair)) {
+        const dismiss = menu?._yayraDismiss || scrim?._yayraDismiss;
+        if (typeof dismiss === 'function') dismiss();
+        else {
+          try { menu?.remove?.(); } catch { /* already gone */ }
+          for (const item of contextScrims) {
+            try { item?.remove?.(); } catch { /* already gone */ }
+          }
+        }
+        healed = true;
+      }
+
+      // A hover card never owns input (CSS pointer-events:none), but keeping
+      // a detached fixed layer around after focus/render loss serves no
+      // purpose and has historically made top-edge hit testing ambiguous.
+      if (closeTransientMenus && this._activeTabHoverCard) {
+        try { this._activeTabHoverCard.remove?.(); } catch { /* already gone */ }
+        this._activeTabHoverCard = null;
+        if (this._tabHoverTimer) clearTimeout(this._tabHoverTimer);
+        this._tabHoverTimer = null;
+      }
+    } catch { /* DOM probing is a recovery path and must itself never stall */ }
+
+    if (healed) {
+      try { this.healStuckPageSurface(); } catch { /* native surface absent */ }
+      this.logger?.('[top-chrome] retired a stale menu/scrim input blocker');
+    }
+    return healed;
+  }
+
+  /** Ensure the currently-rendered strip can never inherit a native drag or
+   * stale inert/pointer-events state, even if a theme/extension mutates CSS. */
+  ensureTopChromeHitTesting() {
+    const strip = this.tabStripElement;
+    if (!strip) return false;
+    const interactive = [
+      strip,
+      ...(strip.querySelectorAll?.('.fb-tabs-scroll-container') || []),
+      ...(strip.querySelectorAll?.('.fb-tab-item') || []),
+      ...(strip.querySelectorAll?.('.fb-btn-newtab') || []),
+      ...(strip.querySelectorAll?.('.fb-tabstrip-drag-handle') || []),
+      ...(strip.querySelectorAll?.('.fb-window-controls') || []),
+      ...(strip.querySelectorAll?.('.fb-wc-btn') || [])
+    ];
+    for (const el of interactive) {
+      try {
+        el.removeAttribute?.('inert');
+        el.style?.setProperty?.('-webkit-app-region', 'no-drag');
+        el.style?.setProperty?.('pointer-events', 'auto');
+      } catch { /* old DOM shim */ }
+    }
+    return true;
+  }
+
+  /**
+   * Tabs/caption controls are browser chrome, so a lightweight toolbar menu
+   * must never hold them hostage. This runs in the strip's capture phase:
+   * close dropdown/context-menu state without re-rendering the pressed strip,
+   * restore the native page if needed, then let the original pointer event
+   * continue to its intended tab/New Tab/window-control target in one click.
+   */
+  prepareTopChromeInteraction() {
+    this.cancelActivePointerGestures('new top-chrome pointer');
+    this.healTopChromeInputBlockers({ closeTransientMenus: true });
+
+    const hadDropdown = Boolean(
+      this.state.isSecurityDropdownOpen ||
+      this.state.isAccountMenuOpen ||
+      this.state.isDownloadsDropdownOpen
+    );
+    if (!hadDropdown) return;
+    this.state.isSecurityDropdownOpen = false;
+    this.state.isAccountMenuOpen = false;
+    this.state.isDownloadsDropdownOpen = false;
+    this.state.isDownloadsDropdownExpanded = false;
+    try {
+      for (const selector of ['.fb-dropdown-scrim', '.fb-security-dropdown', '.fb-account-dropdown', '.fb-downloads-dropdown']) {
+        for (const el of this.rootElement?.querySelectorAll?.(selector) || []) el.remove?.();
+      }
+    } catch { /* a concurrent render already removed them */ }
+
+    // State-tracked overlays hide the native WebContentsView without using
+    // isPageObscured. Since we intentionally avoid a re-render during the
+    // active pointerdown, restore that surface directly after removing them.
+    const tab = this.getActiveTab();
+    const url = String(tab?.url || '');
+    if (tab && /^https?:\/\//i.test(url)) {
+      try { this.syncNativeWebviewVisibility(tab.id, true); } catch { /* web build */ }
+      try { this.syncAndroidTabWebVisibility(tab.id, true); } catch { /* desktop/web build */ }
+      try { this.restoreActiveNativeBounds(tab.id); } catch { /* no native view */ }
+    }
+  }
+
+  recoverTopChromeInput(reason = 'recovery', { closeTransientMenus = false } = {}) {
+    const cancelled = this.cancelActivePointerGestures(reason);
+    const healed = this.healTopChromeInputBlockers({ closeTransientMenus });
+    try {
+      for (const el of this.rootElement?.querySelectorAll?.('.fb-tab-pointer-dragging') || []) {
+        el.classList?.remove?.('fb-tab-pointer-dragging');
+      }
+      for (const el of this.rootElement?.querySelectorAll?.('.fb-tab-pointer-target') || []) {
+        el.classList?.remove?.('fb-tab-pointer-target');
+      }
+      for (const el of this.rootElement?.querySelectorAll?.('.fb-tab-pointer-detach') || []) {
+        el.classList?.remove?.('fb-tab-pointer-detach');
+      }
+      for (const el of document.body?.querySelectorAll?.('.fb-tab-detach-hint') || []) el.remove?.();
+    } catch { /* detached render tree */ }
+    this.ensureTopChromeHitTesting();
+    try { this.ensureActiveNativeSurfaceLive(); } catch { /* best-effort */ }
+    return { cancelled, healed };
+  }
+
+  /** Install redundant browser + native lifecycle recovery once per shell. */
+  installTopChromeInputRecovery() {
+    if (this._topChromeRecoveryInstalled) return;
+    this._topChromeRecoveryInstalled = true;
+    this._topChromeRecoveryBindings ||= [];
+    const bind = (target, type, listener, options = false) => {
+      if (!target || typeof target.addEventListener !== 'function') return;
+      try {
+        target.addEventListener(type, listener, options);
+        this._topChromeRecoveryBindings.push([target, type, listener, options]);
+      } catch { /* optional lifecycle event in a minimal embedder */ }
+    };
+    const cancelOnly = (event) => this.cancelActivePointerGestures(event?.type || 'lifecycle');
+    const recoverAndCloseTransient = (event) => this.recoverTopChromeInput(
+      event?.type || 'lifecycle',
+      { closeTransientMenus: true }
+    );
+    const onVisibility = (event) => {
+      // Both directions matter: hiding cancels the gesture before timers are
+      // throttled; returning performs the truth-based overlay sweep again.
+      recoverAndCloseTransient(event || { type: 'visibilitychange' });
+    };
+    const onPointerDown = () => {
+      // A new physical press proves any older pointer lease is stale. This
+      // capture-phase fallback runs even when an orphan scrim is the target.
+      this.cancelActivePointerGestures('new pointerdown');
+      this.healTopChromeInputBlockers();
+    };
+
+    if (typeof window !== 'undefined') {
+      bind(window, 'blur', recoverAndCloseTransient, true);
+      bind(window, 'focus', recoverAndCloseTransient, true);
+      // If Chromium loses pointerup but still emits legacy mouseup, release
+      // capture/IPC immediately instead of waiting for the watchdog.
+      bind(window, 'mouseup', cancelOnly, true);
+      bind(window, 'dragend', cancelOnly, true);
+      bind(window, 'drop', cancelOnly, true);
+      bind(window, 'pagehide', recoverAndCloseTransient, true);
+      bind(window, 'pointerdown', onPointerDown, true);
+    }
+    if (typeof document !== 'undefined') bind(document, 'visibilitychange', onVisibility, true);
+
+    // Main-process focus/blur/minimize recovery is independent of DOM event
+    // delivery, so even a compositor/pointer-capture anomaly can revoke the
+    // renderer gesture and its matching native window-drag session.
+    try {
+      const controls = this.windowControls;
+      if (controls && typeof controls.onInputRecovery === 'function') {
+        this._unsubscribeTopChromeRecovery = controls.onInputRecovery((payload = {}) => {
+          this.recoverTopChromeInput(payload.reason || 'native recovery', { closeTransientMenus: true });
+        });
+      }
+    } catch { /* web/PWA or older preload */ }
+  }
+
+  /**
+   * Frameless-window movement without `-webkit-app-region: drag`.
+   * Native drag regions own the mouse before Chromium and have repeatedly
+   * wedged the Linux tab strip. Pointer capture + fire-and-forget IPC keeps
+   * clicks, double-clicks, tabs and window controls in the renderer.
+   */
+  bindManualWindowDrag(handle, controls) {
+    if (!handle || !controls || typeof controls.dragStart !== 'function'
+      || typeof controls.dragMove !== 'function' || typeof controls.dragEnd !== 'function') return;
+    let pressed = null;
+    let dragging = false;
+    let captureOwned = false;
+    let globalsBound = false;
+    let lastMoveEvent = null;
+    let lastTapAt = 0;
+    let watchdog = null;
+    const clearWatchdog = () => {
+      if (watchdog) clearTimeout(watchdog);
+      watchdog = null;
+    };
+    const armWatchdog = () => {
+      clearWatchdog();
+      // Inactivity, not total drag duration: a long active drag remains
+      // valid, but a missing pointerup heals itself without a reload.
+      watchdog = setTimeout(() => cancel({ type: 'gesture-timeout' }), 4000);
+      watchdog?.unref?.();
+    };
+    const pointerPoint = (event) => {
+      const x = Number(event?.screenX);
+      const y = Number(event?.screenY);
+      return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+    };
+    const samePointer = (event) => !pressed || pressed.pointerId == null || event?.pointerId == null
+      || pressed.pointerId === event.pointerId;
+    const removeGlobals = () => {
+      if (!globalsBound || typeof window === 'undefined') return;
+      globalsBound = false;
+      window.removeEventListener?.('pointermove', move, true);
+      window.removeEventListener?.('pointerup', end, true);
+      window.removeEventListener?.('pointercancel', cancel, true);
+      window.removeEventListener?.('blur', cancel, true);
+    };
+    const end = (event = null) => {
+      if (!pressed || !samePointer(event)) return;
+      const pointerId = pressed.pointerId;
+      const wasDragging = dragging;
+      pressed = null;
+      dragging = false;
+      clearWatchdog();
+      removeGlobals();
+      this._activePointerCleanups?.delete(cancel);
+      handle.classList?.remove('is-dragging');
+      if (wasDragging) {
+        try { controls.dragEnd(); } catch { /* window raced shutdown */ }
+        event?.preventDefault?.();
+      } else if (event?.type === 'pointerup') {
+        // pointerdown is prevented to eliminate text/image native drags, so
+        // implement titlebar-style double-click explicitly and exactly once.
+        const now = Date.now();
+        if (lastTapAt && now - lastTapAt <= 400) {
+          lastTapAt = 0;
+          Promise.resolve(controls.toggleMaximize?.()).catch(() => {});
+        } else lastTapAt = now;
+      } else {
+        // A recovered/abandoned press must never become half of a later
+        // double-click gesture.
+        lastTapAt = 0;
+      }
+      if (captureOwned) {
+        try { handle.releasePointerCapture?.(pointerId); } catch { /* capture already released */ }
+      }
+      captureOwned = false;
+    };
+    const cancel = (event = null) => end(event);
+    const move = (event) => {
+      if (!pressed || !samePointer(event) || event === lastMoveEvent) return;
+      lastMoveEvent = event;
+      if (event?.pointerType === 'mouse' && event?.buttons != null && Number(event.buttons) === 0) {
+        cancel(event);
+        return;
+      }
+      const current = pointerPoint(event);
+      if (!current) { cancel(event); return; }
+      armWatchdog();
+      if (!dragging) {
+        if (Math.abs(current.x - pressed.x) < 4 && Math.abs(current.y - pressed.y) < 4) return;
+        dragging = true;
+        lastTapAt = 0;
+        // Ordinary handle clicks/double-clicks never capture a pointer. Take
+        // capture only after real movement crosses the drag threshold.
+        try {
+          handle.setPointerCapture?.(pressed.pointerId);
+          captureOwned = typeof handle.setPointerCapture === 'function';
+        } catch { captureOwned = false; }
+        handle.classList?.add('is-dragging');
+        try { controls.dragStart({ x: pressed.x, y: pressed.y }); } catch { cancel(event); return; }
+      }
+      try { controls.dragMove(current); } catch { cancel(event); }
+      event?.preventDefault?.();
+    };
+    handle.addEventListener('pointerdown', (event) => {
+      if (event?.isPrimary === false) return;
+      if (event?.pointerType === 'mouse' && event?.button != null && Number(event.button) !== 0) return;
+      const start = pointerPoint(event);
+      if (!start) return;
+      if (pressed) cancel();
+      pressed = { ...start, pointerId: event?.pointerId };
+      dragging = false;
+      captureOwned = false;
+      lastMoveEvent = null;
+      this._activePointerCleanups.add(cancel);
+      armWatchdog();
+      if (typeof window !== 'undefined') {
+        globalsBound = true;
+        // Capture-phase window fallbacks survive a render replacing `handle`
+        // mid-gesture and also cover embedders without pointer-capture APIs.
+        window.addEventListener?.('pointermove', move, true);
+        window.addEventListener?.('pointerup', end, true);
+        window.addEventListener?.('pointercancel', cancel, true);
+        window.addEventListener?.('blur', cancel, true);
+      }
+      event?.preventDefault?.();
+    });
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', end);
+    handle.addEventListener('pointercancel', cancel);
+    handle.addEventListener('lostpointercapture', cancel);
+  }
+
+  /**
+   * Reorder tabs horizontally or tear one into a new Yayra window by dragging
+   * down, using normal pointer events only. HTML5 drag/drop enters a native
+   * drag loop; when a Linux compositor loses its drop/end event the row stays
+   * input-grabbed and appears frozen. Pointer capture is delayed until real
+   * movement, and every path retains the existing watchdog cleanup.
+   */
+  bindPointerTabReorder(tabEl, fromIndex, tabsScroll) {
+    if (!tabEl || !tabsScroll) return;
+    let pressed = null;
+    let dragging = false;
+    let captureOwned = false;
+    let globalsBound = false;
+    let lastMoveEvent = null;
+    let targetIndex = fromIndex;
+    let detachReady = false;
+    let detachHint = null;
+    let watchdog = null;
+    const clearWatchdog = () => {
+      if (watchdog) clearTimeout(watchdog);
+      watchdog = null;
+    };
+    const armWatchdog = () => {
+      clearWatchdog();
+      watchdog = setTimeout(() => cancel({ type: 'gesture-timeout' }), 4000);
+      watchdog?.unref?.();
+    };
+    const clientPoint = (event) => {
+      const x = Number(event?.clientX);
+      const y = Number(event?.clientY);
+      return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+    };
+    const samePointer = (event) => !pressed || pressed.pointerId == null || event?.pointerId == null
+      || pressed.pointerId === event.pointerId;
+    const clearMarkers = () => {
+      tabEl.classList?.remove('fb-tab-pointer-dragging');
+      tabEl.classList?.remove('fb-tab-pointer-detach');
+      for (const item of tabsScroll.querySelectorAll?.('.fb-tab-item') || []) {
+        item.classList?.remove('fb-tab-pointer-target');
+      }
+      detachHint?.remove?.();
+      detachHint = null;
+    };
+    const showDetachHint = () => {
+      if (detachHint || typeof document === 'undefined' || !document.body) return;
+      const hint = document.createElement('div');
+      hint.className = 'fb-tab-detach-hint';
+      hint.setAttribute('role', 'status');
+      hint.textContent = 'Release to move this site into a new Yayra window';
+      const rect = tabEl.getBoundingClientRect?.();
+      hint.style.left = `${Math.max(8, Number(rect?.left) || 8)}px`;
+      hint.style.top = `${Math.max(44, (Number(rect?.bottom) || 36) + 12)}px`;
+      document.body.appendChild(hint);
+      detachHint = hint;
+    };
+    const hideDetachHint = () => {
+      tabEl.classList?.remove('fb-tab-pointer-detach');
+      detachHint?.remove?.();
+      detachHint = null;
+    };
+    const nearestIndex = (clientX) => {
+      const tabs = Array.from(tabsScroll.querySelectorAll?.('.fb-tab-item') || []);
+      if (!tabs.length) return fromIndex;
+      let winner = fromIndex;
+      let distance = Infinity;
+      tabs.forEach((item, index) => {
+        const rect = item.getBoundingClientRect?.();
+        const center = rect && Number.isFinite(rect.left) && Number.isFinite(rect.width)
+          ? rect.left + rect.width / 2
+          : index;
+        const nextDistance = Math.abs((Number(clientX) || 0) - center);
+        if (nextDistance < distance) { distance = nextDistance; winner = index; }
+      });
+      return winner;
+    };
+    const removeGlobals = () => {
+      if (!globalsBound || typeof window === 'undefined') return;
+      globalsBound = false;
+      window.removeEventListener?.('pointermove', move, true);
+      window.removeEventListener?.('pointerup', commit, true);
+      window.removeEventListener?.('pointercancel', cancel, true);
+      window.removeEventListener?.('blur', cancel, true);
+    };
+    const finish = (event, shouldCommit) => {
+      if (!pressed || !samePointer(event)) return;
+      const pointerId = pressed.pointerId;
+      const wasDragging = dragging;
+      const shouldDetach = Boolean(shouldCommit && detachReady);
+      pressed = null;
+      dragging = false;
+      detachReady = false;
+      clearWatchdog();
+      removeGlobals();
+      this._activePointerCleanups?.delete(cancel);
+      clearMarkers();
+      if (captureOwned) {
+        try { tabEl.releasePointerCapture?.(pointerId); } catch { /* optional */ }
+      }
+      captureOwned = false;
+      if (!wasDragging) return;
+      tabEl._yayraSuppressClick = true;
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      if (shouldDetach) {
+        void this.detachTabToWindow(tabEl.dataset.tabId);
+      } else if (shouldCommit && targetIndex !== fromIndex) {
+        this.reorderTabs(fromIndex, targetIndex);
+      }
+    };
+    const commit = (event) => finish(event, true);
+    const cancel = (event = null) => finish(event, false);
+    const move = (event) => {
+      if (!pressed || !samePointer(event) || event === lastMoveEvent) return;
+      lastMoveEvent = event;
+      if (event?.pointerType === 'mouse' && event?.buttons != null && Number(event.buttons) === 0) {
+        cancel(event);
+        return;
+      }
+      const current = clientPoint(event);
+      if (!current) { cancel(event); return; }
+      armWatchdog();
+      const { x, y } = current;
+      if (!dragging) {
+        if (Math.abs(x - pressed.x) < 6 && Math.abs(y - pressed.y) < 6) return;
+        dragging = true;
+        this._activeTabHoverCard?.remove?.();
+        this._activeTabHoverCard = null;
+        if (this._tabHoverTimer) clearTimeout(this._tabHoverTimer);
+        this._tabHoverTimer = null;
+        try {
+          tabEl.setPointerCapture?.(pressed.pointerId);
+          captureOwned = typeof tabEl.setPointerCapture === 'function';
+        } catch { captureOwned = false; }
+        tabEl.classList?.add('fb-tab-pointer-dragging');
+      }
+      const deltaX = x - pressed.x;
+      const deltaY = y - pressed.y;
+      const detachThreshold = Math.max(54, Number(tabEl.getBoundingClientRect?.()?.height || 0) * 1.5);
+      detachReady = deltaY >= detachThreshold && deltaY > Math.abs(deltaX);
+      const tabs = Array.from(tabsScroll.querySelectorAll?.('.fb-tab-item') || []);
+      if (detachReady) {
+        targetIndex = fromIndex;
+        tabs.forEach((item) => item.classList?.remove('fb-tab-pointer-target'));
+        tabEl.classList?.add('fb-tab-pointer-detach');
+        showDetachHint();
+      } else {
+        hideDetachHint();
+        targetIndex = nearestIndex(x);
+        tabs.forEach((item, index) => item.classList?.toggle('fb-tab-pointer-target', index === targetIndex && index !== fromIndex));
+      }
+      event?.preventDefault?.();
+    };
+    tabEl.addEventListener('pointerdown', (event) => {
+      if (event?.isPrimary === false) return;
+      if (event?.pointerType === 'mouse' && event?.button != null && Number(event.button) !== 0) return;
+      if (event?.target?.closest?.('.fb-tab-close-btn')) return;
+      const start = clientPoint(event);
+      if (!start) return;
+      if (pressed) cancel();
+      pressed = { ...start, pointerId: event?.pointerId };
+      dragging = false;
+      captureOwned = false;
+      targetIndex = fromIndex;
+      detachReady = false;
+      hideDetachHint();
+      lastMoveEvent = null;
+      this._activePointerCleanups.add(cancel);
+      armWatchdog();
+      if (typeof window !== 'undefined') {
+        globalsBound = true;
+        // Keep the gesture alive if a native navigation update re-renders
+        // and replaces this tab before the user releases the pointer.
+        window.addEventListener?.('pointermove', move, true);
+        window.addEventListener?.('pointerup', commit, true);
+        window.addEventListener?.('pointercancel', cancel, true);
+        window.addEventListener?.('blur', cancel, true);
+      }
+    });
+    tabEl.addEventListener('pointermove', move);
+    tabEl.addEventListener('pointerup', commit);
+    tabEl.addEventListener('pointercancel', cancel);
+    tabEl.addEventListener('lostpointercapture', cancel);
+  }
+
   /* -------------------------------------------------------------
    * DESKTOP LAYOUT (COMPACT TABS, OMNIBOX, BRANDING, NO-BLUR DRAWER)
    * ----------------------------------------------------------- */
@@ -1612,6 +2463,22 @@ export class BrowserShell {
     tabStrip.className = 'fb-chrome-tabstrip';
     tabStrip.setAttribute('role', 'tablist');
     tabStrip.setAttribute('aria-label', 'Open tabs');
+    // Inline defense as well as CSS: theme injection or a stale class can
+    // never turn any top-strip pixel into a native app drag region.
+    tabStrip.style?.setProperty?.('-webkit-app-region', 'no-drag');
+    tabStrip.style?.setProperty?.('pointer-events', 'auto');
+    tabStrip.addEventListener('pointerdown', () => this.prepareTopChromeInteraction(), true);
+    tabStrip.addEventListener('dragstart', (event) => {
+      // No child may start Chromium/OS native drag-and-drop. Reordering and
+      // window movement are both renderer pointer gestures with watchdogs.
+      event?.preventDefault?.();
+      this.cancelActivePointerGestures('native dragstart blocked');
+    }, true);
+    tabStrip.addEventListener('dragend', () => this.cancelActivePointerGestures('native dragend'), true);
+    tabStrip.addEventListener('drop', (event) => {
+      event?.preventDefault?.();
+      this.cancelActivePointerGestures('native drop');
+    }, true);
 
     // Brand wordmark at the very top of the app - replaces the removed OS
     // title bar text ("yayra") with the official wordmark image.
@@ -1621,17 +2488,81 @@ export class BrowserShell {
     tabstripBrand.setAttribute('aria-hidden', 'true');
     tabStrip.appendChild(tabstripBrand);
 
+    // ZERO native app-region pixels. Electron/OS drag regions consume input
+    // before Chromium dispatches it and can leave Linux's custom chrome in a
+    // compositor-owned grab (tabs/window buttons look frozen while the page
+    // below keeps working). The dotted handle is renderer-owned and streams
+    // pointer coordinates through the preload bridge instead.
+    const winControls = this.options?.isMiniShell ? null : this.windowControls;
+    if (winControls) {
+      const dragHandle = document.createElement('span');
+      dragHandle.className = 'fb-tabstrip-drag-handle';
+      dragHandle.setAttribute('aria-hidden', 'true');
+      dragHandle.setAttribute('title', 'Drag window · double-click to maximize or restore');
+      tabStrip.appendChild(dragHandle);
+      this.bindManualWindowDrag(dragHandle, winControls);
+    }
+
     const tabsScroll = document.createElement('div');
     tabsScroll.className = 'fb-tabs-scroll-container';
 
     this.state.tabs.forEach((tab, index) => {
       const isActive = tab.id === this.state.activeTabId;
       const tabEl = document.createElement('div');
-      tabEl.className = `fb-tab-item ${isActive ? 'active' : ''} ${tab.isPrivate ? 'fb-tab-incognito' : ''}`;
+      tabEl.className = `fb-tab-item ${isActive ? 'active' : ''} ${tab.isPrivate ? 'fb-tab-incognito' : ''} ${!isActive && this.state.settings.dimInactiveTabs !== false ? 'fb-tab-inactive-dim' : ''}`;
       tabEl.setAttribute('role', 'tab');
       tabEl.setAttribute('aria-selected', isActive ? 'true' : 'false');
-      tabEl.setAttribute('draggable', 'true');
+      // Never enter Chromium's native HTML drag-and-drop loop here. On
+      // Linux/Wayland a tiny accidental tab drag can retain the input grab
+      // and make the complete strip appear frozen. Reordering uses ordinary
+      // pointer events below, so clicks always remain renderer-owned.
+      tabEl.draggable = false;
       tabEl.dataset.tabId = tab.id;
+
+      if (this.state.settings.tabHoverCards !== false) {
+        const titleText = this.getTabTitle(tab);
+        let addressText = String(tab.url || '');
+        try { addressText = new URL(tab.url).host + new URL(tab.url).pathname; } catch { /* internal or empty URL */ }
+        // The custom hover card replaces the native `title` tooltip. Keeping
+        // both produced the doubled black-on-black labels seen on New Tab.
+        tabEl.setAttribute('aria-label', `${titleText}${addressText ? `, ${addressText}` : ''}`);
+        const showHoverCard = () => {
+          if (this._tabHoverTimer) clearTimeout(this._tabHoverTimer);
+          this._tabHoverTimer = setTimeout(() => {
+            if (typeof document === 'undefined' || !document.body) return;
+            this._activeTabHoverCard?.remove?.();
+            const card = document.createElement('div');
+            card.className = 'fb-tab-hover-card';
+            card.setAttribute('role', 'tooltip');
+            const cardTitle = document.createElement('strong');
+            cardTitle.textContent = titleText;
+            const cardAddress = document.createElement('span');
+            cardAddress.textContent = addressText || 'New Tab';
+            card.appendChild(cardTitle);
+            card.appendChild(cardAddress);
+            const rect = tabEl.getBoundingClientRect?.();
+            const width = typeof window !== 'undefined' ? (Number(window.innerWidth) || 1280) : 1280;
+            const height = typeof window !== 'undefined' ? (Number(window.innerHeight) || 800) : 800;
+            const cardWidth = Math.min(280, Math.max(0, width - 16));
+            const left = Math.max(8, Math.min(Number(rect?.left) || 8, width - cardWidth - 8));
+            const top = Math.max(8, Math.min((Number(rect?.bottom) || 0) + 8, height - 96));
+            card.style.left = `${left}px`;
+            card.style.top = `${top}px`;
+            document.body.appendChild(card);
+            this._activeTabHoverCard = card;
+          }, 450);
+        };
+        const hideHoverCard = () => {
+          if (this._tabHoverTimer) clearTimeout(this._tabHoverTimer);
+          this._tabHoverTimer = null;
+          this._activeTabHoverCard?.remove?.();
+          this._activeTabHoverCard = null;
+        };
+        tabEl.addEventListener('mouseenter', showHoverCard);
+        tabEl.addEventListener('mouseleave', hideHoverCard);
+        tabEl.addEventListener('focus', showHoverCard);
+        tabEl.addEventListener('blur', hideHoverCard);
+      }
 
       // Favicon / Orb Icon
       const faviconWrap = document.createElement('span');
@@ -1668,6 +2599,10 @@ export class BrowserShell {
       tabEl.appendChild(closeBtn);
 
       tabEl.addEventListener('click', () => {
+        if (tabEl._yayraSuppressClick) {
+          tabEl._yayraSuppressClick = false;
+          return;
+        }
         this.selectTab(tab.id);
       });
 
@@ -1686,20 +2621,12 @@ export class BrowserShell {
         this.renderTabContextMenu(e.clientX, e.clientY, tab);
       });
 
-      // Tab drag reordering
-      tabEl.addEventListener('dragstart', (e) => {
-        if (e.dataTransfer) {
-          e.dataTransfer.setData('text/plain', String(index));
-        }
-      });
-      tabEl.addEventListener('dragover', (e) => e.preventDefault());
-      tabEl.addEventListener('drop', (e) => {
-        e.preventDefault();
-        const fromIdx = Number(e.dataTransfer?.getData('text/plain'));
-        if (!isNaN(fromIdx) && fromIdx !== index) {
-          this.reorderTabs(fromIdx, index);
-        }
-      });
+      // Pointer-only tab reordering: unlike HTML5 drag/drop this never asks
+      // the compositor/window manager for a native drag session, so a lost
+      // drop cannot lock the strip. The listener is installed before append;
+      // it reads the completed row only when a real pointer move occurs.
+      tabEl.addEventListener('dragstart', (e) => e.preventDefault());
+      this.bindPointerTabReorder(tabEl, index, tabsScroll);
 
       tabsScroll.appendChild(tabEl);
     });
@@ -1730,17 +2657,21 @@ export class BrowserShell {
       });
     }
 
-    // REAL window controls for the frameless Electron window. The OS title
-    // bar and menu block are removed (electron/main.cjs), so the tab strip
-    // IS the title bar now: it is draggable (CSS -webkit-app-region) and
-    // these buttons genuinely minimize/maximize/close the window via IPC -
-    // unlike the old decorative cluster that was removed when the native
-    // frame was still present. Web/PWA builds never render them (the
-    // browser provides the window chrome there).
-    // The frameless mini window has its own slim titlebar (expand/hide) -
-    // never render a second min/max/close cluster there.
-    const winControls = this.options?.isMiniShell ? null : this.windowControls;
+    // REAL window controls for the frameless Electron window. Every part of
+    // the strip, including the manual drag handle, stays in the renderer;
+    // no native app-region can swallow tab/control input. These controls
+    // minimize/maximize/close via IPC. Web/PWA builds omit the cluster; the
+    // frameless mini window keeps its own expand/hide title bar.
     if (winControls) {
+      // Keep a permanent no-control zone between New Tab (+) and Minimize.
+      // Auto margins collapse when many tabs consume the strip; this fixed
+      // spacer never does, so the two unrelated actions cannot look like one
+      // cluster or be clicked by mistake at maximum tab density.
+      const controlsGap = document.createElement('span');
+      controlsGap.className = 'fb-window-controls-safe-gap';
+      controlsGap.setAttribute('aria-hidden', 'true');
+      tabStrip.appendChild(controlsGap);
+
       const controls = document.createElement('div');
       controls.className = 'fb-window-controls';
       const buttons = [
@@ -1764,6 +2695,7 @@ export class BrowserShell {
     }
     root.appendChild(tabStrip);
     this.tabStripElement = tabStrip;
+    this.ensureTopChromeHitTesting();
 
     // 2. Browser Navigation Toolbar (Back, Forward, Reload/Stop, Brand, Lock + Search Engine, Omnibox, Star, Downloads, Extensions, Menu)
     const navbar = document.createElement('nav');
@@ -1884,6 +2816,61 @@ export class BrowserShell {
     this.bindSearchSuggestions(omniboxInput);
     this.omniboxInput = omniboxInput;
 
+    // Standards-based site passkey ceremony indicator. This appears only
+    // while a site has an active navigator.credentials create/get request;
+    // secrets/signatures never enter Yayra's renderer or the website page;
+    // native platforms keep them in the OS authenticator, while Linux keeps
+    // local-provider keys in safeStorage-encrypted main-process storage.
+    if (activeTab.sitePasskeyRequest && !activeTab.sitePasskeyRequest.conditional) {
+      const request = activeTab.sitePasskeyRequest;
+      const providerMode = request.provider?.mode || 'native';
+      const actionable = providerMode === 'local' || providerMode === 'external';
+      const state = request.providerState || '';
+      const indicator = document.createElement(actionable ? 'button' : 'div');
+      if (actionable) indicator.type = 'button';
+      indicator.className = `fb-site-passkey-indicator ${actionable ? 'is-actionable' : ''} ${state ? `is-${state}` : ''}`.trim();
+      indicator.setAttribute('role', actionable ? 'button' : 'status');
+      indicator.setAttribute('aria-live', 'polite');
+
+      let label = request.action === 'create' ? 'Creating passkey' : 'Passkey active';
+      let title = `${request.rpId || 'This site'} is ${request.action === 'create' ? 'creating' : 'requesting'} a passkey. Complete the device or security-key prompt.`;
+      if (providerMode === 'local') {
+        label = state === 'prompting' ? 'Verify with Yayra'
+          : state === 'system-prompt' ? 'Confirm system password'
+            : state === 'approved' ? 'Completing with Yayra'
+              : state === 'handed-off' ? 'Opened in system browser'
+                : state === 'declined' ? 'Use system browser'
+                  : state === 'retry' ? 'Retry Yayra passkey'
+                    : request.action === 'get' ? 'Use Yayra passkey' : 'Create with Yayra';
+        title = state === 'handed-off'
+          ? 'This exact page is open in your system browser. Complete the passkey request there.'
+          : state === 'declined'
+            ? 'Local verification did not complete. Open this exact page in your system browser instead.'
+            : state === 'retry'
+              ? 'Yayra verification was cancelled or failed. Click to try your configured Yayra passkey again.'
+              : state === 'approved'
+                ? `Yayra verified you and is completing the ${request.rpId || 'site'} passkey request.`
+                : `Verify with your configured Yayra passkey. The website credential remains isolated to ${request.rpId || 'this site'}.`;
+      } else if (providerMode === 'external') {
+        label = state === 'handed-off' ? 'Opened in system browser' : 'Use system browser';
+        title = state === 'handed-off'
+          ? 'This exact page is open in your system browser. Complete the passkey request there.'
+          : request.provider?.reason === 'no-local-credential'
+            ? `No Yayra-managed passkey for ${request.rpId || 'this site'} exists in this profile. Open the page in your system browser or register one in Yayra.`
+            : 'This Linux session cannot securely complete this passkey request locally. Open this exact page in your system browser.';
+      }
+      indicator.setAttribute('title', title);
+      indicator.setAttribute('aria-label', title);
+      indicator.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="15" r="4"></circle><path d="m11 12 9-9m-4 4 3 3m-6 0 3 3"></path></svg>'
+        + `<span>${label}</span>`;
+      if (actionable) {
+        indicator.disabled = state === 'prompting' || state === 'system-prompt'
+          || state === 'approved' || state === 'handed-off';
+        indicator.addEventListener('click', () => this.continueWebsitePasskey(activeTab, request));
+      }
+      omnibox.appendChild(indicator);
+    }
+
     // Bookmark Star Icon
     const starBtn = document.createElement('button');
     starBtn.className = `fb-omnibox-star ${this.state.isBookmarked ? 'bookmarked' : ''}`;
@@ -1899,26 +2886,41 @@ export class BrowserShell {
     const toolbarActions = document.createElement('div');
     toolbarActions.className = 'fb-toolbar-actions';
 
-    // Persistent "Update available" chip: background update checks (see
-    // startBackgroundUpdateChecks) can discover a release at any time, and
-    // the one-per-session confirm dialog is easy to dismiss - this chip
-    // stays visible until the update is actually applied.
-    if (this.state.updateState.status === 'ready' || this.state.updateState.status === 'staged') {
+    // Persistent update chip: background checks can discover a release at
+    // any time. It remains visible not only before/after the download, but
+    // DURING it too, so every website has a live view of update progress
+    // without opening Settings or refreshing the page.
+    if (['ready', 'downloading', 'staged'].includes(this.state.updateState.status)) {
       const staged = this.state.updateState.status === 'staged';
+      const downloading = this.state.updateState.status === 'downloading';
       const updateChip = document.createElement('button');
-      updateChip.className = 'fb-update-chip';
+      updateChip.className = `fb-update-chip ${downloading ? 'fb-update-chip-downloading' : ''}`;
+      const downloadDetail = this.formatUpdateDownloadProgress(this.state.updateState);
       updateChip.setAttribute(
         'title',
         staged
           ? `Yayra v${this.state.updateState.availableVersion || 'latest'} is downloaded & verified - click to install`
-          : `Update Yayra to v${this.state.updateState.availableVersion || 'latest'} - click to download & install`
+          : downloading
+            ? `Downloading Yayra v${this.state.updateState.availableVersion || 'latest'} - ${downloadDetail}. Click for update details.`
+            : `Update Yayra to v${this.state.updateState.availableVersion || 'latest'} - click to download & install`
       );
-      updateChip.setAttribute('aria-label', staged ? 'Install downloaded update' : 'Download and install available update');
-      // Downloaded & verified -> the remaining action is INSTALL, and the
-      // chip says exactly that (never "Download and install" again).
-      updateChip.innerHTML = `${Icons.download}<span class="fb-update-chip-label">${staged ? 'Install' : 'Update'}</span>`;
+      updateChip.setAttribute(
+        'aria-label',
+        staged ? 'Install downloaded update' : downloading ? `Downloading Yayra update, ${downloadDetail}` : 'Download and install available update'
+      );
+      // Downloaded & verified -> Install. Active download -> a compact live
+      // percentage/byte count. Available -> Update.
+      updateChip.innerHTML = downloading
+        ? `${Icons.download}<span class="fb-update-chip-label fb-update-progress-label fb-update-progress-toolbar" data-update-progress-context="toolbar" aria-live="polite" aria-atomic="true">${this.formatUpdateDownloadLabel('toolbar')}</span>`
+        : `${Icons.download}<span class="fb-update-chip-label">${staged ? 'Install' : 'Update'}</span>`;
       updateChip.addEventListener('click', (e) => {
         e.stopPropagation();
+        if (downloading) {
+          this.state.settingsActiveCategory = 'updates';
+          this.state.activeSettingsCategory = 'updates';
+          this.openInternalPage('yayra://settings');
+          return;
+        }
         this.applyUpdate();
       });
       toolbarActions.appendChild(updateChip);
@@ -1942,6 +2944,17 @@ export class BrowserShell {
       this.render();
     });
     toolbarActions.appendChild(dlBtn);
+
+    // Local Documents hub sits directly beside Downloads. It is a full
+    // library page (not another transient dropdown), so filtering and file
+    // management stay usable even with thousands of remembered originals.
+    const documentsBtn = document.createElement('button');
+    documentsBtn.className = 'fb-action-btn fb-btn-documents fb-toolbar-documents-btn fb-toolbar-action-btn';
+    documentsBtn.setAttribute('title', 'Documents');
+    documentsBtn.setAttribute('aria-label', 'Open Documents library');
+    documentsBtn.innerHTML = Icons.document;
+    documentsBtn.addEventListener('click', () => this.openInternalPage('yayra://documents'));
+    toolbarActions.appendChild(documentsBtn);
 
     // Requirement 10: Extensions & Shields Button (Transparent, Compact, Matching Star Size)
     const extBtn = document.createElement('button');
@@ -1999,6 +3012,16 @@ export class BrowserShell {
     toolbarActions.appendChild(menuBtn);
 
     navbar.appendChild(toolbarActions);
+    // Native WebContentsViews paint above the HTML viewport, so the viewport
+    // strip alone can be hidden behind the site surface. Mirror it at the
+    // bottom edge of renderer-owned chrome where it is always visible.
+    const chromeProgress = document.createElement('div');
+    chromeProgress.className = 'fb-page-loading-bar fb-chrome-site-loading-bar';
+    chromeProgress.setAttribute('role', 'progressbar');
+    chromeProgress.setAttribute('aria-label', 'Website loading');
+    chromeProgress.setAttribute('aria-valuetext', activeTab.isLoading ? 'Loading website' : 'Website loaded');
+    chromeProgress.style.display = activeTab.isLoading ? 'block' : 'none';
+    navbar.appendChild(chromeProgress);
     root.appendChild(navbar);
 
     // Persistent "Restore pages?" bar: docked INTO the chrome (never
@@ -2100,6 +3123,8 @@ export class BrowserShell {
     safariTabbar.className = 'fb-mobile-safari-tabbar';
     const topActions = [
       { className: 'fb-mobile-tab-overview', icon: Icons.tabs, title: 'Show all tabs', action: () => this.openModal('tab-switcher') },
+      { className: 'fb-mobile-tab-downloads', icon: Icons.download, title: 'Downloads', action: () => this.openInternalPage('yayra://downloads') },
+      { className: 'fb-mobile-tab-documents', icon: Icons.document, title: 'Documents', action: () => this.openInternalPage('yayra://documents') },
       { className: 'fb-mobile-tab-bookmarks', icon: Icons.bookmark, title: 'Bookmarks', action: () => this.openInternalPage('yayra://bookmarks') },
       { className: 'fb-mobile-tab-privacy', icon: Icons.shield, title: 'Privacy and shields', action: () => this.openInternalPage('yayra://permissions') },
       { className: 'fb-mobile-tab-history', icon: Icons.history, title: 'History', action: () => this.openInternalPage('yayra://history') }
@@ -2115,6 +3140,13 @@ export class BrowserShell {
       safariTabbar.appendChild(button);
     });
     topBar.appendChild(safariTabbar);
+    const mobileChromeProgress = document.createElement('div');
+    mobileChromeProgress.className = 'fb-page-loading-bar fb-chrome-site-loading-bar';
+    mobileChromeProgress.setAttribute('role', 'progressbar');
+    mobileChromeProgress.setAttribute('aria-label', 'Website loading');
+    mobileChromeProgress.setAttribute('aria-valuetext', activeTab.isLoading ? 'Loading website' : 'Website loaded');
+    mobileChromeProgress.style.display = activeTab.isLoading ? 'block' : 'none';
+    topBar.appendChild(mobileChromeProgress);
     root.appendChild(topBar);
     // Same persistent restore prompt on mobile - docked, never lost.
     this.renderRestoreBar(root);
@@ -2271,21 +3303,48 @@ export class BrowserShell {
    * VIEWPORT CONTENT ROUTER (IN-TAB INTERNAL PAGES OR WEBVIEW)
    * ----------------------------------------------------------- */
   renderViewportContent(viewport, activeTab) {
+    // A re-render removes the new-tab voice surface. End its microphone
+    // session at the same time so recognition cannot continue off-screen.
+    try { this._closeGoogleVoiceSearch?.(); } catch { /* already closed */ }
+
     // Assume no external pooled frame is on screen until the external
     // branch below proves otherwise - internal pages must hide the layer.
     this.activeWebFrameSlot = null;
     this.activeWebFrameTabId = null;
     if (!activeTab) return;
 
-    // Page Loading Progress Bar
-    if (activeTab.isLoading) {
-      const progressBar = document.createElement('div');
-      progressBar.className = 'fb-page-loading-bar';
-      viewport.appendChild(progressBar);
-    }
+    // Always mount the active site's loading strip. Link clicks can begin a
+    // navigation entirely inside the native page/iframe, AFTER this chrome
+    // was rendered; a conditionally-created bar did not exist to turn on,
+    // so those real loads looked frozen until some unrelated refresh. Engine
+    // events now toggle this stable node in place with zero page rebuild.
+    const progressBar = document.createElement('div');
+    progressBar.className = 'fb-page-loading-bar';
+    progressBar.setAttribute('role', 'progressbar');
+    progressBar.setAttribute('aria-label', 'Website loading');
+    progressBar.setAttribute('aria-valuetext', activeTab.isLoading ? 'Loading website' : 'Website loaded');
+    progressBar.setAttribute('data-tab-id', activeTab.id);
+    progressBar.style.display = activeTab.isLoading ? 'block' : 'none';
+    viewport.setAttribute('aria-busy', activeTab.isLoading ? 'true' : 'false');
+    viewport.appendChild(progressBar);
 
     const url = activeTab.url || '';
     const isInternalPage = !url || url === 'about:blank' || url.startsWith('yayra://');
+    let siteFailure = this._siteFailureFor(activeTab);
+    // A brand-new web/PWA frame cannot emit a useful network error while the
+    // browser already knows it is offline. Record the failure before mounting
+    // anything so the first paint is the recovery page, never about:blank.
+    if (!isInternalPage && !siteFailure && !this.nativeWebview && !this.capacitorTabWeb
+      && !this._onLine() && this._isWebsiteUrl(url) && !this.webFrames?.has(activeTab.id)) {
+      siteFailure = this._recordSiteFailure(activeTab.id, {
+        url,
+        errorCode: -106,
+        errorDescription: 'net::ERR_INTERNET_DISCONNECTED',
+        offline: true,
+        source: 'web-frame',
+        adoptUrl: false
+      });
+    }
     // The native engine (Electron WebContentsView) renders as a separate
     // on-screen surface above the HTML document, not inside it - so it must
     // be explicitly shown/hidden to match whichever tab/page is actually
@@ -2296,13 +3355,13 @@ export class BrowserShell {
     // first so the page still appears present underneath the chrome.
     const overlayOpen = this.hasBlockingOverlay();
     const authHandoffOnly = this.isSystemBrowserAuthHost(url);
-    this.syncNativeWebviewVisibility(activeTab.id, !isInternalPage && !overlayOpen && !authHandoffOnly, {
-      captureActive: overlayOpen && !isInternalPage && !authHandoffOnly
+    this.syncNativeWebviewVisibility(activeTab.id, !isInternalPage && !overlayOpen && !authHandoffOnly && !siteFailure, {
+      captureActive: overlayOpen && !isInternalPage && !authHandoffOnly && !siteFailure
     });
     // Same rule for the Android native tab engine (its hide path captures
     // the page frame natively, so the chrome keeps a page underneath it).
-    // Provider sign-in URLs are rendered as an in-tab handoff card instead.
-    this.syncAndroidTabWebVisibility(activeTab.id, !isInternalPage && !overlayOpen && !authHandoffOnly);
+    // Recognized provider OAuth/auth URLs are rendered as an in-tab handoff card instead.
+    this.syncAndroidTabWebVisibility(activeTab.id, !isInternalPage && !overlayOpen && !authHandoffOnly && !siteFailure);
 
     // LOCAL DOCUMENT TABS (yayra://doc/<id>): the integrated document
     // viewer - never the web frame path, never the native engine. This is
@@ -2320,6 +3379,8 @@ export class BrowserShell {
       this.renderInternalBookmarksPage(viewport, activeTab);
     } else if (url === 'yayra://downloads') {
       this.renderInternalDownloadsPage(viewport, activeTab);
+    } else if (url === 'yayra://documents') {
+      this.renderInternalDocumentsPage(viewport, activeTab);
     } else if (url === 'yayra://passwords') {
       this.renderInternalPasswordsPage(viewport, activeTab);
     } else if (url === 'yayra://extensions') {
@@ -2344,25 +3405,62 @@ export class BrowserShell {
         webViewContainer.style.height = `${(100 / this.state.zoomLevel) * 100}%`;
       }
 
-      // Web/PWA: reuse the persistent pooled iframe for this tab so chrome
-      // re-renders never reload the page (no more white flash when opening
-      // the menu or checking for updates). Falls back to the classic
-      // one-shot frame for the native engine, auth handoff, known
-      // frame-blocked hosts and zoomed viewports.
-      const pooled = this.mountPooledWebFrame(webViewContainer, activeTab);
-      if (!pooled) {
-        const { wrapper } = this.createWebContentFrame(activeTab.url, {
-          frameClassName: 'fb-webview-frame',
-          onLoaded: () => this.updateTabLoading(activeTab.id, false),
+      if (siteFailure) {
+        // Keep retry work underneath the recovery page. Native/Android views
+        // are sibling OS surfaces and stay explicitly hidden above; web/PWA
+        // retry frames load in the persistent layer (also hidden by
+        // syncWebFrameLayer while a failure exists). Success alone removes
+        // the card and reveals the already-painted destination.
+        let pooledRetry = false;
+        if (siteFailure.inFlight && !this.nativeWebview && !this._androidTabWebIds?.has(activeTab.id)) {
+          pooledRetry = this.mountPooledWebFrame(webViewContainer, activeTab);
+          if (!pooledRetry && this._onLine()
+            && !this.isKnownFrameBlockedUrl(activeTab.url)
+            && !this.isSystemBrowserAuthHost(activeTab.url)) {
+            const { wrapper } = this.createWebContentFrame(activeTab.url, {
+              frameClassName: 'fb-webview-frame',
+              onLoaded: () => this._siteRecoverySucceeded(activeTab.id, activeTab.url),
+              tabId: activeTab.id,
+              isPrivate: activeTab.isPrivate,
+              allowNative: false
+            });
+            wrapper.style.visibility = 'hidden';
+            webViewContainer.appendChild(wrapper);
+          }
+        }
+        webViewContainer.appendChild(this.buildOfflineFallback(activeTab.url, {
           tabId: activeTab.id,
-          isPrivate: activeTab.isPrivate,
-          allowNative: true
-        });
+          failure: siteFailure
+        }));
+        this._scheduleSiteRecovery(activeTab.id);
+      } else {
+        // Web/PWA: reuse the persistent pooled iframe for this tab so chrome
+        // re-renders never reload the page (no more white flash when opening
+        // the menu or checking for updates). Falls back to the classic
+        // one-shot frame for the native engine, auth handoff, known
+        // frame-blocked hosts and zoomed viewports.
+        const pooled = this.mountPooledWebFrame(webViewContainer, activeTab);
+        if (!pooled) {
+          const { wrapper } = this.createWebContentFrame(activeTab.url, {
+            frameClassName: 'fb-webview-frame',
+            onLoaded: () => this.updateTabLoading(activeTab.id, false),
+            tabId: activeTab.id,
+            isPrivate: activeTab.isPrivate,
+            allowNative: true
+          });
 
-        webViewContainer.appendChild(wrapper);
+          webViewContainer.appendChild(wrapper);
+        }
       }
       viewport.appendChild(webViewContainer);
     }
+
+    // A newly-created pooled iframe marks itself loading while this render
+    // is still being assembled. Reconcile the stable strip once more so the
+    // very first frame already reflects that state (no second render needed).
+    progressBar.style.display = activeTab.isLoading ? 'block' : 'none';
+    progressBar.setAttribute('aria-valuetext', activeTab.isLoading ? 'Loading website' : 'Website loaded');
+    viewport.setAttribute('aria-busy', activeTab.isLoading ? 'true' : 'false');
   }
 
   /* -------------------------------------------------------------
@@ -2408,6 +3506,32 @@ export class BrowserShell {
     `;
     fallback.querySelector('.fb-frame-blocked-open-btn')?.addEventListener('click', () => {
       this.openExternally(url);
+    });
+    return fallback;
+  }
+
+  /**
+   * Browser/PWA limitation for Voice/Lens only. Google denies iframe
+   * embedding, but these controls are explicitly in-app-only, so never fall
+   * through to window.open or a Capacitor/system browser. Installed desktop
+   * and Android builds use native website surfaces and never see this card.
+   */
+  buildGoogleInAppOnlyFallback(url) {
+    const fallback = document.createElement('div');
+    fallback.className = 'fb-frame-blocked-fallback fb-google-in-app-only-fallback';
+    fallback.style.cssText = 'position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; background:var(--fb-bg-app,#060b19); color:var(--fb-text-primary,#f8fafc); text-align:center; padding:24px; z-index:1;';
+    let feature = 'Google';
+    try { if (new URL(url).hostname.toLowerCase() === 'lens.google.com') feature = 'Google Lens'; } catch { /* validated earlier */ }
+    fallback.innerHTML = `
+      <strong style="font-size:1rem;">${feature} stayed in Yayra</strong>
+      <div style="font-size:0.86rem; max-width:420px; line-height:1.55; color:var(--fb-text-secondary,#94a3b8);">Google blocks this page from being embedded by a browser or PWA. Yayra did not open another browser. Use the Yayra desktop or mobile app to view it in Yayra's built-in website engine.</div>
+      <button type="button" class="fb-btn fb-google-in-app-back-btn" style="padding:8px 16px;">Back in Yayra</button>
+    `;
+    fallback.querySelector('.fb-google-in-app-back-btn')?.addEventListener('click', () => {
+      const activeTab = this.getActiveTab();
+      if (activeTab) this._inAppOnlyGoogleTabs.delete(activeTab.id);
+      if (this.goBack()) this.render();
+      else this.navigateActiveTab('yayra://newtab');
     });
     return fallback;
   }
@@ -2532,16 +3656,21 @@ export class BrowserShell {
 
   buildSystemBrowserHandoffFallback(url, { tabId = null, native = false } = {}) {
     const fallback = document.createElement('div');
+    const googleAuth = this.isGoogleInteractiveAuthenticationUrl(url);
+    const description = googleAuth
+      ? 'Google requires sign-in in your secure system browser. Yayra keeps this tab unchanged and never copies browser cookies or puts Google tokens in a return URL. App-level “Sign in with Google” returns through its verified one-time callback; Google website sessions remain in the browser that created them.'
+      : 'Identity-provider sign-in opens in a separate secure browser. This Yayra tab and its URL stay intact. Browser cookies are not copied into Yayra, so a third-party site may not reflect the sign-in here unless it completes its own supported callback.';
+    const buttonLabel = googleAuth ? 'Open Google sign-in securely' : 'Open sign-in in browser';
     fallback.className = 'fb-frame-blocked-fallback fb-auth-handoff-fallback';
     fallback.style.cssText = 'position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; background:var(--fb-bg-elevated,#15171c); color:var(--fb-text-primary,#d7dbe3); text-align:center; padding:24px; z-index:1;';
     fallback.innerHTML = `
-      <div style="font-size:0.9rem; max-width:380px; line-height:1.5;">Identity-provider sign-in opens in a separate secure browser. This Yayra tab and its URL stay intact. Browser cookies are not copied into Yayra, so a third-party site may not reflect the sign-in here unless it completes its own supported callback.</div>
-      <button type="button" class="fb-btn fb-auth-handoff-open-btn" style="padding:8px 16px; border-radius:8px; border:none; background:#3b82f6; color:#fff; cursor:pointer; font-size:0.875rem;">Open sign-in in browser</button>
+      <div style="font-size:0.9rem; max-width:430px; line-height:1.5;">${description}</div>
+      <button type="button" class="fb-btn fb-auth-handoff-open-btn" style="padding:8px 16px; border-radius:8px; border:none; background:#3b82f6; color:#fff; cursor:pointer; font-size:0.875rem;">${buttonLabel}</button>
     `;
     fallback.querySelector('.fb-auth-handoff-open-btn')?.addEventListener('click', () => {
       if (native && tabId) {
-        // Re-enter the normal native ensure path to ask the main process to
-        // retry shell.openExternal(), without changing this tab or history.
+        // Re-enter the normal native ensure path to retry the provider's
+        // secure top-level surface without changing this tab or history.
         this._systemBrowserHandoffs.delete(tabId);
         if (this.state.activeTabId === tabId) this.render();
         return;
@@ -2575,12 +3704,12 @@ export class BrowserShell {
 
     // No native Electron bridge here: plain web/PWA tab, or an Android/iOS
     // Capacitor build (which still runs this file inside ONE WebView, so a
-    // nested <iframe> is subject to the exact same restrictions a desktop
-    // browser tab would see). Google/Apple/Microsoft refuse to complete
-    // sign-in inside ANY embedded webview on these platforms too - hand off
-    // to the real system/in-app browser instead of attempting (and failing)
-    // to embed the sign-in page. See the matching Electron-side handoff in
-    // electron/webviewBridge.cjs for the desktop equivalent of this check.
+    // nested <iframe> is subject to the exact same framing restrictions a
+    // desktop browser tab would see). Matching Google OAuth and interactive
+    // account sign-in routes are handed off because provider policy restricts
+    // embedded user agents. Account management and ordinary product routes
+    // are not broad-matched. Apple and Microsoft retain their existing
+    // provider handoff behavior. See electron/webviewBridge.cjs.
     if (this.isSystemBrowserAuthHost(url)) {
       let handoff = this._systemBrowserHandoffs.get(tabId);
       if (!handoff || handoff.url !== url) {
@@ -2603,7 +3732,14 @@ export class BrowserShell {
     // card (with Retry) instead. Tabs that already hold a live pooled
     // frame never reach this method - loaded pages stay live offline.
     if (!this._onLine() && /^https?:\/\//i.test(String(url || ''))) {
-      wrapper.appendChild(this.buildOfflineFallback(url));
+      const failure = tabId ? this._recordSiteFailure(tabId, {
+        url,
+        errorCode: -106,
+        errorDescription: 'net::ERR_INTERNET_DISCONNECTED',
+        offline: true,
+        source: 'classic-web-frame'
+      }) : null;
+      wrapper.appendChild(this.buildOfflineFallback(url, { tabId, failure }));
       if (typeof onLoaded === 'function') onLoaded();
       return { wrapper, iframe: null };
     }
@@ -2616,6 +3752,14 @@ export class BrowserShell {
       // Facebook genuinely open IN Yayra, no "open in other app" handoff.
       if (tabId && this.capacitorTabWeb) {
         this.attachAndroidTabWebview(wrapper, tabId, url);
+        return { wrapper, iframe: null };
+      }
+      // Voice/Lens explicitly promised to remain inside Yayra. A plain web
+      // page cannot override Google's frame policy, so keep an honest card
+      // here instead of allowing either auto-external path below.
+      if (this.isGoogleFeatureInAppOnly(tabId, url)) {
+        wrapper.appendChild(this.buildGoogleInAppOnlyFallback(url));
+        if (typeof onLoaded === 'function') onLoaded();
         return { wrapper, iframe: null };
       }
       // SEARCHES: no major engine allows embedded results anymore
@@ -2644,6 +3788,7 @@ export class BrowserShell {
 
     const iframe = document.createElement('iframe');
     if (frameClassName) iframe.className = frameClassName;
+    if (tabId) this.updateTabLoading(tabId, true);
     iframe.src = url;
     iframe.style.cssText = 'flex:1; border:none; width:100%; height:100%;';
     iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-popups');
@@ -2657,6 +3802,7 @@ export class BrowserShell {
     };
 
     iframe.addEventListener('load', () => {
+      if (tabId) this._siteRecoverySucceeded(tabId, url);
       if (typeof onLoaded === 'function') onLoaded();
       // Best-effort secondary net for hosts not in the known-blocked list:
       // a site that refuses framing never actually navigates — the
@@ -2678,6 +3824,20 @@ export class BrowserShell {
         }
       }, 450);
     });
+    iframe.addEventListener('error', () => {
+      if (tabId) {
+        this._recordSiteFailure(tabId, {
+          url,
+          errorDescription: this._onLine() ? 'net::ERR_CONNECTION_FAILED' : 'net::ERR_INTERNET_DISCONNECTED',
+          offline: !this._onLine(),
+          source: 'classic-web-frame'
+        });
+        this.updateTabLoading(tabId, false);
+        if (tabId === this.state.activeTabId) this.requestRender();
+      } else {
+        showBlockedFallback();
+      }
+    });
 
     wrapper.appendChild(iframe);
     return { wrapper, iframe };
@@ -2696,11 +3856,12 @@ export class BrowserShell {
   attachNativeWebviewSlot(wrapper, tabId, url, isPrivate) {
     wrapper.className += ' fb-native-webview-slot';
 
-    // OAuth/sign-in is handled outside the embedded WebContentsView. Keep
-    // the original tab, URL and navigationState authoritative; only the
-    // provider URL is sent to Electron for shell.openExternal(). The record
-    // is installed BEFORE the async IPC call so a fast re-render cannot open
-    // another system-browser window for the same tab+URL.
+    // Matching provider OAuth and interactive sign-in URLs are handled
+    // outside the embedded WebContentsView. Electron opens the OS default
+    // browser required by RFC 8252 / provider policy; Yayra never imports its
+    // cookies. Account management and ordinary Google product routes remain
+    // in the native view. The record is installed BEFORE IPC so a fast
+    // re-render cannot open the same auth URL twice.
     if (this.isSystemBrowserAuthHost(url)) {
       let handoff = this._systemBrowserHandoffs.get(tabId);
       if (!handoff || handoff.url !== url) {
@@ -2721,7 +3882,7 @@ export class BrowserShell {
           } else {
             handoff.status = 'failed';
             if (tab && tab.url === url) this.updateTabLoading(tabId, false);
-            this.showTransientNotice('Could not open the sign-in browser. This tab was kept unchanged.');
+            this.showTransientNotice('Could not open the sign-in window. This tab was kept unchanged.');
           }
         }).catch((err) => {
           if (this._systemBrowserHandoffs.get(tabId) === handoff) handoff.status = 'failed';
@@ -2884,7 +4045,9 @@ export class BrowserShell {
       title: evt.title,
       canGoBack: evt.canGoBack,
       canGoForward: evt.canGoForward,
-      isLoading: evt.isLoading
+      isLoading: evt.isLoading,
+      errorCode: evt.errorCode,
+      errorDescription: evt.errorDescription
     });
   }
 
@@ -3098,6 +4261,13 @@ export class BrowserShell {
       if (typeof document !== 'undefined') {
         this.viewportElement?.querySelectorAll('.fb-page-snapshot-img').forEach((el) => el.remove());
       }
+      // A network recovery page intentionally owns the viewport; healing a
+      // stale chrome overlay must not put the failed native surface on top.
+      if (this._siteFailureFor(tab.id)) {
+        this.syncNativeWebviewVisibility(tab.id, false);
+        this.syncAndroidTabWebVisibility(tab.id, false);
+        return;
+      }
       const restored = this.nativeWebview.setVisible(tab.id, true);
       if (restored && typeof restored.catch === 'function') restored.catch(() => {});
       this.restoreActiveNativeBounds(tab.id);
@@ -3134,6 +4304,7 @@ export class BrowserShell {
       try {
         const up = (el) => Boolean(el) && el.hidden !== true;
         if (up(document.querySelector('.fb-update-splash'))) return false;
+        if (up(document.querySelector('.fb-text-prompt-overlay'))) return false;
         if (up(document.querySelector('.fb-tab-context-menu'))) return false;
         if (up(document.querySelector('.fb-dropdown-scrim'))) return false;
         if (up(document.querySelector('.fb-passkey-dialog-overlay'))) return false;
@@ -3169,8 +4340,34 @@ export class BrowserShell {
         if (typeof document === 'undefined' || document.hidden === true) return;
         this._surfaceHealOnReturnBound = false; // re-arm on the next obscure
         try { this.healStuckPageSurface(); } catch { /* best-effort */ }
+        try { this.ensureActiveNativeSurfaceLive(); } catch { /* best-effort */ }
       });
     } catch { /* embedders/shims without document events */ }
+  }
+
+  /**
+   * Reasserts the live surface itself, not just its state flag. This repairs
+   * the second half of the freeze class: the renderer may say "not obscured"
+   * while a lost/out-of-order bounds update left the native view at 0×0.
+   */
+  ensureActiveNativeSurfaceLive(tabId = this.state.activeTabId) {
+    const tab = this.state.tabs.find((item) => item.id === tabId);
+    if (!tab || tabId !== this.state.activeTabId || !/^https?:\/\//i.test(String(tab.url || ''))) return false;
+    if (this._siteFailureFor(tabId)) return false;
+    if (this.state.isPageObscured) {
+      try { this.healStuckPageSurface(); } catch { /* best-effort */ }
+    }
+    if (this.hasBlockingOverlay() || this.isSystemBrowserAuthHost(tab.url)) return false;
+    try { this.viewportElement?.querySelectorAll('.fb-page-snapshot-img').forEach((el) => el.remove()); } catch { /* detached */ }
+    if (this.nativeWebview && this._nativeWebviewTabIds.has(tabId)) {
+      try {
+        const shown = this.nativeWebview.setVisible(tabId, true);
+        if (shown && typeof shown.catch === 'function') shown.catch(() => {});
+      } catch { /* bridge unavailable during teardown */ }
+      this.restoreActiveNativeBounds(tabId);
+    }
+    if (this._androidTabWebIds?.has?.(tabId)) this.syncAndroidTabWebVisibility(tabId, true);
+    return true;
   }
 
   restoreActiveNativeBounds(tabId) {
@@ -3185,6 +4382,167 @@ export class BrowserShell {
     }
   }
 
+  _websitePasskeyAuthorizationContext(tab, request) {
+    let profileId = 'default';
+    try { profileId = String(this.profileService?.current?.()?.id || 'default'); } catch { /* default profile */ }
+    return {
+      tabId: String(tab.id),
+      requestId: String(request.requestId),
+      rpId: String(request.rpId || '').toLowerCase(),
+      profileId,
+      action: request.action === 'create' ? 'create' : 'get'
+    };
+  }
+
+  async _registerWebsiteApprovalPin(websiteRequest) {
+    const pin = await this._promptNewPin({ websiteApproval: true });
+    if (!pin) return { success: false, reason: 'verification-cancelled' };
+    const profile = this.state.googleAccount?.signedIn ? this.state.googleAccount.profile : null;
+    const accountLabel = (profile && (profile.email || profile.name)) || 'Yayra user';
+    const result = await this.passkeyService.registerPasskey({
+      accountLabel,
+      method: 'pin',
+      pin,
+      websiteRequest
+    });
+    if (result.success) {
+      this.state.passkeyInfo = result.passkey;
+      this._vaultUnlockedAt = Date.now();
+      this.showTransientNotice('Yayra PIN created. It now protects vault access and website-passkey approvals on this device.');
+    }
+    return result;
+  }
+
+  /**
+   * Verify the browser owner without conflating credentials: the Yayra account
+   * passkey authorizes one release, while the separate RP-scoped website key
+   * signs the site's challenge in main/Chromium. The returned opaque token is
+   * one-shot, request-bound and validated entirely in the main process.
+   */
+  async _authorizeWebsitePasskey(tab, request) {
+    if (!this.passkeyService?.usesNativeBridge) return { systemFallback: true };
+    const websiteRequest = this._websitePasskeyAuthorizationContext(tab, request);
+    let stored = this.state.passkeyInfo;
+    if (!stored) {
+      try { stored = await this.passkeyService.getRegisteredPasskey(); } catch { stored = null; }
+      this.state.passkeyInfo = stored;
+    }
+
+    if (!stored) {
+      const choice = await this._passkeyDialog({
+        title: 'Protect website passkeys with Yayra',
+        description: `Create a 6-digit Yayra PIN to approve the ${request.rpId || 'website'} passkey without a Linux system-password prompt. The site credential stays separate and RP-scoped.`,
+        buttons: [
+          { action: 'pin', label: 'Create a Yayra PIN', primary: true },
+          { action: 'system', label: 'Use system password once' },
+          { action: 'cancel', label: 'Cancel' }
+        ]
+      });
+      if (choice.action === 'system') return { systemFallback: true };
+      if (choice.action !== 'pin') return { success: false, reason: 'verification-cancelled' };
+      const registered = await this._registerWebsiteApprovalPin(websiteRequest);
+      return registered.success && registered.authorizationToken
+        ? { success: true, authorizationToken: registered.authorizationToken }
+        : { success: false, reason: registered.reason || 'yayra-authorization-unavailable' };
+    }
+
+    if (stored.method !== 'pin') {
+      const choice = await this._passkeyDialog({
+        title: 'Verify with your Yayra passkey',
+        description: 'Your configured Yayra passkey currently uses the system lock. You can verify with it now, or verify once and switch future website-passkey approvals to a Yayra PIN.',
+        buttons: [
+          { action: 'switch-pin', label: 'Switch to a Yayra PIN', primary: true },
+          { action: 'current', label: 'Use current Yayra passkey' },
+          { action: 'cancel', label: 'Cancel' }
+        ]
+      });
+      if (choice.action === 'cancel') return { success: false, reason: 'verification-cancelled' };
+      if (choice.action === 'switch-pin') {
+        // Replacing an existing verifier itself requires the existing verifier;
+        // an unlocked renderer can never silently downgrade system-lock auth.
+        const current = await this._performPasskeyCeremony();
+        if (!current?.success) return current || { success: false, reason: 'verification-failed' };
+        const registered = await this._registerWebsiteApprovalPin(websiteRequest);
+        return registered.success && registered.authorizationToken
+          ? { success: true, authorizationToken: registered.authorizationToken }
+          : { success: false, reason: registered.reason || 'yayra-authorization-unavailable' };
+      }
+    }
+
+    const verified = await this._performPasskeyCeremony({ websiteRequest });
+    if (!verified?.success || !verified.authorizationToken) {
+      return { success: false, reason: verified?.reason || 'yayra-authorization-unavailable' };
+    }
+    this._vaultUnlockedAt = Date.now();
+    return { success: true, authorizationToken: verified.authorizationToken };
+  }
+
+  async continueWebsitePasskey(tab, request) {
+    if (!tab || !request || !this.nativeWebview?.continuePasskey) return;
+    if (['prompting', 'system-prompt', 'approved', 'handed-off'].includes(request.providerState)) return;
+    const external = request.provider?.mode === 'external'
+      || request.providerState === 'declined';
+    let authorizationToken = '';
+
+    if (!external && request.provider?.mode === 'local') {
+      request.providerState = 'prompting';
+      if (tab.id === this.state.activeTabId) this.requestRender();
+      const authorization = await this._authorizeWebsitePasskey(tab, request);
+      if (!authorization?.success && !authorization?.systemFallback) {
+        request.providerState = 'retry';
+        this.showTransientNotice(`Yayra did not authorize this website passkey: ${describePasskeyReason(authorization?.reason)}. Click to retry.`);
+        if (tab.sitePasskeyRequest?.requestId === request.requestId
+            && tab.id === this.state.activeTabId) this.requestRender();
+        return;
+      }
+      authorizationToken = authorization.authorizationToken || '';
+      if (tab.sitePasskeyRequest?.requestId !== request.requestId) return;
+      request.providerState = authorization.systemFallback ? 'system-prompt' : 'prompting';
+    } else {
+      request.providerState = 'approved';
+    }
+    if (tab.id === this.state.activeTabId) this.requestRender();
+
+    try {
+      const result = await this.nativeWebview.continuePasskey(tab.id, request.requestId, {
+        external,
+        authorizationToken
+      });
+      if (result?.handedOff) {
+        request.providerState = 'handed-off';
+        this.showTransientNotice('The passkey page opened in your system browser. Complete it there using that browser’s passkey provider.');
+      } else if (result?.ok) {
+        // A fast authenticator can settle before the invoke response returns.
+        // In that ordering the terminal success event already removed the chip;
+        // never paint a stale “Completing” state over the newer success.
+        if (tab.sitePasskeyRequest?.requestId !== request.requestId) return;
+        request.providerState = 'approved';
+        this.showTransientNotice(result.verification === 'yayra-passkey'
+          ? 'Yayra passkey verified. Completing the website sign-in...'
+          : 'System verification accepted. Completing the passkey request...');
+        const expiresInMs = Math.max(0, Math.min(60000, Number(result.presenceExpiresInMs) || 0));
+        if (expiresInMs > 0) {
+          setTimeout(() => {
+            if (tab.sitePasskeyRequest?.requestId !== request.requestId
+                || request.providerState !== 'approved') return;
+            request.providerState = 'declined';
+            this.showTransientNotice('The site did not finish the passkey request. Retry it on the site, or click “Use system browser” to continue another way.');
+            if (tab.id === this.state.activeTabId) this.requestRender();
+          }, expiresInMs + 250);
+        }
+      } else {
+        const retryable = String(result?.reason || '').startsWith('yayra-authorization');
+        request.providerState = retryable ? 'retry' : 'declined';
+        this.showTransientNotice(`${describePasskeyReason(result?.reason)}. ${retryable ? 'Click to verify with Yayra again.' : 'Use the system-browser fallback to continue.'}`);
+      }
+    } catch {
+      request.providerState = 'declined';
+      this.showTransientNotice('The secure local passkey provider is unavailable. Click “Use system browser” to continue.');
+    }
+    if (tab.sitePasskeyRequest?.requestId === request.requestId
+        && tab.id === this.state.activeTabId) this.requestRender();
+  }
+
   handleNativeWebviewEvent(evt) {
     if (!evt || !evt.tabId) return;
     const { tabId, type } = evt;
@@ -3193,16 +4551,69 @@ export class BrowserShell {
 
     switch (type) {
       case 'loading-start':
+        // A top-level load invalidates the document that owned any prior
+        // WebAuthn request. Main sends an explicit AbortError settle first;
+        // this is a final UI-side stale-indicator guard.
+        if (tab.sitePasskeyRequest) delete tab.sitePasskeyRequest;
         this.updateTabLoading(tabId, true);
         break;
       case 'loading-stop':
         this.updateTabLoading(tabId, false);
+        // Final safety net: a completed active page may never remain behind a
+        // stale suggestion snapshot. Genuine visible chrome makes the heal a
+        // no-op; otherwise the live WebContentsView is restored immediately.
+        if (tabId === this.state.activeTabId && !this._siteFailureFor(tabId)) {
+          try { this.healStuckPageSurface(); } catch { /* best-effort */ }
+          try { this.ensureActiveNativeSurfaceLive(tabId); } catch { /* best-effort */ }
+        }
+        break;
+      case 'load-succeeded':
+        // Positive main-frame completion (unlike loading-stop, which follows
+        // failures too) is the only native signal that retires recovery UI.
+        this._siteRecoverySucceeded(tabId, evt.url || tab.url);
+        break;
+      case 'page-unresponsive':
+        if (this.state.settings.performanceIssueAlerts !== false) {
+          const name = tab.title || 'This page';
+          this.showTransientNotice(evt.recoveryScheduled
+            ? `${name} is not responding. Yayra will wait briefly before attempting a recovery reload.`
+            : `${name} is not responding. A recent recovery attempt is still in its cooldown; try Reload or close the tab.`);
+        }
+        break;
+      case 'page-recovery-start':
+        if (this.state.settings.performanceIssueAlerts !== false) {
+          this.showTransientNotice(evt.reason === 'navigation'
+            ? 'Page navigation started; the waiting recovery reload was canceled.'
+            : 'Yayra is attempting to reload the unresponsive page.');
+        }
+        break;
+      case 'page-responsive':
+        if (this.state.settings.performanceIssueAlerts !== false) {
+          this.showTransientNotice(`${tab.title || 'The page'} is responding again.`);
+        }
+        break;
+      case 'page-recovery-failed':
+        if (this.state.settings.performanceIssueAlerts !== false) {
+          this.showTransientNotice('Yayra could not start the recovery reload. You can retry Reload or close the tab.');
+        }
         break;
       case 'navigated': {
         const previousUrl = tab.url;
+        if (tab.sitePasskeyRequest && evt.url && evt.url !== previousUrl) delete tab.sitePasskeyRequest;
         const pendingHandoff = this._systemBrowserHandoffs.get(tabId);
         if (pendingHandoff && evt.url && pendingHandoff.url !== evt.url) this._systemBrowserHandoffs.delete(tabId);
+        const pendingFailure = this._siteFailures?.get(tabId);
+        if (pendingFailure && evt.url && evt.url !== pendingFailure.url) {
+          if (pendingFailure.inFlight) {
+            // Redirect within the retry generation: keep the card until the
+            // final document positively finishes, but follow its real target.
+            pendingFailure.url = evt.url;
+          } else {
+            this._clearSiteFailure(tabId);
+          }
+        }
         tab.url = evt.url || tab.url;
+        if (!this.isGoogleOwnedUrl(tab.url)) this._inAppOnlyGoogleTabs.delete(tabId);
         tab.isSecure = (tab.url || '').startsWith('https://');
         tab.canGoBack = Boolean(evt.canGoBack);
         tab.canGoForward = Boolean(evt.canGoForward);
@@ -3217,7 +4628,7 @@ export class BrowserShell {
           navigationState.historyStack.push(tab.url);
           navigationState.currentIndex = navigationState.historyStack.length - 1;
         }
-        if (!tab.isPrivate && this.historyRepo && tab.url !== 'yayra://newtab') {
+        if (!tab.isPrivate && this.historyRepo && /^https?:\/\//i.test(tab.url || '')) {
           const recorded = typeof this.historyRepo.recordVisit === 'function'
             ? this.historyRepo.recordVisit(tab.url, tab.title, tab.favicon)
             : (typeof this.historyRepo.addEntry === 'function' ? this.historyRepo.addEntry(tab.url, tab.title, tab.favicon) : null);
@@ -3245,23 +4656,39 @@ export class BrowserShell {
       case 'favicon-updated':
         tab.favicon = evt.favicon || tab.favicon;
         break;
-      case 'fail-load':
+      case 'fail-load': {
         this.updateTabLoading(tabId, false);
-        console.warn(`[yayra] native webview failed to load ${evt.url}: ${evt.errorDescription} (${evt.errorCode})`);
+        const description = String(evt.errorDescription || '');
+        const code = Number(evt.errorCode);
+        if (code === -3 || /ERR_ABORTED\s*\(-3\)|net::ERR_ABORTED/i.test(description)) break;
+        let host = '';
+        try { host = new URL(evt.url).host; } catch { /* do not expose the full address or search query in logs */ }
+        console.warn(`[yayra] native webview failed to load ${host || 'page'} (error ${Number.isFinite(code) ? code : 'unknown'})`);
+        this._recordSiteFailure(tabId, {
+          url: evt.url || tab.url,
+          errorCode: code,
+          errorDescription: description,
+          offline: code === -106 || /ERR_INTERNET_DISCONNECTED/i.test(description) || !this._onLine(),
+          source: 'native-webview'
+        });
+        if (tabId === this.state.activeTabId) this.requestRender();
         break;
+      }
       case 'system-browser-handoff': {
-        // Direct auth URLs have an in-tab fallback card; popups and blocked
-        // redirects leave the relying site visible and get this non-blocking
-        // notice instead. Never claim browser cookies/session state are shared.
-        const sameTabAuthUrl = evt.url && evt.url === tab.url
-          && this._systemBrowserHandoffs.get(tabId)?.url === evt.url;
-        if (!sameTabAuthUrl) {
-          this.showTransientNotice('Sign-in opened in a separate browser; this tab may not receive the site’s login state.');
+        // Direct auth URLs already have an in-tab explanation card. Popups
+        // and redirects leave the relying site visible and get this notice.
+        // Never claim that browser cookies or website session state are shared.
+        if (evt.reason !== 'direct-navigation') {
+          this.showTransientNotice('Sign-in opened securely in your system browser. Yayra did not copy its cookies or credentials.');
         }
         break;
       }
+      case 'system-browser-handoff-failed':
+        this.updateTabLoading(tabId, false);
+        this.showTransientNotice('Yayra could not open your system browser for sign-in. This tab was left unchanged.');
+        break;
       case 'auth-navigation-blocked': {
-        // Android's native TabWebView cancels top-level provider sign-in
+        // Android's native TabWebView cancels matching provider OAuth/auth
         // navigations before loading them, then asks the Capacitor Browser
         // plugin for its secure system-browser surface. The current tab and
         // its history are deliberately left untouched.
@@ -3279,6 +4706,84 @@ export class BrowserShell {
         this.showTransientNotice(host ? `Cache cleared for ${host} - reloading from the network.` : 'Hard reload - cache bypassed.');
         break;
       }
+      case 'webauthn-request': {
+        // A real website called navigator.credentials.create/get. Keep a
+        // visible browser-chrome indicator while Chromium/OS/security-key UI
+        // owns the ceremony, and clear it on every settle/navigation path.
+        // Conditional mediation is intentionally quiet until a user chooses
+        // an account; those passive requests can remain pending for a page's
+        // entire lifetime by design.
+        if (evt.phase === 'started') {
+          tab.sitePasskeyRequest = {
+            requestId: evt.requestId,
+            action: evt.action,
+            rpId: evt.rpId,
+            attachment: evt.attachment,
+            conditional: evt.conditional === true,
+            provider: evt.provider && ['local', 'external', 'native'].includes(evt.provider.mode)
+              ? {
+                  mode: evt.provider.mode,
+                  available: evt.provider.available === true,
+                  reason: String(evt.provider.reason || '').slice(0, 120),
+                  ...(Number.isSafeInteger(evt.provider.credentialCount)
+                    ? { credentialCount: evt.provider.credentialCount }
+                    : {})
+                }
+              : { mode: 'native', available: false, reason: '' },
+            startedAt: Date.now()
+          };
+          if (!tab.sitePasskeyRequest.conditional && tabId === this.state.activeTabId) this.requestRender();
+        } else if (evt.phase === 'settled') {
+          const current = tab.sitePasskeyRequest;
+          if (current?.requestId === evt.requestId) {
+            delete tab.sitePasskeyRequest;
+            if (tabId === this.state.activeTabId) this.requestRender();
+          }
+          if (tabId === this.state.activeTabId && evt.success) {
+            this.showTransientNotice(evt.action === 'create'
+              ? `Passkey created for ${evt.rpId || 'this site'}.`
+              : `Passkey sign-in completed for ${evt.rpId || 'this site'}.`);
+          } else if (tabId === this.state.activeTabId && evt.errorName && evt.errorName !== 'AbortError') {
+            this.showTransientNotice(`The passkey request from ${evt.rpId || 'this site'} did not complete. You can retry with your device/security key or use the system-browser option.`);
+          } else if (tabId === this.state.activeTabId && evt.errorName === 'AbortError'
+              && current && !current.conditional && current.providerReason !== 'ceremony-timeout') {
+            this.showTransientNotice(`The passkey request from ${evt.rpId || 'this site'} was cancelled.`);
+          }
+        }
+        break;
+      }
+      case 'webauthn-provider-state': {
+        const request = tab.sitePasskeyRequest;
+        if (!request || request.requestId !== evt.requestId) break;
+        if (['prompting', 'approved', 'declined'].includes(evt.state)) {
+          request.providerState = evt.state;
+          request.providerReason = String(evt.reason || '').slice(0, 120);
+          request.verification = evt.verification === 'yayra-passkey' ? 'yayra-passkey' : '';
+          if (evt.state === 'declined') request.provider = { ...request.provider, mode: 'local' };
+          if (evt.state === 'declined' && request.providerReason === 'ceremony-timeout'
+              && tabId === this.state.activeTabId) {
+            this.showTransientNotice('The website did not finish the Yayra passkey request in time. It was cancelled safely; retry on the site or use the system-browser fallback.');
+          }
+          if (tabId === this.state.activeTabId) this.requestRender();
+        }
+        break;
+      }
+      case 'webauthn-account-selection':
+        // Conditional mediation is deliberately quiet until Chromium has an
+        // account to offer. A local Linux credential still needs the trusted
+        // toolbar click after account choice, so promote only the matching
+        // pending request to an active ceremony here.
+        if (tab.sitePasskeyRequest?.conditional
+            && (!evt.requestId || evt.requestId === tab.sitePasskeyRequest.requestId)) {
+          tab.sitePasskeyRequest.conditional = false;
+          if (tabId === this.state.activeTabId) this.requestRender();
+        }
+        // The native chooser is already in front; this notice makes the
+        // reason explicit if the OS/menu appears away from the page surface.
+        if (tabId === this.state.activeTabId) {
+          this.showTransientNotice(`${evt.relyingPartyId || 'This site'} found ${Number(evt.accountCount) || 0} passkey account${Number(evt.accountCount) === 1 ? '' : 's'} - choose one to continue.`);
+        }
+        break;
       case 'autofill-captured':
         // Chrome-style: a login was submitted inside the page. Offer to
         // remember it (never for private tabs - checked again in the vault).
@@ -3287,9 +4792,21 @@ export class BrowserShell {
       case 'autofill-form-detected':
         this.handleAutofillFormDetected(tab, evt);
         break;
+      case 'email-field-focused':
+        this.handleEmailFieldFocused(tab, evt);
+        break;
+      case 'email-address-captured':
+        this.rememberEmailAddress(evt.email, tab, evt.url).catch(() => {});
+        break;
       case 'new-window-request':
         if (evt.url) {
-          this.createNewTab();
+          // Links and window.open requests belong beside the tab that
+          // launched them, not at the end of the strip. Keep the source
+          // profile/privacy scope and existing tab group as well.
+          this.createNewTab(Boolean(tab.isPrivate), {
+            afterTabId: tab.id,
+            group: tab.group || null
+          });
           this.navigateActiveTab(evt.url);
         }
         break;
@@ -3301,6 +4818,92 @@ export class BrowserShell {
   /* -------------------------------------------------------------
    * PASSWORD VAULT: Chrome-style remember prompt, autofill, passkeys
    * ----------------------------------------------------------- */
+
+  async refreshBookmarksState() {
+    if (this.bookmarksRepo && typeof this.bookmarksRepo.getAllBookmarks === 'function') {
+      this.state.bookmarksItems = await this.bookmarksRepo.getAllBookmarks() || [];
+    }
+    if (this.bookmarksRepo && typeof this.bookmarksRepo.getGroups === 'function') {
+      const groups = await this.bookmarksRepo.getGroups();
+      if (Array.isArray(groups) && groups.length) this.state.bookmarkGroups = groups;
+    }
+    if (this.bookmarksRepo && typeof this.bookmarksRepo.getDefaultGroupId === 'function') {
+      this.state.bookmarkDefaultGroupId = await this.bookmarksRepo.getDefaultGroupId() || DEFAULT_BOOKMARK_GROUP_ID;
+    }
+    const groups = Array.isArray(this.state.bookmarkGroups) && this.state.bookmarkGroups.length
+      ? this.state.bookmarkGroups
+      : DEFAULT_BOOKMARK_GROUPS;
+    if (!groups.some((group) => group.id === this.state.bookmarkDefaultGroupId)) {
+      this.state.bookmarkDefaultGroupId = DEFAULT_BOOKMARK_GROUP_ID;
+    }
+    if (!groups.some((group) => group.id === this.state.bookmarksActiveGroupId)) {
+      this.state.bookmarksActiveGroupId = this.state.bookmarkDefaultGroupId;
+    }
+    return this.state.bookmarksItems;
+  }
+
+  async refreshEmailAddressesState() {
+    if (!this.emailAddressesRepo || typeof this.emailAddressesRepo.getAllEmails !== 'function') return [];
+    this.state.rememberedEmails = await this.emailAddressesRepo.getAllEmails() || [];
+    return this.state.rememberedEmails;
+  }
+
+  async pushEmailSuggestionsToOpenTabs() {
+    const native = this.nativeWebview;
+    if (!native || typeof native.suggestEmailAddresses !== 'function') return;
+    const values = (Array.isArray(this.state.rememberedEmails) ? this.state.rememberedEmails : [])
+      .map((item) => typeof item === 'string' ? item : item?.email)
+      .filter((value) => typeof value === 'string');
+    const pending = this.state.tabs
+      .filter((tab) => !tab.isPrivate && /^https?:\/\//i.test(String(tab.url || '')))
+      .map((tab) => Promise.resolve(native.suggestEmailAddresses(tab.id, values)).catch(() => {}));
+    await Promise.all(pending);
+  }
+
+  async rememberEmailAddress(email, tab = null, pageUrl = '') {
+    if (!this.emailAddressesRepo || typeof this.emailAddressesRepo.addEmail !== 'function' || !tab || tab.isPrivate) return null;
+    const url = String(pageUrl || tab.url || '');
+    let parsed;
+    try { parsed = new URL(url); } catch { return null; }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+    const saved = await this.emailAddressesRepo.addEmail(email);
+    if (!saved) return null;
+    try { await this.refreshEmailAddressesState(); } catch { /* the stored address remains saved */ }
+    try { await this.pushEmailSuggestionsToOpenTabs(); } catch { /* a suggestion refresh must not block form handling */ }
+    const active = this.getActiveTab();
+    if (active?.url === 'yayra://passwords') this.requestRender();
+    return saved;
+  }
+
+  async handleEmailFieldFocused(tab, evt = {}) {
+    if (!tab || tab.isPrivate || !this.emailAddressesRepo) return;
+    const native = this.nativeWebview;
+    if (!native || typeof native.suggestEmailAddresses !== 'function') return;
+    const url = String(evt.url || tab.url || '');
+    let pageOrigin;
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return;
+      pageOrigin = parsed.origin;
+    } catch { return; }
+    // Ignore a stale focus event from the document that was just navigated
+    // away from. This also prevents another page from requesting this tab's
+    // profile data during a navigation race.
+    try {
+      const current = new URL(tab.url || '');
+      if ((current.protocol === 'http:' || current.protocol === 'https:') && current.origin !== pageOrigin) return;
+    } catch { /* the first navigation event may not have reached the shell */ }
+    let emails = [];
+    try {
+      emails = typeof this.emailAddressesRepo.getAllEmails === 'function'
+        ? await this.emailAddressesRepo.getAllEmails()
+        : [];
+    } catch { return; }
+    const values = (Array.isArray(emails) ? emails : [])
+      .map((item) => typeof item === 'string' ? item : item?.email)
+      .filter((value) => typeof value === 'string');
+    try { await native.suggestEmailAddresses(tab.id, values); } catch { /* page may have navigated away */ }
+  }
 
   async refreshVaultState() {
     if (this.passwordManager) {
@@ -3347,6 +4950,9 @@ export class BrowserShell {
     try { origin = new URL(url).origin; } catch { return; }
     // Never offer to save Yayra's own internal pages.
     if (origin.startsWith('yayra://')) return;
+    // Login identifiers are useful email suggestions too. Save only to this
+    // profile, and never when the source tab is Incognito (guarded above).
+    try { await this.rememberEmailAddress(username, tab, url); } catch { /* email recall must not block password handling */ }
     // Smart profile separation: an email-shaped sign-in on a real page is
     // the signal Chrome uses for "someone else is using this browser".
     this.handleAccountSignal(username, { source: 'site-signin' });
@@ -3510,6 +5116,9 @@ export class BrowserShell {
         const values = {};
         for (const [id, el] of Object.entries(fields)) values[id] = el.value || '';
         try { overlay.remove(); } catch { /* already gone */ }
+        // This dialog is body-mounted above the HTML renderer. Restore the
+        // native site surface only when no other real overlay still owns it.
+        try { this.healStuckPageSurface(); } catch { /* non-native/test host */ }
         resolve({ action, values });
       };
       const row = document.createElement('div');
@@ -3528,6 +5137,9 @@ export class BrowserShell {
       overlay.addEventListener('pointerdown', (e) => { if (e.target === overlay) done('cancel'); });
       overlay.appendChild(card);
       document.body.appendChild(overlay);
+      // A WebContentsView paints above renderer z-index; hide/capture it so
+      // the trusted Yayra verification UI is actually visible and clickable.
+      try { if (this.nativeWebview) this.setPageObscured(true); } catch { /* web/test host */ }
       const firstField = Object.values(fields)[0];
       if (firstField && typeof firstField.focus === 'function') firstField.focus();
     });
@@ -3566,10 +5178,12 @@ export class BrowserShell {
   }
 
   /** Ask for a new 6-digit PIN twice (typo protection). Returns pin or null. */
-  async _promptNewPin() {
+  async _promptNewPin({ websiteApproval = false } = {}) {
     const first = await this._passkeyDialog({
       title: 'Create your 6-digit PIN',
-      description: 'This PIN protects your Yayra vault on this device. It is stored only as a salted scrypt hash - never the digits themselves.',
+      description: websiteApproval
+        ? 'This PIN protects your Yayra vault and approves RP-isolated website passkeys on this device. It is stored only as a salted scrypt hash - never the digits themselves.'
+        : 'This PIN protects your Yayra vault on this device. It is stored only as a salted scrypt hash - never the digits themselves.',
       inputs: [{ id: 'pin', placeholder: '6-digit PIN' }],
       buttons: [{ action: 'confirm', label: 'Continue', primary: true }, { action: 'cancel', label: 'Cancel' }]
     });
@@ -3598,16 +5212,20 @@ export class BrowserShell {
    *  - everything else runs the silent device/Touch ID ceremony.
    * Returns the service's { success, reason } result.
    */
-  async _performPasskeyCeremony() {
+  async _performPasskeyCeremony({ websiteRequest = null } = {}) {
     const stored = this.state.passkeyInfo;
     if (stored?.method === 'pin') {
       const entry = await this._passkeyDialog({
-        title: 'Enter your 6-digit PIN',
-        description: 'Unlock the Yayra vault on this device.',
+        title: websiteRequest ? 'Verify with your Yayra passkey' : 'Enter your 6-digit PIN',
+        description: websiteRequest
+          ? `Approve the passkey request for ${websiteRequest.rpId}. Your PIN never leaves Yayra.`
+          : 'Unlock the Yayra vault on this device.',
         inputs: [{ id: 'pin', placeholder: '6-digit PIN' }],
         buttons: [
           { action: 'confirm', label: 'Unlock', primary: true },
-          ...(this.passkeyService?.supportsPhoneApproval ? [{ action: 'phone', label: 'Approve from my phone (QR)' }] : []),
+          ...(!websiteRequest && this.passkeyService?.supportsPhoneApproval
+            ? [{ action: 'phone', label: 'Approve from my phone (QR)' }]
+            : []),
           { action: 'cancel', label: 'Cancel' }
         ]
       });
@@ -3616,9 +5234,12 @@ export class BrowserShell {
         return ok ? { success: true } : { success: false, reason: 'verification-cancelled' };
       }
       if (entry.action !== 'confirm') return { success: false, reason: 'verification-cancelled' };
-      return this.passkeyService.verifyPasskey({ pin: entry.values.pin });
+      return this.passkeyService.verifyPasskey({
+        pin: entry.values.pin,
+        ...(websiteRequest ? { websiteRequest } : {})
+      });
     }
-    return this.passkeyService.verifyPasskey();
+    return this.passkeyService.verifyPasskey(websiteRequest ? { websiteRequest } : undefined);
   }
 
   /**
@@ -3811,6 +5432,787 @@ export class BrowserShell {
     }, 4000);
   }
 
+  /** Build a first-party Google AI Mode URL, optionally carrying real tabs
+   * the user selected as context from the new-tab + menu. */
+  buildGoogleAiModeUrl(query = '', contextTabs = []) {
+    const cleanQuery = String(query || '').trim();
+    const contexts = (Array.isArray(contextTabs) ? contextTabs : [])
+      .filter((tab) => /^https?:\/\//i.test(String(tab?.url || '')))
+      .slice(0, 4)
+      .map((tab) => `- ${String(tab.title || tab.url).trim()}: ${tab.url}`);
+    const prompt = contexts.length
+      ? `${cleanQuery || 'Help me with these pages'}\n\nPages from my Yayra tabs:\n${contexts.join('\n')}`
+      : cleanQuery;
+    const params = new URLSearchParams({ udm: '50' });
+    if (prompt) params.set('q', prompt);
+    return `https://www.google.com/search?${params.toString()}`;
+  }
+
+  /** Build Google's current Lens upload/search contract. The `ccm`
+   * entrypoint plus viewport metadata mirrors current Chromium/Firefox Lens
+   * submissions; older incomplete contracts can redirect to the empty
+   * `www.google.com/?olud=` picker instead of processing the supplied image. */
+  buildGoogleLensUrl(path, { imageUrl = '', startedAt = Date.now() } = {}) {
+    const language = typeof navigator !== 'undefined' && navigator.language ? navigator.language : 'en-US';
+    const params = new URLSearchParams({
+      ep: 'ccm',
+      hl: language,
+      st: String(startedAt)
+    });
+    const viewportWidth = typeof window !== 'undefined' ? Math.trunc(Number(window.innerWidth) || 0) : 0;
+    const viewportHeight = typeof window !== 'undefined' ? Math.trunc(Number(window.innerHeight) || 0) : 0;
+    if (viewportWidth > 0) params.set('vpw', String(viewportWidth));
+    if (viewportHeight > 0) params.set('vph', String(viewportHeight));
+    if (imageUrl) params.set('url', imageUrl);
+    return `https://lens.google.com${path}?${params.toString()}`;
+  }
+
+  isGoogleOwnedUrl(value) {
+    try {
+      const parsed = new URL(value);
+      const host = parsed.hostname.toLowerCase();
+      return parsed.protocol === 'https:'
+        && (host === 'google.com' || host.endsWith('.google.com'));
+    } catch {
+      return false;
+    }
+  }
+
+  isGoogleLensResultUrl(value) {
+    try {
+      const parsed = new URL(value);
+      const host = parsed.hostname.toLowerCase();
+      const path = parsed.pathname.replace(/\/+$/, '') || '/';
+      const emptyLensHome = host === 'lens.google.com'
+        && (path === '/' || path === '/v3/upload' || path === '/uploadbyurl');
+      const emptyGooglePicker = (host === 'google.com' || host === 'www.google.com')
+        && path === '/'
+        && (parsed.searchParams.has('olud') || parsed.searchParams.size === 0);
+      return this.isGoogleOwnedUrl(parsed.toString())
+        && host !== 'accounts.google.com'
+        && !emptyLensHome
+        && !emptyGooglePicker;
+    } catch {
+      return false;
+    }
+  }
+
+  isGoogleFeatureInAppOnly(tabId, value) {
+    return Boolean(tabId)
+      && this._inAppOnlyGoogleTabs.has(tabId)
+      && this.isGoogleOwnedUrl(value);
+  }
+
+  /**
+   * Google Voice Search and Lens are allowed to navigate, but ONLY through
+   * the active Yayra tab. Electron uses its WebContentsView, Android uses its
+   * native tab WebView, and web/PWA gets an honest in-tab limitation instead
+   * of window.open. No system-browser bridge is consulted by this path.
+   */
+  openGoogleFeatureInYayra(feature, resultUrl = '') {
+    const urls = {
+      voice: 'https://www.google.com/',
+      lens: 'https://lens.google.com/'
+    };
+    const target = resultUrl || urls[feature];
+    if (!Object.prototype.hasOwnProperty.call(urls, feature)
+      || !this.isGoogleOwnedUrl(target)
+      || this.isSystemBrowserAuthHost(target)) return false;
+    const tab = this.getActiveTab();
+    if (!tab) return false;
+    this._inAppOnlyGoogleTabs.add(tab.id);
+    this.navigateActiveTab(target);
+    return true;
+  }
+
+  googleLensViewport() {
+    return {
+      viewportWidth: typeof window !== 'undefined' ? Math.max(0, Math.trunc(Number(window.innerWidth) || 0)) : 0,
+      viewportHeight: typeof window !== 'undefined' ? Math.max(0, Math.trunc(Number(window.innerHeight) || 0)) : 0
+    };
+  }
+
+  async readGoogleLensImageDimensions(file) {
+    if (!file) return {};
+    if (typeof createImageBitmap === 'function') {
+      try {
+        const bitmap = await createImageBitmap(file);
+        const dimensions = { width: Number(bitmap?.width) || 0, height: Number(bitmap?.height) || 0 };
+        try { bitmap?.close?.(); } catch { /* decoded image already released */ }
+        if (dimensions.width > 0 && dimensions.height > 0) return dimensions;
+      } catch { /* use the image-element fallback below */ }
+    }
+    if (typeof Image !== 'function' || typeof URL?.createObjectURL !== 'function') return {};
+    let objectUrl = '';
+    try {
+      objectUrl = URL.createObjectURL(file);
+      return await new Promise((resolve) => {
+        const image = new Image();
+        const finish = (value) => {
+          image.onload = null;
+          image.onerror = null;
+          resolve(value);
+        };
+        image.onload = () => finish({
+          width: Number(image.naturalWidth || image.width) || 0,
+          height: Number(image.naturalHeight || image.height) || 0
+        });
+        image.onerror = () => finish({});
+        image.src = objectUrl;
+      });
+    } catch {
+      return {};
+    } finally {
+      if (objectUrl) {
+        try { URL.revokeObjectURL(objectUrl); } catch { /* URL was already released */ }
+      }
+    }
+  }
+
+  hasNativeGoogleLensTransport({ file = null } = {}) {
+    const system = this.systemBridge;
+    if (system && typeof system.googleLensUpload === 'function'
+        && (!file || typeof file.arrayBuffer === 'function')) return true;
+    const android = this.capacitorOverlay;
+    return Boolean(android && typeof android.googleLensUpload === 'function'
+      && (!file || typeof FileReader === 'function'));
+  }
+
+  async uploadGoogleLensNatively({ file = null, imageUrl = '', startedAt, width, height } = {}) {
+    const language = typeof navigator !== 'undefined' && navigator.language ? navigator.language : 'en-US';
+    const activeTab = this.getActiveTab();
+    const common = {
+      language,
+      startedAt,
+      width,
+      height,
+      tabId: activeTab?.id || '',
+      isPrivate: Boolean(activeTab?.isPrivate),
+      profileId: this.profileService ? this.profileService.current().id : 'default',
+      ...this.googleLensViewport()
+    };
+    const system = this.systemBridge;
+    if (system && typeof system.googleLensUpload === 'function'
+        && (!file || typeof file.arrayBuffer === 'function')) {
+      try {
+        if (imageUrl) return await system.googleLensUpload({ ...common, imageUrl });
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        return await system.googleLensUpload({
+          ...common,
+          name: file.name || 'lens-upload',
+          type: file.type,
+          data: bytes
+        });
+      } catch (err) {
+        return { ok: false, reason: String(err?.message || 'desktop-upload-failed') };
+      }
+    }
+
+    const android = this.capacitorOverlay;
+    if (android && typeof android.googleLensUpload === 'function'
+        && (!file || typeof FileReader === 'function')) {
+      try {
+        if (imageUrl) return await android.googleLensUpload({ ...common, imageUrl });
+        const dataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result || ''));
+          reader.onerror = () => reject(new Error('file-read-failed'));
+          reader.readAsDataURL(file);
+        });
+        const comma = dataUrl.indexOf(',');
+        if (comma < 0) return { ok: false, reason: 'file-read-failed' };
+        return await android.googleLensUpload({
+          ...common,
+          name: file.name || 'lens-upload',
+          type: file.type,
+          data: dataUrl.slice(comma + 1)
+        });
+      } catch (err) {
+        return { ok: false, reason: String(err?.message || 'android-upload-failed') };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Google Lens handoff shown over the new-tab page. A selected file or URL
+   * is sent exactly once and only a completed Google result URL can replace
+   * the active Yayra tab. Failed uploads keep the original selection visible
+   * and retryable; they never fall through to Google's empty upload picker.
+   */
+  openGoogleLensSearch(viewport) {
+    if (!viewport || typeof document === 'undefined') return;
+    viewport.querySelector('.fb-google-lens-overlay')?.remove();
+    const initialUploadUrl = this.buildGoogleLensUrl('/v3/upload', { startedAt: Date.now() });
+
+    const overlay = document.createElement('div');
+    overlay.className = 'fb-google-lens-overlay';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-labelledby', 'fb-google-lens-title');
+    overlay.setAttribute('tabindex', '-1');
+    overlay.innerHTML = `
+      <section class="fb-google-lens-panel">
+        <header class="fb-google-lens-header">
+          <h2 id="fb-google-lens-title">Search any image with Lens</h2>
+          <button type="button" class="fb-google-lens-close" aria-label="Close Google Lens">${Icons.close}</button>
+        </header>
+        <form class="fb-google-lens-upload-form" action="${escapeAttr(initialUploadUrl)}" method="post" enctype="multipart/form-data" data-yayra-in-app-only="true">
+          <label class="fb-google-lens-dropzone">
+            <span class="fb-google-lens-art" aria-hidden="true">${Icons.lens}</span>
+            <span>Drag an image here or <span class="fb-google-lens-upload-link">upload a file</span></span>
+            <input class="fb-google-lens-file" type="file" name="encoded_image" accept="image/bmp,image/jpeg,image/png,image/tiff,image/webp,image/x-icon" />
+          </label>
+        </form>
+        <div class="fb-google-lens-divider"><span>OR</span></div>
+        <div class="fb-google-lens-url-row">
+          <input type="url" class="fb-google-lens-url" inputmode="url" placeholder="Paste image link" aria-label="Image link" />
+          <button type="button" class="fb-google-lens-url-search">Search</button>
+        </div>
+        <div class="fb-google-lens-status" role="status" aria-live="polite" hidden></div>
+        <button type="button" class="fb-google-lens-retry" hidden>Try again</button>
+      </section>
+    `;
+    viewport.appendChild(overlay);
+
+    const uploadForm = overlay.querySelector('.fb-google-lens-upload-form');
+    const fileInput = overlay.querySelector('.fb-google-lens-file');
+    const urlInput = overlay.querySelector('.fb-google-lens-url');
+    const urlButton = overlay.querySelector('.fb-google-lens-url-search');
+    const retryButton = overlay.querySelector('.fb-google-lens-retry');
+    const status = overlay.querySelector('.fb-google-lens-status');
+    const dropzone = overlay.querySelector('.fb-google-lens-dropzone');
+    let requestVersion = 0;
+    let retryAction = null;
+    let busy = false;
+
+    const setHidden = (element, hidden) => {
+      if (!element) return;
+      element.hidden = hidden;
+      if (hidden) element.setAttribute('hidden', '');
+      else element.removeAttribute('hidden');
+    };
+    const close = () => {
+      requestVersion += 1;
+      overlay.remove();
+    };
+    const setBusy = (nextBusy, message = '') => {
+      busy = nextBusy;
+      if (fileInput) fileInput.disabled = nextBusy;
+      if (urlInput) urlInput.disabled = nextBusy;
+      if (urlButton) urlButton.disabled = nextBusy;
+      if (retryButton) retryButton.disabled = nextBusy;
+      dropzone?.setAttribute('aria-busy', String(nextBusy));
+      dropzone?.classList.toggle('is-uploading', nextBusy);
+      if (message) {
+        status.textContent = message;
+        setHidden(status, false);
+      }
+      if (nextBusy) setHidden(retryButton, true);
+    };
+    const showError = (message, retry) => {
+      setBusy(false);
+      retryAction = typeof retry === 'function' ? retry : null;
+      status.textContent = message;
+      status.classList.add('is-error');
+      setHidden(status, false);
+      setHidden(retryButton, !retryAction);
+    };
+    const beginRequest = (message) => {
+      const version = ++requestVersion;
+      retryAction = null;
+      status.classList.remove('is-error');
+      setBusy(true, message);
+      return version;
+    };
+    const openCompletedResult = (result, version) => {
+      if (version !== requestVersion || !overlay.parentElement) return true;
+      const resultUrl = String(result?.url || '');
+      if (!result?.ok || !this.isGoogleLensResultUrl(resultUrl)) return false;
+      close();
+      return this.openGoogleFeatureInYayra('lens', resultUrl);
+    };
+    const lensFailureMessage = (reason) => {
+      if (reason === 'google-no-result') {
+        return 'Google Lens could not process that image. Your selection is still here—try again.';
+      }
+      if (reason === 'invalid-image-url') return 'That image link could not be used. Check it and try again.';
+      if (String(reason || '').includes('too-large')) return 'Google Lens accepts images up to 20 MB.';
+      if (String(reason || '').includes('unsupported')) {
+        return 'Google Lens supports BMP, JPEG, PNG, TIFF, WebP, and ICO images.';
+      }
+      return 'Could not reach Google Lens. Your image was kept here—check your connection and try again.';
+    };
+
+    // Defense in depth: an Enter key or synthetic submit must never navigate
+    // the shell document or create a new browsing context.
+    uploadForm?.addEventListener('submit', (event) => event.preventDefault());
+
+    const submitLocalImage = async () => {
+      if (busy) return;
+      const file = fileInput?.files?.[0];
+      if (!file) return;
+      const supportedTypes = new Set([
+        'image/bmp', 'image/jpeg', 'image/png', 'image/tiff', 'image/webp', 'image/x-icon'
+      ]);
+      const mimeType = String(file.type || '').toLowerCase();
+      if (!supportedTypes.has(mimeType)) {
+        showError('Google Lens supports BMP, JPEG, PNG, TIFF, WebP, and ICO images.', submitLocalImage);
+        return;
+      }
+      if (Number(file.size) > 20 * 1024 * 1024) {
+        showError('Google Lens accepts images up to 20 MB.', submitLocalImage);
+        return;
+      }
+      if (!this.hasNativeGoogleLensTransport({ file })) {
+        showError('Direct local-image search requires the Yayra desktop or mobile app. No external browser was opened.', submitLocalImage);
+        return;
+      }
+
+      const version = beginRequest('Sending this image directly to Google Lens…');
+      const dimensions = await this.readGoogleLensImageDimensions(file);
+      if (version !== requestVersion || !overlay.parentElement) return;
+      const nativeResult = await this.uploadGoogleLensNatively({
+        file,
+        startedAt: Date.now(),
+        width: dimensions.width,
+        height: dimensions.height
+      });
+      if (openCompletedResult(nativeResult, version)) return;
+      if (version !== requestVersion || !overlay.parentElement) return;
+      showError(lensFailureMessage(nativeResult?.reason), submitLocalImage);
+    };
+
+    const submitImageUrl = async () => {
+      if (busy) return;
+      const raw = String(urlInput?.value || '').trim();
+      let imageUrl;
+      try {
+        imageUrl = new URL(raw);
+      } catch {
+        showError('Paste a valid image link first.', submitImageUrl);
+        urlInput?.focus();
+        return;
+      }
+      if (!/^https?:$/.test(imageUrl.protocol) || imageUrl.username || imageUrl.password) {
+        showError('Google Lens accepts only public http or https image links.', submitImageUrl);
+        urlInput?.focus();
+        return;
+      }
+      if (encodeURI(imageUrl.href).length > 2000) {
+        showError('That image link is too long for Google Lens.', submitImageUrl);
+        urlInput?.focus();
+        return;
+      }
+
+      if (this.hasNativeGoogleLensTransport()) {
+        const version = beginRequest('Sending this image link directly to Google Lens…');
+        const nativeResult = await this.uploadGoogleLensNatively({
+          imageUrl: imageUrl.href,
+          startedAt: Date.now()
+        });
+        if (openCompletedResult(nativeResult, version)) return;
+        if (version !== requestVersion || !overlay.parentElement) return;
+        showError(lensFailureMessage(nativeResult?.reason), submitImageUrl);
+        return;
+      }
+
+      // Plain web/PWA has no privileged CORS-free transport. Its only valid
+      // in-tab option is Google's URL endpoint itself, carrying the supplied
+      // URL immediately (never the empty Lens home page).
+      close();
+      this.openGoogleFeatureInYayra('lens', this.buildGoogleLensUrl('/uploadbyurl', {
+        imageUrl: imageUrl.href,
+        startedAt: Date.now()
+      }));
+    };
+
+    overlay.querySelector('.fb-google-lens-close')?.addEventListener('click', close);
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay && !busy) close();
+    });
+    overlay.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !busy) close();
+    });
+    dropzone?.addEventListener('dragover', (event) => {
+      event.preventDefault();
+      if (!busy) dropzone.classList.add('is-dragging');
+    });
+    dropzone?.addEventListener('dragleave', () => dropzone.classList.remove('is-dragging'));
+    dropzone?.addEventListener('drop', (event) => {
+      event.preventDefault();
+      dropzone.classList.remove('is-dragging');
+      if (busy) return;
+      const files = event.dataTransfer?.files;
+      if (!files?.length || !fileInput) return;
+      try {
+        fileInput.files = files;
+        submitLocalImage();
+      } catch {
+        showError('Use “upload a file” to send this image to Google Lens.', null);
+      }
+    });
+    fileInput?.addEventListener('change', submitLocalImage);
+    urlButton?.addEventListener('click', submitImageUrl);
+    retryButton?.addEventListener('click', () => retryAction?.());
+    urlInput?.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        submitImageUrl();
+      }
+    });
+    overlay.focus?.();
+  }
+
+  /**
+   * Chrome/Google-style full-page voice search. The user-initiated flow first
+   * obtains explicit browser/OS microphone approval with an audio-only media
+   * request, releases that temporary stream, and only then starts recognition.
+   * A final transcript goes straight to Google Search, never Yayra AI.
+   */
+  openGoogleVoiceSearch(viewport, searchInput) {
+    if (!viewport || typeof document === 'undefined') return;
+    try { this._closeGoogleVoiceSearch?.(); } catch { /* already closed */ }
+    this._closeGoogleVoiceSearch = null;
+    viewport.querySelector('.fb-google-voice-overlay')?.remove();
+    try { this._newTabSpeechRecognition?.abort?.(); } catch { /* already stopped */ }
+
+    const overlay = document.createElement('div');
+    overlay.className = 'fb-google-voice-overlay';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-labelledby', 'fb-google-voice-status');
+    overlay.setAttribute('tabindex', '-1');
+    overlay.innerHTML = `
+      <button type="button" class="fb-google-voice-close" aria-label="Close voice search">${Icons.close}</button>
+      <span class="fb-google-voice-brand" aria-hidden="true">${Icons.google}</span>
+      <div class="fb-google-voice-content">
+        <div class="fb-google-voice-texts" aria-live="polite" aria-atomic="true">
+          <div id="fb-google-voice-status" class="fb-google-voice-status">Waiting...</div>
+          <div class="fb-google-voice-transcript"></div>
+          <div class="fb-google-voice-help" hidden></div>
+          <button type="button" class="fb-google-voice-google-btn" hidden>Open Google in Yayra</button>
+        </div>
+        <div class="fb-google-voice-mic-container">
+          <div class="fb-google-voice-volume">
+            <button type="button" class="fb-google-voice-mic" aria-label="Stop listening" aria-pressed="true">${Icons.microphoneFilled}</button>
+          </div>
+        </div>
+      </div>
+    `;
+    viewport.appendChild(overlay);
+
+    const status = overlay.querySelector('.fb-google-voice-status');
+    const transcript = overlay.querySelector('.fb-google-voice-transcript');
+    const help = overlay.querySelector('.fb-google-voice-help');
+    const googleButton = overlay.querySelector('.fb-google-voice-google-btn');
+    const micButton = overlay.querySelector('.fb-google-voice-mic');
+    let recognition = null;
+    let voiceState = 'idle';
+    let completed = false;
+    let dismissed = false;
+    let idleTimer = null;
+    let permissionAttempt = 0;
+    let permissionStream = null;
+
+    const setHidden = (element, hidden) => {
+      if (!element) return;
+      element.hidden = hidden;
+      if (hidden) element.setAttribute('hidden', '');
+      else element.removeAttribute('hidden');
+    };
+    const clearIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = null;
+    };
+    const armIdleTimer = () => {
+      clearIdleTimer();
+      idleTimer = setTimeout(() => {
+        if (completed || dismissed || !overlay.parentElement) return;
+        try { recognition?.stop?.(); } catch { /* already ended */ }
+        voiceState = 'idle';
+        status.textContent = 'Didn’t hear that';
+        help.textContent = 'Tap the microphone to try again.';
+        setHidden(help, false);
+        micButton?.classList.remove('is-listening', 'is-receiving');
+        micButton?.setAttribute('aria-label', 'Try voice search again');
+        micButton?.setAttribute('aria-pressed', 'false');
+      }, 8000);
+    };
+    const stopPermissionStream = () => {
+      const stream = permissionStream;
+      permissionStream = null;
+      try { stream?.getTracks?.().forEach((track) => track.stop?.()); } catch { /* stream already ended */ }
+    };
+    const dismiss = ({ abort = true } = {}) => {
+      if (dismissed) return;
+      dismissed = true;
+      permissionAttempt += 1;
+      stopPermissionStream();
+      clearIdleTimer();
+      if (abort) {
+        try { recognition?.abort?.(); } catch { /* already ended */ }
+      }
+      if (this._newTabSpeechRecognition === recognition) this._newTabSpeechRecognition = null;
+      if (this._closeGoogleVoiceSearch === dismiss) this._closeGoogleVoiceSearch = null;
+      overlay.remove();
+    };
+    this._closeGoogleVoiceSearch = dismiss;
+
+    const showError = (error) => {
+      voiceState = 'error';
+      clearIdleTimer();
+      if (micButton) micButton.disabled = false;
+      micButton?.classList.remove('is-listening', 'is-receiving');
+      micButton?.setAttribute('aria-label', 'Try voice search again');
+      micButton?.setAttribute('aria-pressed', 'false');
+      setHidden(help, false);
+      switch (error) {
+        case 'not-allowed':
+        case 'service-not-allowed':
+          status.textContent = 'Microphone access is blocked';
+          help.textContent = 'Allow microphone access, then tap the microphone to try again.';
+          break;
+        case 'audio-capture':
+        case 'not-found':
+          status.textContent = 'No microphone found';
+          help.textContent = 'Connect a microphone, approve access, and try again.';
+          break;
+        case 'permission-unavailable':
+          status.textContent = 'Microphone permission is unavailable';
+          help.textContent = 'This device cannot request microphone access for Yayra voice search.';
+          break;
+        case 'no-speech':
+          status.textContent = 'Didn’t hear that';
+          help.textContent = 'Tap the microphone to try again.';
+          break;
+        case 'language-not-supported':
+          status.textContent = 'This language isn’t supported';
+          help.textContent = 'Continue to Google inside Yayra to choose another input method.';
+          setHidden(googleButton, false);
+          break;
+        default:
+          status.textContent = 'Voice recognition is unavailable here';
+          help.textContent = 'Open Google inside this Yayra tab to continue without launching another browser.';
+          setHidden(googleButton, false);
+          break;
+      }
+    };
+
+    const submitTranscript = (value) => {
+      const finalText = String(value || '').trim();
+      if (!finalText || completed || dismissed) return false;
+      completed = true;
+      clearIdleTimer();
+      transcript.textContent = finalText;
+      status.textContent = 'Searching...';
+      if (searchInput) searchInput.value = finalText;
+      dismiss({ abort: false });
+      this.openGoogleFeatureInYayra('voice', `https://www.google.com/search?q=${encodeURIComponent(finalText)}`);
+      return true;
+    };
+
+    const Recognition = typeof window !== 'undefined'
+      ? (window.SpeechRecognition || window.webkitSpeechRecognition)
+      : null;
+
+    const startRecognition = async () => {
+      const androidVoice = this.capacitorOverlay;
+      if (androidVoice && typeof androidVoice.googleVoiceSearch === 'function') {
+        completed = false;
+        voiceState = 'permission';
+        status.textContent = 'Requesting microphone permission…';
+        transcript.textContent = '';
+        help.textContent = '';
+        setHidden(help, true);
+        setHidden(googleButton, true);
+        micButton.disabled = true;
+        micButton.classList.remove('is-listening', 'is-receiving');
+        micButton.setAttribute('aria-label', 'Requesting microphone permission');
+        micButton.setAttribute('aria-pressed', 'false');
+        const language = typeof navigator !== 'undefined' && navigator.language ? navigator.language : 'en-US';
+        Promise.resolve(androidVoice.googleVoiceSearch({ language }))
+          .then((result) => {
+            if (dismissed) return;
+            const nativeTranscript = String(result?.transcript || '').trim();
+            if (result?.ok && nativeTranscript) submitTranscript(nativeTranscript);
+            else showError(result?.canceled ? 'no-speech' : (result?.reason || 'native-failed'));
+          })
+          .catch((err) => {
+            if (!dismissed) showError(String(err?.message || 'native-failed'));
+          });
+        return;
+      }
+
+      if (typeof Recognition !== 'function') {
+        showError('unsupported');
+        micButton.disabled = true;
+        return;
+      }
+
+      const mediaDevices = typeof navigator !== 'undefined' ? navigator.mediaDevices : null;
+      if (!mediaDevices || typeof mediaDevices.getUserMedia !== 'function') {
+        showError('permission-unavailable');
+        return;
+      }
+      const thisPermissionAttempt = ++permissionAttempt;
+      completed = false;
+      voiceState = 'permission';
+      status.textContent = 'Requesting microphone permission…';
+      transcript.textContent = '';
+      help.textContent = 'Approve microphone access to start Google Voice Search.';
+      setHidden(help, false);
+      setHidden(googleButton, true);
+      micButton.disabled = true;
+      micButton.classList.remove('is-listening', 'is-receiving');
+      micButton.setAttribute('aria-label', 'Requesting microphone permission');
+      micButton.setAttribute('aria-pressed', 'false');
+      try {
+        permissionStream = await mediaDevices.getUserMedia({ audio: true });
+      } catch (err) {
+        if (dismissed || thisPermissionAttempt !== permissionAttempt) return;
+        const name = String(err?.name || '').toLowerCase();
+        if (name === 'notallowederror' || name === 'securityerror' || name === 'permissiondeniederror') {
+          showError('not-allowed');
+        } else if (name === 'notfounderror' || name === 'devicesnotfounderror') {
+          showError('not-found');
+        } else {
+          showError('audio-capture');
+        }
+        return;
+      }
+      stopPermissionStream();
+      if (dismissed || thisPermissionAttempt !== permissionAttempt || !overlay.parentElement) return;
+
+      const previousRecognition = recognition;
+      if (previousRecognition) {
+        previousRecognition.onend = null;
+        previousRecognition.onerror = null;
+        try { previousRecognition.abort?.(); } catch { /* previous attempt ended */ }
+      }
+      completed = false;
+      voiceState = 'waiting';
+      status.textContent = 'Waiting...';
+      transcript.textContent = '';
+      help.textContent = '';
+      setHidden(help, true);
+      setHidden(googleButton, true);
+      micButton.disabled = false;
+      micButton.classList.remove('is-listening', 'is-receiving');
+      micButton.setAttribute('aria-label', 'Stop listening');
+      micButton.setAttribute('aria-pressed', 'true');
+
+      let currentRecognition;
+      try {
+        currentRecognition = new Recognition();
+      } catch {
+        showError('start-failed');
+        return;
+      }
+      recognition = currentRecognition;
+      this._newTabSpeechRecognition = currentRecognition;
+      currentRecognition.lang = typeof navigator !== 'undefined' && navigator.language ? navigator.language : 'en-US';
+      currentRecognition.continuous = false;
+      currentRecognition.interimResults = true;
+      currentRecognition.maxAlternatives = 1;
+      currentRecognition.onstart = armIdleTimer;
+      currentRecognition.onaudiostart = () => {
+        voiceState = 'listening';
+        status.textContent = 'Listening...';
+        micButton.classList.add('is-listening');
+      };
+      currentRecognition.onspeechstart = () => {
+        voiceState = 'receiving';
+        status.textContent = 'Listening...';
+        micButton.classList.add('is-listening', 'is-receiving');
+        armIdleTimer();
+      };
+      currentRecognition.onresult = (event) => {
+        const finalParts = [];
+        const interimParts = [];
+        for (let index = 0; index < event.results.length; index += 1) {
+          const result = event.results[index];
+          const value = String(result?.[0]?.transcript || '').trim();
+          if (!value) continue;
+          if (result.isFinal) finalParts.push(value);
+          else interimParts.push(value);
+        }
+        const finalText = finalParts.join(' ').trim();
+        const visibleText = [...finalParts, ...interimParts].join(' ').trim();
+        if (visibleText) transcript.textContent = visibleText;
+        status.textContent = finalText ? 'Searching...' : 'Listening...';
+        micButton.classList.add('is-listening', 'is-receiving');
+        armIdleTimer();
+        if (!finalText || completed) return;
+        if (submitTranscript(finalText)) {
+          try { currentRecognition.stop(); } catch { /* browser already stopped */ }
+        }
+      };
+      currentRecognition.onerror = (event) => {
+        if (dismissed || event?.error === 'aborted') return;
+        if (this._newTabSpeechRecognition === currentRecognition) this._newTabSpeechRecognition = null;
+        showError(event?.error || 'unknown');
+      };
+      currentRecognition.onend = () => {
+        if (this._newTabSpeechRecognition === currentRecognition) this._newTabSpeechRecognition = null;
+        if (dismissed || completed || voiceState === 'error' || recognition !== currentRecognition) return;
+        voiceState = 'idle';
+        clearIdleTimer();
+        status.textContent = 'Tap the microphone to try again';
+        micButton.classList.remove('is-listening', 'is-receiving');
+        micButton.setAttribute('aria-label', 'Try voice search again');
+        micButton.setAttribute('aria-pressed', 'false');
+      };
+      const beginRecognition = () => {
+        if (dismissed || recognition !== currentRecognition) return;
+        try {
+          currentRecognition.start();
+        } catch {
+          if (this._newTabSpeechRecognition === currentRecognition) this._newTabSpeechRecognition = null;
+          showError('start-failed');
+        }
+      };
+
+      // New Chromium builds can use an installed on-device speech pack. It
+      // avoids Electron's missing proprietary remote recognizer while
+      // remaining a progressive enhancement: if no pack/API exists, use the
+      // normal browser service and retain the explicit Google fallback.
+      if ('processLocally' in currentRecognition && typeof Recognition.available === 'function') {
+        status.textContent = 'Preparing voice search...';
+        Promise.resolve(Recognition.available({
+          langs: [currentRecognition.lang],
+          processLocally: true
+        })).then((availability) => {
+          if (availability === 'available') currentRecognition.processLocally = true;
+          beginRecognition();
+        }).catch(beginRecognition);
+      } else {
+        beginRecognition();
+      }
+    };
+
+    overlay.querySelector('.fb-google-voice-close')?.addEventListener('click', () => dismiss());
+    overlay.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') dismiss();
+    });
+    micButton?.addEventListener('click', () => {
+      if (voiceState === 'permission') return;
+      if (voiceState === 'waiting' || voiceState === 'listening' || voiceState === 'receiving') {
+        status.textContent = 'Processing...';
+        try { recognition?.stop?.(); } catch { showError('stop-failed'); }
+        return;
+      }
+      startRecognition();
+    });
+    googleButton?.addEventListener('click', () => {
+      dismiss();
+      this.openGoogleFeatureInYayra('voice');
+    });
+
+    overlay.focus?.();
+    startRecognition();
+  }
+
   /* -------------------------------------------------------------
    * 1. NEW TAB PAGE (PHASE 7, REQ 6 & REQ 7)
    * ----------------------------------------------------------- */
@@ -3891,25 +6293,174 @@ export class BrowserShell {
 
     const searchEngine = this.state.settings.searchEngine || 'google';
     const engineCap = searchEngine.charAt(0).toUpperCase() + searchEngine.slice(1);
+    const searchPlaceholder = activeTab.isPrivate
+      ? 'Search securely in Incognito'
+      : (searchEngine === 'google' ? 'Ask Google' : `Search with ${engineCap} or type a URL`);
     searchForm.innerHTML = `
-      <span class="fb-newtab-search-icon">${Icons.search}</span>
-      <input type="text" placeholder="${activeTab.isPrivate ? 'Search securely in Incognito' : `Search with ${engineCap} or type a URL`}" class="fb-newtab-input fb-newtab-search-input" autofocus />
+      <div class="fb-newtab-search-tools">
+        <button type="button" class="fb-newtab-search-action fb-newtab-add-btn" aria-label="Add tabs, images, files, or Google tools" aria-haspopup="menu" aria-expanded="false" title="Add to Google search">${Icons.plus}</button>
+        <div class="fb-newtab-search-tools-menu" role="menu" aria-label="Google search tools" hidden>
+          <section class="fb-google-tools-section fb-google-tools-recent-section">
+            <h3>Add recent tabs</h3>
+            <div class="fb-google-recent-tabs"></div>
+          </section>
+          <div class="fb-google-tools-separator"></div>
+          <button type="button" class="fb-newtab-tool-option fb-google-add-images" role="menuitem">${Icons.lens}<span>Add images</span></button>
+          <button type="button" class="fb-newtab-tool-option fb-google-add-files" role="menuitem">${Icons.document}<span>Add files</span></button>
+          <div class="fb-google-tools-separator"></div>
+          <section class="fb-google-tools-section">
+            <h3>Tools</h3>
+            <button type="button" class="fb-newtab-tool-option fb-google-create-images" role="menuitem">${Icons.sparkles}<span>Create images</span></button>
+            <button type="button" class="fb-newtab-tool-option fb-google-canvas" role="menuitem">${Icons.edit}<span>Canvas</span></button>
+          </section>
+        </div>
+      </div>
+      <input type="text" placeholder="${escapeAttr(searchPlaceholder)}" aria-label="${escapeAttr(searchPlaceholder)}" class="fb-newtab-input fb-newtab-search-input" autocomplete="off" spellcheck="false" autofocus />
+      <div class="fb-newtab-search-actions">
+        <button type="button" class="fb-newtab-search-action fb-newtab-mic-btn" aria-label="Search Google by voice" title="Search by voice">${Icons.microphone}</button>
+        <button type="button" class="fb-newtab-search-action fb-newtab-lens-btn" aria-label="Search with Google Lens" title="Search with Google Lens">${Icons.lens}</button>
+        <button type="button" class="fb-newtab-google-ai-btn" aria-label="Open Google AI Mode" title="Google AI Mode">${Icons.sparkles}<span>AI Mode</span></button>
+      </div>
     `;
     newTabPage.appendChild(searchForm);
-    this.bindSearchSuggestions(searchForm.querySelector('.fb-newtab-search-input'));
+    const newTabSearchInput = searchForm.querySelector('.fb-newtab-search-input');
+    // Yayra AI intentionally stays OUTSIDE this Google-owned pill. The
+    // omnibox keeps its optional Yayra row, while this widget's suggestions
+    // and controls all remain Google search features.
+    this.bindSearchSuggestions(newTabSearchInput, { includeYayraAi: false });
 
-    // Chrome-style AI entry point right under the search box: asks the
-    // typed query (or just opens the yayra://ai chat when empty).
-    if (this.state.aiConfig?.enabled) {
-      const aiChip = document.createElement('button');
-      aiChip.type = 'button';
-      aiChip.className = 'fb-newtab-ai-chip';
-      aiChip.innerHTML = `${Icons.sparkles} <span>Ask Yayra AI</span>`;
-      aiChip.addEventListener('click', () => {
-        const typed = searchForm.querySelector('.fb-newtab-search-input')?.value?.trim() || '';
-        this.openAiPage(typed);
+    const toolsButton = searchForm.querySelector('.fb-newtab-add-btn');
+    const toolsMenu = searchForm.querySelector('.fb-newtab-search-tools-menu');
+    const setToolsOpen = (open) => {
+      if (!toolsButton || !toolsMenu) return;
+      toolsMenu.hidden = !open;
+      if (open) toolsMenu.removeAttribute('hidden');
+      else toolsMenu.setAttribute('hidden', '');
+      toolsButton.setAttribute('aria-expanded', String(open));
+      toolsButton.classList.toggle('active', open);
+    };
+
+    // Real recent/open pages only: never invent Google demo rows. Selecting
+    // one adds its title and URL as context when Google AI Mode is opened.
+    const selectedGoogleContexts = new Map();
+    const recentContextItems = [];
+    const seenContextUrls = new Set();
+    const collectContextItem = (item) => {
+      const url = String(item?.url || '').trim();
+      if (!/^https?:\/\//i.test(url) || seenContextUrls.has(url)) return;
+      seenContextUrls.add(url);
+      recentContextItems.push({
+        id: String(item?.id || `recent-${recentContextItems.length}`),
+        title: String(item?.title || url).trim(),
+        url
       });
-      newTabPage.appendChild(aiChip);
+    };
+    (this.state.tabs || [])
+      .filter((tab) => tab.id !== activeTab.id && Boolean(tab.isPrivate) === Boolean(activeTab.isPrivate))
+      .forEach(collectContextItem);
+    if (!activeTab.isPrivate) {
+      (this.state.closedTabsHistory || []).forEach(collectContextItem);
+      (this.state.historyItems || []).forEach(collectContextItem);
+    }
+    const recentTabsHost = searchForm.querySelector('.fb-google-recent-tabs');
+    recentContextItems.slice(0, 2).forEach((item) => {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'fb-google-recent-tab';
+      row.setAttribute('role', 'menuitemcheckbox');
+      row.setAttribute('aria-checked', 'false');
+      let contextHost = '';
+      try { contextHost = new URL(item.url).hostname; } catch { /* filtered above */ }
+      const contextIcon = contextHost
+        ? `<img class="fb-google-recent-tab-favicon" src="https://icons.duckduckgo.com/ip3/${encodeURIComponent(contextHost)}.ico" alt="" /><span class="fb-google-recent-tab-fallback" hidden>${Icons.history}</span>`
+        : `<span class="fb-google-recent-tab-fallback">${Icons.history}</span>`;
+      row.innerHTML = `<span class="fb-google-recent-tab-icon">${contextIcon}</span><span class="fb-google-recent-tab-title"></span><span class="fb-google-recent-tab-toggle">${Icons.plus}</span>`;
+      row.querySelector('.fb-google-recent-tab-favicon')?.addEventListener('error', (event) => {
+        event.target.remove();
+        row.querySelector('.fb-google-recent-tab-fallback')?.removeAttribute('hidden');
+      });
+      row.querySelector('.fb-google-recent-tab-title').textContent = item.title;
+      // Keep the URL available to screen readers without a native `title`
+      // tooltip: Chromium's large hover bubble covered the rest of this
+      // compact menu and made the Google actions underneath unusable.
+      row.setAttribute('aria-label', `${item.title} — ${item.url}`);
+      row.addEventListener('click', () => {
+        const selected = !selectedGoogleContexts.has(item.url);
+        if (selected) selectedGoogleContexts.set(item.url, item);
+        else selectedGoogleContexts.delete(item.url);
+        row.classList.toggle('is-selected', selected);
+        row.setAttribute('aria-checked', String(selected));
+        row.querySelector('.fb-google-recent-tab-toggle').innerHTML = selected ? Icons.check : Icons.plus;
+      });
+      recentTabsHost?.appendChild(row);
+    });
+    if (recentTabsHost && recentTabsHost.children.length === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'fb-google-recent-tabs-empty';
+      empty.textContent = 'No recent tabs yet';
+      recentTabsHost.appendChild(empty);
+    }
+
+    toolsButton?.addEventListener('click', () => setToolsOpen(toolsMenu?.hasAttribute('hidden') || toolsMenu?.hidden === true));
+    toolsMenu?.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      setToolsOpen(false);
+      toolsButton?.focus();
+    });
+    searchForm.addEventListener('focusout', () => {
+      setTimeout(() => {
+        if (typeof searchForm.contains !== 'function' || !searchForm.contains(document.activeElement)) setToolsOpen(false);
+      }, 0);
+    });
+    newTabSearchInput?.addEventListener('focus', () => setToolsOpen(false));
+
+    const openLens = () => {
+      setToolsOpen(false);
+      this.openGoogleLensSearch(viewport);
+    };
+    searchForm.querySelector('.fb-newtab-lens-btn')?.addEventListener('click', openLens);
+    searchForm.querySelector('.fb-google-add-images')?.addEventListener('click', openLens);
+    searchForm.querySelector('.fb-google-add-files')?.addEventListener('click', () => {
+      setToolsOpen(false);
+      this.navigateActiveTab(this.buildGoogleAiModeUrl(newTabSearchInput?.value || ''));
+      this.showTransientNotice('Google AI Mode opened. Use its + button to upload a file directly to Google.');
+    });
+    searchForm.querySelector('.fb-google-create-images')?.addEventListener('click', () => {
+      setToolsOpen(false);
+      this.navigateActiveTab('https://labs.google/fx/tools/image-fx');
+    });
+    searchForm.querySelector('.fb-google-canvas')?.addEventListener('click', () => {
+      setToolsOpen(false);
+      this.navigateActiveTab('https://gemini.google.com/app');
+    });
+
+    const openGoogleAiMode = () => {
+      setToolsOpen(false);
+      this.navigateActiveTab(this.buildGoogleAiModeUrl(
+        newTabSearchInput?.value || '',
+        [...selectedGoogleContexts.values()]
+      ));
+    };
+    searchForm.querySelector('.fb-newtab-google-ai-btn')?.addEventListener('click', openGoogleAiMode);
+
+    searchForm.querySelector('.fb-newtab-mic-btn')?.addEventListener('click', () => {
+      setToolsOpen(false);
+      this.openGoogleVoiceSearch(viewport, newTabSearchInput);
+    });
+
+    // Yayra's assistant remains a distinct Yayra feature below Google's
+    // search control, exactly like the original start-page layout.
+    if (this.state.aiConfig?.enabled) {
+      searchForm.classList.add('has-yayra-ai-below');
+      const yayraAiChip = document.createElement('button');
+      yayraAiChip.type = 'button';
+      yayraAiChip.className = 'fb-newtab-ai-chip';
+      yayraAiChip.innerHTML = `${Icons.sparkles}<span>Ask Yayra AI</span>`;
+      yayraAiChip.addEventListener('click', () => {
+        this.openAiPage(newTabSearchInput?.value?.trim() || '');
+      });
+      newTabPage.appendChild(yayraAiChip);
     }
 
     if (this.state.isMobile && !activeTab.isPrivate) {
@@ -4012,18 +6563,20 @@ export class BrowserShell {
 
       // Recent History: a proper card (same design language as the
       // continue-tabs card) - click a row to open it, or copy its link.
-      if (this.state.historyItems.length > 0) {
+      const recentWebHistory = (this.state.historyItems || []).filter((item) => /^https?:\/\//i.test(String(item?.url || ''))).slice(0, 5);
+      if (recentWebHistory.length > 0) {
         const recentHist = document.createElement('div');
         recentHist.className = 'fb-continue-card fb-newtab-history';
         recentHist.innerHTML = `
           <div class="fb-continue-card-head">${this.state.isMobile ? 'Suggestions' : 'Recent history'}</div>
-          ${this.state.historyItems.slice(0, 5).map((h) => {
+          ${recentWebHistory.map((h) => {
             let host = h.url;
-            try { host = new URL(h.url).hostname; } catch { /* keep url */ }
+            try { host = new URL(h.url).hostname; } catch { /* filtered above */ }
             const safeUrl = String(h.url).replace(/"/g, '&quot;');
+            const faviconHtml = this.getTabFavicon({ url: h.url, favicon: h.favicon || null, isLoading: false });
             return `
             <div class="fb-continue-item fb-history-quick-item" data-url="${safeUrl}" role="button" tabindex="0" title="${safeUrl}">
-              <img class="fb-continue-favicon" src="https://icons.duckduckgo.com/ip3/${host}.ico" alt="" loading="lazy" onerror="this.style.visibility='hidden'" />
+              <span class="fb-continue-favicon fb-continue-favicon-wrap">${faviconHtml}</span>
               <span class="fb-continue-text">
                 <span class="fb-continue-title">${String(h.title || h.url).replace(/</g, '&lt;')}</span>
                 <span class="fb-continue-meta">${host}</span>
@@ -4157,7 +6710,7 @@ export class BrowserShell {
     if (!profile) {
       return `<span class="fb-avatar fb-avatar-signed-out" style="width:${size}px; height:${size}px; border-radius:50%; display:flex; align-items:center; justify-content:center; background:rgba(255,255,255,0.08); color:var(--fb-text-secondary);">${Icons.userCircle}</span>`;
     }
-    const label = (profile.name || profile.email || '?').trim();
+    const label = String(profile.name || profile.email || '?').trim().slice(0, 200);
     const initials = label
       .split(/\s+/)
       .filter(Boolean)
@@ -4165,11 +6718,26 @@ export class BrowserShell {
       .map((part) => part[0])
       .join('')
       .toUpperCase() || '?';
-    const fallback = `<span class="fb-avatar-fallback" style="width:${size}px; height:${size}px; border-radius:50%; display:${profile.picture ? 'none' : 'flex'}; align-items:center; justify-content:center; background:linear-gradient(135deg,#06b6d4,#3b82f6); color:#fff; font-weight:700; font-size:${Math.max(11, Math.round(size * 0.4))}px;">${initials}</span>`;
-    const img = profile.picture
-      ? `<img src="${profile.picture}" alt="" class="fb-avatar-img" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:cover;" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';" />`
+    const pictureUrl = safeHttpsImageUrl(profile.picture);
+    const fallback = `<span class="fb-avatar-fallback" style="width:${size}px; height:${size}px; border-radius:50%; display:${pictureUrl ? 'none' : 'flex'}; align-items:center; justify-content:center; background:linear-gradient(135deg,#06b6d4,#3b82f6); color:#fff; font-weight:700; font-size:${Math.max(11, Math.round(size * 0.4))}px;">${escapeHtml(initials)}</span>`;
+    const img = pictureUrl
+      ? `<img src="${escapeAttr(pictureUrl)}" alt="" class="fb-avatar-img" style="width:${size}px; height:${size}px; border-radius:50%; object-fit:cover;" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';" />`
       : '';
     return `<span class="fb-avatar" style="position:relative; width:${size}px; height:${size}px; display:inline-flex;">${img}${fallback}</span>`;
+  }
+
+  formatGoogleSignInError(error) {
+    const code = String(error || '');
+    if (code === 'not_configured') return 'Google sign-in isn\u2019t configured for this build yet.';
+    if (code === 'sign_in_cancelled') return 'Google sign-in was closed before it finished.';
+    if (/browser_open_failed|no system browser/i.test(code)) return 'Yayra could not open your secure system browser. Check your browser settings and try again.';
+    if (code === 'oauth_timeout') return 'Google did not return before the secure sign-in attempt expired. Please try again.';
+    if (code === 'oauth_state_mismatch') return 'The sign-in response could not be verified, so Yayra rejected it for your security.';
+    if (code.includes('access_denied')) return 'Google sign-in was cancelled or declined.';
+    if (code.startsWith('token_exchange_failed')) return 'Google returned to Yayra, but the secure sign-in exchange failed. Please try again.';
+    if (code.startsWith('userinfo_failed')) return 'Yayra signed in but could not read your basic Google profile. Please try again.';
+    if (/fetch failed|network/i.test(code)) return 'Yayra could not reach Google. Check your connection and try again.';
+    return 'Please try again.';
   }
 
   renderGoogleAccountSectionHtml() {
@@ -4183,13 +6751,15 @@ export class BrowserShell {
 
     if (account.status === 'signing-in') {
       return `
-        <p>Continue in the browser window that just opened to finish signing in to Google.</p>
-        <button class="fb-btn fb-btn-secondary" disabled>Waiting for sign-in&hellip;</button>
+        <p>Continue in Google’s secure browser page. Yayra will update automatically after the verified callback returns.</p>
+        <button class="fb-btn fb-btn-secondary" disabled>Waiting for Google&hellip;</button>
       `;
     }
 
     if (account.status === 'signed-in' && account.profile) {
       const { name, email } = account.profile;
+      const safeName = escapeHtml(name || email || 'Signed in');
+      const safeEmail = email ? escapeHtml(email) : '';
       const sinceLabel = account.savedAt
         ? new Date(account.savedAt).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })
         : null;
@@ -4197,9 +6767,9 @@ export class BrowserShell {
         <div style="display:flex; align-items:center; gap:12px;">
           ${this.renderAccountAvatarHtml(account.profile, 40)}
           <div>
-            <strong>${name || email || 'Signed in'}</strong>
-            ${email ? `<p style="margin:2px 0 0;">${email}</p>` : ''}
-            ${sinceLabel ? `<p style="margin:2px 0 0; font-size:0.8rem; color:var(--fb-text-muted);">Signed in since ${sinceLabel}</p>` : ''}
+            <strong>${safeName}</strong>
+            ${safeEmail ? `<p style="margin:2px 0 0;">${safeEmail}</p>` : ''}
+            ${sinceLabel ? `<p style="margin:2px 0 0; font-size:0.8rem; color:var(--fb-text-muted);">Signed in since ${escapeHtml(sinceLabel)}</p>` : ''}
           </div>
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap;">
@@ -4211,11 +6781,11 @@ export class BrowserShell {
     }
 
     const errorNote = account.status === 'error'
-      ? `<p class="fb-settings-error-note" style="color:#f66;">Couldn't sign in: ${account.error === 'not_configured' ? 'Google sign-in isn\u2019t configured for this build yet.' : (account.error || 'please try again.')}</p>`
+      ? `<p class="fb-settings-error-note" style="color:#f66;">${this.formatGoogleSignInError(account.error)}</p>`
       : '';
 
     return `
-      <p>Sign in with your Google account to personalize Yayra. Sign-in opens in your default browser for security, per Google's own policy.</p>
+      <p>Sign in with your Google account to personalize Yayra. Google opens in the secure external user-agent required by its policy; only a verified one-time callback returns to Yayra.</p>
       ${errorNote}
       <button class="fb-btn fb-btn-primary fb-in-google-signin-btn" style="align-self:flex-start;">Sign in with Google</button>
     `;
@@ -4274,6 +6844,12 @@ export class BrowserShell {
         <button class="fb-settings-nav-item ${activeCat === 'appearance' ? 'active' : ''}" data-cat="appearance" data-category="appearance">
           ${Icons.moon} <span>Appearance</span>
         </button>
+        <button class="fb-settings-nav-item ${activeCat === 'reader' ? 'active' : ''}" data-cat="reader" data-category="reader">
+          ${Icons.readingMode} <span>Reading Mode</span>
+        </button>
+        <button class="fb-settings-nav-item ${activeCat === 'performance' ? 'active' : ''}" data-cat="performance" data-category="performance">
+          ${Icons.performance} <span>Performance</span>
+        </button>
         <button class="fb-settings-nav-item ${activeCat === 'pointer' ? 'active' : ''}" data-cat="pointer" data-category="pointer">
           ${Icons.lens} <span>Pointer</span>
         </button>
@@ -4294,6 +6870,9 @@ export class BrowserShell {
         </button>
         <button class="fb-settings-nav-item ${activeCat === 'downloads' ? 'active' : ''}" data-cat="downloads" data-category="downloads">
           ${Icons.download} <span>Downloads</span>
+        </button>
+        <button class="fb-settings-nav-item ${activeCat === 'documents' ? 'active' : ''}" data-cat="documents" data-category="documents">
+          ${Icons.document} <span>Documents</span>
         </button>
         <button class="fb-settings-nav-item ${activeCat === 'extensions' ? 'active' : ''}" data-cat="extensions" data-category="extensions">
           ${Icons.shield} <span>Extensions & Shields</span>
@@ -4511,6 +7090,120 @@ export class BrowserShell {
             </div>
           </section>
 
+          <!-- Reading Mode preferences -->
+          <section class="fb-settings-group-card" id="sec-reader" style="${activeCat === 'reader' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
+            <h3 class="fb-settings-group-title">${Icons.readingMode} Reading Mode</h3>
+            <p>Choose how distraction-free articles look and sound. These preferences are saved on this profile and can also be changed while reading.</p>
+            <div class="fb-setting-row">
+              <label for="fb-in-reader-theme">Color theme</label>
+              <select id="fb-in-reader-theme" class="fb-select" data-reader-pref="readerTheme">
+                <option value="dark" ${(this.state.settings.readerTheme || 'dark') === 'dark' ? 'selected' : ''}>Dark</option>
+                <option value="light" ${this.state.settings.readerTheme === 'light' ? 'selected' : ''}>Light</option>
+                <option value="sepia" ${this.state.settings.readerTheme === 'sepia' ? 'selected' : ''}>Sepia</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-reader-font">Font</label>
+              <select id="fb-in-reader-font" class="fb-select" data-reader-pref="readerFont">
+                <option value="serif" ${(this.state.settings.readerFont || 'serif') === 'serif' ? 'selected' : ''}>Serif</option>
+                <option value="sans" ${this.state.settings.readerFont === 'sans' ? 'selected' : ''}>Sans serif</option>
+                <option value="mono" ${this.state.settings.readerFont === 'mono' ? 'selected' : ''}>Monospace</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-reader-size">Text size</label>
+              <input id="fb-in-reader-size" type="range" min="14" max="30" step="1" value="${Math.max(14, Math.min(30, Number(this.state.settings.readerFontSize) || 19))}" data-reader-pref="readerFontSize" />
+              <output id="fb-in-reader-size-value">${Math.max(14, Math.min(30, Number(this.state.settings.readerFontSize) || 19))} px</output>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-reader-line-height">Line height</label>
+              <select id="fb-in-reader-line-height" class="fb-select" data-reader-pref="readerLineHeight">
+                <option value="1.5" ${String(this.state.settings.readerLineHeight || '1.75') === '1.5' ? 'selected' : ''}>Compact</option>
+                <option value="1.75" ${String(this.state.settings.readerLineHeight || '1.75') === '1.75' ? 'selected' : ''}>Comfortable</option>
+                <option value="2" ${String(this.state.settings.readerLineHeight || '1.75') === '2' ? 'selected' : ''}>Relaxed</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-reader-spacing">Letter spacing</label>
+              <select id="fb-in-reader-spacing" class="fb-select" data-reader-pref="readerLetterSpacing">
+                <option value="-0.02" ${String(this.state.settings.readerLetterSpacing ?? '0') === '-0.02' ? 'selected' : ''}>Tight</option>
+                <option value="0" ${String(this.state.settings.readerLetterSpacing ?? '0') === '0' ? 'selected' : ''}>Normal</option>
+                <option value="0.03" ${String(this.state.settings.readerLetterSpacing ?? '0') === '0.03' ? 'selected' : ''}>Wide</option>
+                <option value="0.06" ${String(this.state.settings.readerLetterSpacing ?? '0') === '0.06' ? 'selected' : ''}>Extra wide</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-reader-layout">Reading width</label>
+              <select id="fb-in-reader-layout" class="fb-select" data-reader-pref="readerLayout">
+                <option value="narrow" ${this.state.settings.readerLayout === 'narrow' ? 'selected' : ''}>Narrow</option>
+                <option value="comfortable" ${(this.state.settings.readerLayout || 'comfortable') === 'comfortable' ? 'selected' : ''}>Comfortable</option>
+                <option value="wide" ${this.state.settings.readerLayout === 'wide' ? 'selected' : ''}>Wide</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-reader-rate">Read aloud speed</label>
+              <select id="fb-in-reader-rate" class="fb-select" data-reader-pref="readerSpeechRate">
+                <option value="0.75" ${Number(this.state.settings.readerSpeechRate || 1) === 0.75 ? 'selected' : ''}>0.75×</option>
+                <option value="1" ${Number(this.state.settings.readerSpeechRate || 1) === 1 ? 'selected' : ''}>1×</option>
+                <option value="1.25" ${Number(this.state.settings.readerSpeechRate || 1) === 1.25 ? 'selected' : ''}>1.25×</option>
+                <option value="1.5" ${Number(this.state.settings.readerSpeechRate || 1) === 1.5 ? 'selected' : ''}>1.5×</option>
+                <option value="2" ${Number(this.state.settings.readerSpeechRate || 1) === 2 ? 'selected' : ''}>2×</option>
+              </select>
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Show links</strong><p>Keep links visible and actionable in the clean article.</p></div>
+              <input type="checkbox" data-reader-pref="readerLinks" ${this.state.settings.readerLinks !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Show images</strong><p>Include page images alongside extracted article text.</p></div>
+              <input type="checkbox" data-reader-pref="readerImages" ${this.state.settings.readerImages !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Highlight read-aloud text</strong><p>Highlight the current sentence while supported system speech is playing.</p></div>
+              <input type="checkbox" data-reader-pref="readerVoiceHighlight" ${this.state.settings.readerVoiceHighlight !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Pin Reading Mode controls</strong><p>Keep the reader toolbar at the top while you scroll.</p></div>
+              <input type="checkbox" data-reader-pref="readerPinned" ${this.state.settings.readerPinned !== false ? 'checked' : ''} />
+            </div>
+          </section>
+
+          <!-- Performance settings stay separate from Task Manager metrics. -->
+          <section class="fb-settings-group-card" id="sec-performance" style="${activeCat === 'performance' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
+            <h3 class="fb-settings-group-title">${Icons.performance} Performance</h3>
+            <p>Control background-page activity and tab-strip behavior. Yayra throttles hidden pages when enabled; it does not discard tabs or promise memory savings. Use Task Manager for live process measurements.</p>
+            <div class="fb-performance-metrics" aria-label="Live application metrics">
+              <div class="fb-performance-metric"><span>Open tabs</span><strong id="fb-performance-tabs-value">${this.state.tabs.length}</strong></div>
+              <div class="fb-performance-metric"><span>CPU</span><strong id="fb-performance-cpu-value">—</strong></div>
+              <div class="fb-performance-metric"><span>Working set</span><strong id="fb-performance-memory-value">—</strong></div>
+            </div>
+            <p class="fb-performance-status" id="fb-performance-metrics-status" aria-live="polite">Waiting for desktop metrics…</p>
+            <div class="fb-performance-actions">
+              <button type="button" class="fb-btn fb-btn-secondary fb-performance-refresh">${Icons.refresh} Refresh metrics</button>
+              <button type="button" class="fb-btn fb-btn-primary fb-performance-open-taskmgr">${Icons.taskManager} Open Task Manager</button>
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Performance issue alerts</strong><p>Notify when Yayra receives an unresponsive-page event from the native webview.</p></div>
+              <input type="checkbox" id="fb-in-performance-alerts" ${this.state.settings.performanceIssueAlerts !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Keep background sites live</strong><p>Keep timers, media, sockets and real-time page updates active when you switch tabs. Turn this off only when you prefer lower background CPU use.</p></div>
+              <input type="checkbox" id="fb-in-performance-live-sites" ${this.state.settings.keepSitesLive !== false ? 'checked' : ''} ${this.nativeWebview?.setBackgroundThrottling ? '' : 'disabled'} />
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Dim inactive tabs</strong><p>Use a softer label treatment for tabs that are not selected.</p></div>
+              <input type="checkbox" id="fb-in-performance-dim-tabs" ${this.state.settings.dimInactiveTabs !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Show tab hover cards</strong><p>Show a title and website address when you pause over a tab.</p></div>
+              <input type="checkbox" id="fb-in-performance-hover-cards" ${this.state.settings.tabHoverCards !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Reduce interface motion</strong><p>Reduce animated transitions in Yayra's interface.</p></div>
+              <input type="checkbox" id="fb-in-performance-reduce-motion" ${this.state.settings.reduceMotionForPerformance ? 'checked' : ''} />
+            </div>
+          </section>
+
           <!-- Privacy & Security -->
           <section class="fb-settings-group-card" id="sec-pointer" style="${activeCat === 'pointer' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
             <h3 class="fb-settings-group-title">${Icons.lens} Pointer</h3>
@@ -4539,9 +7232,10 @@ export class BrowserShell {
               </div>
             </div>
             <p style="font-size:0.75rem; color:var(--fb-text-muted); margin:10px 0 0; line-height:1.5;">
-              Custom styles apply to Yayra's interface and websites opened in Yayra's built-in web views. The
-              System style keeps the native operating-system pointer and its configured size. In web/PWA mode,
-              browser security prevents restyling external sites inside cross-origin frames.
+              Custom styles apply to Yayra's interface and websites opened in Yayra's built-in web views. A
+              text cursor appears over selectable page text and dragging still selects it. The System style keeps
+              the native operating-system pointer and its configured size. In web/PWA mode, browser security
+              prevents restyling external sites inside cross-origin frames.
             </p>
           </section>
           <section class="fb-settings-group-card" id="sec-privacy" style="${activeCat === 'privacy' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
@@ -4600,10 +7294,17 @@ export class BrowserShell {
             <div class="fb-tab-groups-settings-list" id="fb-in-tab-groups-list"></div>
           </section>
 
-          <!-- Shortcuts: every keyboard shortcut, system-wide hotkey and
-               bubble gesture in one reference. -->
+          <!-- Website shortcuts and every keyboard shortcut, system-wide
+               hotkey, and bubble gesture in one settings destination. -->
           <section class="fb-settings-group-card" id="sec-shortcuts" style="${activeCat === 'shortcuts' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
             <h3 class="fb-settings-group-title">${Icons.settings} Shortcuts</h3>
+            <h4 class="fb-shortcuts-subhead">New Tab website shortcuts</h4>
+            <p style="margin:0; font-size:0.82rem; color:var(--fb-text-secondary);">Pinned websites appear as tiles on the New Tab page. Add the current website from the page menu, or manage shortcuts here.</p>
+            <div class="fb-tab-group-settings-toolbar">
+              <button type="button" class="fb-btn fb-btn-primary fb-in-add-website-shortcut" ${(this.state.userShortcuts || []).length >= 12 ? 'disabled title="Remove a shortcut before adding another"' : ''}>${Icons.plus} Add website shortcut</button>
+            </div>
+            <div class="fb-shortcuts-settings-list" id="fb-in-shortcuts-list"></div>
+            <h4 class="fb-shortcuts-subhead">Keyboard shortcuts</h4>
             <p style="margin:0; font-size:0.82rem; color:var(--fb-text-secondary);">Everything Yayra answers to - in the browser, system-wide anywhere on your PC, and on the floating bubble.</p>
             <h4 class="fb-shortcuts-subhead">In the browser</h4>
             <div class="fb-shortcuts-table">
@@ -4619,6 +7320,7 @@ export class BrowserShell {
               <div class="fb-shortcut-row"><span>Hard reload (clear this site's cache)</span><kbd>Ctrl+Shift+R</kbd> <span class="fb-shortcut-alt">or</span> <kbd>Ctrl+F5</kbd></div>
               <div class="fb-shortcut-row"><span>History</span><kbd>Ctrl+H</kbd></div>
               <div class="fb-shortcut-row"><span>Downloads</span><kbd>Ctrl+J</kbd></div>
+              <div class="fb-shortcut-row"><span>Open a local file</span><kbd>Ctrl+O</kbd></div>
               <div class="fb-shortcut-row"><span>Find in page</span><kbd>Ctrl+F</kbd></div>
               <div class="fb-shortcut-row"><span>Open tab groups</span><kbd>Ctrl+Shift+G</kbd></div>
               <div class="fb-shortcut-row"><span>Stop loading / close menus &amp; overlays</span><kbd>Esc</kbd></div>
@@ -4651,6 +7353,94 @@ export class BrowserShell {
             <p style="font-size:0.78rem; color:var(--fb-text-muted); margin:0;">Every new download is saved here. ${this.downloadsBridge ? '' : 'Picking a custom folder (e.g. an external drive) requires the Yayra desktop app.'}</p>
           </section>
 
+          <!-- Documents -->
+          <section class="fb-settings-group-card" id="sec-documents" style="${activeCat === 'documents' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
+            <h3 class="fb-settings-group-title">${Icons.document} Documents</h3>
+            <p>Control the Documents hub and presentation defaults. The desktop catalog is shared by Yayra windows on this device. Source locations stay only in the trusted desktop process; ordinary page and tab state receives opaque ids, never filesystem paths.</p>
+            <div class="fb-setting-row">
+              <label for="fb-in-documents-sort">Default sort field</label>
+              <select id="fb-in-documents-sort" class="fb-select">
+                <option value="opened" ${this.state.documentsSort === 'opened' ? 'selected' : ''}>Date opened</option>
+                <option value="name" ${this.state.documentsSort === 'name' ? 'selected' : ''}>Name</option>
+                <option value="type" ${this.state.documentsSort === 'type' ? 'selected' : ''}>File type</option>
+                <option value="size" ${this.state.documentsSort === 'size' ? 'selected' : ''}>File size</option>
+                <option value="frequent" ${this.state.documentsSort === 'frequent' ? 'selected' : ''}>Times opened</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-documents-sort-direction">Default sort direction</label>
+              <select id="fb-in-documents-sort-direction" class="fb-select">
+                <option value="desc" ${this.state.documentsSortDirection !== 'asc' ? 'selected' : ''}>Descending</option>
+                <option value="asc" ${this.state.documentsSortDirection === 'asc' ? 'selected' : ''}>Ascending</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-documents-type">Default file-type filter</label>
+              <select id="fb-in-documents-type" class="fb-select">
+                <option value="all" ${(this.state.settings.documentsDefaultType || 'all') === 'all' ? 'selected' : ''}>All types</option>
+                <option value="pdf" ${this.state.settings.documentsDefaultType === 'pdf' ? 'selected' : ''}>PDF</option>
+                <option value="presentation" ${this.state.settings.documentsDefaultType === 'presentation' ? 'selected' : ''}>Presentations</option>
+                <option value="document" ${this.state.settings.documentsDefaultType === 'document' ? 'selected' : ''}>Documents</option>
+                <option value="spreadsheet" ${this.state.settings.documentsDefaultType === 'spreadsheet' ? 'selected' : ''}>Spreadsheets</option>
+                <option value="image" ${this.state.settings.documentsDefaultType === 'image' ? 'selected' : ''}>Images</option>
+                <option value="text" ${this.state.settings.documentsDefaultType === 'text' ? 'selected' : ''}>Text</option>
+                <option value="archive" ${this.state.settings.documentsDefaultType === 'archive' ? 'selected' : ''}>Archives</option>
+                <option value="other" ${this.state.settings.documentsDefaultType === 'other' ? 'selected' : ''}>Other</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-documents-date">Default opening-date filter</label>
+              <select id="fb-in-documents-date" class="fb-select">
+                <option value="all" ${(this.state.settings.documentsDefaultDate || 'all') === 'all' ? 'selected' : ''}>Any time</option>
+                <option value="today" ${this.state.settings.documentsDefaultDate === 'today' ? 'selected' : ''}>Today</option>
+                <option value="week" ${this.state.settings.documentsDefaultDate === 'week' ? 'selected' : ''}>Last 7 days</option>
+                <option value="month" ${this.state.settings.documentsDefaultDate === 'month' ? 'selected' : ''}>Last 30 days</option>
+                <option value="year" ${this.state.settings.documentsDefaultDate === 'year' ? 'selected' : ''}>Last year</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-documents-size">Default file-size filter</label>
+              <select id="fb-in-documents-size" class="fb-select">
+                <option value="all" ${(this.state.settings.documentsDefaultSize || 'all') === 'all' ? 'selected' : ''}>Any size</option>
+                <option value="under-1mb" ${this.state.settings.documentsDefaultSize === 'under-1mb' ? 'selected' : ''}>Under 1 MB</option>
+                <option value="1mb-10mb" ${this.state.settings.documentsDefaultSize === '1mb-10mb' ? 'selected' : ''}>1–10 MB</option>
+                <option value="10mb-100mb" ${this.state.settings.documentsDefaultSize === '10mb-100mb' ? 'selected' : ''}>10–100 MB</option>
+                <option value="100mb-300mb" ${this.state.settings.documentsDefaultSize === '100mb-300mb' ? 'selected' : ''}>100–300 MB</option>
+                <option value="over-300mb" ${this.state.settings.documentsDefaultSize === 'over-300mb' ? 'selected' : ''}>Over 300 MB</option>
+              </select>
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-documents-retention">History retention</label>
+              <select id="fb-in-documents-retention" class="fb-select">
+                <option value="0" ${Number(this.state.settings.documentsRetentionDays || 0) === 0 ? 'selected' : ''}>Keep until I clear it</option>
+                <option value="30" ${Number(this.state.settings.documentsRetentionDays) === 30 ? 'selected' : ''}>30 days</option>
+                <option value="90" ${Number(this.state.settings.documentsRetentionDays) === 90 ? 'selected' : ''}>90 days</option>
+                <option value="365" ${Number(this.state.settings.documentsRetentionDays) === 365 ? 'selected' : ''}>1 year</option>
+              </select>
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Show moved or unavailable files</strong><p>Keep missing entries visible with a Locate action instead of silently hiding them.</p></div>
+              <input type="checkbox" id="fb-in-documents-show-missing" ${this.state.settings.documentsShowMissing !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Start slideshows in true fullscreen</strong><p>Use the entire display for a projector when browser fullscreen permission is available.</p></div>
+              <input type="checkbox" id="fb-in-pptx-fullscreen" ${this.state.settings.pptxSlideshowFullscreen !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Auto-hide slideshow controls</strong><p>Hide projector controls after a short idle period; move the pointer to bring them back.</p></div>
+              <input type="checkbox" id="fb-in-pptx-autohide" ${this.state.settings.pptxSlideshowAutoHideControls !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-documents-settings-privacy">
+              <strong>What Clear does</strong>
+              <p>Removing or clearing history deletes only Yayra’s catalog metadata. It never deletes, moves, renames, uploads, or rewrites your original files.</p>
+            </div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+              <button class="fb-btn fb-btn-primary fb-in-open-documents">Open Documents hub</button>
+              <button class="fb-btn fb-btn-secondary fb-in-documents-clear-missing">Remove unavailable entries</button>
+              <button class="fb-btn fb-btn-danger fb-in-documents-clear">Clear Documents history</button>
+            </div>
+          </section>
+
           <!-- Extensions -->
           <section class="fb-settings-group-card" id="sec-extensions" style="${activeCat === 'extensions' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
             <h3 class="fb-settings-group-title">${Icons.shield} Extensions & Content Shields</h3>
@@ -4678,7 +7468,12 @@ export class BrowserShell {
     `;
 
     this.renderTabGroupSettingsList(page.querySelector('#fb-in-tab-groups-list'));
+    this.renderShortcutsSettingsList(page.querySelector('#fb-in-shortcuts-list'));
     page.querySelector('.fb-in-create-tab-group')?.addEventListener('click', () => this.createTabGroup());
+    page.querySelector('.fb-in-add-website-shortcut')?.addEventListener('click', () => {
+      this._editingShortcut = null;
+      this.openModal('edit-shortcut');
+    });
     page.querySelector('.fb-in-group-current-tab')?.addEventListener('click', () => this.groupCurrentTab());
     page.querySelector('.fb-in-open-tab-groups')?.addEventListener('click', () => this.openModal('tab-groups'));
 
@@ -4692,8 +7487,10 @@ export class BrowserShell {
       });
     });
 
-    // Yayra Updates section actions
+    // Section-specific controls are immediate-apply and profile-persisted.
     this.bindUpdatesSettingsActions(page);
+    this.bindReaderSettingsActions(page);
+    this.bindPerformanceSettingsActions(page);
 
     // Search filter
     const searchInput = page.querySelector('#fb-in-settings-search') || page.querySelector('#fb-settings-search-input');
@@ -4826,10 +7623,42 @@ export class BrowserShell {
     bindSelect('#fb-in-set-theme', (v) => { this.state.settings.theme = v || 'dark'; });
     bindSelect('#fb-in-set-color-theme', (v) => { this.state.settings.colorTheme = v || 'blue'; });
     bindSelect('#fb-in-set-engine', (v) => { if (v) this.state.settings.searchEngine = v; });
+    bindSelect('#fb-in-documents-sort', (v) => {
+      this.state.settings.documentsDefaultSort = v || 'opened';
+      this.state.documentsSort = this.state.settings.documentsDefaultSort;
+    });
+    bindSelect('#fb-in-documents-sort-direction', (v) => {
+      this.state.settings.documentsDefaultSortDirection = v === 'asc' ? 'asc' : 'desc';
+      this.state.documentsSortDirection = this.state.settings.documentsDefaultSortDirection;
+    });
+    bindSelect('#fb-in-documents-type', (v) => {
+      this.state.settings.documentsDefaultType = v || 'all';
+      this.state.documentsTypeFilter = this.state.settings.documentsDefaultType;
+    });
+    bindSelect('#fb-in-documents-date', (v) => {
+      this.state.settings.documentsDefaultDate = v || 'all';
+      this.state.documentsDateFilter = this.state.settings.documentsDefaultDate;
+    });
+    bindSelect('#fb-in-documents-size', (v) => {
+      this.state.settings.documentsDefaultSize = v || 'all';
+      this.state.documentsSizeFilter = this.state.settings.documentsDefaultSize;
+    });
+    bindSelect('#fb-in-documents-retention', (v) => {
+      const days = Math.max(0, Number(v) || 0);
+      this.state.settings.documentsRetentionDays = days;
+      if (days > 0) {
+        Promise.resolve(this.systemBridge?.documents?.prune?.(days))
+          .then(() => this.refreshDocumentLibrary({ render: false }))
+          .catch(() => {});
+      }
+    });
 
     bindToggle('#fb-in-set-https', (on) => { this.state.settings.httpsFirst = on; });
     bindToggle('#fb-in-set-adblock', (on) => { this.state.settings.adBlockEnabled = on; });
     bindToggle('#fb-in-set-restore-session', (on) => { this.state.settings.restoreSessionOnLaunch = on; });
+    bindToggle('#fb-in-documents-show-missing', (on) => { this.state.settings.documentsShowMissing = on; });
+    bindToggle('#fb-in-pptx-fullscreen', (on) => { this.state.settings.pptxSlideshowFullscreen = on; });
+    bindToggle('#fb-in-pptx-autohide', (on) => { this.state.settings.pptxSlideshowAutoHideControls = on; });
     // (Chrome-style keep-alive: loaded pages are never auto-refreshed -
     // see mountPooledWebFrame(). The old auto-refresh toggle is gone.)
     bindToggle('#fb-in-set-floating-default', (on) => { this.state.settings.floatingEnabledByDefault = on; });
@@ -4944,6 +7773,16 @@ export class BrowserShell {
       }
     });
 
+    page.querySelector('.fb-in-open-documents')?.addEventListener('click', () => {
+      this.openInternalPage('yayra://documents');
+    });
+    page.querySelector('.fb-in-documents-clear-missing')?.addEventListener('click', () => {
+      void this.clearDocumentLibrary({ missingOnly: true });
+    });
+    page.querySelector('.fb-in-documents-clear')?.addEventListener('click', () => {
+      void this.clearDocumentLibrary();
+    });
+
     page.querySelector('.fb-in-jump-passwords')?.addEventListener('click', () => {
       this.openInternalPage('yayra://passwords');
     });
@@ -4973,6 +7812,134 @@ export class BrowserShell {
     });
 
     viewport.appendChild(page);
+  }
+
+  bindReaderSettingsActions(page) {
+    if (!page?.querySelectorAll) return;
+    for (const control of page.querySelectorAll('[data-reader-pref]') || []) {
+      const eventName = control.type === 'range' ? 'input' : 'change';
+      control.addEventListener(eventName, (event) => {
+        const key = control.getAttribute('data-reader-pref');
+        if (!key) return;
+        let value;
+        if (control.type === 'checkbox') value = Boolean(event?.target?.checked ?? control.checked);
+        else if (key === 'readerFontSize' || key === 'readerSpeechRate') value = Number(event?.target?.value ?? control.value);
+        else value = String(event?.target?.value ?? control.value ?? '');
+        if ((key === 'readerFontSize' || key === 'readerSpeechRate') && !Number.isFinite(value)) return;
+        this.state.settings[key] = value;
+        if (key === 'readerFontSize') {
+          const output = page.querySelector('#fb-in-reader-size-value');
+          if (output) output.textContent = `${value} px`;
+        }
+        this.persistSettings();
+      });
+    }
+  }
+
+  bindPerformanceSettingsActions(page) {
+    if (!page?.querySelector) return;
+    const bind = (selector, key, afterChange) => {
+      const control = page.querySelector(selector);
+      control?.addEventListener('change', (event) => {
+        const checked = Boolean(event?.target?.checked ?? control.checked);
+        this.state.settings[key] = checked;
+        this.persistSettings();
+        afterChange?.(checked, control);
+      });
+    };
+
+    bind('#fb-in-performance-alerts', 'performanceIssueAlerts');
+    bind('#fb-in-performance-live-sites', 'keepSitesLive', async (enabled, control) => {
+      // Electron's API is phrased negatively (throttling enabled), while the
+      // user-facing promise is positive (sites stay live). Keep both stored
+      // fields synchronized so old profiles and new builds agree.
+      this.state.settings.backgroundTabThrottling = !enabled;
+      this.persistSettings();
+      try {
+        const result = await this.nativeWebview?.setBackgroundThrottling?.(!enabled);
+        if (!result?.ok) {
+          this.state.settings.keepSitesLive = !enabled;
+          this.state.settings.backgroundTabThrottling = enabled;
+          control.checked = !enabled;
+          this.persistSettings();
+          this.showTransientNotice('Could not change the background live-sites policy in this window.');
+          return;
+        }
+        this.showTransientNotice(enabled
+          ? 'Background sites now stay live and update immediately.'
+          : 'Background site throttling enabled to reduce CPU use.');
+      } catch {
+        this.state.settings.keepSitesLive = !enabled;
+        this.state.settings.backgroundTabThrottling = enabled;
+        control.checked = !enabled;
+        this.persistSettings();
+        this.showTransientNotice('Could not change the background live-sites policy in this window.');
+      }
+    });
+    bind('#fb-in-performance-dim-tabs', 'dimInactiveTabs', () => this.refreshTabAppearance());
+    bind('#fb-in-performance-hover-cards', 'tabHoverCards', (enabled) => {
+      if (!enabled && typeof document !== 'undefined') {
+        document.body?.querySelector('.fb-tab-hover-card')?.remove();
+      }
+    });
+    bind('#fb-in-performance-reduce-motion', 'reduceMotionForPerformance', (enabled) => {
+      const value = enabled ? 'true' : 'false';
+      document.documentElement?.setAttribute('data-reduced-motion', value);
+      document.body?.setAttribute('data-reduced-motion', value);
+      this.rootElement?.setAttribute('data-reduced-motion', value);
+    });
+
+    page.querySelector('.fb-performance-open-taskmgr')?.addEventListener('click', () => this.openTaskManagerModal());
+    const refreshButton = page.querySelector('.fb-performance-refresh');
+    const refresh = async () => {
+      const tabsValue = page.querySelector('#fb-performance-tabs-value');
+      const cpuValue = page.querySelector('#fb-performance-cpu-value');
+      const memoryValue = page.querySelector('#fb-performance-memory-value');
+      const status = page.querySelector('#fb-performance-metrics-status');
+      if (tabsValue) tabsValue.textContent = String(this.state.tabs.length);
+      if (!cpuValue || !memoryValue || !status) return;
+      if (typeof this.systemBridge?.appMetrics !== 'function') {
+        cpuValue.textContent = 'Unavailable';
+        memoryValue.textContent = 'Unavailable';
+        status.textContent = 'Live process metrics require the Yayra desktop app. The tab count is from this window.';
+        return;
+      }
+      if (refreshButton) refreshButton.disabled = true;
+      status.textContent = 'Refreshing live process metrics…';
+      try {
+        const metrics = await this.systemBridge.appMetrics();
+        if (!metrics?.ok || !Array.isArray(metrics.processes)) {
+          cpuValue.textContent = '—';
+          memoryValue.textContent = '—';
+          status.textContent = 'The desktop app did not return process metrics.';
+          return;
+        }
+        const cpu = metrics.processes.map((item) => item.cpu).filter(Number.isFinite);
+        const memory = metrics.processes.map((item) => item.memoryMiB).filter(Number.isFinite);
+        cpuValue.textContent = cpu.length ? `${cpu.reduce((sum, value) => sum + value, 0).toFixed(1)}%` : '—';
+        memoryValue.textContent = memory.length ? `${memory.reduce((sum, value) => sum + value, 0).toFixed(1)} MiB` : '—';
+        const sampled = Number.isFinite(metrics.sampledAt) ? new Date(metrics.sampledAt).toLocaleTimeString() : 'just now';
+        status.textContent = `${metrics.processes.length} desktop process(es) · updated ${sampled}. CPU is measured since the prior sample.`;
+      } catch {
+        cpuValue.textContent = '—';
+        memoryValue.textContent = '—';
+        status.textContent = 'Could not read live process metrics.';
+      } finally {
+        if (refreshButton) refreshButton.disabled = false;
+      }
+    };
+    refreshButton?.addEventListener('click', refresh);
+    refresh();
+  }
+
+  refreshTabAppearance() {
+    if (typeof document === 'undefined') return;
+    const root = this.rootElement || document;
+    for (const tabEl of root.querySelectorAll?.('.fb-tab-item') || []) {
+      const tabId = (tabEl.dataset && tabEl.dataset.tabId) || tabEl.getAttribute?.('data-tab-id');
+      const inactive = tabId !== this.state.activeTabId;
+      tabEl.classList?.toggle('fb-tab-inactive-dim', inactive && this.state.settings.dimInactiveTabs !== false);
+    }
   }
 
   /* -------------------------------------------------------------
@@ -5075,90 +8042,281 @@ export class BrowserShell {
   renderInternalBookmarksPage(viewport) {
     const page = document.createElement('div');
     page.className = 'fb-internal-page';
+    const groups = Array.isArray(this.state.bookmarkGroups) && this.state.bookmarkGroups.length
+      ? this.state.bookmarkGroups
+      : DEFAULT_BOOKMARK_GROUPS;
+    const defaultGroupId = groups.some((group) => group.id === this.state.bookmarkDefaultGroupId)
+      ? this.state.bookmarkDefaultGroupId
+      : DEFAULT_BOOKMARK_GROUP_ID;
+    const activeGroupId = groups.some((group) => group.id === this.state.bookmarksActiveGroupId)
+      ? this.state.bookmarksActiveGroupId
+      : defaultGroupId;
+    this.state.bookmarkDefaultGroupId = defaultGroupId;
+    this.state.bookmarksActiveGroupId = activeGroupId;
+    const allItems = Array.isArray(this.state.bookmarksItems) ? this.state.bookmarksItems : [];
+    const q = String(this.state.bookmarksSearchQuery || '').toLocaleLowerCase().trim();
+    const groupItems = allItems.filter((bookmark) => (bookmark.groupId || DEFAULT_BOOKMARK_GROUP_ID) === activeGroupId);
+    const items = groupItems.filter((bookmark) => !q
+      || String(bookmark.title || '').toLocaleLowerCase().includes(q)
+      || String(bookmark.url || '').toLocaleLowerCase().includes(q));
 
-    const q = (this.state.bookmarksSearchQuery || '').toLowerCase().trim();
-    const items = this.state.bookmarksItems.filter((b) => !q || (b.title && b.title.toLowerCase().includes(q)) || (b.url && b.url.toLowerCase().includes(q)));
+    const container = document.createElement('div');
+    container.className = 'fb-internal-container';
+    const header = document.createElement('header');
+    header.className = 'fb-internal-header';
+    const titleGroup = document.createElement('div');
+    titleGroup.className = 'fb-internal-title-group';
+    const titleIcon = document.createElement('span');
+    titleIcon.className = 'fb-internal-icon';
+    titleIcon.innerHTML = Icons.bookmark;
+    const title = document.createElement('h1');
+    title.className = 'fb-internal-title';
+    title.textContent = 'Bookmarks';
+    titleGroup.appendChild(titleIcon);
+    titleGroup.appendChild(title);
 
-    page.innerHTML = `
-      <div class="fb-internal-container">
-        <header class="fb-internal-header">
-          <div class="fb-internal-title-group">
-            <span class="fb-internal-icon">${Icons.bookmark}</span>
-            <h1 class="fb-internal-title">Bookmarks</h1>
-          </div>
-          <div style="display:flex; align-items:center; gap:12px;">
-            <div class="fb-internal-search">
-              <span class="fb-internal-search-icon">${Icons.search}</span>
-              <input type="text" id="fb-in-bm-search" placeholder="Search bookmarks" value="${this.state.bookmarksSearchQuery || ''}" />
-            </div>
-            <button class="fb-btn fb-btn-primary fb-in-add-bm-btn">${Icons.plus} Add Bookmark</button>
-          </div>
-        </header>
+    const headerActions = document.createElement('div');
+    headerActions.className = 'fb-bookmark-header-actions';
+    const search = document.createElement('div');
+    search.className = 'fb-internal-search';
+    const searchIcon = document.createElement('span');
+    searchIcon.className = 'fb-internal-search-icon';
+    searchIcon.innerHTML = Icons.search;
+    const searchInput = document.createElement('input');
+    searchInput.type = 'text';
+    searchInput.id = 'fb-in-bm-search';
+    searchInput.placeholder = 'Search bookmarks';
+    searchInput.value = this.state.bookmarksSearchQuery || '';
+    search.appendChild(searchIcon);
+    search.appendChild(searchInput);
+    const addButton = document.createElement('button');
+    addButton.className = 'fb-btn fb-btn-primary fb-in-add-bm-btn';
+    addButton.innerHTML = `${Icons.plus} Add Bookmark`;
+    headerActions.appendChild(search);
+    headerActions.appendChild(addButton);
+    header.appendChild(titleGroup);
+    header.appendChild(headerActions);
+    container.appendChild(header);
 
-        <div class="fb-bookmarks-folder-bar">
-          <button class="fb-folder-pill active">Bookmarks Bar</button>
-          <button class="fb-folder-pill">Mobile Bookmarks</button>
-          <button class="fb-folder-pill">Other Bookmarks</button>
-        </div>
+    const folderBar = document.createElement('div');
+    folderBar.className = 'fb-bookmarks-folder-bar';
+    for (const group of groups) {
+      const pill = document.createElement('button');
+      pill.className = `fb-folder-pill${group.id === activeGroupId ? ' active' : ''}`;
+      pill.type = 'button';
+      pill.dataset.groupId = group.id;
+      pill.setAttribute('aria-pressed', String(group.id === activeGroupId));
+      pill.textContent = group.id === defaultGroupId ? `${group.name} · Default` : group.name;
+      pill.addEventListener('click', () => {
+        this.state.bookmarksActiveGroupId = group.id;
+        this.render();
+      });
+      folderBar.appendChild(pill);
+    }
+    container.appendChild(folderBar);
 
-        <div class="fb-items-grid">
-          ${items.length > 0 ? items.map((bm) => `
-            <div class="fb-library-card" data-url="${bm.url}" data-id="${bm.id}">
-              <div class="fb-card-header">
-                <span class="fb-card-icon">${Icons.bookmark}</span>
-                <span class="fb-card-title">${bm.title || bm.url}</span>
-              </div>
-              <span class="fb-card-url">${bm.url}</span>
-              <div class="fb-card-actions">
-                <button class="fb-btn fb-btn-secondary fb-in-bm-open" data-url="${bm.url}">Open</button>
-                <button class="fb-btn fb-btn-secondary fb-in-bm-del" data-url="${bm.url}">${Icons.trash}</button>
-              </div>
-            </div>
-          `).join('') : '<div class="fb-empty-state">No bookmarks found. Click the star icon on any page to bookmark it.</div>'}
-        </div>
-      </div>
-    `;
-
-    const searchInput = page.querySelector('#fb-in-bm-search');
-    searchInput?.addEventListener('input', (e) => {
-      this.state.bookmarksSearchQuery = e.target.value;
+    const groupActions = document.createElement('div');
+    groupActions.className = 'fb-bookmark-group-actions';
+    const currentGroupLabel = document.createElement('span');
+    currentGroupLabel.className = 'fb-bookmark-default-label';
+    const defaultGroup = groups.find((group) => group.id === defaultGroupId);
+    currentGroupLabel.textContent = `New bookmarks default to ${defaultGroup?.name || 'Bookmarks Bar'}.`;
+    const groupButtons = document.createElement('div');
+    groupButtons.className = 'fb-bookmark-group-buttons';
+    const setDefaultButton = document.createElement('button');
+    setDefaultButton.className = 'fb-btn fb-btn-secondary fb-in-bm-set-default';
+    setDefaultButton.type = 'button';
+    setDefaultButton.textContent = activeGroupId === defaultGroupId ? 'Default group' : 'Make default for new bookmarks';
+    setDefaultButton.disabled = activeGroupId === defaultGroupId || typeof this.bookmarksRepo?.setDefaultGroup !== 'function';
+    setDefaultButton.addEventListener('click', async () => {
+      if (typeof this.bookmarksRepo?.setDefaultGroup !== 'function') return;
+      const result = await this.bookmarksRepo.setDefaultGroup(activeGroupId);
+      if (!result?.ok) {
+        this.showTransientNotice('Could not change the default bookmark group.');
+        return;
+      }
+      await this.refreshBookmarksState();
+      this.render();
+      this.showTransientNotice(`New bookmarks will go to ${groups.find((group) => group.id === activeGroupId)?.name || 'that group'}.`);
+    });
+    const newGroupButton = document.createElement('button');
+    newGroupButton.className = 'fb-btn fb-btn-secondary fb-in-bm-new-group';
+    newGroupButton.type = 'button';
+    newGroupButton.textContent = 'New group';
+    newGroupButton.disabled = typeof this.bookmarksRepo?.createGroup !== 'function';
+    newGroupButton.addEventListener('click', async () => {
+      if (typeof this.bookmarksRepo?.createGroup !== 'function') return;
+      const name = await this._textPromptDialog({
+        title: 'Create bookmark group',
+        description: 'Keep related bookmarks together. You can choose this group as the default for new bookmarks.',
+        placeholder: 'e.g. Work, Research, Shopping',
+        initialValue: ''
+      });
+      if (name === null) return;
+      const result = await this.bookmarksRepo.createGroup(name);
+      if (!result?.ok) {
+        this.showTransientNotice(result?.reason === 'duplicate-name'
+          ? 'A bookmark group with that name already exists.'
+          : 'Enter a name for the new bookmark group.');
+        return;
+      }
+      await this.refreshBookmarksState();
+      this.state.bookmarksActiveGroupId = result.group.id;
       this.render();
     });
-
-    page.querySelector('.fb-in-add-bm-btn')?.addEventListener('click', async () => {
-      const url = prompt('Enter Bookmark URL:', 'https://');
-      const title = prompt('Enter Bookmark Title:', 'New Bookmark');
-      if (url && this.bookmarksRepo) {
-        await this.bookmarksRepo.addBookmark({ url, title });
-        this.state.bookmarksItems = await this.bookmarksRepo.getAllBookmarks();
-        this.render();
+    const activeGroup = groups.find((group) => group.id === activeGroupId);
+    const removeGroupButton = document.createElement('button');
+    removeGroupButton.className = 'fb-btn fb-btn-secondary fb-in-bm-remove-group';
+    removeGroupButton.type = 'button';
+    removeGroupButton.textContent = 'Remove group';
+    removeGroupButton.disabled = Boolean(activeGroup?.builtIn) || typeof this.bookmarksRepo?.removeGroup !== 'function';
+    removeGroupButton.addEventListener('click', async () => {
+      if (removeGroupButton.disabled || typeof this.bookmarksRepo?.removeGroup !== 'function') return;
+      const confirmed = typeof confirm !== 'function' || confirm(`Remove “${activeGroup?.name || 'this group'}”? Its bookmarks will be kept in the default group.`);
+      if (!confirmed) return;
+      const result = await this.bookmarksRepo.removeGroup(activeGroupId);
+      if (!result?.ok) {
+        this.showTransientNotice('Could not remove that bookmark group.');
+        return;
       }
+      await this.refreshBookmarksState();
+      this.render();
+      this.showTransientNotice('Group removed; its bookmarks were kept.');
     });
+    groupButtons.appendChild(setDefaultButton);
+    groupButtons.appendChild(newGroupButton);
+    groupButtons.appendChild(removeGroupButton);
+    groupActions.appendChild(currentGroupLabel);
+    groupActions.appendChild(groupButtons);
+    container.appendChild(groupActions);
 
-    page.querySelectorAll('.fb-in-bm-open').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const url = btn.dataset.url;
-        if (url) this.navigateActiveTab(url);
-      });
-    });
-
-    page.querySelectorAll('.fb-in-bm-del').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        const url = btn.dataset.url;
-        if (this.bookmarksRepo && url) {
-          if (typeof this.bookmarksRepo.removeBookmarkByUrl === 'function') {
-            await this.bookmarksRepo.removeBookmarkByUrl(url);
-          } else if (typeof this.bookmarksRepo.removeBookmark === 'function') {
-            await this.bookmarksRepo.removeBookmark(url);
-          }
-          if (typeof this.bookmarksRepo.getAllBookmarks === 'function') {
-            this.state.bookmarksItems = await this.bookmarksRepo.getAllBookmarks();
-          }
-          this.render();
+    const grid = document.createElement('div');
+    grid.className = 'fb-items-grid';
+    const emptyState = document.createElement('div');
+    emptyState.className = 'fb-empty-state fb-bookmarks-empty-state';
+    emptyState.textContent = q
+      ? 'No bookmarks match that search in this group.'
+      : 'No bookmarks in this group yet. Star a page or use Add Bookmark to save one here.';
+    emptyState.style.display = items.length ? 'none' : '';
+    grid.appendChild(emptyState);
+    for (const bookmark of groupItems) {
+      const card = document.createElement('div');
+      card.className = 'fb-library-card';
+      card.dataset.url = bookmark.url || '';
+      card.dataset.id = bookmark.id || '';
+      card.dataset.searchText = `${bookmark.title || ''} ${bookmark.url || ''}`.toLocaleLowerCase();
+      if (q && !card.dataset.searchText.includes(q)) card.style.display = 'none';
+      const cardHeader = document.createElement('div');
+      cardHeader.className = 'fb-card-header';
+      const cardIcon = document.createElement('span');
+      cardIcon.className = 'fb-card-icon';
+      cardIcon.innerHTML = Icons.bookmark;
+      const cardTitle = document.createElement('span');
+      cardTitle.className = 'fb-card-title';
+      cardTitle.textContent = bookmark.title || bookmark.url || 'Bookmark';
+      cardHeader.appendChild(cardIcon);
+      cardHeader.appendChild(cardTitle);
+      const cardUrl = document.createElement('span');
+      cardUrl.className = 'fb-card-url';
+      cardUrl.textContent = bookmark.url || '';
+      const moveLabel = document.createElement('label');
+      moveLabel.className = 'fb-bookmark-move-label';
+      moveLabel.textContent = 'Group';
+      const moveSelect = document.createElement('select');
+      moveSelect.className = 'fb-bookmark-move-select fb-in-bm-move';
+      moveSelect.dataset.id = bookmark.id || '';
+      moveSelect.setAttribute('aria-label', `Move ${bookmark.title || bookmark.url || 'bookmark'} to group`);
+      for (const group of groups) {
+        const option = document.createElement('option');
+        option.value = group.id;
+        option.textContent = group.name;
+        option.selected = group.id === (bookmark.groupId || DEFAULT_BOOKMARK_GROUP_ID);
+        moveSelect.appendChild(option);
+      }
+      moveLabel.appendChild(moveSelect);
+      moveSelect.addEventListener('change', async (event) => {
+        const targetGroupId = event.target.value;
+        if (typeof this.bookmarksRepo?.moveBookmark !== 'function') return;
+        const result = await this.bookmarksRepo.moveBookmark(bookmark.id || bookmark.url, targetGroupId);
+        if (!result?.ok) {
+          this.showTransientNotice('Could not move that bookmark.');
+          return;
         }
+        await this.refreshBookmarksState();
+        this.render();
       });
-    });
+      const cardActions = document.createElement('div');
+      cardActions.className = 'fb-card-actions';
+      const openButton = document.createElement('button');
+      openButton.className = 'fb-btn fb-btn-secondary fb-in-bm-open';
+      openButton.type = 'button';
+      openButton.textContent = 'Open';
+      openButton.dataset.url = bookmark.url || '';
+      openButton.addEventListener('click', () => {
+        if (bookmark.url) this.navigateActiveTab(bookmark.url);
+      });
+      const removeButton = document.createElement('button');
+      removeButton.className = 'fb-btn fb-btn-secondary fb-in-bm-del';
+      removeButton.type = 'button';
+      removeButton.title = 'Remove bookmark';
+      removeButton.setAttribute('aria-label', `Remove ${bookmark.title || bookmark.url || 'bookmark'}`);
+      removeButton.innerHTML = Icons.trash;
+      removeButton.dataset.url = bookmark.url || '';
+      removeButton.addEventListener('click', async () => {
+        if (typeof this.bookmarksRepo?.removeBookmarkByUrl === 'function') {
+          await this.bookmarksRepo.removeBookmarkByUrl(bookmark.url);
+        } else if (typeof this.bookmarksRepo?.removeBookmark === 'function') {
+          await this.bookmarksRepo.removeBookmark(bookmark.url);
+        }
+        await this.refreshBookmarksState();
+        this.render();
+      });
+      cardActions.appendChild(openButton);
+      cardActions.appendChild(removeButton);
+      card.appendChild(cardHeader);
+      card.appendChild(cardUrl);
+      card.appendChild(moveLabel);
+      card.appendChild(cardActions);
+      grid.appendChild(card);
+    }
+    container.appendChild(grid);
+    page.appendChild(container);
 
+    searchInput.addEventListener('input', (event) => {
+      const value = String(event.target?.value || '');
+      const query = value.toLocaleLowerCase().trim();
+      this.state.bookmarksSearchQuery = value;
+      let visibleCount = 0;
+      for (const card of grid.querySelectorAll('.fb-library-card')) {
+        const matches = !query || String(card.dataset.searchText || '').includes(query);
+        card.style.display = matches ? '' : 'none';
+        if (matches) visibleCount += 1;
+      }
+      emptyState.textContent = query
+        ? 'No bookmarks match that search in this group.'
+        : 'No bookmarks in this group yet. Star a page or use Add Bookmark to save one here.';
+      emptyState.style.display = visibleCount ? 'none' : '';
+    });
+    addButton.addEventListener('click', async () => {
+      if (!this.bookmarksRepo) return;
+      const url = await this._textPromptDialog({
+        title: 'Add bookmark',
+        description: `Save a page to ${groups.find((group) => group.id === activeGroupId)?.name || 'this group'}.`,
+        placeholder: 'https://example.com',
+        initialValue: 'https://'
+      });
+      if (url === null || !String(url).trim()) return;
+      const title = await this._textPromptDialog({
+        title: 'Name this bookmark',
+        description: 'Leave the title blank to use the page address.',
+        placeholder: 'Bookmark title',
+        initialValue: String(url).trim()
+      });
+      if (title === null) return;
+      await this.bookmarksRepo.addBookmark({ url: String(url).trim(), title, groupId: activeGroupId });
+      await this.refreshBookmarksState();
+      this.render();
+    });
     viewport.appendChild(page);
   }
 
@@ -5331,6 +8489,12 @@ export class BrowserShell {
       || (p.title && p.title.toLowerCase().includes(q));
     const items = (section === 'keys' ? this.state.vaultKeysItems : this.state.passwordsItems).filter(match);
     const config = this.state.passwordsConfig || { savePasswordsEnabled: true, autofillEnabled: true, requirePasskeyToReveal: false, neverSaveOrigins: [] };
+    const rememberedEmails = (Array.isArray(this.state.rememberedEmails) ? this.state.rememberedEmails : [])
+      .map((item) => typeof item === 'string' ? { email: item, id: item } : item)
+      .filter((item) => item && typeof item.email === 'string');
+    const escapeText = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    })[character]);
     const passkey = this.state.passkeyInfo;
     const passkeySupported = Boolean(this.passkeyService && this.passkeyService.isSupported());
 
@@ -5423,6 +8587,18 @@ export class BrowserShell {
           </div>
         </div>
 
+        <div class="fb-settings-group-card fb-site-passkeys-card" style="margin-bottom:12px;">
+          <div class="fb-setting-toggle-row">
+            <div>
+              <strong>Website passkeys</strong>
+              <p>${this.nativeWebview
+                ? 'Always active. On Linux, Yayra keeps website credentials encrypted and profile-scoped, then uses your configured Yayra passkey (6-digit PIN, Touch ID, or system lock) to authorize each RP-isolated site request. A Yayra PIN avoids repeated system-password prompts. Windows Hello, entitled macOS Touch ID builds, and compatible security keys remain native; unavailable or synced credentials use the system-browser fallback.'
+                : 'Handled automatically by your browser when a secure site asks to create or use a passkey.'}</p>
+            </div>
+            <span class="fb-site-passkeys-ready" role="status">Active</span>
+          </div>
+        </div>
+
         <div class="fb-settings-group-card" style="margin-bottom:12px;">
           <div class="fb-setting-toggle-row">
             <div>
@@ -5447,6 +8623,26 @@ export class BrowserShell {
                 </span>`).join('')}
             </div>` : ''}
         </div>
+
+        ${section === 'passwords' ? `
+          <div class="fb-settings-group-card fb-saved-emails-card" style="margin-bottom:12px;">
+            <div class="fb-saved-emails-header">
+              <div>
+                <strong>Remembered email addresses</strong>
+                <p>Saved locally to this profile after you submit a form. Incognito tabs never save or suggest addresses. Focus an email field on a desktop webpage to choose one.</p>
+              </div>
+              <button type="button" class="fb-btn fb-btn-secondary fb-in-email-clear" ${rememberedEmails.length ? '' : 'disabled'}>Clear all</button>
+            </div>
+            <div class="fb-saved-email-list">
+              ${rememberedEmails.length
+                ? rememberedEmails.map((item) => `
+                  <div class="fb-saved-email-row">
+                    <span>${escapeText(item.email)}</span>
+                    <button type="button" class="fb-btn fb-btn-secondary fb-in-email-remove" data-email-id="${escapeAttr(item.id || item.email)}" data-email="${escapeAttr(item.email)}" aria-label="Remove ${escapeAttr(item.email)}">Remove</button>
+                  </div>`).join('')
+                : '<div class="fb-empty-state">No saved email addresses yet. Use an email on a submitted form and Yayra will remember it for this profile.</div>'}
+            </div>
+          </div>` : ''}
 
         <form class="fb-vault-add-form" id="fb-vault-add-form" style="display:none;">
           ${section === 'keys' ? `
@@ -5521,6 +8717,25 @@ export class BrowserShell {
           this.render();
         }
       });
+    });
+
+    page.querySelectorAll('.fb-in-email-remove').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        if (!this.emailAddressesRepo || typeof this.emailAddressesRepo.removeEmail !== 'function') return;
+        const target = btn.dataset.emailId || btn.dataset.email;
+        await this.emailAddressesRepo.removeEmail(target);
+        await this.refreshEmailAddressesState();
+        await this.pushEmailSuggestionsToOpenTabs();
+        this.render();
+      });
+    });
+    page.querySelector('.fb-in-email-clear')?.addEventListener('click', async () => {
+      if (!this.emailAddressesRepo || typeof this.emailAddressesRepo.clear !== 'function') return;
+      await this.emailAddressesRepo.clear();
+      await this.refreshEmailAddressesState();
+      await this.pushEmailSuggestionsToOpenTabs();
+      this.render();
+      this.showTransientNotice('Saved email addresses cleared for this profile.');
     });
 
     // Inline add form (replaces the old triple prompt() flow).
@@ -5717,8 +8932,8 @@ export class BrowserShell {
    * YAYRA AI - yayra://ai (Chrome-style "AI options on every search")
    * -----------------------------------------------------------
    * The in-tab AI page: a conversation with Yayra AI, reachable from the
-   * omnibox "Ask Yayra AI" suggestion row, the new-tab chip, and directly
-   * via yayra://ai. Opening yayra://ai?q=<query> asks the query
+   * omnibox "Ask Yayra AI" suggestion row, the separate new-tab Yayra
+   * button, and directly via yayra://ai. Opening yayra://ai?q=<query> asks the query
    * immediately (that is how omnibox searches hand over to AI).
    * Providers live in services/aiService.js - no provider, no fake
    * answers: the page says exactly what to configure instead.
@@ -5889,7 +9104,7 @@ export class BrowserShell {
   /**
    * Ask Yayra AI and append both sides to the ACTIVE chat, creating it on
    * demand. With { newChat: true } (every search-engine handoff: omnibox
-   * "Ask Yayra AI", new-tab chip, yayra://ai?q=...) the question starts a
+   * "Ask Yayra AI", new-tab Yayra button, yayra://ai?q=...) the question starts a
    * brand-new chat instead of continuing the current one - ChatGPT-style.
    * Errors become honest assistant-side notices (never fake answers).
    */
@@ -6635,46 +9850,79 @@ export class BrowserShell {
   }
 
   /** Generic single-line text prompt (window.prompt is dead in Electron renderers). */
-  _textPromptDialog({ title, description = '', placeholder = '', initialValue = '' } = {}) {
+  _textPromptDialog({ title, description = '', placeholder = '', initialValue = '', placement = 'center' } = {}) {
     return new Promise((resolve) => {
       if (typeof document === 'undefined' || !document.body) { resolve(null); return; }
+      const isTabGroupPrompt = placement === 'tab-groups';
       const overlay = document.createElement('div');
-      overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(8,10,16,0.62);display:flex;align-items:center;justify-content:center;';
+      overlay.className = `fb-text-prompt-overlay${isTabGroupPrompt ? ' fb-text-prompt-tab-groups' : ''}`;
+      overlay.setAttribute('role', 'presentation');
+      const promptTitleId = `yayra-text-prompt-title-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const card = document.createElement('div');
-      card.style.cssText = 'background:var(--fb-bg-elevated,#171a22);color:var(--fb-text-primary,#f3f4f6);border-radius:16px;padding:22px;max-width:380px;width:92%;box-shadow:0 18px 60px rgba(0,0,0,0.5);display:flex;flex-direction:column;gap:12px;';
+      card.className = 'fb-text-prompt-dialog';
+      card.setAttribute('role', 'dialog');
+      card.setAttribute('aria-modal', 'true');
+      card.setAttribute('aria-labelledby', promptTitleId);
       const h = document.createElement('strong');
+      h.id = promptTitleId;
+      h.className = 'fb-text-prompt-title';
       h.textContent = title;
       card.appendChild(h);
       if (description) {
         const p = document.createElement('p');
+        p.className = 'fb-text-prompt-description';
         p.textContent = description;
-        p.style.cssText = 'margin:0;font-size:0.84rem;color:var(--fb-text-secondary,#9ca3af);line-height:1.5;';
         card.appendChild(p);
       }
       const input = document.createElement('input');
       input.type = 'text';
+      input.className = 'fb-text-prompt-input';
       input.placeholder = placeholder;
       input.value = initialValue;
-      input.style.cssText = 'padding:10px;border-radius:10px;border:1px solid var(--fb-border,#2a2f3b);background:var(--fb-bg,#101218);color:inherit;font-size:0.95rem;';
+      input.setAttribute('aria-label', title || 'Text input');
       card.appendChild(input);
-      const done = (value) => { try { overlay.remove(); } catch { /* gone */ } resolve(value); };
+      let finished = false;
+      const done = (value) => {
+        if (finished) return;
+        finished = true;
+        try { overlay.remove(); } catch { /* gone */ }
+        // Recompute without treating this prompt's own flag as another
+        // overlay, then let setPageObscured perform the native visibility
+        // transition (including the true -> false case).
+        const wasObscured = Boolean(this.state.isPageObscured);
+        this.state.isPageObscured = false;
+        const shouldRemainObscured = this.hasBlockingOverlay();
+        this.state.isPageObscured = wasObscured;
+        this.setPageObscured(shouldRemainObscured);
+        resolve(value);
+      };
       const row = document.createElement('div');
-      row.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;';
+      row.className = 'fb-text-prompt-actions';
       const cancel = document.createElement('button');
+      cancel.type = 'button';
+      cancel.className = 'fb-text-prompt-button fb-text-prompt-cancel';
       cancel.textContent = 'Cancel';
-      cancel.style.cssText = 'padding:10px 14px;border:none;border-radius:10px;font-weight:600;cursor:pointer;background:var(--fb-bg,#232734);color:inherit;';
       cancel.addEventListener('click', () => done(null));
       const ok = document.createElement('button');
+      ok.type = 'button';
+      ok.className = 'fb-text-prompt-button fb-text-prompt-save';
       ok.textContent = 'Save';
-      ok.style.cssText = 'padding:10px 14px;border:none;border-radius:10px;font-weight:600;cursor:pointer;background:var(--fb-accent,#6d5df2);color:#fff;';
-      ok.addEventListener('click', () => done(input.value.trim() || null));
+      ok.addEventListener('click', () => done(input.value.trim()));
       row.appendChild(cancel);
       row.appendChild(ok);
       card.appendChild(row);
-      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') done(input.value.trim() || null); });
+      input.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== 'Escape') return;
+        e.preventDefault?.();
+        e.stopPropagation?.();
+        done(e.key === 'Enter' ? input.value.trim() : null);
+      });
       overlay.addEventListener('pointerdown', (e) => { if (e.target === overlay) done(null); });
       overlay.appendChild(card);
       document.body.appendChild(overlay);
+      // Electron website contents are a native surface above the HTML DOM;
+      // hiding them makes this prompt visible and clickable there.
+      this.setPageObscured(true);
       input.focus();
       input.select();
     });
@@ -6842,9 +10090,51 @@ export class BrowserShell {
     this.showTransientNotice("DevTools aren't available in the web build - use your browser's own (F12 / Ctrl+Shift+I).");
   }
 
-  /** Print the actual page: the native view's print dialog on desktop, window.print on web. */
-  printActivePage() {
+  /** Print the active website or local document. Document tabs never use the
+   *  native website surface; PDF pages are fully painted just for the print
+   *  snapshot and returned to their normal windowed-memory state afterward. */
+  async printActivePage() {
     const tab = this.getActiveTab();
+    if (tab?.isDocument || String(tab?.url || '').startsWith('yayra://doc/')) {
+      const session = this._activeDocViewer?.tabId === tab.id ? this._activeDocViewer : null;
+      const viewer = session?.viewer;
+      if (!viewer || tab.docState?.status !== 'ready') {
+        this.showTransientNotice('Wait for the document to finish opening before printing.');
+        return;
+      }
+      if (this._documentPrintInFlight) {
+        this.showTransientNotice('Yayra is already preparing a document for printing.');
+        return;
+      }
+      this._documentPrintInFlight = tab.id;
+      try {
+        if (typeof viewer?.preparePrint === 'function') {
+          const kind = tab.docState?.viewer;
+          this.showTransientNotice(kind === 'pptx'
+            ? 'Preparing every slide for printing…'
+            : 'Preparing every page for printing…');
+          const ready = await viewer.preparePrint();
+          if (!ready) {
+            this.showTransientNotice('Couldn’t prepare this document for printing. The original is still available.');
+            return;
+          }
+        }
+        const stillActive = this.getActiveTab()?.id === tab.id
+          && this._documentViewerSessions?.get?.(tab.id) === session
+          && !session?.disposed;
+        if (!stillActive) {
+          this.showTransientNotice('Printing was canceled because the document tab changed.');
+          return;
+        }
+        if (typeof window !== 'undefined' && typeof window.print === 'function') window.print();
+      } catch {
+        this.showTransientNotice('Yayra couldn’t open the print dialog for this document.');
+      } finally {
+        try { await viewer?.finishPrint?.(); } catch { /* print cleanup is best effort */ }
+        if (this._documentPrintInFlight === tab.id) this._documentPrintInFlight = null;
+      }
+      return;
+    }
     if (this.nativeWebview && typeof this.nativeWebview.print === 'function' && tab) {
       try {
         const res = this.nativeWebview.print(tab.id);
@@ -6855,9 +10145,18 @@ export class BrowserShell {
     if (typeof window !== 'undefined' && window.print) window.print();
   }
 
-  /** Save the real page (HTML + assets) through the OS save dialog on desktop. */
+  /** Save a website (HTML + assets) or download a document's unchanged source. */
   async savePageAs() {
     const tab = this.getActiveTab();
+    if (tab?.isDocument || String(tab?.url || '').startsWith('yayra://doc/')) {
+      const session = this._documentViewerSessions?.get?.(tab.id);
+      if (typeof session?.downloadOriginal === 'function') {
+        await session.downloadOriginal();
+        return;
+      }
+      this.showTransientNotice('Wait for the document viewer to finish opening, then try Download again.');
+      return;
+    }
     if (this.nativeWebview && typeof this.nativeWebview.savePage === 'function' && tab) {
       try {
         const res = await this.nativeWebview.savePage(tab.id);
@@ -6869,15 +10168,14 @@ export class BrowserShell {
   }
 
   /**
-   * OFFLINE PROMPTING ("when there is no internet connection, it must
-   * prompt users so not to give blank pages"): without this, opening a
-   * page while offline rendered a silent BLANK frame (the iframe request
-   * fails and nothing explains why). Two guarantees:
-   *   1. A NEW page opened while offline shows an honest offline card
-   *      with a Retry button - never a blank page.
-   *   2. A page that is ALREADY LOADED stays exactly as it is (the
-   *      loaded-page contract) - the listeners below only INFORM and
-   *      heal failed tabs; they never reload or touch live pages.
+   * WEBSITE FAILURE RECOVERY
+   *
+   * A network failure is state attached to the TAB, never a navigation to an
+   * internal error URL. That distinction preserves the requested address,
+   * history and live surface. The failed native/iframe surface is hidden and
+   * this shell paints a first-party browser-style recovery page above it.
+   * Only the active FAILED tab is retried; healthy loaded pages and background
+   * tabs are never refreshed merely because connectivity changed.
    */
   _onLine() {
     try {
@@ -6887,41 +10185,342 @@ export class BrowserShell {
     }
   }
 
+  _isWebsiteUrl(url) {
+    return /^https?:\/\//i.test(String(url || ''));
+  }
+
+  _siteFailureFor(tabOrId) {
+    const tab = typeof tabOrId === 'string'
+      ? this.state.tabs.find((item) => item.id === tabOrId)
+      : tabOrId;
+    if (!tab || !this._siteFailures) return null;
+    const failure = this._siteFailures.get(tab.id) || null;
+    if (!failure) return null;
+    // A stale event/timer may never cover a destination the user navigated to.
+    if (failure.url !== tab.url) {
+      this._clearSiteFailure(tab.id);
+      return null;
+    }
+    return failure;
+  }
+
+  _clearSiteFailure(tabId) {
+    const failure = this._siteFailures?.get(tabId);
+    if (!failure) return false;
+    if (failure.retryTimer) clearTimeout(failure.retryTimer);
+    if (failure.attemptWatchdog) clearTimeout(failure.attemptWatchdog);
+    failure.retryTimer = null;
+    failure.attemptWatchdog = null;
+    this._siteFailures.delete(tabId);
+    return true;
+  }
+
+  _recordSiteFailure(tabId, details = {}) {
+    const tab = this.state.tabs.find((item) => item.id === tabId);
+    if (!tab) return null;
+    const candidateUrl = this._isWebsiteUrl(details.url) ? String(details.url) : String(tab.url || '');
+    if (!this._isWebsiteUrl(candidateUrl)) return null;
+    // A genuine failed main-frame navigation owns the omnibox just as it does
+    // in Chromium. Keeping this target is what lets Retry/online recovery load
+    // the page the user actually requested rather than the previous page.
+    if (candidateUrl !== tab.url && details.adoptUrl !== false) {
+      tab.url = candidateUrl;
+      tab.title = this.getTabTitle(tab);
+      tab.isSecure = candidateUrl.startsWith('https://');
+      const navigationState = this.ensureNavigationState(tab);
+      const currentUrl = navigationState.historyStack[navigationState.currentIndex];
+      if (currentUrl !== candidateUrl) {
+        navigationState.historyStack = navigationState.historyStack.slice(0, navigationState.currentIndex + 1);
+        navigationState.historyStack.push(candidateUrl);
+        navigationState.currentIndex = navigationState.historyStack.length - 1;
+      }
+      tab.canGoBack = navigationState.currentIndex > 0;
+      tab.canGoForward = navigationState.currentIndex < navigationState.historyStack.length - 1;
+      if (tabId === this.state.activeTabId) this.state.urlInputValue = this.getDisplayUrl(candidateUrl);
+    }
+
+    const previous = this._siteFailures.get(tabId);
+    if (previous?.retryTimer) clearTimeout(previous.retryTimer);
+    if (previous?.attemptWatchdog) clearTimeout(previous.attemptWatchdog);
+    const numericCode = details.errorCode === null || details.errorCode === undefined
+      ? Number.NaN
+      : Number(details.errorCode);
+    const offline = details.offline === true
+      || numericCode === -106
+      || /ERR_INTERNET_DISCONNECTED/i.test(String(details.errorDescription || ''))
+      || !this._onLine();
+    const failure = {
+      tabId,
+      url: candidateUrl,
+      errorCode: Number.isFinite(numericCode) ? numericCode : null,
+      errorDescription: String(details.errorDescription || (offline ? 'net::ERR_INTERNET_DISCONNECTED' : 'The website did not respond.')).slice(0, 240),
+      source: String(details.source || previous?.source || 'website'),
+      offline,
+      failedAt: previous?.failedAt || Date.now(),
+      retryCount: previous?.retryCount || 0,
+      lastAttemptAt: previous?.lastAttemptAt || 0,
+      inFlight: false,
+      retryTimer: null,
+      attemptWatchdog: null,
+      nextRetryAt: null
+    };
+    this._siteFailures.set(tabId, failure);
+    this.updateTabLoading(tabId, false);
+    if (tabId === this.state.activeTabId) this._scheduleSiteRecovery(tabId);
+    return failure;
+  }
+
+  _scheduleSiteRecovery(tabId, { immediate = false } = {}) {
+    const failure = this._siteFailureFor(tabId);
+    if (!failure || failure.inFlight || failure.retryTimer || this._destroyed) return false;
+    // Background websites keep their URL/error state but never churn the
+    // network invisibly. Selecting the tab calls this again from rendering.
+    if (tabId !== this.state.activeTabId) return false;
+    const delays = [1500, 3000, 6000, 12000, 20000, 30000];
+    const delay = immediate ? 0 : delays[Math.min(failure.retryCount, delays.length - 1)];
+    failure.nextRetryAt = Date.now() + delay;
+    const expected = failure;
+    failure.retryTimer = setTimeout(() => {
+      if (this._siteFailures.get(tabId) !== expected) return;
+      expected.retryTimer = null;
+      expected.nextRetryAt = null;
+      this._retrySiteRecovery(tabId, { reason: immediate ? 'immediate' : 'backoff' });
+    }, delay);
+    failure.retryTimer?.unref?.();
+    return true;
+  }
+
+  _retrySiteRecovery(tabId, { reason = 'manual' } = {}) {
+    const failure = this._siteFailureFor(tabId);
+    const tab = this.state.tabs.find((item) => item.id === tabId);
+    if (!failure || !tab || tabId !== this.state.activeTabId || this._destroyed) return false;
+
+    // Connectivity restoration is the one forced attempt: stop a still-pending
+    // offline request before restarting it, so "online" is immediate without
+    // ever allowing two concurrent loads for the same tab.
+    if (failure.inFlight) {
+      if (reason !== 'online') return false;
+      if (failure.attemptWatchdog) clearTimeout(failure.attemptWatchdog);
+      failure.attemptWatchdog = null;
+      try {
+        if (this.nativeWebview && this._nativeWebviewTabIds.has(tabId)) this.nativeWebview.stop?.(tabId)?.catch?.(() => {});
+        else if (this._androidTabWebIds?.has(tabId)) this.capacitorTabWeb?.tabWebStop?.({ id: tabId })?.catch?.(() => {});
+        else this.webFrames?.get(tabId)?.iframe?.contentWindow?.stop?.();
+      } catch { /* the new generation below remains authoritative */ }
+      failure.inFlight = false;
+    }
+    if (failure.retryTimer) clearTimeout(failure.retryTimer);
+    failure.retryTimer = null;
+    failure.nextRetryAt = null;
+    failure.inFlight = true;
+    failure.offline = !this._onLine();
+    failure.retryCount += 1;
+    failure.lastAttemptAt = Date.now();
+    this.updateTabLoading(tabId, true);
+
+    // A load engine is required to report success/failure. If neither event
+    // arrives (renderer crash, captive portal, broken embedder), retire this
+    // attempt and continue the bounded backoff instead of leaving a spinner.
+    const expected = failure;
+    failure.attemptWatchdog = setTimeout(() => {
+      if (this._siteFailures.get(tabId) !== expected || !expected.inFlight) return;
+      this._recordSiteFailure(tabId, {
+        url: expected.url,
+        errorCode: expected.errorCode,
+        errorDescription: expected.offline ? 'net::ERR_INTERNET_DISCONNECTED' : 'net::ERR_TIMED_OUT',
+        offline: expected.offline,
+        source: expected.source
+      });
+      if (tabId === this.state.activeTabId) this.requestRender();
+    }, 20000);
+    failure.attemptWatchdog?.unref?.();
+
+    const failAttempt = (error) => {
+      if (this._siteFailures.get(tabId) !== expected) return;
+      this._recordSiteFailure(tabId, {
+        url: expected.url,
+        errorCode: expected.errorCode,
+        errorDescription: String(error?.message || error || expected.errorDescription),
+        offline: !this._onLine(),
+        source: expected.source
+      });
+      if (tabId === this.state.activeTabId) this.requestRender();
+    };
+
+    if (this.nativeWebview && this._nativeWebviewTabIds.has(tabId)) {
+      try {
+        const retry = typeof this.nativeWebview.retry === 'function'
+          ? this.nativeWebview.retry(tabId, failure.url)
+          : this.nativeWebview.reload(tabId); // compatible with an older preload during hot update
+        Promise.resolve(retry).then((result) => {
+          if (result?.ok === false) failAttempt(result.reason || 'retry unavailable');
+        }).catch(failAttempt);
+      } catch (error) { failAttempt(error); }
+      this.requestRender();
+      return true;
+    }
+    if (this._androidTabWebIds?.has(tabId) && this.capacitorTabWeb?.tabWebReload) {
+      try {
+        Promise.resolve(this.capacitorTabWeb.tabWebReload({ id: tabId, url: failure.url })).catch(failAttempt);
+      } catch (error) { failAttempt(error); }
+      this.requestRender();
+      return true;
+    }
+
+    const frame = this.webFrames?.get(tabId);
+    if (frame?.iframe) {
+      frame.blockedFallbackShown = false;
+      frame.url = failure.url;
+      const stale = frame.host?.querySelector?.('.fb-frame-blocked-fallback');
+      stale?.remove?.();
+      try { frame.iframe.src = failure.url; } catch (error) { failAttempt(error); }
+      this.requestRender();
+      return true;
+    }
+
+    // No frame exists yet (the common "opened while offline" case). Rendering
+    // the recovery state creates one hidden retry frame; the card remains on
+    // screen until its load event positively reports success.
+    this.requestRender();
+    return true;
+  }
+
+  _siteRecoverySucceeded(tabId, url = '') {
+    const failure = this._siteFailures?.get(tabId);
+    if (!failure) return false;
+    const tab = this.state.tabs.find((item) => item.id === tabId);
+    if (!tab) {
+      this._clearSiteFailure(tabId);
+      return false;
+    }
+    // A late success from an old URL must not clear a newer failed target.
+    const loadedUrl = this._isWebsiteUrl(url) ? String(url) : failure.url;
+    if (loadedUrl !== failure.url && tab.url !== loadedUrl) return false;
+    this._clearSiteFailure(tabId);
+    if (this._isWebsiteUrl(loadedUrl)) {
+      tab.url = loadedUrl;
+      tab.isSecure = loadedUrl.startsWith('https://');
+      if (tabId === this.state.activeTabId) this.state.urlInputValue = this.getDisplayUrl(loadedUrl);
+    }
+    this.updateTabLoading(tabId, false);
+    if (tabId === this.state.activeTabId) this.requestRender();
+    return true;
+  }
+
   _armConnectivityAwareness() {
-    if (this._connectivityArmed) return;
+    if (this._connectivityArmed || typeof window === 'undefined') return;
     this._connectivityArmed = true;
-    try {
-      window.addEventListener?.('offline', () => {
-        this.showTransientNotice('You\u2019re offline - new pages can\u2019t load until the connection is back. Pages you already opened stay available.');
-      });
-      window.addEventListener?.('online', () => {
-        // Never reloads anything: pooled live frames survive re-renders
-        // (the no-blink architecture); only tabs stuck on the offline
-        // card get a fresh attempt because they never loaded at all.
+    const onOffline = () => {
+      // Do not obscure or reload a healthy completed page. A destination
+      // that is currently loading, however, has just lost its transport: put
+      // the recovery surface in place immediately rather than waiting for a
+      // native engine's delayed error callback (and showing blank meanwhile).
+      const activeTab = this.getActiveTab();
+      let activeFailure = this._siteFailureFor(this.state.activeTabId);
+      if (!activeFailure && activeTab?.isLoading && this._isWebsiteUrl(activeTab.url)) {
+        activeFailure = this._recordSiteFailure(activeTab.id, {
+          url: activeTab.url,
+          errorCode: -106,
+          errorDescription: 'net::ERR_INTERNET_DISCONNECTED',
+          offline: true,
+          source: 'connectivity'
+        });
+      }
+      if (activeFailure) {
+        activeFailure.offline = true;
+        activeFailure.errorDescription = 'net::ERR_INTERNET_DISCONNECTED';
+        this.requestRender();
+      }
+      this.showTransientNotice('You\u2019re offline - new pages can\u2019t load until the connection is back. Pages you already opened stay available.');
+    };
+    const onOnline = () => {
+      // Exactly the requested scope: immediately reload the active site only
+      // when it is in a failed recovery state. Healthy tabs remain untouched.
+      const activeFailure = this._siteFailureFor(this.state.activeTabId);
+      if (activeFailure) {
+        this.showTransientNotice('Back online - retrying this page now.');
+        activeFailure.offline = false;
+        this._retrySiteRecovery(activeFailure.tabId, { reason: 'online' });
+      } else {
         this.showTransientNotice('Back online.');
-        try { this.render(); } catch { /* best-effort heal */ }
-      });
+        try { this.render(); } catch { /* best-effort connectivity repaint */ }
+      }
+    };
+    this._connectivityListeners = { onOffline, onOnline };
+    try {
+      window.addEventListener?.('offline', onOffline);
+      window.addEventListener?.('online', onOnline);
     } catch { /* older shims */ }
   }
 
-  /** The honest in-tab card shown instead of a blank frame. */
-  buildOfflineFallback(url) {
-    const fallback = document.createElement('div');
-    fallback.className = 'fb-frame-blocked-fallback fb-offline-fallback';
-    fallback.style.cssText = 'position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; background:var(--fb-bg-elevated,#15171c); color:var(--fb-text-primary,#d7dbe3); text-align:center; padding:24px; z-index:1;';
+  /** Informative browser-style page shown instead of every failed blank surface. */
+  buildOfflineFallback(url, { tabId = this.state.activeTabId, failure: suppliedFailure = null } = {}) {
+    const failure = suppliedFailure || this._siteFailureFor(tabId) || {
+      url,
+      offline: !this._onLine(),
+      retryCount: 0,
+      inFlight: false,
+      errorCode: null,
+      errorDescription: !this._onLine() ? 'net::ERR_INTERNET_DISCONNECTED' : 'net::ERR_FAILED'
+    };
+    const escapeHtml = (value) => String(value || '').replace(/[&<>"']/g, (char) => (
+      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]
+    ));
+    let host = 'this website';
+    try { host = new URL(failure.url || url).host || host; } catch { /* visible generic label */ }
+    const offline = failure.offline || !this._onLine();
+    const symbolicMatch = /(?:net::)?(ERR_[A-Z0-9_]+)/i.exec(failure.errorDescription || '');
+    const errorName = offline
+      ? 'ERR_INTERNET_DISCONNECTED'
+      : (symbolicMatch?.[1]?.toUpperCase() || (failure.errorCode === -105 ? 'ERR_NAME_NOT_RESOLVED' : 'ERR_CONNECTION_FAILED'));
+    const heading = offline ? 'No internet' : 'This site can\u2019t be reached';
+    const detail = offline
+      ? `Yayra couldn\u2019t connect to ${escapeHtml(host)} because this device is offline.`
+      : `${escapeHtml(host)} didn\u2019t respond. The address is still here, and Yayra will keep trying.`;
+    const retryStatus = failure.inFlight
+      ? `Trying again now${failure.retryCount ? ` (attempt ${failure.retryCount})` : ''}\u2026`
+      : 'Automatic retry is on. The delay is capped at 30 seconds.';
+
+    const fallback = document.createElement('section');
+    fallback.className = 'fb-network-recovery fb-offline-fallback';
+    fallback.setAttribute('role', 'status');
+    fallback.setAttribute('aria-live', 'polite');
+    fallback.setAttribute('aria-label', `${heading}. ${errorName}`);
     fallback.innerHTML = `
-      <div style="font-size:1.4rem;">\u26A1</div>
-      <div style="font-size:0.95rem; font-weight:700;">You\u2019re offline</div>
-      <div style="font-size:0.9rem; max-width:380px; line-height:1.5;">There\u2019s no internet connection, so \u201C${String(url).replace(/</g, '&lt;').slice(0, 80)}\u201D can\u2019t load. Pages you already have open keep working.</div>
-      <button type="button" class="fb-btn fb-offline-retry-btn" style="padding:8px 16px; border-radius:8px; border:none; background:#3b82f6; color:#fff; cursor:pointer; font-size:0.875rem;">Retry</button>
-      <div style="font-size:0.75rem; color:var(--fb-text-secondary,#9aa3b2);">Yayra reloads it automatically once you\u2019re back online.</div>
+      <div class="fb-network-recovery-card">
+        <div class="fb-network-recovery-mark" aria-hidden="true">
+          <svg viewBox="0 0 64 64" role="presentation"><path d="M14 43h34a10 10 0 0 0 1.8-19.8A18 18 0 0 0 15.4 20 12 12 0 0 0 14 43Z"/><path d="m19 17 28 32"/><path d="m47 17-28 32"/></svg>
+        </div>
+        <h1>${heading}</h1>
+        <p class="fb-network-recovery-detail">${detail}</p>
+        <div class="fb-network-recovery-try">
+          <strong>Try:</strong>
+          <ul>
+            <li>Checking the network cables, modem, and router</li>
+            <li>Reconnecting to Wi-Fi or mobile data</li>
+            <li>Checking firewall, proxy, or DNS settings</li>
+          </ul>
+        </div>
+        <code class="fb-network-recovery-code">${escapeHtml(errorName)}</code>
+        <div class="fb-network-recovery-actions">
+          <button type="button" class="fb-btn fb-offline-retry-btn">Try again</button>
+          <span class="fb-network-recovery-status">${escapeHtml(retryStatus)}</span>
+        </div>
+        <p class="fb-network-recovery-promise">Yayra will reload this active site automatically when the connection returns. Other open pages stay live.</p>
+      </div>
     `;
     fallback.querySelector('.fb-offline-retry-btn')?.addEventListener('click', () => {
-      if (this._onLine()) {
-        try { this.render(); } catch { /* best effort */ }
-      } else {
-        this.showTransientNotice('Still offline - reconnect and try again.');
+      let current = this._siteFailureFor(tabId);
+      if (!current) {
+        current = this._recordSiteFailure(tabId, {
+          url: failure.url || url,
+          errorCode: failure.errorCode,
+          errorDescription: failure.errorDescription,
+          offline: !this._onLine(),
+          source: failure.source || 'manual'
+        });
       }
+      if (current) this._retrySiteRecovery(tabId, { reason: 'manual' });
     });
     return fallback;
   }
@@ -7013,7 +10612,9 @@ export class BrowserShell {
         const editedName = await this._installPageAsAppDialog({
           title,
           url: tab.url,
-          iconHtml: this.getTabFavicon(tab)
+          // An app identity must stay stable while the page is loading; the
+          // animated tab hourglass is navigation chrome, never an app icon.
+          iconHtml: this.getTabFavicon(tab, { showLoading: false })
         });
         if (editedName === null) { this.showTransientNotice('Install cancelled.'); return; }
         shortcutName = editedName;
@@ -7049,7 +10650,9 @@ export class BrowserShell {
           const editedName = await this._installPageAsAppDialog({
             title: installName,
             url: tab.url,
-            iconHtml: this.getTabFavicon(tab)
+            // Show the site's identity even when the live page is currently
+            // navigating; loading chrome is not a usable launcher icon.
+            iconHtml: this.getTabFavicon(tab, { showLoading: false })
           });
           if (editedName === null) { this.showTransientNotice('Install cancelled.'); return; }
           finalName = editedName;
@@ -7062,7 +10665,7 @@ export class BrowserShell {
           return;
         }
         if (res && res.reason === 'unsupported-platform') {
-          this.showTransientNotice('Installing pages as apps is not supported on macOS yet - use "Create shortcut..." instead.');
+          this.showTransientNotice('Installing pages as apps is not supported on macOS yet - use "Create desktop shortcut..." instead.');
           return;
         }
         this.showTransientNotice(`Couldn't install the app${res && res.reason ? ` (${res.reason})` : ''}.`);
@@ -7087,18 +10690,72 @@ export class BrowserShell {
     this.showTransientNotice('A web page can\u2019t install another site as an app - use the Yayra desktop or Android app for that. To install Yayra itself, use your browser\u2019s install / add-to-home-screen option.');
   }
 
-  /** Real desktop shortcut for the current page (desktop app only). */
+  /** Pin the active website in Yayra's profile-scoped New Tab shortcuts. */
   async createShortcutForActivePage() {
+    const tab = this.getActiveTab();
+    let url;
+    try {
+      const parsed = new URL(String(tab?.url || '').trim());
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('not-a-website');
+      url = parsed.toString();
+    } catch {
+      this.showTransientNotice('Open a website first - only http and https pages can be added as shortcuts.');
+      return false;
+    }
+
+    if (!this.shortcutsRepo?.addShortcut || !this.shortcutsRepo?.getShortcuts) {
+      this.showTransientNotice('Yayra shortcuts are unavailable in this profile.');
+      return false;
+    }
+
+    let shortcuts = [];
+    try {
+      shortcuts = await this.shortcutsRepo.getShortcuts();
+    } catch {
+      this.showTransientNotice('Could not load your New Tab shortcuts.');
+      return false;
+    }
+    this.state.userShortcuts = Array.isArray(shortcuts) ? shortcuts : [];
+    const canonicalUrl = (value) => {
+      try { return new URL(String(value || '')).toString(); } catch { return String(value || ''); }
+    };
+    const existing = this.state.userShortcuts.find((shortcut) => canonicalUrl(shortcut.url) === url);
+    if (existing) {
+      this.render();
+      this.showTransientNotice('This website is already in your New Tab shortcuts.');
+      return existing;
+    }
+
+    const title = String(tab.title || new URL(url).hostname).replace(/\s+/g, ' ').trim().slice(0, 60) || url;
+    let created;
+    try {
+      created = await this.shortcutsRepo.addShortcut({ title, url });
+      this.state.userShortcuts = await this.shortcutsRepo.getShortcuts();
+    } catch {
+      this.showTransientNotice('Could not save this New Tab shortcut.');
+      return false;
+    }
+    this.render();
+    if (!created) {
+      this.showTransientNotice('Shortcut limit reached (12) - remove one in Settings > Shortcuts.');
+      return false;
+    }
+    this.showTransientNotice('Added to your New Tab shortcuts.');
+    return created;
+  }
+
+  /** Real OS desktop shortcut for the current page (desktop app only). */
+  async createDesktopShortcutForActivePage() {
     const tab = this.getActiveTab();
     if (this.systemBridge && typeof this.systemBridge.createShortcut === 'function' && tab) {
       try {
         const res = await this.systemBridge.createShortcut({ url: tab.url, title: tab.title || tab.url });
-        if (res && res.ok) { this.showTransientNotice(`Shortcut created on your desktop: ${res.path}`); return; }
-        this.showTransientNotice(`Couldn't create the shortcut${res && res.reason ? ` (${res.reason})` : ''}.`);
+        if (res && res.ok) { this.showTransientNotice(`Desktop shortcut created: ${res.path}`); return; }
+        this.showTransientNotice(`Couldn't create the desktop shortcut${res && res.reason ? ` (${res.reason})` : ''}.`);
         return;
       } catch { /* fall through */ }
     }
-    this.showTransientNotice('Desktop shortcuts need the desktop app - on web, use your browser\'s "Install" / "Add to home screen".');
+    this.showTransientNotice('Desktop shortcuts need the Yayra desktop app.');
   }
 
   /**
@@ -7108,49 +10765,286 @@ export class BrowserShell {
    */
   async openReadingMode() {
     const tab = this.getActiveTab();
-    if (this.nativeWebview && typeof this.nativeWebview.readerExtract === 'function' && tab) {
-      try {
-        const res = await this.nativeWebview.readerExtract(tab.id);
-        if (res && res.ok && Array.isArray(res.blocks) && res.blocks.length) {
-          this.renderReaderOverlay(res);
-          return;
-        }
-      } catch { /* fall through */ }
-      this.showTransientNotice("This page doesn't have readable article text.");
-      return;
+    if (!this.nativeWebview || typeof this.nativeWebview.readerExtract !== 'function' || !tab) {
+      this.showTransientNotice('Reading Mode can extract external page content in the Yayra desktop app.');
+      return false;
     }
-    this.showTransientNotice('Reading mode needs the desktop app - web pages here live in frames Yayra may not read.');
+    try {
+      const result = await this.nativeWebview.readerExtract(tab.id);
+      const blocks = Array.isArray(result?.blocks) ? result.blocks : [];
+      if (result?.ok && blocks.some((block) => String(block?.text || '').trim().length > 1)) {
+        this.renderReaderOverlay({ ...result, blocks, title: result.title || tab.title || 'Untitled article', url: result.url || tab.url });
+        return true;
+      }
+    } catch { /* extraction is best effort; the page remains open */ }
+    this.showTransientNotice("This page doesn't have readable article text.");
+    return false;
   }
 
-  renderReaderOverlay({ title, url, blocks }) {
+  renderReaderOverlay(result = {}) {
     if (typeof document === 'undefined' || !document.body) return;
-    document.getElementById('yayra-reader-overlay')?.remove();
+    document.getElementById('yayra-reader-overlay')?._yayraFinish?.();
+    const blocks = Array.isArray(result.blocks) ? result.blocks.slice(0, 600) : [];
+    const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+    const webUrl = (value) => { try { const u = new URL(String(value || ''), result.url); return /^https?:$/.test(u.protocol) ? u.href : ''; } catch { return ''; } };
+    const speech = [];
+    const sections = [];
+    let html = '';
+    let listOpen = false;
+    const closeList = () => { if (listOpen) { html += '</ul>'; listOpen = false; } };
+    for (let index = 0; index < blocks.length; index += 1) {
+      const block = blocks[index] || {};
+      const tag = String(block.tag || '').toLowerCase();
+      const type = String(block.type || 'text');
+      const text = String(block.text || block.alt || '').trim();
+      const src = webUrl(block.src);
+      if ((type === 'image' || type === 'figure' || tag === 'img' || tag === 'figure') && src) {
+        closeList();
+        html += `<figure class="fb-reader-figure"><img src="${esc(src)}" alt="${esc(block.alt || text)}" loading="lazy" /><figcaption>${esc(text)}</figcaption></figure>`;
+        continue;
+      }
+      if (text.length < 2) continue;
+      const id = `fb-reader-block-${index}`;
+      const speechIndex = speech.push(text) - 1;
+      const speechAttr = `id="${id}" data-reader-speech="${speechIndex}"`;
+      const segments = Array.isArray(block.segments) ? block.segments : [];
+      const richText = segments.length ? segments.map((segment) => {
+        const segmentText = esc(segment?.text || '');
+        const href = webUrl(segment?.href);
+        return href ? `<a href="#" data-reader-href="${esc(href)}">${segmentText}</a>` : segmentText;
+      }).join('') : esc(text);
+      if (/^h[1-4]$/.test(tag)) {
+        closeList();
+        sections.push({ id, text, speechIndex, level: Number(tag.slice(1)) });
+        const level = Math.min(4, Math.max(2, Number(tag.slice(1)) || 2));
+        html += `<h${level} ${speechAttr}>${richText}</h${level}>`;
+      } else if (type === 'list-item' || tag === 'li') {
+        if (!listOpen) { html += '<ul class="fb-reader-list">'; listOpen = true; }
+        html += `<li ${speechAttr}>${richText}</li>`;
+      } else {
+        closeList();
+        const element = type === 'quote' || tag === 'blockquote' ? 'blockquote' : type === 'code' || tag === 'pre' ? 'pre' : 'p';
+        html += `<${element} ${speechAttr}>${richText}</${element}>`;
+      }
+    }
+    closeList();
+    if (!speech.length) return;
+    const theme = ['dark', 'light', 'sepia'].includes(this.state.settings.readerTheme) ? this.state.settings.readerTheme : 'dark';
+    const fontSize = Math.max(14, Math.min(30, Number(this.state.settings.readerFontSize) || 19));
+    const minutes = Math.max(1, Number(result.readingMinutes) || Math.ceil(speech.join(' ').split(/\s+/).length / 220));
+    const toc = sections.map((section) => `<button type="button" class="fb-reader-toc-link" data-reader-section="${section.id}" data-level="${section.level}">${esc(section.text)}</button>`).join('');
     const overlay = document.createElement('div');
     overlay.id = 'yayra-reader-overlay';
-    overlay.style.cssText = 'position:fixed;inset:0;z-index:99998;background:var(--fb-bg,#101218);overflow:auto;';
-    const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;');
-    const body = blocks.map((b) => {
-      if (b.tag === 'h1' || b.tag === 'h2' || b.tag === 'h3') return `<h2 style="font:700 1.25rem/1.4 Georgia,serif;margin:1.4em 0 0.4em;">${esc(b.text)}</h2>`;
-      if (b.tag === 'li') return `<li style="margin:0.3em 0;">${esc(b.text)}</li>`;
-      return `<p style="margin:0.8em 0;">${esc(b.text)}</p>`;
-    }).join('');
+    overlay.className = 'fb-reader-overlay';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-label', 'Reading Mode');
     overlay.innerHTML = `
-      <div style="position:sticky;top:0;display:flex;justify-content:flex-end;padding:12px;background:linear-gradient(var(--fb-bg,#101218),transparent);">
-        <button class="fb-reader-close" style="padding:8px 16px;border:none;border-radius:10px;font-weight:600;cursor:pointer;background:var(--fb-bg-elevated,#232734);color:var(--fb-text-primary,#f3f4f6);">Close reader</button>
-      </div>
-      <article style="max-width:680px;margin:0 auto;padding:12px 20px 80px;color:var(--fb-text-primary,#e8eaf0);font:400 1.05rem/1.75 Georgia,serif;">
-        <h1 style="font:700 1.7rem/1.3 Georgia,serif;">${esc(title)}</h1>
-        <p style="font-size:0.8rem;color:var(--fb-text-secondary,#9ca3af);word-break:break-all;">${esc(url)}</p>
-        ${body}
-      </article>`;
+      <header class="fb-reader-topbar">
+        <div class="fb-reader-toolbar">
+          <button type="button" class="fb-reader-play" aria-label="Read aloud" title="Read aloud">${Icons.play}</button>
+          <button type="button" class="fb-reader-prev" aria-label="Previous section" title="Previous section">${Icons.arrowLeft}</button>
+          <button type="button" class="fb-reader-next" aria-label="Next section" title="Next section">${Icons.arrowRight}</button>
+          <button type="button" class="fb-reader-stop" aria-label="Stop reading" title="Stop reading">${Icons.stop}</button>
+          <label class="fb-reader-rate-label">Speed <select class="fb-reader-rate" aria-label="Read aloud speed"><option value="0.75">0.75×</option><option value="1">1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
+          <button type="button" class="fb-reader-smaller" aria-label="Decrease text size">A−</button><span class="fb-reader-size-value">${fontSize}px</span><button type="button" class="fb-reader-larger" aria-label="Increase text size">A+</button>
+          <button type="button" class="fb-reader-settings-toggle" aria-expanded="false" aria-controls="fb-reader-settings">${Icons.settings}<span>Settings</span></button>
+          <button type="button" class="fb-reader-pin" aria-pressed="${this.state.settings.readerPinned !== false}" title="Pin reader controls">${Icons.pin}</button>
+          <button type="button" class="fb-reader-close" aria-label="Close Reading Mode">${Icons.close}</button>
+        </div>
+        <div class="fb-reader-progress" role="progressbar" aria-label="Reading progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span></span></div>
+        <section class="fb-reader-settings" id="fb-reader-settings" hidden>
+          <label>Theme <select data-reader-pref="readerTheme"><option value="dark">Dark</option><option value="light">Light</option><option value="sepia">Sepia</option></select></label>
+          <label>Font <select data-reader-pref="readerFont"><option value="serif">Serif</option><option value="sans">Sans serif</option><option value="mono">Monospace</option></select></label>
+          <label>Text size <input type="range" min="14" max="30" step="1" data-reader-pref="readerFontSize" value="${fontSize}" /></label>
+          <label>Line height <select data-reader-pref="readerLineHeight"><option value="1.5">Compact</option><option value="1.75">Comfortable</option><option value="2">Relaxed</option></select></label>
+          <label>Letter spacing <select data-reader-pref="readerLetterSpacing"><option value="-0.02">Tight</option><option value="0">Normal</option><option value="0.03">Wide</option><option value="0.06">Extra wide</option></select></label>
+          <label>Width <select data-reader-pref="readerLayout"><option value="narrow">Narrow</option><option value="comfortable">Comfortable</option><option value="wide">Wide</option></select></label>
+          <label>Voice <select class="fb-reader-voice" data-reader-pref="readerVoice"><option value="">System default</option></select></label>
+          <label class="fb-reader-check"><input type="checkbox" data-reader-pref="readerLinks" /> Show links</label>
+          <label class="fb-reader-check"><input type="checkbox" data-reader-pref="readerImages" /> Show images</label>
+          <label class="fb-reader-check"><input type="checkbox" data-reader-pref="readerVoiceHighlight" /> Highlight read-aloud text</label>
+          <p class="fb-reader-speech-status" aria-live="polite"></p>
+        </section>
+      </header>
+      <div class="fb-reader-layout">
+        <nav class="fb-reader-toc" aria-label="Article sections">${toc || '<p>No headings in this article.</p>'}</nav>
+        <main class="fb-reader-article" data-reader-content>
+          <p class="fb-reader-source">${esc(result.siteName || (() => { try { return new URL(result.url).hostname; } catch { return ''; } })())} · ${minutes} min read · ${Number(result.wordCount) || speech.join(' ').split(/\s+/).filter(Boolean).length} words</p>
+          <h1>${esc(result.title || 'Untitled article')}</h1>
+          <div class="fb-reader-content">${html}</div>
+        </main>
+      </div>`;
+    overlay.dataset.theme = theme;
     document.body.appendChild(overlay);
-    // DESKTOP: hide the native page view (with snapshot) so the reader is
-    // visible above it; restore the live page on close.
     if (this.nativeWebview) this.setPageObscured(true);
-    overlay.querySelector('.fb-reader-close')?.addEventListener('click', () => {
+
+    const content = overlay.querySelector('.fb-reader-content');
+    const panel = overlay.querySelector('.fb-reader-settings');
+    const playButton = overlay.querySelector('.fb-reader-play');
+    const speechStatus = overlay.querySelector('.fb-reader-speech-status');
+    const synth = typeof window !== 'undefined' ? window.speechSynthesis : null;
+    const Utterance = typeof window !== 'undefined' ? window.SpeechSynthesisUtterance : null;
+    const supportsSpeech = Boolean(synth && Utterance);
+    let closed = false;
+    let voiceList = [];
+    let speechState = 'stopped';
+    let speechIndex = 0;
+    let speechToken = 0;
+    let currentUtterance = null;
+    let currentSection = 0;
+    const clearHighlight = () => content?.querySelectorAll('.is-speaking').forEach((node) => node.classList.remove('is-speaking'));
+    const updatePlay = () => {
+      if (!playButton) return;
+      playButton.innerHTML = speechState === 'speaking' ? Icons.pause : Icons.play;
+      playButton.setAttribute('aria-label', speechState === 'paused' ? 'Resume reading' : speechState === 'speaking' ? 'Pause reading' : 'Read aloud');
+    };
+    const refreshVoices = () => {
+      if (!synth || !overlay.isConnected) return;
+      try { voiceList = synth.getVoices() || []; } catch { voiceList = []; }
+      const select = overlay.querySelector('.fb-reader-voice');
+      if (!select) return;
+      const selected = this.state.settings.readerVoice || '';
+      select.innerHTML = '<option value="">System default</option>';
+      for (const voice of voiceList) {
+        const option = document.createElement('option');
+        option.value = voice.voiceURI || voice.name;
+        option.textContent = `${voice.name}${voice.lang ? ` (${voice.lang})` : ''}`;
+        select.appendChild(option);
+      }
+      select.value = selected;
+    };
+    const applyPrefs = () => {
+      const settings = this.state.settings;
+      overlay.dataset.theme = ['dark', 'light', 'sepia'].includes(settings.readerTheme) ? settings.readerTheme : 'dark';
+      overlay.dataset.font = ['serif', 'sans', 'mono'].includes(settings.readerFont) ? settings.readerFont : 'serif';
+      overlay.dataset.layout = ['narrow', 'comfortable', 'wide'].includes(settings.readerLayout) ? settings.readerLayout : 'comfortable';
+      overlay.dataset.showLinks = settings.readerLinks === false ? 'false' : 'true';
+      overlay.dataset.showImages = settings.readerImages === false ? 'false' : 'true';
+      overlay.dataset.highlight = settings.readerVoiceHighlight === false ? 'false' : 'true';
+      content?.style.setProperty('--fb-reader-font-size', `${Math.max(14, Math.min(30, Number(settings.readerFontSize) || 19))}px`);
+      content?.style.setProperty('--fb-reader-line-height', String(settings.readerLineHeight || '1.75'));
+      content?.style.setProperty('--fb-reader-letter-spacing', `${Number(settings.readerLetterSpacing) || 0}em`);
+      overlay.classList.toggle('is-pinned', settings.readerPinned !== false);
+      const sizeValue = overlay.querySelector('.fb-reader-size-value');
+      if (sizeValue) sizeValue.textContent = `${Math.max(14, Math.min(30, Number(settings.readerFontSize) || 19))}px`;
+      for (const control of overlay.querySelectorAll('[data-reader-pref]')) {
+        const key = control.getAttribute('data-reader-pref');
+        const value = settings[key];
+        if (control.type === 'checkbox') control.checked = value !== false;
+        else if (value !== undefined && value !== null) control.value = String(value);
+      }
+      const rate = overlay.querySelector('.fb-reader-rate');
+      if (rate) rate.value = String(settings.readerSpeechRate || 1);
+    };
+    const persistPref = (key, value) => {
+      this.state.settings[key] = value;
+      this.persistSettings();
+      applyPrefs();
+    };
+    const stopSpeech = (reset = true) => {
+      speechToken += 1;
+      try { synth?.cancel(); } catch { /* speech engine may be gone */ }
+      speechState = 'stopped'; currentUtterance = null;
+      if (reset) speechIndex = 0;
+      clearHighlight(); updatePlay();
+    };
+    const speak = (index, chained = false, scroll = false) => {
+      if (!supportsSpeech || !speech.length || closed) return;
+      if (index >= speech.length) { speechIndex = 0; speechState = 'stopped'; updatePlay(); return; }
+      if (!chained) { try { synth.cancel(); } catch { /* ignore */ } }
+      const token = ++speechToken;
+      speechIndex = index;
+      currentUtterance = new Utterance(speech[index]);
+      currentUtterance.rate = Math.max(0.5, Math.min(2, Number(this.state.settings.readerSpeechRate) || 1));
+      const voice = voiceList.find((item) => (item.voiceURI || item.name) === this.state.settings.readerVoice);
+      if (voice) currentUtterance.voice = voice;
+      currentUtterance.onstart = () => { if (token === speechToken && !closed) { speechState = 'speaking'; updatePlay(); } };
+      currentUtterance.onboundary = (event) => {
+        if (token !== speechToken || this.state.settings.readerVoiceHighlight === false) return;
+        const node = content?.querySelector(`[data-reader-speech="${index}"]`);
+        if (node) { node.classList.add('is-speaking'); node.style.setProperty('--fb-reader-voice-progress', `${Math.min(100, Math.round((event.charIndex / Math.max(1, speech[index].length)) * 100))}%`); }
+      };
+      currentUtterance.onend = () => {
+        if (token !== speechToken || closed) return;
+        clearHighlight();
+        if (index + 1 < speech.length) speak(index + 1, true);
+        else { speechState = 'stopped'; speechIndex = 0; currentUtterance = null; updatePlay(); }
+      };
+      currentUtterance.onerror = () => { if (token === speechToken && !closed) { speechState = 'stopped'; updatePlay(); if (speechStatus) speechStatus.textContent = 'Speech playback stopped by the system.'; } };
+      speechState = 'speaking'; updatePlay();
+      if (scroll) content?.querySelector(`[data-reader-speech="${index}"]`)?.scrollIntoView?.({ block: 'center', behavior: this.state.settings.reduceMotionForPerformance ? 'auto' : 'smooth' });
+      try { synth.speak(currentUtterance); } catch { speechState = 'stopped'; updatePlay(); }
+    };
+    const close = () => {
+      if (closed) return;
+      closed = true; stopSpeech();
+      try { synth?.removeEventListener?.('voiceschanged', refreshVoices); } catch { /* optional */ }
       overlay.remove();
+      if (this._readerOverlayCleanup === close) this._readerOverlayCleanup = null;
       if (this.nativeWebview) this.setPageObscured(false);
+    };
+    overlay._yayraFinish = close;
+    this._readerOverlayCleanup = close;
+    overlay.querySelector('.fb-reader-close')?.addEventListener('click', close);
+    overlay.querySelector('.fb-reader-settings-toggle')?.addEventListener('click', (event) => {
+      const button = event.currentTarget;
+      panel.hidden = !panel.hidden;
+      button.setAttribute('aria-expanded', panel.hidden ? 'false' : 'true');
     });
+    overlay.querySelector('.fb-reader-pin')?.addEventListener('click', () => persistPref('readerPinned', this.state.settings.readerPinned === false));
+    overlay.querySelector('.fb-reader-play')?.addEventListener('click', () => {
+      if (!supportsSpeech) { if (speechStatus) speechStatus.textContent = 'Read aloud is not supported in this browser build.'; return; }
+      if (speechState === 'paused') { try { synth.resume(); speechState = 'speaking'; updatePlay(); } catch { /* optional */ } }
+      else if (speechState === 'speaking') { try { synth.pause(); speechState = 'paused'; updatePlay(); } catch { /* optional */ } }
+      else speak(speechIndex, false, true);
+    });
+    overlay.querySelector('.fb-reader-stop')?.addEventListener('click', () => stopSpeech());
+    overlay.querySelector('.fb-reader-rate')?.addEventListener('change', (event) => persistPref('readerSpeechRate', Number(event.target.value) || 1));
+    overlay.querySelector('.fb-reader-smaller')?.addEventListener('click', () => persistPref('readerFontSize', Math.max(14, (Number(this.state.settings.readerFontSize) || 19) - 1)));
+    overlay.querySelector('.fb-reader-larger')?.addEventListener('click', () => persistPref('readerFontSize', Math.min(30, (Number(this.state.settings.readerFontSize) || 19) + 1)));
+    overlay.querySelector('.fb-reader-prev')?.addEventListener('click', () => goSection(-1));
+    overlay.querySelector('.fb-reader-next')?.addEventListener('click', () => goSection(1));
+    for (const control of overlay.querySelectorAll('[data-reader-pref]')) {
+      control.addEventListener(control.type === 'range' ? 'input' : 'change', (event) => {
+        const key = control.getAttribute('data-reader-pref');
+        const value = control.type === 'checkbox' ? Boolean(event.target.checked)
+          : ['readerFontSize', 'readerSpeechRate'].includes(key) ? Number(event.target.value)
+            : String(event.target.value || '');
+        persistPref(key, value);
+      });
+    }
+    const scrollToSection = (index) => {
+      if (!sections.length) return;
+      currentSection = Math.max(0, Math.min(sections.length - 1, index));
+      const section = sections[currentSection];
+      stopSpeech(false);
+      speechIndex = section.speechIndex;
+      overlay.querySelector(`#${section.id}`)?.scrollIntoView?.({ block: 'start', behavior: this.state.settings.reduceMotionForPerformance ? 'auto' : 'smooth' });
+      for (const item of overlay.querySelectorAll('.fb-reader-toc-link')) item.classList.toggle('active', item.getAttribute('data-reader-section') === section.id);
+    };
+    function goSection(delta) { scrollToSection(currentSection + delta); }
+    overlay.querySelectorAll('.fb-reader-toc-link').forEach((button, index) => button.addEventListener('click', () => scrollToSection(index)));
+    content?.addEventListener('click', (event) => {
+      const link = event.target?.closest?.('[data-reader-href]');
+      if (!link || this.state.settings.readerLinks === false) return;
+      event.preventDefault();
+      const href = webUrl(link.getAttribute('data-reader-href'));
+      if (!href) return;
+      close(); this.navigateActiveTab(href);
+    });
+    const progress = overlay.querySelector('.fb-reader-progress');
+    const updateProgress = () => {
+      if (!progress) return;
+      const max = Math.max(1, overlay.scrollHeight - overlay.clientHeight);
+      const value = Math.max(0, Math.min(100, Math.round((overlay.scrollTop / max) * 100)));
+      progress.setAttribute('aria-valuenow', String(value));
+      progress.querySelector('span').style.width = `${value}%`;
+    };
+    overlay.addEventListener('scroll', updateProgress, { passive: true });
+    if (supportsSpeech) { if (speechStatus) speechStatus.textContent = 'Read aloud uses your system speech voices.'; refreshVoices(); synth.addEventListener?.('voiceschanged', refreshVoices); }
+    else if (speechStatus) speechStatus.textContent = 'Read aloud is not available in this browser build.';
+    applyPrefs(); updatePlay(); updateProgress();
   }
 
   /**
@@ -7160,60 +11054,167 @@ export class BrowserShell {
    */
   async openTaskManagerModal() {
     if (typeof document === 'undefined' || !document.body) return;
+    this._taskManagerCleanup?.();
     document.getElementById('yayra-taskmgr-overlay')?.remove();
-
-    let metrics = null;
-    if (this.systemBridge && typeof this.systemBridge.appMetrics === 'function') {
-      try { metrics = await this.systemBridge.appMetrics(); } catch { metrics = null; }
-    }
-    const heap = (typeof performance !== 'undefined' && performance.memory)
-      ? Math.round(performance.memory.usedJSHeapSize / (1024 * 1024))
-      : null;
-
-    const esc = (s) => String(s || '').replace(/</g, '&lt;');
-    let rowsHtml = '';
-    if (metrics && Array.isArray(metrics.processes) && metrics.processes.length) {
-      rowsHtml = metrics.processes.map((p) => `
-        <tr>
-          <td style="padding:6px 10px;border-bottom:1px solid rgba(255,255,255,0.06);">${esc(p.label || p.type)}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid rgba(255,255,255,0.06);text-align:right;">${p.pid ?? '-'}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid rgba(255,255,255,0.06);text-align:right;">${Number.isFinite(p.cpu) ? `${p.cpu.toFixed(1)}%` : '-'}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid rgba(255,255,255,0.06);text-align:right;">${Number.isFinite(p.memoryMB) ? `${p.memoryMB} MB` : '-'}</td>
-        </tr>`).join('');
-    }
-    const heapLine = heap !== null
-      ? `<p style="margin:8px 0 0;font-size:0.8rem;color:var(--fb-text-secondary,#9ca3af);">This window's JS heap: ${heap} MB &middot; ${this.state.tabs.length} tab(s) open</p>`
-      : `<p style="margin:8px 0 0;font-size:0.8rem;color:var(--fb-text-secondary,#9ca3af);">${this.state.tabs.length} tab(s) open</p>`;
-    const table = rowsHtml
-      ? `<table style="width:100%;border-collapse:collapse;font-size:0.84rem;">
-           <thead><tr>
-             <th style="text-align:left;padding:6px 10px;color:var(--fb-text-secondary,#9ca3af);font-weight:600;">Process</th>
-             <th style="text-align:right;padding:6px 10px;color:var(--fb-text-secondary,#9ca3af);font-weight:600;">PID</th>
-             <th style="text-align:right;padding:6px 10px;color:var(--fb-text-secondary,#9ca3af);font-weight:600;">CPU</th>
-             <th style="text-align:right;padding:6px 10px;color:var(--fb-text-secondary,#9ca3af);font-weight:600;">Memory</th>
-           </tr></thead><tbody>${rowsHtml}</tbody></table>`
-      : '<p style="margin:0;font-size:0.84rem;color:var(--fb-text-secondary,#9ca3af);">Per-process metrics are only available in the desktop app. Your browser\'s own task manager (Shift+Esc in Chrome) covers this tab here.</p>';
 
     const overlay = document.createElement('div');
     overlay.id = 'yayra-taskmgr-overlay';
-    overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(8,10,16,0.62);display:flex;align-items:center;justify-content:center;';
+    overlay.className = 'fb-taskmgr-overlay';
     overlay.innerHTML = `
-      <div style="background:var(--fb-bg-elevated,#171a22);color:var(--fb-text-primary,#f3f4f6);border-radius:16px;padding:22px;max-width:560px;width:94%;max-height:72vh;overflow:auto;box-shadow:0 18px 60px rgba(0,0,0,0.5);">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
-          <strong style="font-size:1.05rem;">Performance &amp; Task Manager</strong>
-          <button class="fb-taskmgr-close" style="border:none;background:transparent;color:inherit;font-size:18px;cursor:pointer;">×</button>
+      <section class="fb-taskmgr-panel" role="dialog" aria-modal="true" aria-labelledby="fb-taskmgr-title">
+        <header class="fb-taskmgr-header">
+          <div><h2 id="fb-taskmgr-title">Task Manager</h2><p>Live process readings from the Yayra desktop app.</p></div>
+          <button type="button" class="fb-taskmgr-close" aria-label="Close Task Manager">${Icons.close}</button>
+        </header>
+        <div class="fb-taskmgr-summary">
+          <div><span>Open tabs</span><strong data-metric="tabs">${this.state.tabs.length}</strong></div>
+          <div><span>Total CPU</span><strong data-metric="cpu">—</strong></div>
+          <div><span>Working set</span><strong data-metric="memory">—</strong></div>
         </div>
-        ${table}
-        ${heapLine}
-      </div>`;
+        <p class="fb-taskmgr-status" aria-live="polite">Fetching live metrics…</p>
+        <section class="fb-taskmgr-section">
+          <h3>Tabs</h3>
+          <div class="fb-taskmgr-table-wrap"><table><thead><tr><th>Tab</th><th>PID</th><th>CPU</th><th>Memory</th><th></th></tr></thead><tbody data-rows="tabs"></tbody></table></div>
+        </section>
+        <section class="fb-taskmgr-section">
+          <h3>Desktop processes</h3>
+          <div class="fb-taskmgr-table-wrap"><table><thead><tr><th>Process</th><th>PID</th><th>CPU</th><th>Memory</th></tr></thead><tbody data-rows="processes"></tbody></table></div>
+        </section>
+        <footer class="fb-taskmgr-footer"><span data-heap>Renderer JS heap: not exposed by this build.</span><button type="button" class="fb-btn fb-btn-secondary fb-taskmgr-refresh">${Icons.refresh} Refresh</button></footer>
+      </section>`;
     document.body.appendChild(overlay);
     if (this.nativeWebview) this.setPageObscured(true);
+
+    const processRows = overlay.querySelector('[data-rows="processes"]');
+    const tabRows = overlay.querySelector('[data-rows="tabs"]');
+    const status = overlay.querySelector('.fb-taskmgr-status');
+    const refreshButton = overlay.querySelector('.fb-taskmgr-refresh');
+    const clearRows = (tbody) => { if (tbody) tbody.innerHTML = ''; };
+    const addCell = (row, value, className = '') => {
+      const cell = document.createElement('td');
+      if (className) cell.className = className;
+      cell.textContent = value == null || value === '' ? '—' : String(value);
+      row.appendChild(cell);
+      return cell;
+    };
+    const addEmptyRow = (tbody, colspan, message) => {
+      const row = document.createElement('tr');
+      const cell = document.createElement('td');
+      cell.colSpan = colspan;
+      cell.className = 'fb-taskmgr-empty';
+      cell.textContent = message;
+      row.appendChild(cell);
+      tbody?.appendChild(row);
+    };
+    const formatCpu = (value) => Number.isFinite(value) ? `${value.toFixed(1)}%` : '—';
+    const formatMemory = (value) => Number.isFinite(value) ? `${value.toFixed(1)} MiB` : '—';
+    let closed = false;
+    let refreshing = false;
+    let timer = null;
     const close = () => {
+      if (closed) return;
+      closed = true;
+      if (timer) clearInterval(timer);
+      timer = null;
       overlay.remove();
+      if (this._taskManagerCleanup === close) this._taskManagerCleanup = null;
       if (this.nativeWebview) this.setPageObscured(false);
     };
-    overlay.addEventListener('pointerdown', (e) => { if (e.target === overlay) close(); });
+    overlay._yayraFinish = close;
+    this._taskManagerCleanup = close;
+
+    const refresh = async () => {
+      if (closed || refreshing) return;
+      refreshing = true;
+      if (refreshButton) refreshButton.disabled = true;
+      clearRows(processRows);
+      clearRows(tabRows);
+      const tabValue = overlay.querySelector('[data-metric="tabs"]');
+      if (tabValue) tabValue.textContent = String(this.state.tabs.length);
+      try {
+        const [metrics, tabProcesses] = await Promise.all([
+          typeof this.systemBridge?.appMetrics === 'function' ? Promise.resolve().then(() => this.systemBridge.appMetrics()).catch(() => null) : Promise.resolve(null),
+          typeof this.nativeWebview?.taskTabs === 'function' ? Promise.resolve().then(() => this.nativeWebview.taskTabs()).catch(() => null) : Promise.resolve(null)
+        ]);
+        if (closed) return;
+        const processes = metrics?.ok && Array.isArray(metrics.processes) ? metrics.processes : [];
+        const cpuValues = processes.map((p) => p.cpu).filter(Number.isFinite);
+        const memoryValues = processes.map((p) => p.memoryMiB).filter(Number.isFinite);
+        const cpuValue = overlay.querySelector('[data-metric="cpu"]');
+        const memoryValue = overlay.querySelector('[data-metric="memory"]');
+        if (cpuValue) cpuValue.textContent = cpuValues.length ? formatCpu(cpuValues.reduce((sum, value) => sum + value, 0)) : '—';
+        if (memoryValue) memoryValue.textContent = memoryValues.length ? formatMemory(memoryValues.reduce((sum, value) => sum + value, 0)) : '—';
+
+        const processByPid = new Map(processes.map((p) => [Number(p.pid), p]).filter(([pid]) => Number.isInteger(pid) && pid > 0));
+        const tabPid = new Map((Array.isArray(tabProcesses?.tabs) ? tabProcesses.tabs : []).map((item) => [String(item.tabId), Number(item.pid) || null]));
+        const pidCounts = new Map();
+        for (const pid of tabPid.values()) if (pid) pidCounts.set(pid, (pidCounts.get(pid) || 0) + 1);
+
+        if (!this.state.tabs.length) addEmptyRow(tabRows, 5, 'No open tabs.');
+        else for (const tab of this.state.tabs) {
+          const row = document.createElement('tr');
+          const titleCell = document.createElement('td');
+          titleCell.className = 'fb-taskmgr-tab-title';
+          const title = document.createElement('strong');
+          title.textContent = this.getTabTitle(tab) || 'Untitled tab';
+          const address = document.createElement('small');
+          try { address.textContent = new URL(tab.url).host; } catch { address.textContent = tab.url || 'New Tab'; }
+          titleCell.appendChild(title); titleCell.appendChild(address); row.appendChild(titleCell);
+          const pid = tabPid.get(String(tab.id));
+          const process = pid ? processByPid.get(pid) : null;
+          addCell(row, pid || '—');
+          addCell(row, pid && pidCounts.get(pid) > 1 ? 'Shared' : formatCpu(process?.cpu));
+          addCell(row, pid && pidCounts.get(pid) > 1 ? 'Shared' : formatMemory(process?.memoryMiB));
+          const actionCell = document.createElement('td');
+          const closeTabButton = document.createElement('button');
+          closeTabButton.type = 'button'; closeTabButton.className = 'fb-taskmgr-close-tab';
+          closeTabButton.setAttribute('data-close-tab', String(tab.id)); closeTabButton.textContent = 'Close';
+          closeTabButton.setAttribute('aria-label', `Close ${this.getTabTitle(tab)}`);
+          actionCell.appendChild(closeTabButton); row.appendChild(actionCell);
+          tabRows?.appendChild(row);
+        }
+
+        if (!metrics?.ok) addEmptyRow(processRows, 4, 'Desktop process metrics are unavailable in this build.');
+        else if (!processes.length) addEmptyRow(processRows, 4, 'No process metrics were returned.');
+        else for (const process of processes) {
+          const row = document.createElement('tr');
+          addCell(row, `${process.label || 'Process'}${process.type ? ` · ${process.type}` : ''}`);
+          addCell(row, process.pid);
+          addCell(row, formatCpu(process.cpu));
+          addCell(row, formatMemory(process.memoryMiB));
+          processRows?.appendChild(row);
+        }
+        if (status) {
+          const sampled = Number.isFinite(metrics?.sampledAt) ? new Date(metrics.sampledAt).toLocaleTimeString() : 'just now';
+          status.textContent = metrics?.ok
+            ? `Updated ${sampled}. CPU is sampled between readings; shared renderer processes are labelled as shared.`
+            : 'Live process rows require the Yayra desktop app; tab names remain available here.';
+        }
+        const heap = typeof performance !== 'undefined' && Number.isFinite(performance.memory?.usedJSHeapSize)
+          ? `${(performance.memory.usedJSHeapSize / (1024 * 1024)).toFixed(1)} MiB`
+          : 'not exposed by this build';
+        const heapLabel = overlay.querySelector('[data-heap]');
+        if (heapLabel) heapLabel.textContent = `This shell renderer JS heap: ${heap}`;
+      } catch {
+        if (status) status.textContent = 'Could not refresh process metrics. Use Refresh to try again.';
+        addEmptyRow(processRows, 4, 'Metrics are temporarily unavailable.');
+      } finally {
+        refreshing = false;
+        if (!closed && refreshButton) refreshButton.disabled = false;
+      }
+    };
+
+    overlay.addEventListener('click', (event) => {
+      const button = event.target?.closest?.('[data-close-tab]');
+      const tabId = button?.getAttribute('data-close-tab');
+      if (tabId) this.closeTab(tabId);
+      if (event.target === overlay) close();
+    });
     overlay.querySelector('.fb-taskmgr-close')?.addEventListener('click', close);
+    refreshButton?.addEventListener('click', refresh);
+    refresh();
+    timer = setInterval(refresh, 2000);
+    timer?.unref?.();
   }
 
   /** Bookmark every open web tab (menu + Ctrl+Shift+D). */
@@ -7226,7 +11227,7 @@ export class BrowserShell {
           saved += 1;
         }
       }
-      try { this.state.bookmarksItems = await this.bookmarksRepo.getAllBookmarks(); } catch { /* keep stale list */ }
+      try { await this.refreshBookmarksState(); } catch { /* keep stale list */ }
       const active = this.getActiveTab();
       if (active) await this.updateBookmarkState(active.url);
     }
@@ -7318,7 +11319,7 @@ export class BrowserShell {
     for (const b of parsed) {
       if (!before.has(b.url)) await this.bookmarksRepo.addBookmark({ url: b.url, title: b.title });
     }
-    try { this.state.bookmarksItems = await this.bookmarksRepo.getAllBookmarks(); } catch { /* keep stale list */ }
+    try { await this.refreshBookmarksState(); } catch { /* keep stale list */ }
     const added = this.state.bookmarksItems.filter((b) => !before.has(b.url)).length;
     this.render();
     this.showTransientNotice(added > 0
@@ -7340,23 +11341,99 @@ export class BrowserShell {
     return { name, color };
   }
 
+  tabGroupIdentity(group, isPrivate = false) {
+    const safeGroup = this.sanitizeTabGroup(group);
+    if (!safeGroup) return null;
+    const privacyScope = isPrivate ? 'private::' : '';
+    return `${privacyScope}${safeGroup.name.toLocaleLowerCase()}::${safeGroup.color.toLowerCase()}`;
+  }
+
   getTabGroups() {
     const groups = new Map();
-    for (const tab of this.state.tabs || []) {
+    const addMember = (tab, fromRestore = false) => {
       const group = this.sanitizeTabGroup(tab?.group);
-      if (!group) continue;
-      const id = `${group.name.toLocaleLowerCase()}::${group.color.toLowerCase()}`;
-      if (!groups.has(id)) groups.set(id, { id, name: group.name, color: group.color, tabs: [] });
-      groups.get(id).tabs.push(tab);
-    }
-    return Array.from(groups.values());
+      if (!group) return;
+      // Private groups are ephemeral and never merge with the normal
+      // profile's groups, even when their names and colours are identical.
+      const isPrivate = fromRestore ? false : Boolean(tab.isPrivate);
+      const id = this.tabGroupIdentity(group, isPrivate);
+      if (!groups.has(id)) groups.set(id, { id, name: group.name, color: group.color, isPrivate, tabs: [], _keys: new Set() });
+      const record = groups.get(id);
+      const url = String(tab.url || '');
+      // A recovered session row and its already-open counterpart represent
+      // one member. Live duplicate tabs still remain distinct by tab id.
+      if (fromRestore && record.tabs.some((member) => member.url === url)) return;
+      const key = tab.id ? `tab:${tab.id}` : `restore:${url}`;
+      if (record._keys.has(key)) return;
+      record._keys.add(key);
+      record.tabs.push(tab);
+    };
+    for (const tab of this.state.tabs || []) addMember(tab);
+    for (const tab of this.state.tabGroupRestoreTabs || []) addMember(tab, true);
+    return Array.from(groups.values(), ({ _keys, ...group }) => group);
   }
 
   openTabGroup(groupId) {
     const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
     if (!group || !group.tabs.length) return false;
-    const target = group.tabs.find((tab) => tab.id === this.state.activeTabId) || group.tabs[0];
+    const groupData = { name: group.name, color: group.color };
+    const openedMembers = [];
+    const restoredEntries = [];
+
+    for (const member of group.tabs) {
+      const liveTab = member.id
+        ? this.state.tabs.find((tab) => tab.id === member.id)
+        : null;
+      if (liveTab) {
+        openedMembers.push(liveTab);
+        continue;
+      }
+
+      const saved = (this.state.tabGroupRestoreTabs || []).find((entry) =>
+        entry.url === member.url && this.tabGroupIdentity(entry.group, false) === group.id);
+      if (!saved || !/^https?:\/\//i.test(String(saved.url || ''))) continue;
+
+      const alreadyGrouped = this.state.tabs.find((tab) =>
+        !tab.isPrivate && tab.url === saved.url
+        && this.tabGroupIdentity(tab.group, false) === group.id);
+      if (alreadyGrouped) {
+        openedMembers.push(alreadyGrouped);
+        restoredEntries.push(saved);
+        continue;
+      }
+
+      // Reuse an identical ungrouped tab rather than opening a duplicate;
+      // tabs in a different group are left alone and get their own copy.
+      const ungrouped = this.state.tabs.find((tab) =>
+        !tab.isPrivate && tab.url === saved.url && !this.sanitizeTabGroup(tab.group));
+      if (ungrouped) {
+        ungrouped.group = groupData;
+        openedMembers.push(ungrouped);
+        restoredEntries.push(saved);
+        continue;
+      }
+
+      const restored = this.createNewTab(false, { group: groupData, render: false });
+      this.navigateActiveTab(saved.url);
+      if (saved.title) restored.title = String(saved.title).slice(0, 120);
+      openedMembers.push(restored);
+      restoredEntries.push(saved);
+    }
+
+    if (!openedMembers.length) return false;
+    if (restoredEntries.length) {
+      const restoredUrls = new Set(restoredEntries.map((entry) => entry.url));
+      this.state.tabGroupRestoreTabs = (this.state.tabGroupRestoreTabs || []).filter((entry) =>
+        !(this.tabGroupIdentity(entry.group, false) === group.id && restoredUrls.has(entry.url)));
+      this.state.continueTabs = (this.state.continueTabs || []).filter((entry) =>
+        !(this.tabGroupIdentity(entry.group, false) === group.id && restoredUrls.has(entry.url)));
+    }
+
+    const target = openedMembers[0];
     this.selectTab(target.id);
+    if (restoredEntries.length) {
+      this.showTransientNotice(`Opened ${restoredEntries.length} saved tab${restoredEntries.length === 1 ? '' : 's'} from “${group.name}”.`);
+    }
     return true;
   }
 
@@ -7367,7 +11444,8 @@ export class BrowserShell {
       title: 'Rename tab group',
       description: 'Choose a name for this group of tabs.',
       placeholder: 'e.g. Research, Shopping, Work',
-      initialValue: group.name
+      initialValue: group.name,
+      placement: 'tab-groups'
     });
     if (prompted === null || prompted === undefined) return false;
     const name = String(prompted).replace(/\s+/g, ' ').trim().slice(0, 48);
@@ -7376,10 +11454,15 @@ export class BrowserShell {
       return false;
     }
     for (const tab of this.state.tabs) {
-      const current = this.sanitizeTabGroup(tab.group);
-      if (current && `${current.name.toLocaleLowerCase()}::${current.color.toLowerCase()}` === groupId) {
+      if (this.tabGroupIdentity(tab.group, tab.isPrivate) === groupId) {
         tab.group = { name, color: group.color };
       }
+    }
+    for (const tab of this.state.tabGroupRestoreTabs || []) {
+      if (this.tabGroupIdentity(tab.group, false) === groupId) tab.group = { name, color: group.color };
+    }
+    for (const tab of this.state.continueTabs || []) {
+      if (this.tabGroupIdentity(tab.group, false) === groupId) tab.group = { name, color: group.color };
     }
     this.render();
     this.showTransientNotice(`Tab group renamed to “${name}”.`);
@@ -7389,28 +11472,55 @@ export class BrowserShell {
   ungroupTabGroup(groupId) {
     const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
     if (!group) return 0;
-    const memberIds = new Set(group.tabs.map((tab) => tab.id));
+    let changed = 0;
     for (const tab of this.state.tabs) {
-      if (memberIds.has(tab.id)) tab.group = null;
+      if (this.tabGroupIdentity(tab.group, tab.isPrivate) === groupId) {
+        tab.group = null;
+        changed += 1;
+      }
+    }
+    this.state.tabGroupRestoreTabs = (this.state.tabGroupRestoreTabs || []).filter((tab) =>
+      this.tabGroupIdentity(tab.group, false) !== groupId);
+    for (const tab of this.state.continueTabs || []) {
+      if (this.tabGroupIdentity(tab.group, false) === groupId) tab.group = null;
     }
     this.render();
-    this.showTransientNotice(`“${group.name}” ungrouped - its tabs stay open.`);
-    return memberIds.size;
+    this.showTransientNotice(`“${group.name}” ungrouped - its open tabs stay open.`);
+    return changed;
   }
 
-  ungroupCurrentTab() {
-    const tab = this.getActiveTab();
+  ungroupTab(tabId) {
+    const tab = this.state.tabs.find((candidate) => candidate.id === tabId);
     if (!tab?.group) return false;
+    const groupId = this.tabGroupIdentity(tab.group, tab.isPrivate);
     const name = this.sanitizeTabGroup(tab.group)?.name || 'Tab group';
     tab.group = null;
+    // A previous-session copy of this same member should not make it appear
+    // grouped again after this tab was explicitly ungrouped.
+    this.state.tabGroupRestoreTabs = (this.state.tabGroupRestoreTabs || []).filter((entry) =>
+      !(this.tabGroupIdentity(entry.group, false) === groupId && entry.url === tab.url));
+    for (const entry of this.state.continueTabs || []) {
+      if (this.tabGroupIdentity(entry.group, false) === groupId && entry.url === tab.url) entry.group = null;
+    }
     this.render();
     this.showTransientNotice(`This tab was removed from “${name}”.`);
     return true;
   }
 
+  ungroupCurrentTab() {
+    const tab = this.getActiveTab();
+    return tab ? this.ungroupTab(tab.id) : false;
+  }
+
   openTabGroupsSettings() {
     this.state.settingsActiveCategory = 'tab-groups';
     this.state.activeSettingsCategory = 'tab-groups';
+    this.openInternalPage('yayra://settings');
+  }
+
+  openPerformanceSettings() {
+    this.state.settingsActiveCategory = 'performance';
+    this.state.activeSettingsCategory = 'performance';
     this.openInternalPage('yayra://settings');
   }
 
@@ -7441,7 +11551,7 @@ export class BrowserShell {
       details.textContent = `${group.tabs.length} tab${group.tabs.length === 1 ? '' : 's'} · ${group.tabs.map((tab) => this.getTabTitle(tab)).join(', ')}`;
       const open = document.createElement('span');
       open.className = 'fb-tab-group-picker-open';
-      open.textContent = 'Open';
+      open.textContent = group.tabs.length > 1 ? 'Open all' : 'Open';
       copy.appendChild(title);
       copy.appendChild(details);
       item.appendChild(swatch);
@@ -7503,15 +11613,84 @@ export class BrowserShell {
     }
   }
 
+  renderShortcutsSettingsList(container) {
+    if (!container) return;
+    container.innerHTML = '';
+    const shortcuts = Array.isArray(this.state.userShortcuts) ? this.state.userShortcuts : [];
+    if (!shortcuts.length) {
+      const empty = document.createElement('p');
+      empty.className = 'fb-shortcuts-settings-empty';
+      empty.textContent = 'No website shortcuts yet. Add one here or use “Add to New Tab shortcuts” from a website.';
+      container.appendChild(empty);
+      return;
+    }
+
+    for (const shortcut of shortcuts) {
+      const card = document.createElement('article');
+      card.className = 'fb-shortcut-settings-card';
+      const icon = document.createElement('span');
+      icon.className = 'fb-shortcut-settings-icon';
+      icon.innerHTML = this.frequentSiteIconHtml(shortcut);
+      const copy = document.createElement('span');
+      copy.className = 'fb-shortcut-settings-copy';
+      const title = document.createElement('strong');
+      title.textContent = shortcut.title || shortcut.url;
+      const url = document.createElement('small');
+      url.textContent = shortcut.url;
+      copy.appendChild(title);
+      copy.appendChild(url);
+      const actions = document.createElement('div');
+      actions.className = 'fb-shortcut-settings-actions';
+      const edit = document.createElement('button');
+      edit.type = 'button';
+      edit.className = 'fb-btn fb-btn-secondary fb-shortcut-settings-edit';
+      edit.textContent = 'Edit';
+      edit.setAttribute('aria-label', `Edit shortcut ${shortcut.title || shortcut.url}`);
+      edit.addEventListener('click', () => {
+        this._editingShortcut = shortcut;
+        this.openModal('edit-shortcut');
+      });
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'fb-btn fb-btn-secondary fb-shortcut-settings-remove';
+      remove.textContent = 'Remove';
+      remove.setAttribute('aria-label', `Remove shortcut ${shortcut.title || shortcut.url}`);
+      remove.addEventListener('click', async () => {
+        if (!this.shortcutsRepo?.removeShortcut || !this.shortcutsRepo?.getShortcuts) return;
+        remove.disabled = true;
+        try {
+          await this.shortcutsRepo.removeShortcut(shortcut.id);
+          this.state.userShortcuts = await this.shortcutsRepo.getShortcuts();
+          this.render();
+          this.showTransientNotice('Removed from your New Tab shortcuts.');
+        } catch {
+          remove.disabled = false;
+          this.showTransientNotice('Could not remove this shortcut.');
+        }
+      });
+      actions.appendChild(edit);
+      actions.appendChild(remove);
+      card.appendChild(icon);
+      card.appendChild(copy);
+      card.appendChild(actions);
+      container.appendChild(card);
+    }
+  }
+
   renderTabGroupsModal(modal) {
-    modal.className = 'fb-modal-card fb-tab-groups-modal';
+    // Tab groups is a compact toolbar popover, not a centered full-screen
+    // modal. The transparent click-away layer mirrors Connection is Secure.
+    modal.className = 'fb-modal-card fb-tab-groups-modal fb-tab-groups-popover';
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'false');
+    modal.setAttribute('aria-label', 'Tab groups');
     modal.innerHTML = `
       <div class="fb-modal-header">
         <h2 class="fb-modal-title">${Icons.tabGroup} Tab groups</h2>
         <button class="fb-modal-close-btn" aria-label="Close tab groups">${Icons.close}</button>
       </div>
       <div class="fb-modal-body fb-tab-groups-modal-body">
-        <p class="fb-tab-groups-modal-description">Choose a group to switch straight to one of its tabs.</p>
+        <p class="fb-tab-groups-modal-description">Choose a group to open all of its tabs. Tabs already open stay open; the first group tab becomes active.</p>
         <div class="fb-tab-groups-picker-list"></div>
         <div class="fb-tab-groups-modal-actions">
           <button class="fb-btn fb-btn-primary fb-tab-groups-create-btn">${Icons.plus} New group</button>
@@ -7547,62 +11726,118 @@ export class BrowserShell {
     return free || BrowserShell.TAB_GROUP_COLORS[this.state.tabs.length % BrowserShell.TAB_GROUP_COLORS.length];
   }
 
-  /** Create a named, colour-coded tab group from the active tab + open a
-   *  fresh tab inside it (exactly like Chrome's "New tab group"). */
+  /** Create a named group from the active tab and a fresh tab in one render. */
   async createTabGroup() {
     const tab = this.getActiveTab();
-    if (!tab) return;
-    const name = await this._textPromptDialog({
+    if (!tab) return false;
+    const prompted = await this._textPromptDialog({
       title: 'New tab group',
-      description: 'Tabs in a group share a colour dot in the tab strip.',
+      description: 'Give this group a name. The current tab and a fresh tab will be added.',
       placeholder: 'e.g. Research, Shopping, Work',
-      initialValue: ''
+      initialValue: '',
+      placement: 'tab-groups'
     });
-    if (name === null) return;
-    const groupName = String(name || '').replace(/\s+/g, ' ').trim().slice(0, 48) || 'Group';
-    const color = this._nextTabGroupColor();
-    tab.group = { name: groupName, color };
+    if (prompted === null || prompted === undefined) return false;
+    const groupName = String(prompted).replace(/\s+/g, ' ').trim().slice(0, 48);
+    if (!groupName) {
+      this.showTransientNotice('Enter a name to create the tab group.');
+      return false;
+    }
+    const existing = this.getTabGroups().find((candidate) =>
+      candidate.isPrivate === Boolean(tab.isPrivate)
+      && candidate.name.toLocaleLowerCase() === groupName.toLocaleLowerCase());
+    const group = existing
+      ? { name: existing.name, color: existing.color }
+      : { name: groupName, color: this._nextTabGroupColor() };
+    tab.group = group;
+    this.createNewTab(Boolean(tab.isPrivate), { group, render: false });
     this.render();
-    this.showTransientNotice(`Group \u201C${groupName}\u201D created - new tabs open into it until you ungroup.`);
-    this.createNewTab();
-    const fresh = this.getActiveTab();
-    if (fresh) fresh.group = { name: groupName, color };
+    this.showTransientNotice(`Group “${group.name}” created with the current tab and a new tab.`);
+    return true;
+  }
+
+  async groupTabWithPrompt(tabId, { title, description, placeholder, initialValue = '' } = {}) {
+    const tab = this.state.tabs.find((candidate) => candidate.id === tabId);
+    if (!tab) return false;
+    const prompted = await this._textPromptDialog({
+      title,
+      description,
+      placeholder,
+      initialValue,
+      placement: 'tab-groups'
+    });
+    if (prompted === null || prompted === undefined) return false;
+    const groupName = String(prompted).replace(/\s+/g, ' ').trim().slice(0, 48);
+    if (!groupName) {
+      this.showTransientNotice('Group name was empty - tab left ungrouped.');
+      return false;
+    }
+    const existing = this.getTabGroups().find((candidate) =>
+      candidate.isPrivate === Boolean(tab.isPrivate)
+      && candidate.name.toLocaleLowerCase() === groupName.toLocaleLowerCase());
+    const group = existing
+      ? { name: existing.name, color: existing.color }
+      : { name: groupName, color: this._nextTabGroupColor() };
+    tab.group = group;
     this.render();
+    this.showTransientNotice(`“${this.getTabTitle(tab)}” added to group “${group.name}”.`);
+    return true;
+  }
+
+  /** Add a tab to a selected existing group without prompting. */
+  addTabToExistingGroup(tabId, groupId) {
+    const tab = this.state.tabs.find((candidate) => candidate.id === tabId);
+    const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
+    if (!tab || !group || Boolean(tab.isPrivate) !== Boolean(group.isPrivate)) return false;
+    if (this.tabGroupIdentity(tab.group, tab.isPrivate) === group.id) return true;
+    tab.group = { name: group.name, color: group.color };
+    this.render();
+    this.showTransientNotice(`“${this.getTabTitle(tab)}” added to group “${group.name}”.`);
+    return true;
   }
 
   /** Add the active tab to a named group (Chrome's "Group current tab"). */
-  async groupCurrentTab() {
+  groupCurrentTab() {
     const tab = this.getActiveTab();
-    if (!tab) return;
-    const name = await this._textPromptDialog({
+    if (!tab) return false;
+    return this.groupTabWithPrompt(tab.id, {
       title: 'Group current tab',
       description: 'Give the group a name - tabs in it share a colour dot.',
       placeholder: 'e.g. Research',
       initialValue: tab.group ? tab.group.name : ''
     });
-    if (name === null) return;
-    const groupName = String(name || '').replace(/\s+/g, ' ').trim().slice(0, 48);
-    if (!groupName) {
-      this.showTransientNotice('Group name was empty - tab left ungrouped.');
-      return;
-    }
-    const existing = this.getTabGroups().find((candidate) => candidate.name.toLocaleLowerCase() === groupName.toLocaleLowerCase());
-    tab.group = existing
-      ? { name: existing.name, color: existing.color }
-      : { name: groupName, color: this._nextTabGroupColor() };
-    this.render();
-    this.showTransientNotice(`\u201C${tab.title || 'Tab'}\u201D added to group \u201C${groupName}\u201D.`);
+  }
+
+  /** Create a group around the tab that was right-clicked in the strip. */
+  createTabGroupForTab(tabId) {
+    return this.groupTabWithPrompt(tabId, {
+      title: 'Create tab group',
+      description: 'Add this tab to a new group. You can add more tabs from their right-click menus.',
+      placeholder: 'e.g. Research',
+      initialValue: ''
+    });
   }
 
   /** Remove every tab from its group (Chrome's "Ungroup"). */
   ungroupAllTabs() {
     let count = 0;
+    const openMembers = new Set();
     for (const tab of this.state.tabs) {
       if (tab.group) {
+        const id = this.tabGroupIdentity(tab.group, tab.isPrivate);
+        openMembers.add(`${id}::${tab.url}`);
         tab.group = null;
         count += 1;
       }
     }
+    for (const tab of this.state.tabGroupRestoreTabs || []) {
+      if (tab.group) {
+        const key = `${this.tabGroupIdentity(tab.group, false)}::${tab.url}`;
+        if (!openMembers.has(key)) count += 1;
+        tab.group = null;
+      }
+    }
+    for (const tab of this.state.continueTabs || []) tab.group = null;
     this.render();
     this.showTransientNotice(count > 0
       ? `${count} tab${count === 1 ? '' : 's'} removed from their group${count === 1 ? '' : 's'}.`
@@ -7656,6 +11891,434 @@ export class BrowserShell {
     this.showTransientNotice(`Translating this page to \u201C${target}\u201D\u2026`);
   }
 
+  /**
+   * Install the text interaction layer once per shell.
+   *
+   * - custom cursor themes recover Chromium's native I-beam over actual text
+   *   nodes instead of showing Yayra's arrow/hand everywhere;
+   * - drag, keyboard, and touch selections reveal an unobtrusive action bar;
+   * - any outside press dismisses that bar without consuming the user's click.
+   */
+  installTextInteractionEnhancements() {
+    if (this._selectionActionsInstalled || typeof document === 'undefined') return false;
+    const doc = document;
+    if (typeof doc.addEventListener !== 'function') return false;
+    this._selectionActionsInstalled = true;
+    const bind = (target, type, listener, options = false) => {
+      if (!target || typeof target.addEventListener !== 'function') return;
+      target.addEventListener(type, listener, options);
+      this._selectionActionBindings.push([target, type, listener, options]);
+    };
+
+    const onPointerDown = (event) => {
+      const toolbar = this._selectionToolbar;
+      if (toolbar && (event?.target === toolbar || toolbar.contains?.(event?.target))) return;
+      // Remember the old range so a simple click can close the action bar even
+      // on a browser that leaves the visual highlight in place.
+      this.dismissSelectionToolbar({ rememberSelection: true });
+      this._selectionPointerDown = true;
+      this._updateSelectableTextCursor(event, { synchronous: true });
+    };
+    const onPointerMove = (event) => this._updateSelectableTextCursor(event);
+    const onPointerUp = () => {
+      this._selectionPointerDown = false;
+      this.scheduleSelectionToolbarUpdate();
+    };
+    const onSelectionChange = () => {
+      if (!this._selectionPointerDown) this.scheduleSelectionToolbarUpdate();
+    };
+    const onEscape = (event) => {
+      if (event?.key === 'Escape' && this._selectionToolbar) {
+        this.dismissSelectionToolbar({ rememberSelection: true });
+      }
+    };
+    const onLeave = (event) => {
+      if (!event?.relatedTarget) this._clearSelectableTextCursor();
+    };
+
+    bind(doc, 'pointerdown', onPointerDown, true);
+    bind(doc, 'pointermove', onPointerMove, true);
+    bind(doc, 'pointerup', onPointerUp, true);
+    bind(doc, 'pointercancel', onPointerUp, true);
+    bind(doc, 'pointerout', onLeave, true);
+    bind(doc, 'selectionchange', onSelectionChange, true);
+    bind(doc, 'select', onSelectionChange, true);
+    bind(doc, 'keyup', onSelectionChange, true);
+    bind(doc, 'keydown', onEscape, true);
+    if (typeof window !== 'undefined') {
+      bind(window, 'blur', () => this.dismissSelectionToolbar({ rememberSelection: false }), true);
+      // A fixed toolbar can otherwise become detached from its range while a
+      // nested document pane scrolls. The highlight remains and selecting it
+      // again immediately recreates the bar in the correct place.
+      bind(window, 'scroll', () => this.dismissSelectionToolbar({ rememberSelection: true }), true);
+    }
+    return true;
+  }
+
+  _clearSelectableTextCursor() {
+    try { this._selectableTextCursorElement?.removeAttribute?.('data-yayra-selectable-text'); } catch { /* detached */ }
+    this._selectableTextCursorElement = null;
+  }
+
+  _isInteractiveTextTarget(target) {
+    let element = target?.nodeType === 1 ? target : target?.parentElement;
+    try {
+      while (element) {
+        if (element.closest?.(TEXT_POINTER_INTERACTIVE_SELECTOR)) return true;
+        const root = element.getRootNode?.();
+        element = root?.host || null;
+      }
+    } catch { return false; }
+    return false;
+  }
+
+  /** Hit-test a real glyph, not merely the blank area of a text container. */
+  _updateSelectableTextCursor(event, { synchronous = false } = {}) {
+    const customPointer = typeof document !== 'undefined'
+      && ['yayra', 'high-visibility'].includes(document.body?.getAttribute?.('data-fb-pointer'));
+    if (!customPointer || !event) {
+      this._clearSelectableTextCursor();
+      return;
+    }
+    // Touch has no visible pointer, but pointerdown still needs to opt the
+    // underlying text into selection before the browser begins its long-press
+    // selection gesture.
+    if (event.pointerType === 'touch' && event.type !== 'pointerdown') return;
+    if (this._isInteractiveTextTarget(event.target)) {
+      this._clearSelectableTextCursor();
+      return;
+    }
+
+    const run = () => {
+      this._textPointerFrame = null;
+      let range = null;
+      try {
+        if (typeof document.caretRangeFromPoint === 'function') {
+          range = document.caretRangeFromPoint(event.clientX, event.clientY);
+        } else if (typeof document.caretPositionFromPoint === 'function') {
+          const position = document.caretPositionFromPoint(event.clientX, event.clientY);
+          if (position?.offsetNode && typeof document.createRange === 'function') {
+            range = document.createRange();
+            range.setStart(position.offsetNode, position.offset);
+            range.collapse(true);
+          }
+        }
+      } catch { range = null; }
+      const node = range?.startContainer;
+      const element = node?.nodeType === 3 ? node.parentElement : null;
+      if (!element || !String(node.nodeValue || '').trim() || this._isInteractiveTextTarget(element)) {
+        this._clearSelectableTextCursor();
+        return;
+      }
+      try {
+        const check = document.createRange();
+        check.selectNodeContents(node);
+        const hit = Array.from(check.getClientRects?.() || []).some((rect) => (
+          event.clientX >= rect.left && event.clientX <= rect.right
+          && event.clientY >= rect.top && event.clientY <= rect.bottom
+        ));
+        if (!hit) {
+          this._clearSelectableTextCursor();
+          return;
+        }
+      } catch {
+        this._clearSelectableTextCursor();
+        return;
+      }
+      if (element === this._selectableTextCursorElement) return;
+      this._clearSelectableTextCursor();
+      try {
+        element.setAttribute('data-yayra-selectable-text', 'true');
+        this._selectableTextCursorElement = element;
+      } catch { /* detached during a render */ }
+    };
+
+    if (synchronous || event.type === 'pointerdown' || typeof window === 'undefined'
+      || typeof window.requestAnimationFrame !== 'function') {
+      if (this._textPointerFrame !== null && typeof window !== 'undefined' && typeof window.cancelAnimationFrame === 'function') {
+        window.cancelAnimationFrame(this._textPointerFrame);
+        this._textPointerFrame = null;
+      }
+      run();
+      return;
+    }
+    this._pendingTextPointerEvent = event;
+    if (this._textPointerFrame !== null) return;
+    this._textPointerFrame = window.requestAnimationFrame(() => {
+      const latest = this._pendingTextPointerEvent;
+      this._pendingTextPointerEvent = null;
+      if (latest) this._updateSelectableTextCursor(latest, { synchronous: true });
+    });
+  }
+
+  _focusedSelectableField() {
+    const el = typeof document !== 'undefined' ? document.activeElement : null;
+    if (!el || (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') || el.disabled || el.readOnly) return null;
+    const type = String(el.type || el.getAttribute?.('type') || 'text').toLowerCase();
+    if (el.tagName === 'INPUT' && ['password', 'hidden', 'checkbox', 'radio', 'button', 'submit', 'reset', 'file', 'image', 'range', 'color'].includes(type)) return null;
+    return typeof el.selectionStart === 'number' && typeof el.selectionEnd === 'number' ? el : null;
+  }
+
+  _currentSelectionSnapshot() {
+    const field = this._focusedSelectableField();
+    if (field && field.selectionEnd > field.selectionStart) {
+      const text = String(field.value || '').slice(field.selectionStart, field.selectionEnd);
+      if (!text.trim() || text.length > MAX_SELECTION_ACTION_TEXT) return null;
+      const rect = field.getBoundingClientRect?.() || null;
+      return {
+        kind: 'field', text, editable: true, field,
+        start: field.selectionStart, end: field.selectionEnd, rect
+      };
+    }
+
+    let selection = null;
+    try {
+      if (typeof window !== 'undefined' && typeof window.getSelection === 'function') selection = window.getSelection();
+      else if (typeof document?.getSelection === 'function') selection = document.getSelection();
+    } catch { selection = null; }
+    if (!selection || selection.isCollapsed === true || Number(selection.rangeCount || 0) < 1) return null;
+    const text = String(selection || '');
+    if (!text.trim() || text.length > MAX_SELECTION_ACTION_TEXT) return null;
+    let range;
+    try { range = selection.getRangeAt(selection.rangeCount - 1); } catch { return null; }
+    let selectedElement = range.commonAncestorContainer;
+    if (selectedElement?.nodeType !== 1) selectedElement = selectedElement?.parentElement || selectedElement?.parentNode;
+    if (this._selectionToolbar?.contains?.(selectedElement)) return null;
+    let editableRoot = null;
+    try {
+      editableRoot = selectedElement?.closest?.('[contenteditable]:not([contenteditable="false"])') || null;
+      if (!editableRoot && selectedElement?.isContentEditable) editableRoot = selectedElement;
+    } catch { editableRoot = null; }
+    let rect = null;
+    try {
+      rect = range.getBoundingClientRect?.() || null;
+      if ((!rect || (!rect.width && !rect.height)) && range.getClientRects) rect = range.getClientRects()[0] || rect;
+    } catch { rect = null; }
+    return {
+      kind: 'range', text, editable: Boolean(editableRoot), editableRoot,
+      range, selection, rect,
+      anchorNode: selection.anchorNode, anchorOffset: selection.anchorOffset,
+      focusNode: selection.focusNode, focusOffset: selection.focusOffset
+    };
+  }
+
+  _sameSelectionSnapshot(left, right) {
+    if (!left || !right || left.kind !== right.kind || left.text !== right.text) return false;
+    if (left.kind === 'field') {
+      return left.field === right.field && left.start === right.start && left.end === right.end;
+    }
+    return left.anchorNode === right.anchorNode && left.anchorOffset === right.anchorOffset
+      && left.focusNode === right.focusNode && left.focusOffset === right.focusOffset;
+  }
+
+  scheduleSelectionToolbarUpdate() {
+    if (this._destroyed) return;
+    if (this._selectionUpdateFrame !== null) return;
+    const update = () => {
+      this._selectionUpdateFrame = null;
+      const snapshot = this._currentSelectionSnapshot();
+      if (!snapshot) {
+        this._dismissedSelectionSignature = null;
+        this.dismissSelectionToolbar({ rememberSelection: false });
+        return;
+      }
+      if (this._sameSelectionSnapshot(snapshot, this._dismissedSelectionSignature)) return;
+      this.showSelectionToolbar(snapshot);
+    };
+    if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+      this._selectionUpdateFrame = window.requestAnimationFrame(update);
+    } else {
+      this._selectionUpdateFrame = setTimeout(update, 0);
+    }
+  }
+
+  dismissSelectionToolbar({ rememberSelection = false } = {}) {
+    const snapshot = this._selectionToolbarSnapshot || this._currentSelectionSnapshot?.();
+    if (rememberSelection && snapshot) this._dismissedSelectionSignature = snapshot;
+    else if (!rememberSelection) this._dismissedSelectionSignature = null;
+    try { this._selectionToolbar?.remove?.(); } catch { /* already detached */ }
+    this._selectionToolbar = null;
+    this._selectionToolbarSnapshot = null;
+  }
+
+  showSelectionToolbar(snapshot) {
+    if (!snapshot || typeof document === 'undefined' || !document.body) return null;
+    if (this._sameSelectionSnapshot(snapshot, this._selectionToolbarSnapshot) && this._selectionToolbar?.parentElement) {
+      return this._selectionToolbar;
+    }
+    this.dismissSelectionToolbar({ rememberSelection: false });
+    const toolbar = document.createElement('div');
+    toolbar.className = 'fb-selection-actions';
+    toolbar.setAttribute('role', 'toolbar');
+    toolbar.setAttribute('aria-label', 'Text selection actions');
+    toolbar.setAttribute('data-selection-kind', snapshot.editable ? 'editable' : 'read-only');
+
+    const addAction = (label, action, className = '') => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = `fb-selection-action${className ? ` ${className}` : ''}`;
+      button.textContent = label;
+      button.setAttribute('aria-label', label);
+      button.addEventListener('pointerdown', (event) => {
+        // Keep the underlying range alive until the action runs.
+        event.preventDefault?.();
+        event.stopPropagation?.();
+      });
+      button.addEventListener('click', (event) => {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        this._dismissedSelectionSignature = snapshot;
+        this.dismissSelectionToolbar({ rememberSelection: true });
+        void action();
+      });
+      toolbar.appendChild(button);
+      return button;
+    };
+
+    addAction('Copy', () => this.copySelectionSnapshot(snapshot), 'fb-selection-copy');
+    if (snapshot.editable) {
+      addAction('Cut', () => this.cutSelectionSnapshot(snapshot), 'fb-selection-cut');
+      addAction('Paste', () => this.pasteSelectionSnapshot(snapshot), 'fb-selection-paste');
+    }
+    if (snapshot.text.length <= MAX_SELECTION_SEARCH_TEXT) {
+      addAction('Search', () => this.openSelectionSearch(snapshot.text), 'fb-selection-search');
+      addAction('Ask Yayra AI', () => this.openSelectionInYayraAi(snapshot.text), 'fb-selection-ai');
+    }
+    toolbar.addEventListener('pointerdown', (event) => {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+    });
+    document.body.appendChild(toolbar);
+    this._selectionToolbar = toolbar;
+    this._selectionToolbarSnapshot = snapshot;
+
+    const rect = snapshot.rect || {};
+    const viewportWidth = Math.max(1, Number(typeof window !== 'undefined' ? window.innerWidth : 0) || 1024);
+    const viewportHeight = Math.max(1, Number(typeof window !== 'undefined' ? window.innerHeight : 0) || 768);
+    const toolbarWidth = Number(toolbar.offsetWidth) || Math.min(390, viewportWidth - 16);
+    const toolbarHeight = Number(toolbar.offsetHeight) || 42;
+    const center = Number.isFinite(rect.left) && Number.isFinite(rect.right)
+      ? (rect.left + rect.right) / 2
+      : viewportWidth / 2;
+    let left = Math.max(8, Math.min(viewportWidth - toolbarWidth - 8, center - toolbarWidth / 2));
+    let top = (Number.isFinite(rect.top) ? rect.top : viewportHeight / 2) - toolbarHeight - 10;
+    if (top < 8) top = Math.min(viewportHeight - toolbarHeight - 8, (Number(rect.bottom) || 8) + 10);
+    left = Math.max(8, left);
+    top = Math.max(8, top);
+    toolbar.style.left = `${Math.round(left)}px`;
+    toolbar.style.top = `${Math.round(top)}px`;
+    return toolbar;
+  }
+
+  async _writeSelectionText(text) {
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch { /* use the current live selection as a compatibility fallback */ }
+    try { return Boolean(document.execCommand?.('copy')); } catch { return false; }
+  }
+
+  async copySelectionSnapshot(snapshot) {
+    if (!snapshot?.text) return false;
+    const copied = await this._writeSelectionText(snapshot.text);
+    this.showTransientNotice(copied
+      ? 'Copied to the clipboard.'
+      : 'This browser blocked clipboard access - press Ctrl+C instead.');
+    return copied;
+  }
+
+  async cutSelectionSnapshot(snapshot) {
+    if (!snapshot?.editable || !snapshot.text) return false;
+    // execCommand remains the only synchronous browser primitive that can cut
+    // a contenteditable range and populate the OS clipboard atomically.
+    try {
+      if (document.execCommand?.('cut')) {
+        this.showTransientNotice('Cut to the clipboard.');
+        return true;
+      }
+    } catch { /* use the bounded explicit fallback below */ }
+    const copied = await this._writeSelectionText(snapshot.text);
+    if (!copied) {
+      this.showTransientNotice('This browser blocked clipboard access - press Ctrl+X instead.');
+      return false;
+    }
+    if (snapshot.kind === 'field' && snapshot.field) {
+      const field = snapshot.field;
+      if (typeof field.setRangeText === 'function') field.setRangeText('', snapshot.start, snapshot.end, 'end');
+      else {
+        field.value = String(field.value || '').slice(0, snapshot.start) + String(field.value || '').slice(snapshot.end);
+        try { field.selectionStart = field.selectionEnd = snapshot.start; } catch { /* unsupported input type */ }
+      }
+      try { field.dispatchEvent?.(new Event('input', { bubbles: true, inputType: 'deleteByCut' })); } catch { /* shim */ }
+    } else {
+      try { snapshot.range?.deleteContents?.(); } catch { /* range was replaced */ }
+      try { snapshot.editableRoot?.dispatchEvent?.(new Event('input', { bubbles: true, inputType: 'deleteByCut' })); } catch { /* shim */ }
+    }
+    this.showTransientNotice('Cut to the clipboard.');
+    return true;
+  }
+
+  async pasteSelectionSnapshot(snapshot) {
+    if (!snapshot?.editable) return false;
+    let text = '';
+    try {
+      if (typeof navigator === 'undefined' || !navigator.clipboard?.readText) throw new Error('clipboard unavailable');
+      text = await navigator.clipboard.readText();
+    } catch {
+      this.showTransientNotice('This browser blocked clipboard access - press Ctrl+V instead.');
+      return false;
+    }
+    if (!text) {
+      this.showTransientNotice('The clipboard is empty.');
+      return false;
+    }
+    if (snapshot.kind === 'field' && snapshot.field) {
+      const field = snapshot.field;
+      if (typeof field.setRangeText === 'function') field.setRangeText(text, snapshot.start, snapshot.end, 'end');
+      else {
+        field.value = String(field.value || '').slice(0, snapshot.start) + text + String(field.value || '').slice(snapshot.end);
+        try { field.selectionStart = field.selectionEnd = snapshot.start + text.length; } catch { /* unsupported input type */ }
+      }
+      try { field.dispatchEvent?.(new Event('input', { bubbles: true, inputType: 'insertFromPaste', data: text })); } catch { /* shim */ }
+    } else {
+      try {
+        snapshot.range?.deleteContents?.();
+        const node = document.createTextNode(text);
+        snapshot.range?.insertNode?.(node);
+        snapshot.range?.setStartAfter?.(node);
+        snapshot.range?.collapse?.(true);
+        snapshot.selection?.removeAllRanges?.();
+        snapshot.selection?.addRange?.(snapshot.range);
+      } catch {
+        this.showTransientNotice('Couldn\u2019t paste into that editable region - press Ctrl+V instead.');
+        return false;
+      }
+      try { snapshot.editableRoot?.dispatchEvent?.(new Event('input', { bubbles: true, inputType: 'insertFromPaste', data: text })); } catch { /* shim */ }
+    }
+    this.showTransientNotice('Pasted from the clipboard.');
+    return true;
+  }
+
+  openSelectionSearch(text) {
+    const query = String(text || '').trim().slice(0, MAX_SELECTION_SEARCH_TEXT);
+    if (!query) return false;
+    const isPrivate = Boolean(this.getActiveTab()?.isPrivate);
+    this.createNewTab(isPrivate, { render: false });
+    this.navigateActiveTab(`https://www.google.com/search?q=${encodeURIComponent(query)}`);
+    return true;
+  }
+
+  openSelectionInYayraAi(text) {
+    const query = String(text || '').trim().slice(0, MAX_SELECTION_SEARCH_TEXT);
+    if (!query) return false;
+    const isPrivate = Boolean(this.getActiveTab()?.isPrivate);
+    this.createNewTab(isPrivate, { render: false });
+    this.navigateActiveTab(`yayra://ai?q=${encodeURIComponent(query)}`);
+    return true;
+  }
+
   /** The focused editable field, or null (shared by cut/copy/paste). */
   _focusedEditableField() {
     const el = typeof document !== 'undefined' ? document.activeElement : null;
@@ -7665,12 +12328,8 @@ export class BrowserShell {
   /** Whatever text is currently selected: page selection, or the selection
    *  inside the focused Yayra field. '' when nothing is selected. */
   _currentSelectionText() {
-    try {
-      if (typeof document !== 'undefined' && typeof document.getSelection === 'function') {
-        const sel = String(document.getSelection() || '');
-        if (sel) return sel;
-      }
-    } catch { /* shim without getSelection */ }
+    // Focused fields come first: browsers can retain an unrelated document
+    // range while the user selects fresh text inside an input.
     const el = this._focusedEditableField();
     if (el) {
       const start = el.selectionStart ?? 0;
@@ -7679,6 +12338,13 @@ export class BrowserShell {
         return el.value.slice(start, end);
       }
     }
+    try {
+      const selection = typeof window !== 'undefined' && typeof window.getSelection === 'function'
+        ? window.getSelection()
+        : (typeof document !== 'undefined' && typeof document.getSelection === 'function' ? document.getSelection() : null);
+      const text = String(selection || '');
+      if (text) return text;
+    } catch { /* shim without getSelection */ }
     return '';
   }
 
@@ -7781,9 +12447,11 @@ export class BrowserShell {
     let host = '';
     try { host = new URL(site.url).hostname; } catch { host = ''; }
     const letter = String(site.title || host || '?').trim().charAt(0).toUpperCase() || '?';
-    const badge = `<span class="fb-frequent-letter" style="display:none;font:700 18px/1 system-ui;">${letter}</span>`;
+    const safeLetter = letter.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const badge = `<span class="fb-frequent-letter" style="display:none;font:700 18px/1 system-ui;">${safeLetter}</span>`;
     if (!host) return badge.replace('display:none;', '');
-    return `<img src="https://icons.duckduckgo.com/ip3/${host}.ico" alt="" style="width:24px;height:24px;border-radius:6px;" `
+    const safeHost = encodeURIComponent(host);
+    return `<img src="https://icons.duckduckgo.com/ip3/${safeHost}.ico" alt="" style="width:24px;height:24px;border-radius:6px;" `
       + `onerror="this.style.display='none'; if (this.nextElementSibling) this.nextElementSibling.style.display='';" />${badge}`;
   }
 
@@ -7921,6 +12589,12 @@ export class BrowserShell {
       }
       if (this.bookmarksRepo?.getAllBookmarks) {
         try { fresh.bookmarks = await this.bookmarksRepo.getAllBookmarks(); } catch { /* keep current */ }
+        if (this.bookmarksRepo.getGroups) {
+          try { fresh.bookmarkGroups = await this.bookmarksRepo.getGroups(); } catch { /* keep current */ }
+        }
+        if (this.bookmarksRepo.getDefaultGroupId) {
+          try { fresh.bookmarkDefaultGroupId = await this.bookmarksRepo.getDefaultGroupId(); } catch { /* keep current */ }
+        }
       }
       if (this.downloadsBridge?.list) {
         try {
@@ -7936,13 +12610,15 @@ export class BrowserShell {
         try { fresh.shortcuts = await this.shortcutsRepo.getShortcuts(); } catch { /* keep current */ }
       }
 
-      const snapshot = JSON.stringify([fresh.history, fresh.bookmarks, fresh.downloads, fresh.settings, fresh.shortcuts]);
+      const snapshot = JSON.stringify([fresh.history, fresh.bookmarks, fresh.bookmarkGroups, fresh.bookmarkDefaultGroupId, fresh.downloads, fresh.settings, fresh.shortcuts]);
       if (snapshot === this._bgRefreshSnapshot) return false;
       const isFirstPass = this._bgRefreshSnapshot === undefined;
       this._bgRefreshSnapshot = snapshot;
 
       if (fresh.history) this.state.historyItems = fresh.history;
       if (fresh.bookmarks) this.state.bookmarksItems = fresh.bookmarks;
+      if (fresh.bookmarkGroups) this.state.bookmarkGroups = fresh.bookmarkGroups;
+      if (fresh.bookmarkDefaultGroupId) this.state.bookmarkDefaultGroupId = fresh.bookmarkDefaultGroupId;
       if (fresh.downloads) this.state.downloadsItems = fresh.downloads;
       if (fresh.downloadRoot !== undefined) this.state.downloadRoot = fresh.downloadRoot;
       if (fresh.settings) this.state.settings = { ...this.state.settings, ...fresh.settings };
@@ -7962,7 +12638,7 @@ export class BrowserShell {
     const tab = this.getActiveTab();
     if (!tab) return false;
     const url = String(tab.url || '');
-    const livePages = ['yayra://history', 'yayra://bookmarks', 'yayra://downloads', 'yayra://newtab'];
+    const livePages = ['yayra://history', 'yayra://bookmarks', 'yayra://downloads', 'yayra://documents', 'yayra://newtab'];
     if (!livePages.some((p) => url === p || url.startsWith(`${p}?`))) return false;
     // Never repaint over an open menu/modal/find bar - and never yank
     // the cursor out from under someone typing (e.g. the history search).
@@ -7983,22 +12659,24 @@ export class BrowserShell {
     const bar = document.createElement('div');
     bar.className = 'fb-bookmarks-bar';
     bar.style.cssText = 'display:flex;align-items:center;gap:4px;padding:3px 10px;overflow-x:auto;white-space:nowrap;background:var(--fb-bg-elevated,rgba(255,255,255,0.03));border-bottom:1px solid var(--fb-border,rgba(255,255,255,0.07));min-height:28px;';
-    const items = this.state.bookmarksItems || [];
+    const allItems = this.state.bookmarksItems || [];
+    const items = allItems.filter((bookmark) => (bookmark.groupId || DEFAULT_BOOKMARK_GROUP_ID) === DEFAULT_BOOKMARK_GROUP_ID);
     if (!items.length) {
       const hint = document.createElement('span');
       hint.style.cssText = 'font-size:0.75rem;color:var(--fb-text-secondary,#9ca3af);padding:2px 6px;';
-      hint.textContent = 'No bookmarks yet - star a page and it shows up here.';
+      hint.textContent = allItems.length
+        ? 'No bookmarks in Bookmarks Bar - choose that group to pin a page here.'
+        : 'No bookmarks yet - star a page and it shows up here.';
       bar.appendChild(hint);
       return bar;
     }
     for (const bm of items.slice(0, 30)) {
-      let host = '';
-      try { host = new URL(bm.url).hostname; } catch { host = ''; }
+      const icon = this.getTabFavicon({ url: bm.url, favicon: bm.favicon || null, isLoading: false });
       const chip = document.createElement('button');
       chip.className = 'fb-bookmarks-bar-item';
       chip.title = bm.url;
       chip.style.cssText = 'display:inline-flex;align-items:center;gap:6px;max-width:170px;padding:3px 8px;border:none;border-radius:8px;background:transparent;color:var(--fb-text-primary,#e8eaf0);cursor:pointer;font:500 12px/1.2 system-ui;overflow:hidden;';
-      chip.innerHTML = `${host ? `<img src="https://icons.duckduckgo.com/ip3/${host}.ico" alt="" style="width:14px;height:14px;border-radius:4px;flex:none;" onerror="this.remove()" />` : ''}<span style="overflow:hidden;text-overflow:ellipsis;">${String(bm.title || bm.url).replace(/</g, '&lt;')}</span>`;
+      chip.innerHTML = `<span class="fb-continue-favicon-wrap">${icon}</span><span style="overflow:hidden;text-overflow:ellipsis;">${String(bm.title || bm.url).replace(/</g, '&lt;')}</span>`;
       chip.addEventListener('click', () => this.navigateActiveTab(bm.url));
       bar.appendChild(chip);
     }
@@ -8195,7 +12873,7 @@ export class BrowserShell {
         <div class="fb-nav-controls">
           <button class="fb-nav-btn fb-mini-back-btn" title="Back" aria-label="Back" ${activeTab.canGoBack ? '' : 'disabled'}>${Icons.arrowLeft}</button>
           <button class="fb-nav-btn fb-mini-fwd-btn" title="Forward" aria-label="Forward" ${activeTab.canGoForward ? '' : 'disabled'}>${Icons.arrowRight}</button>
-          <button class="fb-nav-btn fb-mini-reload-btn" title="Reload" aria-label="Reload">${Icons.refresh}</button>
+          <button class="fb-nav-btn fb-mini-reload-btn" title="${activeTab.isLoading ? 'Stop loading this page' : 'Reload'}" aria-label="${activeTab.isLoading ? 'Stop' : 'Reload'}">${activeTab.isLoading ? Icons.stop : Icons.refresh}</button>
         </div>
         <div class="fb-omnibox-container fb-mini-omnibox-container">
           <div class="fb-toolbar-brand" title="Yayra">
@@ -8209,6 +12887,7 @@ export class BrowserShell {
         </div>
         <div class="fb-toolbar-actions">
           <button class="fb-action-btn fb-toolbar-action-btn fb-mini-download-btn" title="Downloads" aria-label="Downloads">${Icons.download}</button>
+          <button class="fb-action-btn fb-toolbar-action-btn fb-mini-documents-btn" title="Documents" aria-label="Documents">${Icons.document}</button>
           <button class="fb-action-btn fb-toolbar-action-btn fb-mini-extensions-btn" title="Extensions and Shields" aria-label="Extensions and Shields">${Icons.shield}</button>
           ${this.authBridge ? `<button class="fb-action-btn fb-toolbar-action-btn fb-account-btn fb-mini-account-btn" title="Yayra account" aria-label="Account">${this.renderAccountAvatarHtml(this.state.googleAccount?.signedIn ? this.state.googleAccount.profile : null, 22)}</button>` : ''}
           <button class="fb-action-btn fb-menu-btn fb-toolbar-action-btn fb-mini-drawer-btn" title="Customize and control Yayra" aria-label="Main menu">${Icons.moreVertical}</button>
@@ -8253,7 +12932,8 @@ export class BrowserShell {
     });
 
     win.querySelector('.fb-mini-reload-btn')?.addEventListener('click', () => {
-      this.reload();
+      if (this.getActiveTab()?.isLoading) this.stopLoading();
+      else this.reload();
     });
 
     win.querySelector('.fb-mini-star-btn')?.addEventListener('click', async () => {
@@ -8263,6 +12943,10 @@ export class BrowserShell {
 
     win.querySelector('.fb-mini-download-btn')?.addEventListener('click', () => {
       this.openInternalPage('yayra://downloads');
+    });
+
+    win.querySelector('.fb-mini-documents-btn')?.addEventListener('click', () => {
+      this.openInternalPage('yayra://documents');
     });
 
     win.querySelector('.fb-mini-extensions-btn')?.addEventListener('click', () => {
@@ -8332,6 +13016,14 @@ export class BrowserShell {
     // Render In-Mini Viewport Content (Full features of Yayra)
     const miniViewport = win.querySelector('.fb-mini-viewport');
     if (miniViewport) {
+      const miniProgress = document.createElement('div');
+      miniProgress.className = 'fb-page-loading-bar';
+      miniProgress.setAttribute('role', 'progressbar');
+      miniProgress.setAttribute('aria-label', 'Website loading');
+      miniProgress.setAttribute('aria-valuetext', activeTab.isLoading ? 'Loading website' : 'Website loaded');
+      miniProgress.style.display = activeTab.isLoading ? 'block' : 'none';
+      miniViewport.setAttribute('aria-busy', activeTab.isLoading ? 'true' : 'false');
+      miniViewport.appendChild(miniProgress);
       const url = activeTab.url || '';
       if (!url || url === 'yayra://newtab' || url === 'about:blank') {
         this.renderNewTabPage(miniViewport, activeTab);
@@ -8343,6 +13035,8 @@ export class BrowserShell {
         this.renderInternalBookmarksPage(miniViewport, activeTab);
       } else if (url === 'yayra://downloads') {
         this.renderInternalDownloadsPage(miniViewport, activeTab);
+      } else if (url === 'yayra://documents') {
+        this.renderInternalDocumentsPage(miniViewport, activeTab);
       } else if (url === 'yayra://passwords') {
         this.renderInternalPasswordsPage(miniViewport, activeTab);
       } else if (url === 'yayra://extensions') {
@@ -8375,13 +13069,29 @@ export class BrowserShell {
     const scrim = document.createElement('button');
     scrim.type = 'button';
     scrim.className = 'fb-dropdown-scrim';
+    scrim.setAttribute('data-chrome-dropdown', 'true');
     scrim.setAttribute('aria-label', 'Close menu');
-    scrim.addEventListener('click', onClose);
+    const stripBottom = Math.max(36, Number(this.tabStripElement?.getBoundingClientRect?.()?.bottom) || 0);
+    scrim.style.top = `${stripBottom}px`;
+    scrim.style.height = `calc(100% - ${stripBottom}px)`;
+    // Pointerdown closes before a potentially lost pointerup can strand the
+    // full-viewport hit target. The click listener remains for keyboard use.
+    let closed = false;
+    const closeOnce = (event) => {
+      if (closed) return;
+      closed = true;
+      onClose(event);
+    };
+    scrim.addEventListener('pointerdown', (event) => {
+      event?.preventDefault?.();
+      closeOnce(event);
+    });
+    scrim.addEventListener('click', closeOnce);
     // A right-click (or long-press context menu) anywhere outside must
     // dismiss the open menu too - exactly like native browser menus.
     scrim.addEventListener('contextmenu', (e) => {
       e.preventDefault();
-      onClose(e);
+      closeOnce(e);
     });
     root.appendChild(scrim);
     return scrim;
@@ -8546,6 +13256,74 @@ export class BrowserShell {
     return false;
   }
 
+  /**
+   * Chrome-style tab tear-off. A downward tab gesture opens the same HTTP(S)
+   * destination in a separate Yayra shell window, under the same profile and
+   * private-tab mode, and only then removes it from this strip. Document and
+   * internal tabs stay put because their in-memory state cannot be transferred
+   * truthfully to another renderer.
+   */
+  async detachTabToWindow(tabId) {
+    const tab = this.state.tabs.find((item) => item.id === tabId);
+    let destination = null;
+    try {
+      const parsed = new URL(String(tab?.url || ''));
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') destination = parsed.toString();
+    } catch { /* internal or malformed destination */ }
+    if (!tab || !destination) {
+      this.showTransientNotice('Only website tabs can move into a new Yayra window.');
+      return false;
+    }
+    let profileId = 'default';
+    try { profileId = String(this.profileService?.current?.()?.id || 'default'); } catch { /* default */ }
+
+    const bridge = this.profileWindowsBridge;
+    if (bridge) {
+      try {
+        const result = await bridge.openWindow(profileId, destination, { isPrivate: Boolean(tab.isPrivate) });
+        if (!result?.ok) {
+          this.showTransientNotice('Yayra couldn’t create a new window for this tab.');
+          return false;
+        }
+        if (this.state.tabs.some((item) => item.id === tabId)) this.closeTab(tabId);
+        this.showTransientNotice('Tab moved to a new Yayra window.');
+        return true;
+      } catch {
+        this.showTransientNotice('Yayra couldn’t create a new window for this tab.');
+        return false;
+      }
+    }
+
+    if (typeof window !== 'undefined' && typeof window.open === 'function') {
+      let target = '';
+      try {
+        const appUrl = new URL(window.location.href);
+        appUrl.search = '';
+        appUrl.hash = '';
+        appUrl.searchParams.set('profile', profileId);
+        appUrl.searchParams.set('page', destination);
+        if (tab.isPrivate) appUrl.searchParams.set('private', '1');
+        target = appUrl.toString();
+      } catch {
+        const params = new URLSearchParams({ profile: profileId, page: destination });
+        if (tab.isPrivate) params.set('private', '1');
+        target = `?${params.toString()}`;
+      }
+      const opened = window.open(target, '_blank', 'popup=yes,width=1200,height=800');
+      if (!opened) {
+        this.showTransientNotice('Allow pop-ups to move this tab into a new window.');
+        return false;
+      }
+      try { opened.opener = null; } catch { /* cross-window hardening is best effort */ }
+      if (this.state.tabs.some((item) => item.id === tabId)) this.closeTab(tabId);
+      this.showTransientNotice('Tab moved to a new Yayra window.');
+      return true;
+    }
+
+    this.showTransientNotice('New app windows aren’t available on this device.');
+    return false;
+  }
+
   switchProfile(profileId) {
     if (!this.profileService) return;
     const current = this.profileService.current();
@@ -8606,13 +13384,26 @@ export class BrowserShell {
       try {
         const stored = await this.settingsRepo.getSettings();
         if (stored) this.state.settings = { ...this.state.settings, ...stored };
-      } catch { /* keep current */ }
+        // Unlike generic display settings, this preference must never bleed
+        // from the old profile when the new profile has no settings blob.
+        this.state.settings.pptxNotesColor = normalizePptxNotesColor(
+          stored?.pptxNotesColor
+        );
+      } catch {
+        this.state.settings.pptxNotesColor = DEFAULT_PPTX_NOTES_COLOR;
+      }
     }
     if (this.historyRepo?.getEntries) {
       try { this.state.historyItems = await this.historyRepo.getEntries(100); } catch { /* keep current */ }
     }
     if (this.bookmarksRepo?.getAllBookmarks) {
-      try { this.state.bookmarksItems = await this.bookmarksRepo.getAllBookmarks(); } catch { /* keep current */ }
+      try { await this.refreshBookmarksState(); } catch { /* keep current */ }
+    }
+    if (this.emailAddressesRepo?.getAllEmails) {
+      try {
+        await this.refreshEmailAddressesState();
+        await this.pushEmailSuggestionsToOpenTabs();
+      } catch { /* keep current */ }
     }
     if (this.wheelRepo?.getItems) {
       try {
@@ -8632,7 +13423,9 @@ export class BrowserShell {
         // profile; the rolling snapshot restarts from its tabs too.
         const prev = await this.sessionRepo.getLastSession();
         const openNow = new Set(this.state.tabs.map((t) => t.url));
-        this.state.continueTabs = (prev.tabs || []).filter((t) => !openNow.has(t.url)).slice(0, 5);
+        const previousTabs = (prev.tabs || []).filter((t) => !t?.isPrivate && /^https?:\/\//i.test(t?.url || ''));
+        this.state.tabGroupRestoreTabs = previousTabs;
+        this.state.continueTabs = previousTabs.filter((t) => !openNow.has(t.url)).slice(0, 5);
         this._lastSessionSnapshotJson = null;
       } catch { /* keep current */ }
     }
@@ -8847,8 +13640,10 @@ export class BrowserShell {
 
   profileAvatarHtml(profile, size = 28) {
     const initial = String((profile && (profile.name || profile.email)) || '?').charAt(0).toUpperCase();
-    const color = (profile && profile.color) || '#3b82f6';
-    return `<span class="fb-profile-avatar" style="width:${size}px; height:${size}px; background:${color}; font-size:${Math.round(size * 0.5)}px;">${initial}</span>`;
+    const requestedColor = String((profile && profile.color) || '');
+    const color = /^#[0-9a-f]{6}$/i.test(requestedColor) ? requestedColor : '#3b82f6';
+    const safeSize = Number.isFinite(size) ? Math.min(64, Math.max(16, Math.round(size))) : 28;
+    return `<span class="fb-profile-avatar" style="width:${safeSize}px; height:${safeSize}px; background:${color}; font-size:${Math.round(safeSize * 0.5)}px;">${escapeHtml(initial)}</span>`;
   }
 
   renderProfileSuggestionCard(root) {
@@ -8871,10 +13666,10 @@ export class BrowserShell {
       </div>
       <strong class="fb-profile-suggestion-title">Keep your browsing separate?</strong>
       <p class="fb-profile-suggestion-text">
-        <b>${current.name}</b>${current.email ? ` (${current.email})` : ''} is already using this profile.
+        <b>${escapeHtml(current.name)}</b>${current.email ? ` (${escapeHtml(current.email)})` : ''} is already using this profile.
         ${isSwitch
-          ? `Switch to the existing profile for <b>${suggestion.email}</b> to keep cookies, logins and passwords separate.`
-          : `Create a separate profile for <b>${suggestion.email}</b> so their cookies, logins and passwords stay their own.`}
+          ? `Switch to the existing profile for <b>${escapeHtml(suggestion.email)}</b> to keep cookies, logins and passwords separate.`
+          : `Create a separate profile for <b>${escapeHtml(suggestion.email)}</b> so their cookies, logins and passwords stay their own.`}
       </p>
       <div class="fb-profile-suggestion-actions">
         <button class="fb-btn fb-btn-secondary fb-profile-suggestion-decline">No thanks</button>
@@ -8930,11 +13725,11 @@ export class BrowserShell {
       <div class="fb-account-profiles">
         <small class="fb-account-profiles-label">Browsing profiles</small>
         ${profiles.map((p) => `
-          <button class="fb-profile-row${p.id === currentProfileId ? ' fb-profile-row-current' : ''}" data-profile-id="${p.id}" title="${p.id === currentProfileId ? 'Current profile' : `Switch to ${p.name}`}">
+          <button class="fb-profile-row${p.id === currentProfileId ? ' fb-profile-row-current' : ''}" data-profile-id="${escapeAttr(p.id)}" title="${escapeAttr(p.id === currentProfileId ? 'Current profile' : `Switch to ${p.name}`)}">
             ${this.profileAvatarHtml(p, 26)}
             <span class="fb-profile-row-text">
-              <strong>${p.name}</strong>
-              ${p.email ? `<small>${p.email}</small>` : ''}
+              <strong>${escapeHtml(p.name)}</strong>
+              ${p.email ? `<small>${escapeHtml(p.email)}</small>` : ''}
             </span>
             ${p.id === currentProfileId ? `<span class="fb-profile-row-check">${Icons.check || '&#10003;'}</span>` : ''}
           </button>
@@ -8947,6 +13742,8 @@ export class BrowserShell {
 
     if (account.status === 'signed-in' && account.profile) {
       const { name, email } = account.profile;
+      const safeName = escapeHtml(name || email || 'Signed in');
+      const safeEmail = email ? escapeHtml(email) : '';
       const sinceLabel = account.savedAt
         ? new Date(account.savedAt).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })
         : null;
@@ -8954,11 +13751,11 @@ export class BrowserShell {
         <div class="fb-account-dropdown-header">
           ${this.renderAccountAvatarHtml(account.profile, 40)}
           <div>
-            <strong>${name || email || 'Signed in'}</strong>
-            ${email ? `<p style="margin:2px 0 0; font-size:0.8rem; color:var(--fb-text-muted);">${email}</p>` : ''}
+            <strong>${safeName}</strong>
+            ${safeEmail ? `<p style="margin:2px 0 0; font-size:0.8rem; color:var(--fb-text-muted);">${safeEmail}</p>` : ''}
           </div>
         </div>
-        ${sinceLabel ? `<p style="margin:0; padding:0 2px; font-size:0.75rem; color:var(--fb-text-muted);">Signed in since ${sinceLabel}</p>` : ''}
+        ${sinceLabel ? `<p style="margin:0; padding:0 2px; font-size:0.75rem; color:var(--fb-text-muted);">Signed in since ${escapeHtml(sinceLabel)}</p>` : ''}
         ${vaultSummaryHtml}
         ${profilesHtml}
         <div class="fb-account-dropdown-actions">
@@ -8971,7 +13768,7 @@ export class BrowserShell {
     } else {
       const isSigningIn = account.status === 'signing-in';
       const errorNote = account.status === 'error'
-        ? `<p style="margin:0; color:#f66; font-size:0.8rem;">Couldn't sign in: ${account.error === 'not_configured' ? 'Google sign-in isn\u2019t configured for this build yet.' : (account.error || 'please try again.')}</p>`
+        ? `<p style="margin:0; color:#f66; font-size:0.8rem;">${this.formatGoogleSignInError(account.error)}</p>`
         : '';
       dropdown.innerHTML = `
         <div class="fb-account-dropdown-header">
@@ -9073,7 +13870,15 @@ export class BrowserShell {
   }
 
   async checkForUpdates(manual = false) {
-    if (this.state.updateState.status === 'checking') return;
+    // Never let a periodic/manual check overwrite an active download or
+    // installer state. Doing so removed the live progress targets while
+    // bytes were still arriving and made the UI appear frozen until reload.
+    if (['checking', 'downloading', 'installing'].includes(this.state.updateState.status)) {
+      if (manual && this.state.updateState.status === 'downloading') {
+        this.showTransientNotice(`Update download is already in progress (${this.formatUpdateDownloadProgress()}).`);
+      }
+      return;
+    }
     this.state.updateState = { ...this.state.updateState, status: 'checking' };
     this.render();
 
@@ -9346,6 +14151,25 @@ export class BrowserShell {
     try { return JSON.parse(localStorage.getItem('yayra:pending-update-install') || 'null'); } catch { return null; }
   }
 
+  /** Human-readable live download progress shared by Settings, the toolbar
+   * chip, and the Yayra menu. Keeping one formatter means a later render
+   * can never jump back to stale text after an in-place progress update. */
+  formatUpdateDownloadProgress(updateState = this.state.updateState || {}) {
+    if (typeof updateState.progressPercent === 'number' && Number.isFinite(updateState.progressPercent)) {
+      return `${Math.max(0, Math.min(100, Math.round(updateState.progressPercent)))}%`;
+    }
+    const received = Number(updateState.progressReceivedBytes) || 0;
+    if (received > 0) return `${(received / (1024 * 1024)).toFixed(1)} MB`;
+    return 'Starting…';
+  }
+
+  formatUpdateDownloadLabel(context = 'compact', updateState = this.state.updateState || {}) {
+    const detail = this.formatUpdateDownloadProgress(updateState);
+    if (context === 'settings') return `Downloading v${updateState.availableVersion || 'latest'}… ${detail}`;
+    if (context === 'toolbar') return `Update ${detail}`;
+    return `Downloading update… ${detail}`;
+  }
+
   /**
    * Settings -> "Yayra Updates": the full manual home of the update
    * pipeline. Everything the prompts offer lives here too - check,
@@ -9359,9 +14183,14 @@ export class BrowserShell {
     const configured = Number(this.updateService?.config?.checkIntervalMinutes);
     const intervalMin = Math.max(15, Number.isFinite(configured) && configured > 0 ? configured : 720);
     const intervalLabel = intervalMin % 60 === 0 ? `${intervalMin / 60} hour${intervalMin === 60 ? '' : 's'}` : `${intervalMin} minutes`;
+    const isDownloading = u.status === 'downloading';
+    const progressPercent = typeof u.progressPercent === 'number' && Number.isFinite(u.progressPercent)
+      ? Math.max(0, Math.min(100, Math.round(u.progressPercent)))
+      : null;
+    const progressDetail = this.formatUpdateDownloadProgress(u);
 
     const statusLabel = u.status === 'checking' ? 'Checking for updates…'
-      : u.status === 'downloading' ? `Downloading v${u.availableVersion || ''}… ${typeof u.progressPercent === 'number' ? `${u.progressPercent}%` : ''}`
+      : isDownloading ? this.formatUpdateDownloadLabel('settings', u)
       : u.status === 'staged' ? `v${u.availableVersion || ''} downloaded & verified - ready to install`
       : u.status === 'ready' ? `v${u.availableVersion || ''} is available`
       : u.status === 'installing' ? 'Installer running…'
@@ -9371,12 +14200,16 @@ export class BrowserShell {
     return `
       <div class="fb-updates-settings">
         <div class="fb-updates-status-row">
-          <span class="fb-status-orb ${u.status === 'error' ? '' : u.status === 'checking' || u.status === 'downloading' ? 'pulse' : 'green'}" ${u.status === 'error' ? 'style="background:#ef4444;"' : ''}></span>
-          <div>
-            <strong>${statusLabel}</strong>
+          <span class="fb-status-orb ${u.status === 'error' ? '' : u.status === 'checking' || isDownloading ? 'pulse' : 'green'}" ${u.status === 'error' ? 'style="background:#ef4444;"' : ''}></span>
+          <div class="fb-updates-status-copy">
+            <strong class="${isDownloading ? 'fb-update-progress-label fb-update-progress-settings' : ''}" ${isDownloading ? 'data-update-progress-context="settings" aria-live="polite" aria-atomic="true"' : ''}>${statusLabel}</strong>
             <p style="margin:2px 0 0; font-size:0.78rem; color:var(--fb-text-muted);">Installed: v${u.installedVersion || 'unknown'} &#183; Auto-checks every ${intervalLabel} while Yayra is open.</p>
           </div>
         </div>
+        ${isDownloading ? `
+          <div class="fb-update-live-progress ${progressPercent == null ? 'is-indeterminate' : ''}" role="progressbar" aria-label="Yayra update download" aria-valuemin="0" aria-valuemax="100" ${progressPercent == null ? '' : `aria-valuenow="${progressPercent}"`} aria-valuetext="${progressDetail}">
+            <span class="fb-update-live-progress-fill" style="width:${progressPercent == null ? 30 : progressPercent}%;"></span>
+          </div>` : ''}
         ${scheduled ? `
           <div class="fb-updates-scheduled-row">
             <span>${Icons.hourglass}</span>
@@ -9384,7 +14217,7 @@ export class BrowserShell {
             <button class="fb-btn fb-btn-secondary fb-up-cancel-scheduled">Cancel</button>
           </div>` : ''}
         <div class="fb-updates-actions">
-          <button class="fb-btn fb-btn-secondary fb-up-check">Check for updates now</button>
+          <button class="fb-btn fb-btn-secondary fb-up-check" ${['checking', 'downloading', 'installing'].includes(u.status) ? 'disabled' : ''}>${isDownloading ? 'Download in progress' : u.status === 'checking' ? 'Checking…' : u.status === 'installing' ? 'Installer running…' : 'Check for updates now'}</button>
           ${u.status === 'ready' ? `<button class="fb-btn fb-btn-primary fb-up-download">${desktopPipeline && u.download?.url ? `Download v${u.availableVersion || 'update'} (verified)` : `Update now to v${u.availableVersion || 'latest'}`}</button>` : ''}
           ${u.status === 'staged' ? `
             <button class="fb-btn fb-btn-primary fb-up-install-now">Install &amp; restart now</button>
@@ -9450,7 +14283,13 @@ export class BrowserShell {
     if (!bridge || !download?.url) return;
     if (this.state.updateState.status === 'downloading') return;
 
-    this.state.updateState = { ...this.state.updateState, status: 'downloading', progressPercent: 0 };
+    this.state.updateState = {
+      ...this.state.updateState,
+      status: 'downloading',
+      progressPercent: 0,
+      progressReceivedBytes: 0,
+      progressTotalBytes: Number(download.bytes) || null
+    };
     this.render();
     this.showTransientNotice(`Downloading Yayra v${availableVersion || ''}…`);
 
@@ -9623,24 +14462,60 @@ export class BrowserShell {
   }
 
   /**
-   * Live progress events from electron/desktopUpdater.cjs. Updates the
-   * drawer progress label in place (no full re-render per chunk - that
-   * would tear down input focus dozens of times per second).
+   * Paint one update-progress event into EVERY currently visible surface:
+   * Settings, the global toolbar chip, and the Yayra menu. This is a
+   * surgical DOM update rather than a full render per network chunk, so
+   * websites, focused inputs, and scroll positions stay live while the
+   * number and progress bar advance without a manual refresh.
    */
+  syncDesktopUpdateProgressUi() {
+    if (typeof document === 'undefined') return;
+    const root = this.rootElement || document;
+    const detail = this.formatUpdateDownloadProgress(this.state.updateState);
+    for (const label of root.querySelectorAll('.fb-update-progress-label')) {
+      const context = label.getAttribute('data-update-progress-context') || 'compact';
+      label.textContent = this.formatUpdateDownloadLabel(context, this.state.updateState);
+    }
+    for (const progress of root.querySelectorAll('.fb-update-live-progress')) {
+      const rawPercent = this.state.updateState.progressPercent;
+      const percent = typeof rawPercent === 'number' && Number.isFinite(rawPercent)
+        ? Math.max(0, Math.min(100, Math.round(rawPercent)))
+        : null;
+      progress.setAttribute('aria-valuetext', detail);
+      if (percent == null) {
+        progress.removeAttribute('aria-valuenow');
+        progress.classList.add('is-indeterminate');
+      } else {
+        progress.setAttribute('aria-valuenow', String(percent));
+        progress.classList.remove('is-indeterminate');
+      }
+      const fill = progress.querySelector('.fb-update-live-progress-fill');
+      if (fill) fill.style.width = `${percent == null ? 30 : percent}%`;
+    }
+    for (const chip of root.querySelectorAll('.fb-update-chip-downloading')) {
+      chip.setAttribute('aria-label', `Downloading Yayra update, ${detail}`);
+      chip.setAttribute('title', `Downloading Yayra v${this.state.updateState.availableVersion || 'latest'} - ${detail}. Click for update details.`);
+    }
+  }
+
   handleDesktopUpdateEvent(evt) {
-    if (!evt || typeof document === 'undefined') return;
+    if (!evt) return;
     if (evt.type === 'download-progress') {
-      if (typeof evt.percent === 'number') {
-        this.state.updateState.progressPercent = evt.percent;
-      }
-      const label = document.querySelector('.fb-update-progress-label');
-      if (label) {
-        const received = Number(evt.received) || 0;
-        const mb = (received / (1024 * 1024)).toFixed(1);
-        label.textContent = typeof evt.percent === 'number'
-          ? `Downloading update… ${evt.percent}%`
-          : `Downloading update… ${mb} MB`;
-      }
+      // Ignore a late queued chunk after the verified/staged or install
+      // transition; progress must never move the state machine backwards.
+      if (this.state.updateState.status === 'staged' || this.state.updateState.status === 'installing') return;
+      const percent = typeof evt.percent === 'number' && Number.isFinite(evt.percent)
+        ? Math.max(0, Math.min(100, Math.round(evt.percent)))
+        : null;
+      this.state.updateState = {
+        ...this.state.updateState,
+        status: 'downloading',
+        availableVersion: this.state.updateState.availableVersion || evt.version || null,
+        progressPercent: percent,
+        progressReceivedBytes: Math.max(0, Number(evt.received) || 0),
+        progressTotalBytes: Math.max(0, Number(evt.total) || 0) || null
+      };
+      this.syncDesktopUpdateProgressUi();
     } else if (evt.type === 'download-failed') {
       this.state.updateState = { ...this.state.updateState, status: 'error', notes: evt.reason || 'download failed' };
       this.requestRender();
@@ -9709,7 +14584,7 @@ export class BrowserShell {
             <div class="fb-drawer-update-status-row">
               <div class="fb-update-status-left">
                 <span class="fb-status-orb pulse"></span>
-                <span class="fb-update-status-text fb-update-progress-label">Downloading update… ${typeof this.state.updateState.progressPercent === 'number' ? `${this.state.updateState.progressPercent}%` : ''}</span>
+                <span class="fb-update-status-text fb-update-progress-label fb-update-progress-compact" data-update-progress-context="compact" aria-live="polite" aria-atomic="true">${this.formatUpdateDownloadLabel('compact')}</span>
               </div>
             </div>
           ` : this.state.updateState.status === 'staged' ? `
@@ -9767,8 +14642,9 @@ export class BrowserShell {
           </div>
         </div>
 
-        <!-- 4. Downloads -->
+        <!-- 4. Downloads and local Documents -->
         <button class="fb-drawer-item fb-dr-downloads">${Icons.download} <span>Downloads</span> <kbd>Ctrl+J</kbd></button>
+        <button class="fb-drawer-item fb-dr-documents">${Icons.document} <span>Documents</span></button>
 
         <!-- 5. Bookmarks & Lists with Submenu -->
         <div class="fb-drawer-item-has-submenu">
@@ -9859,7 +14735,8 @@ export class BrowserShell {
             <button class="fb-drawer-item fb-dr-open-doc">${Icons.document} <span>Open document... (PDF)</span></button>
             <button class="fb-drawer-item fb-dr-install-app">${Icons.download} <span>Install page as app...</span></button>
             <button class="fb-drawer-item fb-dr-open-pharmagame">${Icons.sparkles} <span>Open in pharmaGAME Ai</span></button>
-            <button class="fb-drawer-item fb-dr-create-shortcut">${Icons.externalLink} <span>Create shortcut...</span></button>
+            <button class="fb-drawer-item fb-dr-create-shortcut">${Icons.externalLink} <span>Add to New Tab shortcuts</span></button>
+            ${typeof this.systemBridge?.createShortcut === 'function' ? `<button class="fb-drawer-item fb-dr-create-desktop-shortcut">${Icons.externalLink} <span>Create desktop shortcut...</span></button>` : ''}
 
             <div class="fb-submenu-section-label">Share</div>
             <button class="fb-drawer-item fb-dr-copy-link">${Icons.copy} <span>Copy link</span></button>
@@ -9906,6 +14783,44 @@ export class BrowserShell {
         <button class="fb-drawer-item fb-dr-exit">${Icons.close} <span>Exit</span></button>
       </div>
     `;
+
+    // Existing groups are direct one-click entries as well as being
+    // available in the full picker. Build their labels as text nodes so a
+    // user-entered name can never be parsed as HTML.
+    const groupSubmenu = drawer.querySelector('.fb-dr-tabgroups-parent')?.parentElement?.querySelector('.fb-drawer-submenu');
+    const tabGroups = this.getTabGroups();
+    if (groupSubmenu && tabGroups.length) {
+      const separator = document.createElement('div');
+      separator.className = 'fb-drawer-separator';
+      groupSubmenu.appendChild(separator);
+      const label = document.createElement('div');
+      label.className = 'fb-submenu-section-label';
+      label.textContent = 'Open group';
+      groupSubmenu.appendChild(label);
+      for (const group of tabGroups) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'fb-drawer-item fb-dr-tg-open';
+        button.setAttribute('aria-label', `Open ${group.name} group (${group.tabs.length} tabs)`);
+        const swatch = document.createElement('span');
+        swatch.className = 'fb-drawer-group-swatch';
+        swatch.style.background = group.color;
+        const name = document.createElement('span');
+        name.className = 'fb-drawer-group-name';
+        name.textContent = group.name;
+        const count = document.createElement('small');
+        count.className = 'fb-drawer-group-count';
+        count.textContent = String(group.tabs.length);
+        button.appendChild(swatch);
+        button.appendChild(name);
+        button.appendChild(count);
+        button.addEventListener('click', () => {
+          this.state.isSideDrawerOpen = false;
+          this.openTabGroup(group.id);
+        });
+        groupSubmenu.appendChild(button);
+      }
+    }
 
     // Event Listeners
     drawer.querySelector('.fb-close-drawer-btn')?.addEventListener('click', () => {
@@ -9959,6 +14874,23 @@ export class BrowserShell {
       })
       .filter(Boolean);
     const pinnedSubmenus = new Set();
+    const hoverCloseTimers = new Map();
+    const cancelHoverClose = (entry) => {
+      const timer = hoverCloseTimers.get(entry.parent);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        hoverCloseTimers.delete(entry.parent);
+      }
+    };
+    const scheduleHoverClose = (entry) => {
+      cancelHoverClose(entry);
+      if (pinnedSubmenus.has(entry.parent)) return;
+      const timer = setTimeout(() => {
+        hoverCloseTimers.delete(entry.parent);
+        if (!pinnedSubmenus.has(entry.parent)) closeFlyout(entry);
+      }, 160);
+      hoverCloseTimers.set(entry.parent, timer);
+    };
 
     const positionFlyout = ({ button, submenu }) => {
       const drawerRect = drawer.getBoundingClientRect();
@@ -9994,6 +14926,7 @@ export class BrowserShell {
     };
 
     const closeFlyout = (entry) => {
+      cancelHoverClose(entry);
       pinnedSubmenus.delete(entry.parent);
       entry.parent.classList.remove('open');
       entry.button.setAttribute('aria-expanded', 'false');
@@ -10013,6 +14946,7 @@ export class BrowserShell {
     };
 
     const openFlyout = (entry) => {
+      cancelHoverClose(entry);
       closeOtherFlyouts(entry);
       if (entry.submenu.parentElement !== drawer) drawer.appendChild(entry.submenu);
       entry.parent.classList.add('open');
@@ -10030,13 +14964,19 @@ export class BrowserShell {
       entry.parent.addEventListener('pointerleave', (event) => {
         const nextTarget = event.relatedTarget;
         if (nextTarget && (entry.submenu.contains?.(nextTarget) || entry.parent.contains?.(nextTarget))) return;
-        if (!pinnedSubmenus.has(entry.parent)) closeFlyout(entry);
+        // Give the pointer a brief grace period to cross the gap into the
+        // flyout. relatedTarget can be null during DOM reparenting.
+        scheduleHoverClose(entry);
+      });
+
+      entry.submenu.addEventListener('pointerenter', () => {
+        cancelHoverClose(entry);
       });
 
       entry.submenu.addEventListener('pointerleave', (event) => {
         const nextTarget = event.relatedTarget;
         if (nextTarget && (entry.parent.contains?.(nextTarget) || entry.submenu.contains?.(nextTarget))) return;
-        if (!pinnedSubmenus.has(entry.parent)) closeFlyout(entry);
+        scheduleHoverClose(entry);
       });
 
       entry.button.addEventListener('click', (event) => {
@@ -10090,11 +15030,13 @@ export class BrowserShell {
 
     drawer.querySelector('.fb-dr-tg-new')?.addEventListener('click', () => {
       this.state.isSideDrawerOpen = false;
+      this.render();
       this.createTabGroup();
     });
 
     drawer.querySelector('.fb-dr-tg-add')?.addEventListener('click', () => {
       this.state.isSideDrawerOpen = false;
+      this.render();
       this.groupCurrentTab();
     });
 
@@ -10111,6 +15053,11 @@ export class BrowserShell {
     drawer.querySelector('.fb-dr-downloads')?.addEventListener('click', () => {
       this.state.isSideDrawerOpen = false;
       this.openInternalPage('yayra://downloads');
+    });
+
+    drawer.querySelector('.fb-dr-documents')?.addEventListener('click', () => {
+      this.state.isSideDrawerOpen = false;
+      this.openInternalPage('yayra://documents');
     });
 
     drawer.querySelector('.fb-dr-bookmarks')?.addEventListener('click', () => {
@@ -10246,7 +15193,10 @@ export class BrowserShell {
     drawer.querySelector('.fb-dr-lens')?.addEventListener('click', () => {
       this.state.isSideDrawerOpen = false;
       const url = activeTab.url || 'https://yayra.app';
-      this.navigateActiveTab(`https://lens.google.com/uploadbyurl?url=${encodeURIComponent(url)}`);
+      this.openGoogleFeatureInYayra('lens', this.buildGoogleLensUrl('/uploadbyurl', {
+        imageUrl: url,
+        startedAt: Date.now()
+      }));
     });
 
     drawer.querySelector('.fb-dr-translate')?.addEventListener('click', () => {
@@ -10290,6 +15240,12 @@ export class BrowserShell {
       this.state.isSideDrawerOpen = false;
       this.render();
       this.createShortcutForActivePage();
+    });
+
+    drawer.querySelector('.fb-dr-create-desktop-shortcut')?.addEventListener('click', () => {
+      this.state.isSideDrawerOpen = false;
+      this.render();
+      this.createDesktopShortcutForActivePage();
     });
 
     drawer.querySelector('.fb-dr-copy-link')?.addEventListener('click', () => {
@@ -10343,7 +15299,7 @@ export class BrowserShell {
     drawer.querySelector('.fb-dr-performance')?.addEventListener('click', () => {
       this.state.isSideDrawerOpen = false;
       this.render();
-      this.openTaskManagerModal();
+      this.openPerformanceSettings();
     });
 
     drawer.querySelector('.fb-dr-task-mgr')?.addEventListener('click', () => {
@@ -10400,7 +15356,10 @@ export class BrowserShell {
     if (!this.state.activeModal) return;
 
     const backdrop = document.createElement('div');
-    backdrop.className = `fb-modal-backdrop ${this.state.activeModal === 'search-overlay' ? 'fb-search-backdrop' : ''}`;
+    const isCompactTabSearch = this.state.activeModal === 'tab-switcher'
+      && this.state.settings.tabSwitcherView === 'list';
+    const isTabGroupsPopover = this.state.activeModal === 'tab-groups';
+    backdrop.className = `fb-modal-backdrop ${this.state.activeModal === 'search-overlay' ? 'fb-search-backdrop' : ''} ${isCompactTabSearch ? 'fb-tab-search-list-backdrop' : ''} ${isTabGroupsPopover ? 'fb-tab-groups-popover-backdrop' : ''}`;
     backdrop.addEventListener('click', (e) => {
       if (e.target === backdrop) this.closeModal();
     });
@@ -10482,12 +15441,11 @@ export class BrowserShell {
           ` : `
             <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:8px;">
               ${bookmarks.map((bm) => {
-                let domain = bm.url;
-                try { domain = new URL(bm.url).hostname; } catch {}
+                const icon = this.getTabFavicon({ url: bm.url, favicon: bm.favicon || null, isLoading: false });
                 return `
                 <div style="display:flex; align-items:center; justify-content:space-between; padding:6px 10px; background:rgba(255,255,255,0.04); border-radius:8px; border:1px solid rgba(255,255,255,0.08);">
                   <div style="display:flex; align-items:center; gap:8px; overflow:hidden;">
-                    <img src="https://icons.duckduckgo.com/ip3/${domain}.ico" style="width:16px; height:16px; border-radius:50%;" alt="" />
+                    <span class="fb-continue-favicon-wrap">${icon}</span>
                     <span style="font-size:0.825rem; white-space:nowrap; text-overflow:ellipsis; overflow:hidden;">${bm.title || bm.url}</span>
                   </div>
                   <button class="fb-btn fb-btn-primary fb-add-bm-to-wheel-btn" data-url="${bm.url}" data-title="${bm.title || bm.url}" style="padding:2px 8px; font-size:11px;">+ Add</button>
@@ -10667,16 +15625,25 @@ export class BrowserShell {
   }
 
   renderTabSwitcherModal(modal) {
+    if (this.state.settings.tabSwitcherView === 'list') {
+      this.renderTabSwitcherListModal(modal);
+      return;
+    }
+
     modal.className = 'fb-modal-card fb-modal-tab-switcher fb-mobile-tabswitcher-card';
     modal.innerHTML = `
       <div class="fb-modal-header">
         <h2 class="fb-modal-title">${Icons.tabs} Tabs (${this.state.tabs.length})</h2>
-        <div style="display:flex; gap:8px;">
+        <div class="fb-tab-switcher-header-actions">
+          <div class="fb-tab-search-view-switch" role="group" aria-label="Tab search view">
+            <button type="button" class="fb-tab-search-view-btn" data-tab-search-view="grid" aria-pressed="true">Cards</button>
+            <button type="button" class="fb-tab-search-view-btn" data-tab-search-view="list" aria-pressed="false">List</button>
+          </div>
           <button class="fb-btn fb-btn-primary fb-mobile-addtab-btn">${Icons.plus} New Tab</button>
-          <button class="fb-modal-close-btn">${Icons.close}</button>
+          <button class="fb-modal-close-btn" aria-label="Close tab search">${Icons.close}</button>
         </div>
       </div>
-      <div class="fb-modal-body fb-mobile-tabs-grid">
+      <div class="fb-modal-body fb-mobile-tabs-grid fb-tabswitcher-grid">
         ${this.state.tabs.map((tab) => {
           // Real page preview: the last capturePage() snapshot of this
           // tab's native view (taken when overlays open, when switching
@@ -10703,6 +15670,7 @@ export class BrowserShell {
       </div>
     `;
 
+    this.bindTabSwitcherViewButtons(modal);
     modal.querySelector('.fb-modal-close-btn')?.addEventListener('click', () => this.closeModal());
     modal.querySelector('.fb-mobile-addtab-btn')?.addEventListener('click', () => {
       this.closeModal();
@@ -10721,13 +15689,185 @@ export class BrowserShell {
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
         this.closeTab(btn.dataset.tabId);
-        if (this.state.tabs.length === 0) {
-          this.closeModal();
-        } else {
-          this.renderTabSwitcherModal(modal);
-        }
+        if (this.state.tabs.length === 0) this.closeModal();
       });
     });
+  }
+
+  bindTabSwitcherViewButtons(modal) {
+    modal.querySelectorAll('.fb-tab-search-view-btn').forEach((button) => {
+      button.addEventListener('click', () => {
+        this.setTabSwitcherView(button.getAttribute('data-tab-search-view'));
+      });
+    });
+  }
+
+  setTabSwitcherView(view) {
+    const nextView = view === 'list' ? 'list' : 'grid';
+    if (this.state.settings.tabSwitcherView === nextView) return;
+    this.state.settings.tabSwitcherView = nextView;
+    this.persistSettings();
+    this.render();
+  }
+
+  renderTabSwitcherListModal(modal) {
+    const escapeHtml = (value) => String(value || '').replace(/[&<>"']/g, (char) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    })[char]);
+    const query = this.state.tabSwitcherSearchQuery || '';
+    const recentlyExpanded = Boolean(this.state.tabSwitcherRecentlyClosedExpanded);
+    const tabs = this.state.tabs;
+    const closedTabs = (this.state.closedTabsHistory || [])
+      .map((tab, index) => ({ tab, index }))
+      .filter(({ tab }) => tab && !tab.isPrivate);
+
+    modal.className = 'fb-modal-card fb-modal-tab-switcher fb-tab-search-list-panel';
+    modal.innerHTML = `
+      <div class="fb-tab-search-list-header">
+        <div class="fb-tab-search-searchbox">
+          <span class="fb-tab-search-search-icon">${Icons.search}</span>
+          <input type="search" class="fb-tab-search-input" placeholder="Search tabs" aria-label="Search tabs" value="${escapeHtml(query)}" />
+          <kbd>Ctrl+Shift+A</kbd>
+        </div>
+        <div class="fb-tab-search-list-actions">
+          <div class="fb-tab-search-view-switch" role="group" aria-label="Tab search view">
+            <button type="button" class="fb-tab-search-view-btn" data-tab-search-view="grid" aria-pressed="false">Cards</button>
+            <button type="button" class="fb-tab-search-view-btn" data-tab-search-view="list" aria-pressed="true">List</button>
+          </div>
+          <button type="button" class="fb-tab-search-newtab-btn" title="Open a new tab">${Icons.plus}<span>New Tab</span></button>
+          <button type="button" class="fb-modal-close-btn" aria-label="Close tab search">${Icons.close}</button>
+        </div>
+      </div>
+      <div class="fb-tab-search-list-scroll">
+        <section class="fb-tab-search-section">
+          <div class="fb-tab-search-section-title"><span>Open Tabs</span><span class="fb-tab-search-count">${tabs.length}</span></div>
+          <div class="fb-tab-search-open-list"></div>
+          <p class="fb-tab-search-empty fb-tab-search-open-empty" style="display:none;"></p>
+        </section>
+        <section class="fb-tab-search-section fb-tab-search-recent-section">
+          <button type="button" class="fb-tab-search-recent-toggle" aria-expanded="${recentlyExpanded}">
+            <span>Recently Closed</span><span class="fb-tab-search-count">${closedTabs.length}</span><span class="fb-tab-search-chevron">${recentlyExpanded ? '⌄' : '›'}</span>
+          </button>
+          <div class="fb-tab-search-closed-list" style="display:${recentlyExpanded ? 'flex' : 'none'};"></div>
+          <p class="fb-tab-search-empty fb-tab-search-closed-empty" style="display:none;"></p>
+        </section>
+      </div>
+    `;
+
+    this.bindTabSwitcherViewButtons(modal);
+    modal.querySelector('.fb-modal-close-btn')?.addEventListener('click', () => this.closeModal());
+    modal.querySelector('.fb-tab-search-newtab-btn')?.addEventListener('click', () => {
+      this.closeModal();
+      this.createNewTab();
+    });
+
+    const openList = modal.querySelector('.fb-tab-search-open-list');
+    const closedList = modal.querySelector('.fb-tab-search-closed-list');
+    const openEmpty = modal.querySelector('.fb-tab-search-open-empty');
+    const closedEmpty = modal.querySelector('.fb-tab-search-closed-empty');
+    const recentToggle = modal.querySelector('.fb-tab-search-recent-toggle');
+    const searchInput = modal.querySelector('.fb-tab-search-input');
+    if (searchInput) searchInput.value = query;
+    const tabSubtitle = (tab) => {
+      const url = String(tab?.url || '');
+      if (!url || url === 'yayra://newtab') return 'New Tab';
+      if (url.startsWith('yayra://')) return url.slice('yayra://'.length).split(/[?#]/, 1)[0];
+      try {
+        const parsed = new URL(url);
+        return `${parsed.host}${parsed.pathname === '/' ? '' : parsed.pathname}`;
+      } catch { return url; }
+    };
+    const makeTabRow = (tab, { closed = false, index = -1 } = {}) => {
+      const titleText = this.getTabTitle(tab);
+      const row = document.createElement('div');
+      const isActive = !closed && tab.id === this.state.activeTabId;
+      row.className = `fb-tab-search-row ${closed ? 'is-closed' : ''} ${isActive ? 'is-active' : ''}`;
+      row.dataset.searchText = `${titleText} ${tab.url || ''}`.toLocaleLowerCase();
+
+      const select = document.createElement('button');
+      select.type = 'button';
+      select.className = 'fb-tab-search-row-main';
+      select.setAttribute('aria-label', `${closed ? 'Reopen' : 'Switch to'} ${titleText}`);
+      if (isActive) select.setAttribute('aria-current', 'page');
+      const icon = document.createElement('span');
+      icon.className = 'fb-tab-search-row-icon';
+      icon.innerHTML = this.getTabFavicon(tab);
+      const copy = document.createElement('span');
+      copy.className = 'fb-tab-search-row-copy';
+      const title = document.createElement('strong');
+      title.className = 'fb-tab-search-row-title';
+      title.textContent = titleText;
+      const subtitle = document.createElement('small');
+      subtitle.className = 'fb-tab-search-row-subtitle';
+      subtitle.textContent = closed ? `${tabSubtitle(tab)} · Recently closed` : `${tabSubtitle(tab)}${isActive ? ' · Current tab' : ''}`;
+      copy.appendChild(title);
+      copy.appendChild(subtitle);
+      select.appendChild(icon);
+      select.appendChild(copy);
+      row.appendChild(select);
+
+      if (!closed) {
+        const close = document.createElement('button');
+        close.type = 'button';
+        close.className = 'fb-tab-search-row-close';
+        close.innerHTML = Icons.close;
+        close.setAttribute('aria-label', `Close ${titleText}`);
+        close.addEventListener('click', (event) => {
+          event.stopPropagation();
+          this.closeTab(tab.id);
+        });
+        row.appendChild(close);
+      }
+
+      select.addEventListener('click', () => {
+        if (closed) this.reopenClosedTabAt(index);
+        else {
+          this.selectTab(tab.id);
+          this.closeModal();
+        }
+      });
+      return row;
+    };
+
+    tabs.forEach((tab) => openList.appendChild(makeTabRow(tab)));
+    closedTabs.forEach(({ tab, index }) => closedList.appendChild(makeTabRow(tab, { closed: true, index })));
+
+    const applySearch = ({ autoExpandRecent = false } = {}) => {
+      const currentQuery = String(searchInput?.value || '').trim().toLocaleLowerCase();
+      this.state.tabSwitcherSearchQuery = currentQuery;
+      let openMatches = 0;
+      let closedMatches = 0;
+      openList.querySelectorAll('.fb-tab-search-row').forEach((row) => {
+        const matches = !currentQuery || (row.dataset.searchText || '').includes(currentQuery);
+        row.style.display = matches ? '' : 'none';
+        if (matches) openMatches += 1;
+      });
+      closedList.querySelectorAll('.fb-tab-search-row').forEach((row) => {
+        const matches = !currentQuery || (row.dataset.searchText || '').includes(currentQuery);
+        row.style.display = matches ? '' : 'none';
+        if (matches) closedMatches += 1;
+      });
+      openEmpty.textContent = currentQuery ? 'No matching open tabs.' : 'No open tabs.';
+      openEmpty.style.display = openMatches ? 'none' : 'block';
+      closedEmpty.textContent = currentQuery ? 'No matching recently closed tabs.' : 'No recently closed tabs.';
+      if (autoExpandRecent && currentQuery && closedMatches) {
+        this.state.tabSwitcherRecentlyClosedExpanded = true;
+      }
+      const expanded = this.state.tabSwitcherRecentlyClosedExpanded;
+      closedList.style.display = expanded ? 'flex' : 'none';
+      closedEmpty.style.display = expanded && !closedMatches ? 'block' : 'none';
+      recentToggle.setAttribute('aria-expanded', String(expanded));
+      const chevron = recentToggle.querySelector('.fb-tab-search-chevron');
+      if (chevron) chevron.textContent = expanded ? '⌄' : '›';
+    };
+
+    searchInput?.addEventListener('input', () => applySearch({ autoExpandRecent: true }));
+    recentToggle?.addEventListener('click', () => {
+      this.state.tabSwitcherRecentlyClosedExpanded = recentToggle.getAttribute('aria-expanded') !== 'true';
+      applySearch();
+    });
+    applySearch();
+    searchInput?.focus();
   }
 
   renderHistoryModal(modal) {
@@ -10998,6 +16138,7 @@ export class BrowserShell {
     const phrases = [];
     const items = (this.state.historyItems || []).slice(0, 300);
     for (const item of items) {
+      if (!/^https?:\/\//i.test(String(item?.url || ''))) continue;
       try {
         const parsed = new URL(item.url);
         const phrase = parsed.searchParams.get('q') || parsed.searchParams.get('query') || parsed.searchParams.get('p');
@@ -11040,38 +16181,89 @@ export class BrowserShell {
   }
 
   getLocalSearchSuggestions(query) {
-    const normalized = String(query || '').trim().toLowerCase();
-    if (!normalized) return [];
+    const raw = String(query || '').trim();
+    const normalized = raw.toLowerCase();
+    if (!normalized || raw.length > 120 || /[\r\n]/.test(raw)) return [];
+    const webItems = (items) => (items || []).filter((item) => /^https?:\/\//i.test(String(item?.url || '')));
     const remembered = [
       ...this.getRememberedSearchPhrases(),
-      ...(this.state.historyItems || []).map((item) => item.title || item.url),
-      ...(this.state.bookmarksItems || []).map((item) => item.title || item.url),
-      ...(this.state.tabs || []).map((tab) => tab.title || tab.url)
+      ...webItems(this.state.historyItems).map((item) => item.title || item.url),
+      ...webItems(this.state.bookmarksItems).map((item) => item.title || item.url),
+      ...webItems(this.state.tabs).map((tab) => tab.title || tab.url)
     ];
-    const common = [
-      `${query} news`,
-      `${query} near me`,
-      `${query} today`,
-      `${query} website`
-    ];
+    const common = [`${raw} news`, `${raw} near me`, `${raw} today`, `${raw} website`];
     return [...new Set([...remembered, ...common].filter((item) => String(item).toLowerCase().includes(normalized)))].slice(0, 8);
   }
 
+  /**
+   * Ends every suggestion request/dropdown before a navigation replaces its
+   * input. Without this boundary an old async suggestion response can finish
+   * after render() detached the omnibox, set isPageObscured back to true, and
+   * leave the newly loaded native page hidden behind a static screenshot.
+   */
+  retireSearchSuggestionsForNavigation({ restoreSurface = true } = {}) {
+    this._suggestionGeneration = (this._suggestionGeneration || 0) + 1;
+    if (this._suggestionsDebounceTimer) clearTimeout(this._suggestionsDebounceTimer);
+    this._suggestionsDebounceTimer = null;
+    try { this._suggestionsDebounceResolve?.(); } catch { /* already settled */ }
+    this._suggestionsDebounceResolve = null;
+    try { this.searchSuggestionController?.abort(); } catch { /* already settled */ }
+    this.searchSuggestionController = null;
+    if (typeof document !== 'undefined') {
+      try {
+        for (const list of document.querySelectorAll('.fb-search-suggestions') || []) list.hidden = true;
+      } catch { /* detached shell */ }
+    }
+    if (restoreSurface && this.state.isPageObscured) {
+      try { this.setPageObscured(false); }
+      catch { this.state.isPageObscured = false; }
+    }
+  }
+
   async getGoogleSearchSuggestions(query) {
-    const local = this.getLocalSearchSuggestions(query);
+    const raw = String(query || '').trim();
+    const generation = (this._suggestionGeneration || 0) + 1;
+    this._suggestionGeneration = generation;
+    if (this._suggestionsDebounceTimer) clearTimeout(this._suggestionsDebounceTimer);
+    this._suggestionsDebounceTimer = null;
+    this._suggestionsDebounceResolve?.();
+    this._suggestionsDebounceResolve = null;
+    this.searchSuggestionController?.abort();
+    this.searchSuggestionController = null;
+    const local = this.getLocalSearchSuggestions(raw);
+    // Do not send pasted logs, multiline text, internal Yayra routes, or
+    // arbitrarily long free-form content to the remote suggestion service.
+    if (/^yayra:\/\//i.test(raw)) return [];
+    if (raw.length < 2 || raw.length > 120 || /[\r\n]/.test(raw) || /^https?:\/\//i.test(raw)) return local;
+    if (Date.now() < (this._suggestionsRetryAfter || 0)) return local;
     if (typeof fetch !== 'function') return local;
+    await new Promise((resolve) => {
+      this._suggestionsDebounceResolve = resolve;
+      this._suggestionsDebounceTimer = setTimeout(() => {
+        this._suggestionsDebounceTimer = null;
+        this._suggestionsDebounceResolve = null;
+        resolve();
+      }, 180);
+    });
+    if (generation !== this._suggestionGeneration) return local;
     try {
       this.searchSuggestionController?.abort();
       this.searchSuggestionController = typeof AbortController === 'function' ? new AbortController() : null;
-      const response = await fetch(`https://yayra-updates-api.g2code335.workers.dev/api/suggestions?q=${encodeURIComponent(query)}`, {
+      const response = await fetch(`https://yayra-updates-api.g2code335.workers.dev/api/suggestions?q=${encodeURIComponent(raw)}`, {
         headers: { accept: 'application/json' },
         signal: this.searchSuggestionController?.signal
       });
-      if (!response.ok) return local;
+      if (generation !== this._suggestionGeneration) return local;
+      if (!response.ok) {
+        this._suggestionsRetryAfter = Date.now() + 60_000;
+        return local;
+      }
       const payload = await response.json();
+      if (generation !== this._suggestionGeneration) return local;
       const remote = Array.isArray(payload?.[1]) ? payload[1].filter((item) => typeof item === 'string') : [];
       return [...new Set([...remote, ...local])].slice(0, 8);
-    } catch {
+    } catch (error) {
+      if (error?.name !== 'AbortError') this._suggestionsRetryAfter = Date.now() + 60_000;
       return local;
     }
   }
@@ -11092,6 +16284,28 @@ export class BrowserShell {
     list.setAttribute('role', 'listbox');
     list.hidden = true;
     host.appendChild(list);
+
+    // Async responses belong only to the render tree that requested them.
+    // `isConnected` is authoritative in browsers; root containment also
+    // keeps detached DOM test hosts valid while rejecting an old omnibox
+    // after BrowserShell.render() has replaced it.
+    const surfaceIsCurrent = () => {
+      try {
+        const isWithinCurrentRoot = (element) => {
+          let node = element;
+          for (let depth = 0; node && depth < 64; depth += 1) {
+            if (node === this.rootElement) return true;
+            node = node.parentElement || node.parentNode || null;
+          }
+          return false;
+        };
+        if (isWithinCurrentRoot(input) && isWithinCurrentRoot(list)) return true;
+        if (typeof input.isConnected === 'boolean' || typeof list.isConnected === 'boolean') {
+          return input.isConnected === true && list.isConnected === true;
+        }
+        return false;
+      } catch { return false; }
+    };
 
     let activeIndex = -1;
     let requestId = 0;
@@ -11131,11 +16345,11 @@ export class BrowserShell {
       }
       const currentRequest = ++requestId;
       const suggestions = await this.getGoogleSearchSuggestions(query);
-      if (currentRequest !== requestId || input.value.trim() !== query) return;
+      if (!surfaceIsCurrent() || currentRequest !== requestId || input.value.trim() !== query) return;
       list.innerHTML = '';
-      // Chrome-style AI entry: every search also offers "Ask Yayra AI"
-      // as the first row, opening yayra://ai with the query pre-asked.
-      if (this.state.aiConfig?.enabled && this.state.aiConfig?.suggestInOmnibox) {
+      // Optional Yayra entry for the browser omnibox. The Google-owned
+      // new-tab pill opts out and keeps its separate Ask Yayra AI button.
+      if (options.includeYayraAi !== false && this.state.aiConfig?.enabled && this.state.aiConfig?.suggestInOmnibox) {
         const aiItem = document.createElement('button');
         aiItem.type = 'button';
         aiItem.className = 'fb-search-suggestion fb-ai-suggestion';
@@ -11528,7 +16742,7 @@ export class BrowserShell {
   /* -------------------------------------------------------------
    * TAB MANAGEMENT
    * ----------------------------------------------------------- */
-  createNewTab(isPrivate = false) {
+  createNewTab(isPrivate = false, { group = null, render = true, afterTabId = null } = {}) {
     // Collision-proof id: `tab-${Date.now()}` alone DUPLICATED when two tabs
     // were created in the same millisecond (fast Ctrl+T, scripted flows) -
     // aliased tabs then shared ONE pooled frame, silently overwriting each
@@ -11545,13 +16759,20 @@ export class BrowserShell {
       isPrivate,
       favicon: null
     };
+    const safeGroup = this.sanitizeTabGroup(group);
+    if (safeGroup) newTab.group = safeGroup;
 
-    this.state.tabs.push(newTab);
+    const insertAfterIndex = afterTabId
+      ? this.state.tabs.findIndex((tab) => tab.id === afterTabId)
+      : -1;
+    if (insertAfterIndex >= 0) this.state.tabs.splice(insertAfterIndex + 1, 0, newTab);
+    else this.state.tabs.push(newTab);
     this.state.activeTabId = newId;
     this.state.urlInputValue = '';
     this.state.isBookmarked = false;
 
-    this.render();
+    if (render) this.render();
+    return newTab;
   }
 
   selectTab(tabId) {
@@ -11581,16 +16802,46 @@ export class BrowserShell {
   closeTab(tabId) {
     const tabIndex = this.state.tabs.findIndex((t) => t.id === tabId);
     if (tabIndex === -1) return;
+    const activeDocumentShow = this._documentSlideshow || this._pptxSlideshow;
+    if (activeDocumentShow?.active && activeDocumentShow.tabId === tabId) {
+      void this.exitDocumentSlideshow();
+    }
 
+    this._clearSiteFailure(tabId);
     this.destroyNativeWebview(tabId);
     this._systemBrowserHandoffs.delete(tabId);
+    this._inAppOnlyGoogleTabs.delete(tabId);
     this._pageSnapshots.delete(tabId); // closed tab, dead preview
 
     const [closedTab] = this.state.tabs.splice(tabIndex, 1);
+    if (closedTab?.docId) {
+      const session = this._documentViewerSessions?.get(tabId);
+      if (session) {
+        session.disposed = true;
+        try { session.viewer?.destroy(); } catch { /* already gone */ }
+        this._documentViewerSessions.delete(tabId);
+      }
+      if (this._activeDocViewer?.tabId === tabId) this._activeDocViewer = null;
+      if (!this.state.tabs.some((tab) => tab.docId === closedTab.docId)) {
+        this.documentStore?.remove(closedTab.docId);
+        const sessionEntry = this.state.documentsItems?.find?.((entry) => entry.source === 'session' && entry.docId === closedTab.docId);
+        if (sessionEntry) sessionEntry.available = false;
+      }
+    }
 
-    // Save to closed tabs history (for Ctrl+Shift+T restore)
-    if (closedTab && !closedTab.isPrivate && closedTab.url !== 'yayra://newtab') {
-      this.state.closedTabsHistory.unshift(closedTab);
+    // A closed PDF is intentionally not kept in the in-memory restore list:
+    // closing it releases its bytes, so advertising it to Ctrl+Shift+T would
+    // create a dead document tab. If a document tab navigated to a website,
+    // that website remains restorable without the document metadata.
+    const isDocumentUrl = String(closedTab?.url || '').startsWith('yayra://doc/');
+    if (closedTab && !closedTab.isPrivate && closedTab.url !== 'yayra://newtab' && !isDocumentUrl) {
+      const restorableTab = { ...closedTab };
+      if (restorableTab.docId) {
+        delete restorableTab.isDocument;
+        delete restorableTab.docId;
+        delete restorableTab.docState;
+      }
+      this.state.closedTabsHistory.unshift(restorableTab);
       if (this.state.closedTabsHistory.length > 25) {
         this.state.closedTabsHistory.pop();
       }
@@ -11655,8 +16906,15 @@ export class BrowserShell {
    * CHROME-STYLE RIGHT-CLICK CONTEXT MENU FOR THE TAB STRIP
    * ----------------------------------------------------------- */
   renderTabContextMenu(x, y, tab) {
-    document.body.querySelector('.fb-tab-context-menu')?.remove();
-    document.body.querySelector('.fb-dropdown-scrim[data-tab-ctx]')?.remove();
+    const previousMenu = document.body.querySelector('.fb-tab-context-menu');
+    const previousScrim = Array.from(document.body.querySelectorAll('.fb-dropdown-scrim') || [])
+      .find((el) => el?.dataset?.tabCtx === 'true');
+    const previousDismiss = previousMenu?._yayraDismiss || previousScrim?._yayraDismiss;
+    if (typeof previousDismiss === 'function') previousDismiss();
+    else {
+      previousMenu?.remove?.();
+      previousScrim?.remove?.();
+    }
 
     const scrim = document.createElement('button');
     scrim.type = 'button';
@@ -11666,47 +16924,158 @@ export class BrowserShell {
 
     const menu = document.createElement('div');
     menu.className = 'fb-tab-context-menu';
+    menu.setAttribute('role', 'menu');
+    if (!tab || !tab.id) return;
 
     // Clicking/tapping OR right-clicking anywhere outside the menu must
-    // dismiss BOTH the scrim and the menu (previously only the scrim was
-    // removed, stranding the menu on screen forever).
+    // dismiss BOTH the scrim and the menu. Pointerdown (not only click) is
+    // intentional: even if the OS loses pointerup/click, the transparent
+    // blocker is gone synchronously and can never freeze the next gesture.
+    let dismissed = false;
+    let safetyTimer = null;
     const dismiss = () => {
+      if (dismissed) return;
+      dismissed = true;
+      if (safetyTimer) clearTimeout(safetyTimer);
+      safetyTimer = null;
       scrim.remove();
       menu.remove();
-      // Un-obscure the native page surface (see below).
-      this.setPageObscured(false);
+      try { window.removeEventListener?.('blur', dismiss, true); } catch { /* shim */ }
+      // Truth-check all remaining overlays before restoring the native page;
+      // another real modal may still legitimately own it.
+      this.healStuckPageSurface();
     };
+    scrim._yayraDismiss = dismiss;
+    menu._yayraDismiss = dismiss;
+    const shownAt = String(Date.now());
+    scrim.dataset.shownAt = shownAt;
+    menu.dataset.shownAt = shownAt;
+    scrim.addEventListener('pointerdown', (e) => { e.preventDefault?.(); dismiss(); });
     scrim.addEventListener('click', dismiss);
     scrim.addEventListener('contextmenu', (e) => { e.preventDefault(); dismiss(); });
+    try { window.addEventListener?.('blur', dismiss, true); } catch { /* shim */ }
+    // Independent of pointer/focus/render delivery: a native/compositor
+    // anomaly cannot leave the body-mounted blocker around indefinitely.
+    safetyTimer = setTimeout(dismiss, 30000);
+    safetyTimer?.unref?.();
     const canCloseOthers = this.state.tabs.length > 1;
     const tabIndex = this.state.tabs.findIndex((t) => t.id === tab.id);
     const canCloseRight = tabIndex > -1 && tabIndex < this.state.tabs.length - 1;
 
+    const currentGroupId = this.tabGroupIdentity(tab.group, tab.isPrivate);
+    const currentGroup = this.getTabGroups().find((group) => group.id === currentGroupId);
+    const availableGroups = this.getTabGroups().filter((group) =>
+      group.isPrivate === Boolean(tab.isPrivate) && group.id !== currentGroupId);
     const items = [
       { label: 'New Tab', action: () => this.createNewTab() },
-      null,
       { label: 'Reload', action: () => this.reloadTabById(tab.id) },
       { label: 'Duplicate Tab', action: () => this.duplicateTabById(tab.id) },
+      ...(/^https?:\/\//i.test(String(tab.url || '')) ? [{
+        label: 'Move Tab to New Window',
+        action: () => { void this.detachTabToWindow(tab.id); }
+      }] : []),
+      null,
+      { label: 'Create group with this tab…', action: () => this.createTabGroupForTab(tab.id) },
+      ...(availableGroups.length ? [{
+        label: 'Add to…',
+        submenu: availableGroups.map((group) => ({
+          label: group.name,
+          action: () => this.addTabToExistingGroup(tab.id, group.id)
+        }))
+      }] : []),
+      ...(currentGroup ? [
+        { label: `Open “${currentGroup.name}” group`, action: () => this.openTabGroup(currentGroup.id) },
+        { label: `Remove from “${currentGroup.name}”`, action: () => this.ungroupTab(tab.id) }
+      ] : []),
+      { label: 'Manage tab groups', action: () => this.openTabGroupsSettings() },
       null,
       { label: 'Close Tab', action: () => this.closeTab(tab.id) },
       { label: 'Close Other Tabs', action: () => this.closeOtherTabs(tab.id), disabled: !canCloseOthers },
       { label: 'Close Tabs to the Right', action: () => this.closeTabsToTheRight(tab.id), disabled: !canCloseRight }
     ];
 
-    menu.innerHTML = items.map((item, i) => item === null
-      ? '<div class="fb-tab-context-menu-sep"></div>'
-      : `<button type="button" class="fb-tab-context-menu-item" data-idx="${i}" ${item.disabled ? 'disabled' : ''}>${item.label}</button>`
-    ).join('');
+    const menuWidth = 240;
+    const baseMenuHeight = items.reduce((height, item) => height + (item ? 34 : 12), 16);
+    const stripRect = this.tabStripElement?.getBoundingClientRect?.();
+    const stripBottom = Math.max(36, Number(stripRect?.bottom) || 0);
+    // Keep the transparent outside-click target and the menu itself below
+    // tabs/New Tab/caption controls. Even a stale browser menu therefore
+    // cannot physically intercept the complete top row.
+    scrim.style.top = `${stripBottom}px`;
+    scrim.style.height = `calc(100% - ${stripBottom}px)`;
+    const positionMenu = (extraHeight = 0) => {
+      const left = Math.min(x, window.innerWidth - menuWidth - 8);
+      const maxTop = window.innerHeight - baseMenuHeight - extraHeight - 8;
+      const top = Math.max(stripBottom + 4, Math.min(y, maxTop));
+      menu.style.left = `${Math.max(8, left)}px`;
+      menu.style.top = `${top}px`;
+    };
 
-    menu.querySelectorAll('.fb-tab-context-menu-item').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const item = items[Number(btn.dataset.idx)];
-        scrim.remove();
-        menu.remove();
-        this.setPageObscured(false);
-        item?.action?.();
+    // Use textContent for labels: group names are user-entered and must
+    // never be interpreted as markup in a tab context menu.
+    items.forEach((item, index) => {
+      if (item === null) {
+        const separator = document.createElement('div');
+        separator.className = 'fb-tab-context-menu-sep';
+        separator.setAttribute('role', 'separator');
+        menu.appendChild(separator);
+        return;
+      }
+
+      if (Array.isArray(item.submenu)) {
+        const groupRow = document.createElement('div');
+        groupRow.className = 'fb-tab-context-menu-submenu-row';
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.className = 'fb-tab-context-menu-item fb-tab-context-menu-submenu-toggle';
+        toggle.setAttribute('role', 'menuitem');
+        toggle.setAttribute('data-idx', String(index));
+        toggle.setAttribute('aria-haspopup', 'menu');
+        toggle.setAttribute('aria-expanded', 'false');
+        toggle.textContent = item.label;
+        const submenu = document.createElement('div');
+        submenu.className = 'fb-tab-context-submenu';
+        submenu.setAttribute('role', 'menu');
+        submenu.setAttribute('aria-label', 'Available tab groups');
+        submenu.style.display = 'none';
+        for (const child of item.submenu) {
+          const childButton = document.createElement('button');
+          childButton.type = 'button';
+          childButton.className = 'fb-tab-context-menu-item fb-tab-context-submenu-item';
+          childButton.setAttribute('role', 'menuitem');
+          childButton.textContent = child.label;
+          childButton.addEventListener('click', () => {
+            dismiss();
+            child.action?.();
+            this.render();
+          });
+          submenu.appendChild(childButton);
+        }
+        toggle.addEventListener('click', () => {
+          const expanded = toggle.getAttribute('aria-expanded') === 'true';
+          toggle.setAttribute('aria-expanded', String(!expanded));
+          submenu.style.display = expanded ? 'none' : 'flex';
+          positionMenu(expanded ? 0 : item.submenu.length * 34 + 8);
+        });
+        groupRow.appendChild(toggle);
+        groupRow.appendChild(submenu);
+        menu.appendChild(groupRow);
+        return;
+      }
+
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'fb-tab-context-menu-item';
+      button.setAttribute('role', 'menuitem');
+      button.setAttribute('data-idx', String(index));
+      button.disabled = Boolean(item.disabled);
+      button.textContent = item.label;
+      button.addEventListener('click', () => {
+        dismiss();
+        item.action?.();
         this.render();
       });
+      menu.appendChild(button);
     });
 
     document.body.appendChild(scrim);
@@ -11721,12 +17090,7 @@ export class BrowserShell {
     this.setPageObscured(true);
 
     // Clamp to viewport so it never renders off-screen near the right/bottom edge.
-    const menuWidth = 220;
-    const menuHeight = items.length * 34 + 16;
-    const left = Math.min(x, window.innerWidth - menuWidth - 8);
-    const top = Math.min(y, window.innerHeight - menuHeight - 8);
-    menu.style.left = `${Math.max(8, left)}px`;
-    menu.style.top = `${Math.max(8, top)}px`;
+    positionMenu();
   }
 
   restoreLastClosedTab() {
@@ -11780,7 +17144,20 @@ export class BrowserShell {
     const query = (rawInput || '').trim();
     if (!query) return;
 
+    // Navigation is a hard lifecycle boundary for autocomplete. Retire the
+    // old dropdown and its async request BEFORE replacing the omnibox; an old
+    // response must never hide the destination's live native surface.
+    this.retireSearchSuggestionsForNavigation();
+
     const targetUrl = this.interpretUrl(query);
+    // A typed/selected destination supersedes every failure generation from
+    // the previous address before any asynchronous engine event can arrive.
+    this._clearSiteFailure(activeTab.id);
+    const googleFeatureInAppOnly = this.isGoogleFeatureInAppOnly(activeTab.id, targetUrl);
+    // Leaving Google ends the special Voice/Lens routing promise for this
+    // tab. Other ordinary Google navigations remain in-app while the user is
+    // still following the Voice/Lens result chain.
+    if (!googleFeatureInAppOnly) this._inAppOnlyGoogleTabs.delete(activeTab.id);
     // An explicit navigation (including re-entering the same auth URL) is a
     // fresh attempt, unlike a render. It may therefore launch the browser once
     // again; passive chrome updates may not.
@@ -11804,8 +17181,8 @@ export class BrowserShell {
     this.state.urlInputValue = this.getDisplayUrl(targetUrl);
     this.updateBookmarkState(targetUrl);
 
-    // Record history if not in private mode and not internal newtab
-    if (!activeTab.isPrivate && this.historyRepo && targetUrl !== 'yayra://newtab') {
+    // History is for visited websites, never Yayra's own settings/tool pages.
+    if (!activeTab.isPrivate && this.historyRepo && /^https?:\/\//i.test(targetUrl)) {
       const recorded = typeof this.historyRepo.recordVisit === 'function'
         ? this.historyRepo.recordVisit(targetUrl, activeTab.title, activeTab.favicon)
         : (typeof this.historyRepo.addEntry === 'function' ? this.historyRepo.addEntry(targetUrl, activeTab.title, activeTab.favicon) : null);
@@ -11826,8 +17203,9 @@ export class BrowserShell {
     // honest already-opened state; the per tab+url keys keep the render
     // path from opening a second tab.
     if (/^https?:\/\//i.test(targetUrl)
+      && !googleFeatureInAppOnly
       && !this.nativeWebview && !this.capacitorBrowser && !this.capacitorTabWeb
-      && !this.isSystemBrowserAuthHost(targetUrl) // sign-in hosts have their OWN single handoff
+      && !this.isSystemBrowserAuthHost(targetUrl) // recognized auth endpoints have their OWN single handoff
       && typeof window !== 'undefined' && typeof window.open === 'function') {
       const serp = typeof this.getSearchIntent === 'function' ? this.getSearchIntent(targetUrl) : null;
       const blocked = this.isKnownFrameBlockedUrl(targetUrl);
@@ -11860,6 +17238,7 @@ export class BrowserShell {
     if (trimmed === 'history') return 'yayra://history';
     if (trimmed === 'bookmarks') return 'yayra://bookmarks';
     if (trimmed === 'downloads') return 'yayra://downloads';
+    if (trimmed === 'documents' || trimmed === 'docs') return 'yayra://documents';
     if (trimmed === 'passwords') return 'yayra://passwords';
     if (trimmed === 'extensions') return 'yayra://extensions';
     if (trimmed === 'permissions') return 'yayra://permissions';
@@ -11899,10 +17278,9 @@ export class BrowserShell {
         this.render();
       }).catch(() => {});
     } else if (schemeUrl === 'yayra://bookmarks' && this.bookmarksRepo?.getAllBookmarks) {
-      this.bookmarksRepo.getAllBookmarks().then((items) => {
-        this.state.bookmarksItems = items || [];
-        this.render();
-      }).catch(() => {});
+      this.refreshBookmarksState().then(() => this.render()).catch(() => {});
+    } else if (schemeUrl === 'yayra://documents') {
+      void this.refreshDocumentLibrary();
     }
   }
 
@@ -11916,7 +17294,9 @@ export class BrowserShell {
     const navigationState = this.ensureNavigationState(activeTab);
     if (navigationState.currentIndex <= 0) return false;
     navigationState.currentIndex -= 1;
+    this._clearSiteFailure(activeTab.id);
     activeTab.url = navigationState.historyStack[navigationState.currentIndex];
+    if (!this.isGoogleOwnedUrl(activeTab.url)) this._inAppOnlyGoogleTabs.delete(activeTab.id);
     activeTab.title = this.getTabTitle(activeTab);
     activeTab.isSecure = activeTab.url.startsWith('https://') || activeTab.url.startsWith('yayra://');
     activeTab.canGoBack = navigationState.currentIndex > 0;
@@ -11938,7 +17318,9 @@ export class BrowserShell {
     const navigationState = this.ensureNavigationState(activeTab);
     if (navigationState.currentIndex >= navigationState.historyStack.length - 1) return false;
     navigationState.currentIndex += 1;
+    this._clearSiteFailure(activeTab.id);
     activeTab.url = navigationState.historyStack[navigationState.currentIndex];
+    if (!this.isGoogleOwnedUrl(activeTab.url)) this._inAppOnlyGoogleTabs.delete(activeTab.id);
     activeTab.title = this.getTabTitle(activeTab);
     activeTab.isSecure = activeTab.url.startsWith('https://') || activeTab.url.startsWith('yayra://');
     activeTab.canGoBack = navigationState.currentIndex > 0;
@@ -11960,6 +17342,13 @@ export class BrowserShell {
     // FREEZE FIX: refresh must ALWAYS hand back the live page surface -
     // in the field a stuck obscured flag made refresh look dead.
     try { this.healStuckPageSurface(); } catch { /* best-effort heal */ }
+    // On a recovery page, Reload is the explicit immediate retry. Keep the
+    // card and target URL in place until the engine reports real success.
+    if (this._siteFailureFor(activeTab.id)) {
+      this._retrySiteRecovery(activeTab.id, { reason: 'manual' });
+      this.requestRender();
+      return;
+    }
     if (this.nativeWebview && this._nativeWebviewTabIds.has(activeTab.id)
       && !this.isSystemBrowserAuthHost(activeTab.url)) {
       // The X (stop) must appear the INSTANT the reload is requested -
@@ -12002,6 +17391,11 @@ export class BrowserShell {
     }
     // FREEZE FIX: same invariant as reload() - the live surface comes back.
     try { this.healStuckPageSurface(); } catch { /* best-effort heal */ }
+    if (this._siteFailureFor(activeTab.id)) {
+      this._retrySiteRecovery(activeTab.id, { reason: 'manual' });
+      this.requestRender();
+      return;
+    }
     if (this.nativeWebview && typeof this.nativeWebview.hardReload === 'function' && this._nativeWebviewTabIds.has(activeTab.id)) {
       try {
         const res = await this.nativeWebview.hardReload(activeTab.id);
@@ -12123,16 +17517,18 @@ export class BrowserShell {
     const continueEntries = [];
     const seenContinue = new Set(this.state.tabs.map((t) => t.url));
     for (const t of (this.state.continueTabs || [])) {
-      if (seenContinue.has(t.url)) continue;
-      seenContinue.add(t.url);
-      continueEntries.push({ url: t.url, title: t.title || t.url, reason: 'From last session', group: t.group });
+      const url = String(t?.url || '');
+      if (!url || seenContinue.has(url)) continue;
+      seenContinue.add(url);
+      continueEntries.push({ url, favicon: t.favicon || null, title: t.title || url, reason: 'From last session', group: t.group });
       if (continueEntries.length >= 5) break;
     }
     for (const site of frequentSites) {
+      const url = String(site?.url || '');
       if (continueEntries.length >= 5) break;
-      if (seenContinue.has(site.url)) continue;
-      seenContinue.add(site.url);
-      continueEntries.push({ url: site.url, title: site.title || site.url, reason: 'You visit often' });
+      if (!/^https?:\/\//i.test(url) || seenContinue.has(url)) continue;
+      seenContinue.add(url);
+      continueEntries.push({ url, favicon: site.favicon || null, title: site.title || url, reason: 'You visit often' });
     }
     const continueSnapshotId = this.state.continueSavedAt || 'no-snapshot-id';
     const continueDismissed = this.state.settings.continueDismissedAt === continueSnapshotId;
@@ -12143,12 +17539,18 @@ export class BrowserShell {
       <div class="fb-continue-card-head">Continue with these tabs?</div>
       ${continueEntries.map((entry) => {
         let host = entry.url;
-        try { host = new URL(entry.url).hostname; } catch { /* keep url */ }
+        try {
+          const parsed = new URL(entry.url);
+          host = parsed.protocol === 'yayra:' ? 'Yayra' : parsed.hostname;
+        } catch { /* keep the visible label for a non-URL tab */ }
+        const icon = this.getTabFavicon({ url: entry.url, favicon: entry.favicon, isLoading: false });
+        const safeUrl = String(entry.url).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+        const safeTitle = String(entry.title || entry.url).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
         return `
-        <button class="fb-continue-item" data-url="${String(entry.url).replace(/"/g, '&quot;')}">
-          <img class="fb-continue-favicon" src="https://icons.duckduckgo.com/ip3/${host}.ico" alt="" loading="lazy" onerror="this.style.visibility='hidden'" />
+        <button class="fb-continue-item" data-url="${safeUrl}">
+          <span class="fb-continue-favicon fb-continue-favicon-wrap">${icon}</span>
           <span class="fb-continue-text">
-            <span class="fb-continue-title">${String(entry.title).replace(/</g, '&lt;')}</span>
+            <span class="fb-continue-title">${safeTitle}</span>
             <span class="fb-continue-meta">${host} &bull; ${entry.reason}</span>
           </span>
         </button>`;
@@ -12254,8 +17656,20 @@ export class BrowserShell {
         tab.loadingStartedAt = Date.now();
         this._ensureLoadingWatchdog();
       }
-      const countEl = this.rootElement?.querySelector('.fb-page-loading-bar');
-      if (countEl) countEl.style.display = isLoading ? 'block' : 'none';
+      // The loading strip is permanently mounted, so an engine event from a
+      // link click can toggle it even though no Yayra render/navigation ran.
+      // Include the body-mounted popup mini, not only the main shell tree.
+      if (tabId === this.state.activeTabId && typeof document !== 'undefined') {
+        const roots = [this.rootElement, document.getElementById?.('yayra-floating-popup-window')].filter(Boolean);
+        for (const root of roots) {
+          for (const bar of root.querySelectorAll?.('.fb-page-loading-bar') || []) {
+            bar.style.display = tab.isLoading ? 'block' : 'none';
+            bar.setAttribute('aria-valuetext', tab.isLoading ? 'Loading website' : 'Website loaded');
+          }
+          const viewport = root.querySelector?.('.fb-browser-viewport') || root.querySelector?.('.fb-mini-viewport');
+          viewport?.setAttribute?.('aria-busy', tab.isLoading ? 'true' : 'false');
+        }
+      }
       if (changed) this.refreshLoadingUi(tabId);
       this.ensurePersistentAssistiveBubble();
     }
@@ -12339,30 +17753,35 @@ export class BrowserShell {
     if (typeof document === 'undefined') return;
     const tab = this.state.tabs.find((t) => t.id === tabId);
     if (!tab) return;
-    const root = this.rootElement || document;
-    if (!root || typeof root.querySelectorAll !== 'function') return;
+    const roots = [this.rootElement, document.getElementById?.('yayra-floating-popup-window')]
+      .filter((root, index, all) => root && typeof root.querySelectorAll === 'function' && all.indexOf(root) === index);
+    if (!roots.length) return;
 
-    // Reload/stop button(s) - only the ACTIVE tab drives the toolbar.
-    if (tabId === this.state.activeTabId) {
-      for (const selector of ['.fb-nav-reload', '.fb-mobile-refresh-btn']) {
-        const btn = root.querySelector(selector);
-        if (!btn) continue;
-        btn.innerHTML = tab.isLoading ? Icons.stop : Icons.refresh;
-        btn.setAttribute('title', tab.isLoading ? 'Stop loading this page (Esc)' : 'Reload this page (Ctrl+R)');
-        btn.setAttribute('aria-label', tab.isLoading ? 'Stop' : 'Reload');
+    for (const root of roots) {
+      // Reload/stop button(s) - only the ACTIVE tab drives each toolbar,
+      // including the full mobile layout and the body-mounted popup mini.
+      if (tabId === this.state.activeTabId) {
+        for (const selector of ['.fb-nav-reload', '.fb-mobile-refresh-btn', '.fb-mini-reload-btn']) {
+          const btn = root.querySelector(selector);
+          if (!btn) continue;
+          btn.innerHTML = tab.isLoading ? Icons.stop : Icons.refresh;
+          btn.setAttribute('title', tab.isLoading ? 'Stop loading this page (Esc)' : 'Reload this page (Ctrl+R)');
+          btn.setAttribute('aria-label', tab.isLoading ? 'Stop' : 'Reload');
+        }
       }
-    }
 
-    // The tab's icon slot: hourglass while loading, favicon when done.
-    for (const tabEl of root.querySelectorAll('.fb-tab-item') || []) {
-      const elTabId = (tabEl.dataset && tabEl.dataset.tabId)
-        || (typeof tabEl.getAttribute === 'function' ? tabEl.getAttribute('data-tab-id') : null);
-      if (elTabId !== tabId) continue;
-      const favicon = tabEl.querySelector?.('.fb-tab-favicon');
-      if (favicon) {
-        favicon.innerHTML = this.getTabFavicon(tab);
-        // Fresh <img> from innerHTML: re-attach the CSP-safe fallbacks.
-        this.bindTabLogoFallbacks(favicon);
+      // Every tab strip is live, even for a background tab: hourglass while
+      // loading, favicon the moment that tab's engine reports completion.
+      for (const tabEl of root.querySelectorAll('.fb-tab-item') || []) {
+        const elTabId = (tabEl.dataset && tabEl.dataset.tabId)
+          || (typeof tabEl.getAttribute === 'function' ? tabEl.getAttribute('data-tab-id') : null);
+        if (elTabId !== tabId) continue;
+        const favicon = tabEl.querySelector?.('.fb-tab-favicon');
+        if (favicon) {
+          favicon.innerHTML = this.getTabFavicon(tab);
+          // Fresh <img> from innerHTML: re-attach the CSP-safe fallbacks.
+          this.bindTabLogoFallbacks(favicon);
+        }
       }
     }
   }
@@ -12542,8 +17961,8 @@ export class BrowserShell {
    * PDF EVERYWHERE (user request): drag-and-drop, OS "Open with",
    * downloads right-click "Open in Yayra".
    * ----------------------------------------------------------- */
-  /** One global drop zone: any PDF dropped anywhere in Yayra opens in
-   *  the document viewer. Non-PDF files get the honest roadmap notice. */
+  /** One global drop zone: any supported local document or image dropped
+   *  anywhere in Yayra opens in the matching bundled viewer. */
   _armPdfDropZone() {
     if (this._pdfDropArmed || typeof document === 'undefined') return;
     this._pdfDropArmed = true;
@@ -12572,15 +17991,19 @@ export class BrowserShell {
   }
 
   async _openDroppedPdfFiles(files) {
-    const pdfs = files.filter((f) => classifyDocument(f && f.name) === 'pdf');
-    if (!pdfs.length) {
-      this.showTransientNotice('Only PDF documents open in Yayra right now - Word, Excel and PowerPoint are on the roadmap.');
-      return;
-    }
-    for (const file of pdfs.slice(0, 8)) {
+    // Do not reject solely by extension: DocumentStore sniffs the bytes, so a
+    // renamed PDF/Office package still reaches the right viewer. Truly unknown
+    // file types are rejected with a notice rather than creating a dead tab.
+    const documents = files.filter((file) => file && file.name);
+    if (!documents.length) return;
+    for (const file of documents.slice(0, 8)) {
+      if (Number.isFinite(file?.size) && file.size > MAX_DOCUMENT_BYTES) {
+        this.showTransientNotice(`Documents larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`);
+        continue;
+      }
       try {
         const bytes = await this._readFileBytes(file);
-        this.addDocumentTab({ name: file.name, bytes });
+        this.addDocumentTab({ name: file.name, bytes, mime: file.type || '' });
       } catch { this.showTransientNotice(`Couldn\u2019t read \u201C${file.name}\u201D.`); }
     }
   }
@@ -12601,8 +18024,14 @@ export class BrowserShell {
       || (/\.pdf$/i.test(String(item.path || ''))));
   }
 
-  /** Right-click menu for a download: "Open in Yayra" for PDFs (the
-   *  in-app viewer), plus the OS open / reveal / copy actions. */
+  isViewableDocumentDownload(item) {
+    if (!item) return false;
+    const name = item.filename || item.name || item.path || '';
+    return classifyDocument(name, item.mime || item.mimeType || '') !== null;
+  }
+
+  /** Right-click menu: supported downloads open in the matching bundled
+   *  viewer; OS open/reveal/copy actions remain available beside it. */
   showDownloadsContextMenu(evt, item) {
     if (typeof document === 'undefined' || !document.body || !item) return;
     document.getElementById('yayra-dl-context-menu')?.remove();
@@ -12620,7 +18049,7 @@ export class BrowserShell {
       b.addEventListener('click', () => { dismiss(); fn(); });
       menu.appendChild(b);
     };
-    if (this.isPdfDownload(item)) entry('Open in Yayra', () => this.performDownloadAction(item.id, 'open-in-yayra'));
+    if (this.isViewableDocumentDownload(item)) entry('Open in Yayra', () => this.performDownloadAction(item.id, 'open-in-yayra'));
     if (this.downloadsBridge) {
       entry('Open (desktop app)', () => this.performDownloadAction(item.id, 'open'));
       entry('Show in folder', () => this.performDownloadAction(item.id, 'show'));
@@ -12689,7 +18118,7 @@ export class BrowserShell {
 
     for (const row of dropdown.querySelectorAll('.fb-dl-item')) {
       const id = (row.dataset && row.dataset.dlId) || row.getAttribute?.('data-dl-id');
-      // RIGHT-CLICK: the per-download menu ("Open in Yayra" for PDFs,
+      // RIGHT-CLICK: the per-download menu (internal document viewer plus
       // OS open / reveal / copy actions).
       row.addEventListener('contextmenu', (e) => {
         e.preventDefault();
@@ -12738,15 +18167,16 @@ export class BrowserShell {
         if (item.url) copy(item.url, 'Download address copied');
         break;
       case 'open-in-yayra': {
-        if (!bridge || typeof bridge.openPdf !== 'function') {
+        const openDownloadedDocument = bridge?.openDocument || bridge?.openPdf;
+        if (typeof openDownloadedDocument !== 'function') {
           this.showTransientNotice('Opening downloads inside Yayra needs the desktop app.');
           break;
         }
         this.state.isDownloadsDropdownOpen = false;
         this.state.isDownloadsDropdownExpanded = false;
-        const res = await bridge.openPdf(id);
+        const res = await openDownloadedDocument.call(bridge, id);
         if (res && res.ok) {
-          this.addDocumentTab({ name: res.name, bytes: res.data });
+          this.addDocumentTab({ name: res.name, bytes: res.data, mime: item.mime || item.mimeType || '' });
         } else {
           this.showTransientNotice(`Couldn't open it in Yayra${res && res.reason ? ` (${res.reason})` : ''}.`);
         }
@@ -12826,7 +18256,7 @@ export class BrowserShell {
         }
       }
       if (typeof this.bookmarksRepo.getAllBookmarks === 'function') {
-        this.state.bookmarksItems = await this.bookmarksRepo.getAllBookmarks();
+        await this.refreshBookmarksState();
       }
     }
 
@@ -12872,6 +18302,10 @@ export class BrowserShell {
   }
 
   openModal(modalName) {
+    if (modalName === 'tab-switcher') {
+      this.state.tabSwitcherSearchQuery = '';
+      this.state.tabSwitcherRecentlyClosedExpanded = false;
+    }
     this.state.activeModal = modalName;
     this.render();
   }
@@ -12913,10 +18347,12 @@ export class BrowserShell {
     if (typeof document === 'undefined') return this.resolveEffectiveTheme();
     const theme = this.resolveEffectiveTheme();
     const colorTheme = this.state.settings.colorTheme || 'blue';
+    const reducedMotion = this.state.settings.reduceMotionForPerformance ? 'true' : 'false';
     const roots = [document.documentElement, document.body].filter(Boolean);
     for (const root of roots) {
       root.setAttribute?.('data-theme', theme);
       root.setAttribute?.('data-color-theme', colorTheme);
+      root.setAttribute?.('data-reduced-motion', reducedMotion);
       root.style?.setProperty?.('color-scheme', theme);
     }
     return theme;
@@ -12967,9 +18403,33 @@ export class BrowserShell {
     this.render();
   }
 
+  reopenClosedTabAt(index) {
+    if (!Number.isInteger(index) || index < 0 || index >= this.state.closedTabsHistory.length) return null;
+    const [closedTab] = this.state.closedTabsHistory.splice(index, 1);
+    if (!closedTab) return null;
+    const newTab = {
+      ...closedTab,
+      id: `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      url: closedTab.url || 'yayra://newtab',
+      title: closedTab.title || this.getTabTitle(closedTab),
+      isSecure: true,
+      canGoBack: false,
+      canGoForward: false,
+      isLoading: false,
+      isPrivate: false
+    };
+    this.state.tabs.push(newTab);
+    this.state.activeTabId = newTab.id;
+    this.state.urlInputValue = newTab.url;
+    this.state.activeModal = null;
+    this.render();
+    return newTab;
+  }
+
   reopenLastClosedTab() {
     if (this.state.closedTabsHistory.length === 0) return null;
-    const lastClosed = this.state.closedTabsHistory.pop();
+    // closeTab() prepends newly closed tabs, so the most recent entry is first.
+    const lastClosed = this.state.closedTabsHistory.shift();
     const newTab = {
       id: 'tab-' + Math.random().toString(36).substring(2, 9),
       url: lastClosed.url || 'yayra://newtab',
@@ -13066,12 +18526,18 @@ export class BrowserShell {
 
   getTabTitle(tab) {
     if (!tab) return 'New Tab';
-    if (tab.title && tab.title !== 'New Tab') return tab.title;
+    const documentTitle = tab.docId ? this.documentStore?.get(tab.docId)?.name : null;
+    if (String(tab.url || '').startsWith('yayra://doc/')) return documentTitle || tab.title || 'Document';
+    // A tab can navigate away from a PDF and later go Back. In that case its
+    // old filename is not the title of the current website, but the document
+    // bytes stay available until the tab itself closes.
+    if (tab.title && tab.title !== 'New Tab' && tab.title !== documentTitle) return tab.title;
     if (!tab.url || tab.url === 'yayra://newtab') return tab.isPrivate ? 'Incognito Tab' : 'New Tab';
     if (tab.url === 'yayra://settings') return 'Settings';
     if (tab.url === 'yayra://history') return 'History';
     if (tab.url === 'yayra://bookmarks') return 'Bookmarks';
     if (tab.url === 'yayra://downloads') return 'Downloads';
+    if (tab.url === 'yayra://documents') return 'Documents';
     if (tab.url === 'yayra://passwords') return 'Passwords';
     if (tab.url === 'yayra://extensions') return 'Extensions';
     if (tab.url === 'yayra://permissions') return 'Site Permissions';
@@ -13087,8 +18553,479 @@ export class BrowserShell {
   }
 
   /* -------------------------------------------------------------
-   * LOCAL DOCUMENT WORKSPACE (Phase 1: PDF - docs/DOCUMENT_WORKSPACE.md)
+   * LOCAL DOCUMENT LIBRARY + WORKSPACE
    * ----------------------------------------------------------- */
+
+  documentCategoryForKind(kind) {
+    if (kind === 'pdf') return 'pdf';
+    if (kind === 'pptx') return 'presentation';
+    if (kind === 'docx') return 'document';
+    if (kind === 'xlsx') return 'spreadsheet';
+    if (kind === 'image') return 'image';
+    if (kind === 'text') return 'text';
+    return 'other';
+  }
+
+  rememberSessionDocument(doc) {
+    if (!doc) return;
+    const id = `session-${doc.id}`;
+    const existing = this.state.documentsItems.find((entry) => entry.id === id);
+    const entry = {
+      id,
+      docId: doc.id,
+      source: 'session',
+      name: doc.name,
+      extension: doc.extension || '',
+      category: this.documentCategoryForKind(doc.type),
+      size: doc.size || 0,
+      firstOpenedAt: doc.openedAt || Date.now(),
+      lastOpenedAt: doc.openedAt || Date.now(),
+      modifiedAt: 0,
+      openedCount: existing?.openedCount || 1,
+      available: true,
+      canOpenInYayra: true,
+      preferredAction: 'yayra'
+    };
+    this.state.documentsItems = [
+      entry,
+      ...this.state.documentsItems.filter((item) => item.id !== id)
+    ];
+  }
+
+  async refreshDocumentLibrary({ render = true } = {}) {
+    if (this._documentsRefreshPromise) return this._documentsRefreshPromise;
+    const bridge = this.systemBridge?.documents;
+    if (typeof bridge?.list !== 'function') {
+      this._documentsLoaded = true;
+      return this.state.documentsItems;
+    }
+    this.state.documentsLoading = true;
+    const task = Promise.resolve(bridge.list()).then((result) => {
+      if (result?.ok && Array.isArray(result.entries)) {
+        const sessionEntries = this.state.documentsItems.filter((entry) => entry.source === 'session');
+        const desktopEntries = result.entries.map((entry) => ({ ...entry, source: 'desktop' }));
+        this.state.documentsItems = [...desktopEntries, ...sessionEntries];
+      }
+      this._documentsLoaded = true;
+      return this.state.documentsItems;
+    }).catch(() => this.state.documentsItems).finally(() => {
+      this.state.documentsLoading = false;
+      this._documentsRefreshPromise = null;
+      if (render && this.getActiveTab()?.url === 'yayra://documents') this.render();
+    });
+    this._documentsRefreshPromise = task;
+    return task;
+  }
+
+  formatDocumentBytes(value) {
+    const bytes = Math.max(0, Number(value) || 0);
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(bytes < 10240 ? 1 : 0)} KB`;
+    if (bytes < 1024 ** 3) return `${(bytes / (1024 ** 2)).toFixed(bytes < 10 * 1024 ** 2 ? 1 : 0)} MB`;
+    return `${(bytes / (1024 ** 3)).toFixed(1)} GB`;
+  }
+
+  formatDocumentOpenedAt(value) {
+    const timestamp = Number(value) || 0;
+    if (!timestamp) return 'Unknown date';
+    const elapsed = Date.now() - timestamp;
+    if (elapsed >= 0 && elapsed < 60000) return 'Just now';
+    if (elapsed >= 0 && elapsed < 3600000) return `${Math.max(1, Math.floor(elapsed / 60000))} min ago`;
+    if (elapsed >= 0 && elapsed < 86400000) return `${Math.max(1, Math.floor(elapsed / 3600000))} hr ago`;
+    return new Date(timestamp).toLocaleString(undefined, {
+      year: new Date(timestamp).getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
+      month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+    });
+  }
+
+  documentTypeLabel(entry) {
+    const labels = {
+      pdf: 'PDF', presentation: 'Presentation', document: 'Document',
+      spreadsheet: 'Spreadsheet', image: 'Image', text: 'Text',
+      archive: 'Archive', other: 'Other file'
+    };
+    return entry?.extension
+      ? `${labels[entry.category] || labels.other} · ${String(entry.extension).toLocaleUpperCase()}`
+      : (labels[entry?.category] || labels.other);
+  }
+
+  filteredDocumentLibraryEntries() {
+    const query = String(this.state.documentsSearchQuery || '').trim().toLocaleLowerCase();
+    const type = this.state.documentsTypeFilter || 'all';
+    const date = this.state.documentsDateFilter || 'all';
+    const sizeFilter = this.state.documentsSizeFilter || 'all';
+    const now = Date.now();
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    const thresholds = {
+      today: startOfToday.getTime(),
+      week: now - (7 * 86400000),
+      month: now - (30 * 86400000),
+      year: now - (365 * 86400000)
+    };
+    const showMissing = this.state.settings.documentsShowMissing !== false;
+    const entries = (this.state.documentsItems || []).filter((entry) => {
+      if (!showMissing && entry.available === false) return false;
+      if (query && !`${entry.name || ''} ${entry.extension || ''} ${entry.category || ''}`.toLocaleLowerCase().includes(query)) return false;
+      if (type !== 'all' && entry.category !== type) return false;
+      if (date !== 'all' && thresholds[date] && Number(entry.lastOpenedAt || 0) < thresholds[date]) return false;
+      const bytes = Math.max(0, Number(entry.size) || 0);
+      const mb = 1024 ** 2;
+      if (sizeFilter === 'under-1mb' && bytes >= mb) return false;
+      if (sizeFilter === '1mb-10mb' && (bytes < mb || bytes >= 10 * mb)) return false;
+      if (sizeFilter === '10mb-100mb' && (bytes < 10 * mb || bytes >= 100 * mb)) return false;
+      if (sizeFilter === '100mb-300mb' && (bytes < 100 * mb || bytes > 300 * mb)) return false;
+      if (sizeFilter === 'over-300mb' && bytes <= 300 * mb) return false;
+      return true;
+    });
+    const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+    const rawSort = this.state.documentsSort || 'opened';
+    const sort = ({ recent: 'opened', oldest: 'opened', largest: 'size', smallest: 'size' })[rawSort] || rawSort;
+    const direction = ['oldest', 'smallest'].includes(rawSort)
+      ? 'asc'
+      : (this.state.documentsSortDirection === 'asc' ? 'asc' : 'desc');
+    entries.sort((a, b) => {
+      let comparison = 0;
+      if (sort === 'name') comparison = collator.compare(a.name || '', b.name || '');
+      else if (sort === 'type') comparison = collator.compare(`${a.category}-${a.extension}`, `${b.category}-${b.extension}`);
+      else if (sort === 'size') comparison = Number(a.size || 0) - Number(b.size || 0);
+      else if (sort === 'frequent') comparison = Number(a.openedCount || 0) - Number(b.openedCount || 0);
+      else comparison = Number(a.lastOpenedAt || 0) - Number(b.lastOpenedAt || 0);
+      if (comparison === 0) comparison = collator.compare(a.name || '', b.name || '');
+      return direction === 'desc' ? -comparison : comparison;
+    });
+    return entries;
+  }
+
+  async openDocumentLibraryEntry(id, { external = false } = {}) {
+    const entry = this.state.documentsItems.find((item) => item.id === id);
+    if (!entry) return false;
+    if (entry.source === 'session') {
+      const doc = this.documentStore?.get(entry.docId);
+      const existing = this.state.tabs.find((tab) => tab.docId === entry.docId);
+      if (existing) {
+        this.switchTab(existing.id);
+        return true;
+      }
+      if (!doc) {
+        entry.available = false;
+        this.showTransientNotice('This browser-session file is no longer available. Choose it again to reopen it.');
+        this.render();
+        return false;
+      }
+      return Boolean(this.addDocumentTab({ name: doc.name, bytes: doc.bytes, mime: doc.mime }));
+    }
+    const bridge = this.systemBridge?.documents;
+    const fn = external || !entry.canOpenInYayra ? bridge?.openLibraryExternal : bridge?.reopen;
+    if (typeof fn !== 'function') {
+      this.showTransientNotice('Persistent reopening is available in the Yayra desktop app.');
+      return false;
+    }
+    try {
+      const result = await fn.call(bridge, id);
+      if (result?.ok && result.action === 'yayra' && result.data) {
+        this.addDocumentTab({
+          name: result.name || entry.name,
+          bytes: result.data,
+          libraryId: result.libraryId || id
+        });
+      } else if (result?.ok) {
+        this.showTransientNotice(`Opening \u201C${result.entry?.name || entry.name}\u201D with its desktop app…`);
+      } else {
+        if (result?.reason === 'unavailable' || result?.reason === 'not-found') entry.available = false;
+        this.showTransientNotice(result?.reason === 'file-too-large'
+          ? `Files larger than ${MAX_DOCUMENT_SIZE_MB} MB must open in a desktop app.`
+          : result?.reason === 'permission-denied'
+            ? 'Yayra no longer has permission to read this file.'
+            : result?.reason === 'unavailable'
+              ? 'This file was moved or is unavailable. Use Locate to reconnect it.'
+              : `Couldn\u2019t open this file${result?.reason ? ` (${result.reason})` : ''}.`);
+      }
+      await this.refreshDocumentLibrary({ render: false });
+      if (this.getActiveTab()?.url === 'yayra://documents') this.render();
+      return Boolean(result?.ok);
+    } catch {
+      this.showTransientNotice('Couldn\u2019t open this file.');
+      return false;
+    }
+  }
+
+  async locateDocumentLibraryEntry(id) {
+    const bridge = this.systemBridge?.documents;
+    if (typeof bridge?.locate !== 'function') return false;
+    const result = await bridge.locate(id);
+    if (result?.canceled) return false;
+    this.showTransientNotice(result?.ok ? 'Document location updated.' : `Couldn\u2019t reconnect the file${result?.reason ? ` (${result.reason})` : ''}.`);
+    await this.refreshDocumentLibrary();
+    return Boolean(result?.ok);
+  }
+
+  async removeDocumentLibraryEntry(id) {
+    const entry = this.state.documentsItems.find((item) => item.id === id);
+    if (!entry) return;
+    if (entry.source === 'desktop') await this.systemBridge?.documents?.remove?.(id);
+    this.state.documentsItems = this.state.documentsItems.filter((item) => item.id !== id);
+    this.render();
+  }
+
+  async clearDocumentLibrary({ missingOnly = false } = {}) {
+    const bridge = this.systemBridge?.documents;
+    if (missingOnly) {
+      await bridge?.clearMissing?.();
+      this.state.documentsItems = this.state.documentsItems.filter((entry) => entry.available !== false);
+      await this.refreshDocumentLibrary({ render: false });
+      this.showTransientNotice('Unavailable document entries removed.');
+      this.render();
+      return;
+    }
+    const approved = typeof confirm !== 'function' || confirm('Clear the Documents history? Your original files will not be deleted.');
+    if (!approved) return;
+    await bridge?.clear?.();
+    this.state.documentsItems = [];
+    this.showTransientNotice('Documents history cleared. Original files were not deleted.');
+    this.render();
+  }
+
+  renderInternalDocumentsPage(viewport) {
+    if (!this._documentsLoaded && !this._documentsRefreshPromise) void this.refreshDocumentLibrary();
+    const page = document.createElement('div');
+    page.className = 'fb-internal-page fb-documents-page';
+    const container = document.createElement('div');
+    container.className = 'fb-internal-container fb-documents-container';
+
+    const header = document.createElement('header');
+    header.className = 'fb-internal-header fb-documents-header';
+    const titleGroup = document.createElement('div');
+    titleGroup.className = 'fb-internal-title-group';
+    titleGroup.innerHTML = `<span class="fb-internal-icon">${Icons.document}</span><div><h1 class="fb-internal-title">Documents</h1><p class="fb-documents-subtitle">Every local file you open through Yayra, ready to reopen.</p></div>`;
+    const headerActions = document.createElement('div');
+    headerActions.className = 'fb-documents-header-actions';
+    const settingsButton = document.createElement('button');
+    settingsButton.type = 'button';
+    settingsButton.className = 'fb-btn fb-btn-secondary';
+    settingsButton.innerHTML = `${Icons.settings} Settings`;
+    settingsButton.addEventListener('click', () => {
+      this.state.settingsActiveCategory = 'documents';
+      this.state.activeSettingsCategory = 'documents';
+      this.openInternalPage('yayra://settings');
+    });
+    const openButton = document.createElement('button');
+    openButton.type = 'button';
+    openButton.className = 'fb-btn fb-btn-primary fb-documents-open-file';
+    openButton.innerHTML = `${Icons.plus} Open local file`;
+    openButton.addEventListener('click', () => this.openDocument());
+    headerActions.appendChild(settingsButton);
+    headerActions.appendChild(openButton);
+    header.appendChild(titleGroup);
+    header.appendChild(headerActions);
+    container.appendChild(header);
+
+    const safeEntries = this.state.documentsItems || [];
+    const availableCount = safeEntries.filter((entry) => entry.available !== false).length;
+    const missingCount = safeEntries.length - availableCount;
+    const totalBytes = safeEntries.reduce((sum, entry) => sum + (Number(entry.size) || 0), 0);
+    const summary = document.createElement('section');
+    summary.className = 'fb-documents-summary';
+    summary.innerHTML = `
+      <div><strong>${safeEntries.length}</strong><span>Remembered</span></div>
+      <div><strong>${availableCount}</strong><span>Available</span></div>
+      <div><strong>${this.formatDocumentBytes(totalBytes)}</strong><span>Indexed size</span></div>
+      <div class="${missingCount ? 'is-warning' : ''}"><strong>${missingCount}</strong><span>Unavailable</span></div>`;
+    container.appendChild(summary);
+
+    const toolbar = document.createElement('section');
+    toolbar.className = 'fb-documents-toolbar';
+    const searchWrap = document.createElement('label');
+    searchWrap.className = 'fb-internal-search fb-documents-search';
+    searchWrap.innerHTML = `<span class="fb-internal-search-icon">${Icons.search}</span>`;
+    const search = document.createElement('input');
+    search.type = 'search';
+    search.placeholder = 'Search files by name or type';
+    search.setAttribute('aria-label', 'Search Documents');
+    search.value = this.state.documentsSearchQuery || '';
+    search.addEventListener('input', (event) => {
+      this.state.documentsSearchQuery = event.target.value;
+      if (this._documentsSearchTimer) clearTimeout(this._documentsSearchTimer);
+      this._documentsSearchTimer = setTimeout(() => {
+        this._documentsSearchTimer = null;
+        this.render();
+        const next = this.viewportElement?.querySelector?.('.fb-documents-search input');
+        next?.focus?.();
+        if (next && typeof next.setSelectionRange === 'function') {
+          const end = next.value.length;
+          next.setSelectionRange(end, end);
+        }
+      }, 140);
+    });
+    searchWrap.appendChild(search);
+    const makeSelect = (label, value, options, onChange) => {
+      const wrap = document.createElement('label');
+      wrap.className = 'fb-documents-filter';
+      const text = document.createElement('span');
+      text.textContent = label;
+      const select = document.createElement('select');
+      select.className = 'fb-select';
+      select.setAttribute('aria-label', label);
+      for (const [optionValue, optionLabel] of options) {
+        const option = document.createElement('option');
+        option.value = optionValue;
+        option.textContent = optionLabel;
+        option.selected = optionValue === value;
+        select.appendChild(option);
+      }
+      select.addEventListener('change', () => onChange(select.value));
+      wrap.appendChild(text);
+      wrap.appendChild(select);
+      return wrap;
+    };
+    toolbar.appendChild(searchWrap);
+    toolbar.appendChild(makeSelect('Type', this.state.documentsTypeFilter, [
+      ['all', 'All types'], ['pdf', 'PDF'], ['presentation', 'Presentations'],
+      ['document', 'Documents'], ['spreadsheet', 'Spreadsheets'], ['image', 'Images'],
+      ['text', 'Text'], ['archive', 'Archives'], ['other', 'Other']
+    ], (value) => { this.state.documentsTypeFilter = value; this.render(); }));
+    toolbar.appendChild(makeSelect('Opened', this.state.documentsDateFilter, [
+      ['all', 'Any time'], ['today', 'Today'], ['week', 'Last 7 days'],
+      ['month', 'Last 30 days'], ['year', 'Last year']
+    ], (value) => { this.state.documentsDateFilter = value; this.render(); }));
+    toolbar.appendChild(makeSelect('Size', this.state.documentsSizeFilter, [
+      ['all', 'Any size'], ['under-1mb', 'Under 1 MB'], ['1mb-10mb', '1–10 MB'],
+      ['10mb-100mb', '10–100 MB'], ['100mb-300mb', '100–300 MB'],
+      ['over-300mb', 'Over 300 MB']
+    ], (value) => { this.state.documentsSizeFilter = value; this.render(); }));
+    toolbar.appendChild(makeSelect('Sort by', this.state.documentsSort, [
+      ['opened', 'Date opened'], ['name', 'Name'], ['type', 'File type'],
+      ['size', 'File size'], ['frequent', 'Times opened']
+    ], (value) => { this.state.documentsSort = value; this.render(); }));
+    toolbar.appendChild(makeSelect('Order', this.state.documentsSortDirection, [
+      ['desc', 'Descending'], ['asc', 'Ascending']
+    ], (value) => { this.state.documentsSortDirection = value === 'asc' ? 'asc' : 'desc'; this.render(); }));
+    container.appendChild(toolbar);
+
+    const privacy = document.createElement('div');
+    privacy.className = 'fb-documents-privacy-note';
+    privacy.innerHTML = `${Icons.shield}<span>${typeof this.systemBridge?.documents?.list === 'function'
+      ? '<strong>Private by design:</strong> source locations stay in Yayra’s trusted desktop process. This page receives no filesystem paths.'
+      : '<strong>Session library:</strong> browsers cannot silently retain local-file access. Reopening after this session may require choosing the original again.'}</span>`;
+    container.appendChild(privacy);
+
+    const entries = this.filteredDocumentLibraryEntries();
+    const list = document.createElement('section');
+    list.className = 'fb-documents-list';
+    list.setAttribute('aria-label', 'Document library');
+    if (!entries.length) {
+      const empty = document.createElement('div');
+      empty.className = 'fb-empty-state fb-documents-empty';
+      empty.innerHTML = safeEntries.length
+        ? `<strong>No files match these filters.</strong><span>Try another name, type, opening date, or size.</span>`
+        : this.state.documentsLoading
+          ? `<span class="fb-documents-empty-icon">${Icons.hourglass}</span><strong>Checking your Documents…</strong><span>Yayra is verifying that remembered originals are still available.</span>`
+          : `<span class="fb-documents-empty-icon">${Icons.document}</span><strong>Your Documents hub is ready.</strong><span>Open any local file. Supported formats stay in Yayra; everything else opens honestly in its desktop app.</span>`;
+      if (safeEntries.length) {
+        const resetFilters = document.createElement('button');
+        resetFilters.type = 'button';
+        resetFilters.className = 'fb-btn fb-btn-secondary';
+        resetFilters.textContent = 'Reset filters';
+        resetFilters.addEventListener('click', () => {
+          this.state.documentsSearchQuery = '';
+          this.state.documentsTypeFilter = 'all';
+          this.state.documentsDateFilter = 'all';
+          this.state.documentsSizeFilter = 'all';
+          this.render();
+        });
+        empty.appendChild(resetFilters);
+      }
+      list.appendChild(empty);
+    } else {
+      for (const entry of entries) {
+        const row = document.createElement('article');
+        row.className = `fb-document-row${entry.available === false ? ' is-missing' : ''}`;
+        row.dataset.documentId = entry.id;
+        const glyph = document.createElement('span');
+        glyph.className = `fb-document-glyph fb-document-glyph-${entry.category || 'other'}`;
+        glyph.textContent = entry.extension ? String(entry.extension).slice(0, 5).toLocaleUpperCase() : 'FILE';
+        const details = document.createElement('div');
+        details.className = 'fb-document-details';
+        const name = document.createElement('strong');
+        name.className = 'fb-document-name';
+        name.textContent = entry.name || 'Local file';
+        name.title = entry.name || 'Local file';
+        const meta = document.createElement('span');
+        meta.className = 'fb-document-meta';
+        meta.textContent = entry.available === false
+          ? `${this.documentTypeLabel(entry)} · ${this.formatDocumentBytes(entry.size)} · File moved or unavailable`
+          : `${this.documentTypeLabel(entry)} · ${this.formatDocumentBytes(entry.size)} · Opened ${this.formatDocumentOpenedAt(entry.lastOpenedAt)} · ${entry.openedCount || 1}×`;
+        details.appendChild(name);
+        details.appendChild(meta);
+        const status = document.createElement('span');
+        status.className = `fb-document-status ${entry.available === false ? 'is-missing' : 'is-ready'}`;
+        status.textContent = entry.available === false ? 'Unavailable' : (entry.canOpenInYayra ? 'Opens in Yayra' : 'Desktop app');
+        const actions = document.createElement('div');
+        actions.className = 'fb-document-actions';
+        const button = (label, title, handler, className = 'fb-btn fb-btn-secondary') => {
+          const control = document.createElement('button');
+          control.type = 'button';
+          control.className = className;
+          control.textContent = label;
+          control.title = title;
+          control.setAttribute('aria-label', `${title}: ${entry.name}`);
+          control.addEventListener('click', handler);
+          return control;
+        };
+        if (entry.available === false && entry.source === 'desktop') {
+          actions.appendChild(button('Locate…', 'Locate moved file', () => this.locateDocumentLibraryEntry(entry.id), 'fb-btn fb-btn-primary'));
+        } else {
+          actions.appendChild(button('Open', entry.canOpenInYayra ? 'Open in Yayra' : 'Open with desktop app', () => this.openDocumentLibraryEntry(entry.id), 'fb-btn fb-btn-primary'));
+          if (entry.source === 'desktop' && entry.canOpenInYayra) {
+            actions.appendChild(button('Desktop app', 'Open unchanged original with desktop app', () => this.openDocumentLibraryEntry(entry.id, { external: true })));
+          }
+          if (entry.source === 'desktop') {
+            actions.appendChild(button('Show', 'Show original in folder', async () => {
+              const result = await this.systemBridge?.documents?.showInFolder?.(entry.id);
+              if (!result?.ok) {
+                if (result?.reason === 'unavailable') entry.available = false;
+                this.showTransientNotice('Couldn\u2019t show this file in its folder.');
+                this.render();
+              }
+            }));
+          }
+        }
+        actions.appendChild(button('Remove', 'Remove from Documents history (does not delete the file)', () => this.removeDocumentLibraryEntry(entry.id), 'fb-btn fb-btn-ghost fb-document-remove'));
+        row.appendChild(glyph);
+        row.appendChild(details);
+        row.appendChild(status);
+        row.appendChild(actions);
+        list.appendChild(row);
+      }
+    }
+    container.appendChild(list);
+
+    const footer = document.createElement('footer');
+    footer.className = 'fb-documents-footer';
+    const resultLabel = document.createElement('span');
+    resultLabel.textContent = `${entries.length} of ${safeEntries.length} file${safeEntries.length === 1 ? '' : 's'}`;
+    const footerActions = document.createElement('div');
+    if (missingCount) {
+      const clearMissing = document.createElement('button');
+      clearMissing.className = 'fb-btn fb-btn-secondary';
+      clearMissing.textContent = 'Remove unavailable';
+      clearMissing.addEventListener('click', () => this.clearDocumentLibrary({ missingOnly: true }));
+      footerActions.appendChild(clearMissing);
+    }
+    const clear = document.createElement('button');
+    clear.className = 'fb-btn fb-btn-danger';
+    clear.textContent = 'Clear Documents history';
+    clear.disabled = safeEntries.length === 0;
+    clear.addEventListener('click', () => this.clearDocumentLibrary());
+    footerActions.appendChild(clear);
+    footer.appendChild(resultLabel);
+    footer.appendChild(footerActions);
+    container.appendChild(footer);
+
+    page.appendChild(container);
+    viewport.appendChild(page);
+  }
+
   /**
    * Opens a local document. Electron: the native picker in the main
    * process (the file path never reaches the renderer - only the bytes of
@@ -13098,14 +19035,26 @@ export class BrowserShell {
   async openDocument() {
     try {
       const bridge = this.systemBridge?.documents;
-      if (bridge && typeof bridge.openPdf === 'function') {
-        const res = await bridge.openPdf();
+      const openNative = bridge && (bridge.openFile || bridge.openPdf);
+      if (typeof openNative === 'function') {
+        const res = await openNative.call(bridge);
         if (!res || !res.ok) {
           if (res && res.canceled) return; // user closed the picker
-          this.showTransientNotice(`Couldn\u2019t open the document${res && res.reason ? ` (${res.reason})` : ''}.`);
+          if (res?.libraryId) void this.refreshDocumentLibrary({ render: false });
+          if (res?.reason === 'file-too-large') {
+            this.showTransientNotice(`This file is in Documents, but files larger than ${MAX_DOCUMENT_SIZE_MB} MB must open in a desktop app.`);
+          } else {
+            this.showTransientNotice(`Couldn\u2019t open the document${res && res.reason ? ` (${res.reason})` : ''}.`);
+          }
           return;
         }
-        this.addDocumentTab({ name: res.name, bytes: res.data });
+        if (res.action === 'system') {
+          void this.refreshDocumentLibrary({ render: false });
+          this.showTransientNotice(`Opening \u201C${res.entry?.name || 'file'}\u201D with its desktop app…`);
+          return;
+        }
+        this.addDocumentTab({ name: res.name, bytes: res.data, libraryId: res.libraryId });
+        void this.refreshDocumentLibrary({ render: false });
         return;
       }
     } catch { /* fall through to the file input */ }
@@ -13123,21 +19072,28 @@ export class BrowserShell {
     if (!input) {
       input = document.createElement('input');
       input.type = 'file';
-      input.accept = 'application/pdf,.pdf';
-      input.setAttribute('aria-label', 'Open a PDF document');
+      // Intentionally no `accept` restriction: every file can enter the hub.
+      // Known formats render safely; unknown ones get an honest unchanged-file
+      // fallback instead of being silently excluded from the picker.
+      input.removeAttribute?.('accept');
+      input.setAttribute('aria-label', 'Open any local file');
       input.style.cssText = 'position:fixed; left:-9999px; top:0; opacity:0;';
       input.addEventListener('change', () => {
         const file = input.files && input.files[0];
         if (!file) return;
-        if (classifyDocument(file.name) !== 'pdf') {
-          this.showTransientNotice('Only PDF documents are supported right now - Word, Excel and PowerPoint are on the roadmap.');
+        // Reset first so the same rejected file can be selected again after
+        // the user chooses a smaller/different document.
+        input.value = '';
+        // Read before final routing: the byte sniffer outranks the extension,
+        // so a renamed PDF or Office package still opens correctly.
+        if (Number.isFinite(file.size) && file.size > MAX_DOCUMENT_BYTES) {
+          this.showTransientNotice(`Documents larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`);
           return;
         }
         const reader = new FileReader();
-        reader.onload = () => this.addDocumentTab({ name: file.name, bytes: reader.result });
+        reader.onload = () => this.addDocumentTab({ name: file.name, bytes: reader.result, mime: file.type || '' });
         reader.onerror = () => this.showTransientNotice('Couldn\u2019t read the file.');
         reader.readAsArrayBuffer(file);
-        input.value = '';
       });
       document.body.appendChild(input);
       this._docFileInput = input;
@@ -13145,15 +19101,19 @@ export class BrowserShell {
     input.click();
   }
 
-  /** Registers the document and opens it in a fresh tab of its own. */
-  addDocumentTab({ name, bytes }) {
+  /** Registers a local file and opens a fresh tab. Recognized types use a
+   * bundled viewer; unknown formats use the honest original-file fallback. */
+  addDocumentTab({ name, bytes, mime = '', libraryId = null }) {
     let doc;
     try {
-      doc = this.documentStore.add({ name, bytes });
-    } catch {
-      this.showTransientNotice('That file appears to be empty.');
+      doc = this.documentStore.add({ name, bytes, mime, libraryId });
+    } catch (error) {
+      this.showTransientNotice(error?.message === 'document-too-large'
+        ? `Documents larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`
+        : 'That file appears to be empty.');
       return null;
     }
+    if (!doc.libraryId) this.rememberSessionDocument(doc);
     this.createNewTab();
     const tab = this.getActiveTab();
     if (!tab) return null;
@@ -13161,7 +19121,13 @@ export class BrowserShell {
     tab.title = doc.name;
     tab.isDocument = true;
     tab.docId = doc.id;
-    tab.docState = { status: 'loading', numPages: 0, page: 1, zoom: 1.25, query: '', matches: [], matchIndex: -1, error: null };
+    tab.docState = createDocumentViewerState(doc.type);
+    if (doc.type === 'pptx') {
+      tab.docState.notesColor = normalizePptxNotesColor(
+        this.state.settings.pptxNotesColor
+      );
+    }
+    tab.docState.status = 'loading';
     this.render();
     return doc;
   }
@@ -13171,32 +19137,59 @@ export class BrowserShell {
    *  main-thread parsing automatically. */
   async _pdfjsModule() {
     if (this._pdfjsLib) return this._pdfjsLib;
-    const lib = await import('../vendor/pdfjs/pdf.mjs');
-    try {
-      lib.GlobalWorkerOptions.workerSrc = new URL('../vendor/pdfjs/pdf.worker.mjs', import.meta.url).toString();
-    } catch { /* older embedders - PDF.js self-heals to main-thread */ }
-    // Standard-14 font data + CJK cmaps (vendored, offline): without
-    // these, PDFs that rely on non-embedded standard fonts (very common
-    // in simple/older documents) render with missing/degraded text, and
-    // CJK documents fail outright. Wrapped so every getDocument call the
-    // viewer makes carries them without the viewer knowing.
-    const stdFontUrl = new URL('../vendor/pdfjs/standard_fonts/', import.meta.url).toString();
-    const cMapUrl = new URL('../vendor/pdfjs/cmaps/', import.meta.url).toString();
-    const wrapped = Object.create(lib);
-    wrapped.getDocument = (params = {}) => lib.getDocument({
-      standardFontDataUrl: stdFontUrl,
-      cMapUrl,
-      cMapPacked: true,
-      ...params
-    });
-    this._pdfjsLib = wrapped;
-    return this._pdfjsLib;
+    if (!this._pdfjsLibPromise) {
+      this._pdfjsLibPromise = import('../vendor/pdfjs/pdf.mjs').then((lib) => {
+        try {
+          lib.GlobalWorkerOptions.workerSrc = new URL('../vendor/pdfjs/pdf.worker.mjs', import.meta.url).toString();
+        } catch { /* older embedders - PDF.js self-heals to main-thread */ }
+        // Standard-14 font data + CJK cmaps (vendored, offline): without
+        // these, PDFs that rely on non-embedded standard fonts (very common
+        // in simple/older documents) render with missing/degraded text, and
+        // CJK documents fail outright. Wrapped so every getDocument call the
+        // viewer makes carries them without the viewer knowing.
+        const stdFontUrl = new URL('../vendor/pdfjs/standard_fonts/', import.meta.url).toString();
+        const cMapUrl = new URL('../vendor/pdfjs/cmaps/', import.meta.url).toString();
+        // Browser ESM namespace objects are immutable exotic objects. Using
+        // one as a prototype and assigning an exported name can throw in
+        // Chromium ("Cannot assign to property 'getDocument' of [object
+        // Module]"). Copy the exports into an ordinary object and define the
+        // configured entry point in the same object literal instead.
+        const wrapped = {
+          ...lib,
+          getDocument: (params = {}) => lib.getDocument({
+            standardFontDataUrl: stdFontUrl,
+            cMapUrl,
+            cMapPacked: true,
+            ...params
+          })
+        };
+        this._pdfjsLib = wrapped;
+        return wrapped;
+      }).catch((error) => {
+        // A transient asset/worker failure should be retryable rather than
+        // pinning every future PDF tab to a rejected module promise.
+        this._pdfjsLibPromise = null;
+        throw error;
+      });
+    }
+    return this._pdfjsLibPromise;
   }
 
   /** The integrated document tab: toolbar (pages, zoom, search, close) +
    *  the canvas host, driven by createPdfViewer. Honest states only -
    *  no placeholder buttons for unsupported operations. */
   renderDocumentViewer(viewport, tab) {
+    const doc = this.documentStore.get(tab.docId);
+    const documentKind = doc?.type || tab.docState?.viewer || 'unsupported';
+    const documentRoute = routeDocument(documentKind);
+    const capabilities = documentRoute.capabilities;
+    const state = tab.docState || createDocumentViewerState(documentKind);
+    tab.docState = state;
+    if (documentKind === 'pptx') {
+      state.notesColor = normalizePptxNotesColor(
+        this.state.settings.pptxNotesColor || state.notesColor
+      );
+    }
     const wrap = document.createElement('div');
     wrap.className = 'fb-doc-viewer';
     wrap.style.cssText = 'flex:1; min-height:0; display:flex; flex-direction:column; background:var(--fb-bg-app,#191c23); outline:none;';
@@ -13216,45 +19209,248 @@ export class BrowserShell {
       b.addEventListener('click', fn);
       return b;
     };
+    // The toolbar is painted before the asynchronous PDF engine is ready.
+    // Every interaction must therefore tolerate a session whose controller
+    // is still null (and must never act on another tab's controller).
+    const activeViewer = () => {
+      const session = this._activeDocViewer;
+      return session && session.tabId === tab.id ? session.viewer : null;
+    };
+    const downloadOriginal = async () => {
+      const current = this.documentStore.get(tab.docId);
+      if (!current) return false;
+      const bridge = this.systemBridge?.documents;
+      if (typeof bridge?.saveCopy === 'function') {
+        try {
+          const result = await bridge.saveCopy({ name: current.name, data: current.bytes });
+          if (result?.canceled) return false;
+          this.showTransientNotice(result?.ok
+            ? `Downloaded \u201C${result.name || current.name}\u201D without changing the original.`
+            : `Couldn\u2019t download this file${result?.reason ? ` (${result.reason})` : ''}.`);
+          return Boolean(result?.ok);
+        } catch {
+          this.showTransientNotice('Couldn\u2019t download the original file.');
+          return false;
+        }
+      }
+      let href = null;
+      let link = null;
+      try {
+        href = URL.createObjectURL(new Blob([current.bytes], { type: current.mime || 'application/octet-stream' }));
+        link = document.createElement('a');
+        link.href = href;
+        link.download = current.name;
+        link.rel = 'noopener';
+        document.body?.appendChild?.(link);
+        link.click();
+        this.showTransientNotice(`Downloading \u201C${current.name}\u201D…`);
+        return true;
+      } catch {
+        this.showTransientNotice('Couldn\u2019t download the original file.');
+        return false;
+      } finally {
+        link?.remove?.();
+        // Large (up to 300 MB) browser downloads may not consume the Blob in
+        // the same task. Keep its URL alive briefly, then release it.
+        if (href) {
+          const revokeTimer = setTimeout(() => URL.revokeObjectURL(href), 60000);
+          revokeTimer?.unref?.();
+        }
+      }
+    };
 
-    // ---- Row A: identity + the big actions -----------------------------
+    const openOriginal = async () => {
+      const current = this.documentStore.get(tab.docId);
+      if (!current) return;
+      const bridge = this.systemBridge?.documents;
+      if (typeof bridge?.openExternal !== 'function') {
+        await downloadOriginal();
+        return;
+      }
+      try {
+        const res = current.libraryId && typeof bridge.openLibraryExternal === 'function'
+          ? await bridge.openLibraryExternal(current.libraryId)
+          : await bridge.openExternal({ name: current.name, data: current.bytes });
+        this.showTransientNotice(res?.ok
+          ? `Opening \u201C${current.name}\u201D with your desktop app...`
+          : `Couldn\u2019t open it externally${res?.reason ? ` (${res.reason})` : ''}.`);
+      } catch { this.showTransientNotice('Couldn\u2019t open it externally.'); }
+    };
+
+    // ---- Row A: identity + original-file escape hatch ------------------
     const bar = document.createElement('div');
-    bar.className = 'fb-doc-toolbar';
-    bar.style.cssText = 'flex:none; display:flex; align-items:center; gap:6px; padding:6px 10px; background:var(--fb-bg-elevated,#141824); border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.8rem; color:var(--fb-text-primary,#dfe4ee);';
+    bar.className = 'fb-doc-toolbar fb-doc-toolbar-primary';
+    // Keep the identity row deliberately compact: the canvas is the product,
+    // not a tall title banner. CSS owns the exact density so desktop/mobile
+    // use the same single-row geometry without inline-theme conflicts.
+    bar.style.cssText = 'flex:none; display:flex; align-items:center; gap:7px; padding:4px 10px; background:var(--fb-bg-elevated,#141824); border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.78rem; color:var(--fb-text-primary,#dfe4ee);';
+    const kindBadge = document.createElement('span');
+    kindBadge.className = `fb-doc-kind-badge fb-doc-kind-${documentKind}`;
+    kindBadge.textContent = documentRoute.shortLabel || 'Document';
+    kindBadge.title = `${documentRoute.engine}${documentRoute.limitations ? ` — ${documentRoute.limitations}` : ''}`;
+    kindBadge.style.cssText = 'flex:none;padding:3px 7px;border-radius:6px;background:rgba(109,93,242,.18);color:var(--fb-accent-primary,#9b8cff);font-size:.66rem;font-weight:800;text-transform:uppercase;letter-spacing:.06em;';
+    bar.appendChild(kindBadge);
     const nameEl = document.createElement('span');
     nameEl.textContent = tab.title || 'Document';
-    nameEl.style.cssText = 'max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600;';
+    nameEl.title = tab.title || 'Document';
+    nameEl.style.cssText = 'max-width:min(420px,42vw); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:650;';
     bar.appendChild(nameEl);
     const spacerA = document.createElement('span');
     spacerA.style.cssText = 'flex:1;';
     bar.appendChild(spacerA);
-    // "Use the desktop PDF app instead": the honest escape hatch from the
-    // in-Yayra viewer (main process writes a temp file + OS open-with).
-    if (this.systemBridge && this.systemBridge.documents && typeof this.systemBridge.documents.openExternal === 'function') {
-      bar.appendChild(mkBtn('Desktop app', 'Open this PDF with your desktop PDF app instead', async () => {
-        const d = this.documentStore.get(tab.docId);
-        if (!d) return;
-        try {
-          const res = await this.systemBridge.documents.openExternal({ name: d.name, data: d.bytes });
-          this.showTransientNotice(res && res.ok
-            ? `Opening \u201C${d.name}\u201D with your desktop PDF app...`
-            : `Couldn\u2019t open it externally${res && res.reason ? ` (${res.reason})` : ''}.`);
-        } catch { this.showTransientNotice('Couldn\u2019t open it externally.'); }
-      }));
-    }
-    bar.appendChild(mkBtn('\u2715 Close', 'Close the document and return to browsing', () => this.closeTab(tab.id), 'fb-doc-close-btn'));
 
-    // ---- Row B: pages, zoom, fit, rotate, night, outline, search -------
+    // pharmaTRACK_PERFECT_new v1.4.22 introduced the manual notes colour
+    // picker beside Download. Yayra keeps the native platform picker, then
+    // adds profile scoping, malformed-value validation and an explicit
+    // current-colour swatch/focus ring for desktop, PWA and mobile.
+    let notesColorControl = null;
+    let notesColorInput = null;
+    let notesColorSwatch = null;
+    if (documentKind === 'pptx' && capabilities.notes) {
+      notesColorControl = document.createElement('label');
+      notesColorControl.className = 'fb-doc-notes-color-control';
+      notesColorControl.dataset.notesColor = state.notesColor;
+
+      const notesColorWheel = document.createElement('span');
+      notesColorWheel.className = 'fb-doc-notes-color-wheel';
+      notesColorWheel.setAttribute('aria-hidden', 'true');
+      notesColorSwatch = document.createElement('span');
+      notesColorSwatch.className = 'fb-doc-notes-color-swatch';
+      notesColorSwatch.style.backgroundColor = state.notesColor;
+      notesColorWheel.appendChild(notesColorSwatch);
+
+      notesColorInput = document.createElement('input');
+      notesColorInput.className = 'fb-doc-notes-color-input';
+      notesColorInput.type = 'color';
+      notesColorInput.value = state.notesColor;
+      notesColorInput.setAttribute('aria-label', 'Speaker notes text colour');
+      notesColorInput.setAttribute('aria-valuetext', state.notesColor);
+      notesColorInput.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;margin:0;padding:0;border:0;opacity:0;cursor:pointer;';
+
+      const describeNotesColor = (color) => {
+        const title = `Speaker notes text colour: ${color}`;
+        notesColorControl.title = title;
+        notesColorInput.title = title;
+        notesColorControl.dataset.notesColor = color;
+        notesColorInput.setAttribute('aria-valuetext', color);
+        if (notesColorSwatch) notesColorSwatch.style.backgroundColor = color;
+      };
+      const applyNotesColor = () => {
+        const color = normalizePptxNotesColor(notesColorInput.value);
+        notesColorInput.value = color;
+        describeNotesColor(color);
+        if (color === state.notesColor && color === this.state.settings.pptxNotesColor) return;
+        state.notesColor = color;
+        this.state.settings.pptxNotesColor = color;
+        activeViewer()?.setNotesColor?.(color);
+        // Fire-and-forget persistence keeps the selected colour live even if
+        // profile storage is unavailable or full.
+        this.persistSettings();
+      };
+      notesColorInput.addEventListener('input', applyNotesColor);
+      notesColorInput.addEventListener('change', applyNotesColor);
+      describeNotesColor(state.notesColor);
+      notesColorControl.appendChild(notesColorWheel);
+      notesColorControl.appendChild(notesColorInput);
+      bar.appendChild(notesColorControl);
+    }
+
+    const hasDesktopDocumentBridge = typeof this.systemBridge?.documents?.openExternal === 'function';
+    const originalTitle = `Open this ${documentRoute.shortLabel.toLowerCase()} with the system default app`;
+    const printTitle = documentKind === 'pptx'
+      ? 'Print every slide in this presentation (Ctrl+P)'
+      : documentKind === 'pdf'
+        ? 'Print every PDF page (Ctrl+P)'
+        : documentKind === 'image'
+          ? 'Print this image (Ctrl+P)'
+          : `Print this ${documentRoute.shortLabel.toLowerCase()} (Ctrl+P)`;
+
+    // The primary row exposes the high-value file actions consistently across
+    // every viewer. PowerPoint's top Present button intentionally always
+    // starts at slide 1; the controls row below has a separate current-slide
+    // action, matching PowerPoint's F5 / Shift+F5 model.
+    bar.appendChild(mkBtn('\u2b07 Download', 'Download the unchanged original file', () => {
+      void downloadOriginal();
+    }, 'fb-doc-download-btn'));
+    if (documentKind === 'pptx') {
+      bar.appendChild(mkBtn('\u25b6 Present', 'Start slideshow from slide 1 (F5)', () => {
+        this.startDocumentSlideshow(tab.id, { fromBeginning: true });
+      }, 'fb-doc-btn-present-first'));
+    }
+    if (capabilities.print) {
+      bar.appendChild(mkBtn('Print', printTitle, () => { void this.printActivePage(); }, 'fb-doc-btn-print'));
+    }
+
+    if (documentKind === 'pptx') {
+      // Presentation-destructive/escape actions live in one accessible
+      // overflow instead of competing with the slide controls.
+      const overflow = document.createElement('div');
+      overflow.className = 'fb-doc-overflow';
+      overflow.style.cssText = 'position:relative;flex:none;';
+      const overflowButton = mkBtn('\u22ee', 'Presentation menu', () => {}, 'fb-doc-overflow-btn');
+      overflowButton.setAttribute('aria-haspopup', 'menu');
+      overflowButton.setAttribute('aria-expanded', 'false');
+      const menu = document.createElement('div');
+      menu.className = 'fb-doc-overflow-menu';
+      menu.setAttribute('role', 'menu');
+      menu.hidden = true;
+      // This menu is always a dark elevated surface, even when the active app
+      // theme is light. Give it an explicit foreground too: inheriting the
+      // light theme's dark toolbar text made every action nearly invisible.
+      menu.style.cssText = 'position:absolute;right:0;top:calc(100% + 5px);z-index:20;min-width:220px;padding:6px;border:1px solid rgba(255,255,255,.16);border-radius:10px;background:#171a24;color:#f8fafc;color-scheme:dark;box-shadow:0 18px 45px rgba(0,0,0,.45);';
+      const closeMenu = () => {
+        menu.hidden = true;
+        overflowButton.setAttribute('aria-expanded', 'false');
+      };
+      const addMenuAction = (label, title, action, { danger = false } = {}) => {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.role = 'menuitem';
+        item.className = `fb-doc-overflow-item${danger ? ' is-danger' : ''}`;
+        item.textContent = label;
+        // Keep the explanation for assistive technology without invoking the
+        // browser's native `title` bubble. That oversized bubble sat over the
+        // next menu row and made the overflow itself impossible to read.
+        item.setAttribute('aria-label', `${label}. ${title}`);
+        item.style.cssText = `display:block;width:100%;padding:9px 10px;border:0;border-radius:7px;background:transparent;color:${danger ? '#fca5a5' : '#f8fafc'};text-align:left;cursor:pointer;font-size:.78rem;`;
+        item.addEventListener('click', () => { closeMenu(); action(); });
+        menu.appendChild(item);
+      };
+      overflowButton.addEventListener('click', (event) => {
+        event.stopPropagation();
+        menu.hidden = !menu.hidden;
+        overflowButton.setAttribute('aria-expanded', String(!menu.hidden));
+        if (!menu.hidden) menu.querySelector('button')?.focus?.();
+      });
+      overflow.addEventListener('focusout', () => {
+        setTimeout(() => { if (!overflow.contains?.(document.activeElement)) closeMenu(); }, 0);
+      });
+      overflow.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') { event.preventDefault(); closeMenu(); overflowButton.focus?.(); }
+      });
+      if (hasDesktopDocumentBridge) addMenuAction('Desktop app', originalTitle, openOriginal);
+      addMenuAction('Close presentation', 'Close this presentation tab', () => this.closeTab(tab.id), { danger: true });
+      overflow.appendChild(overflowButton);
+      overflow.appendChild(menu);
+      bar.appendChild(overflow);
+    } else {
+      if (hasDesktopDocumentBridge) {
+        bar.appendChild(mkBtn('Desktop app', originalTitle, openOriginal, 'fb-doc-original-btn'));
+      }
+      bar.appendChild(mkBtn('\u2715 Close', 'Close the document and return to browsing', () => this.closeTab(tab.id), 'fb-doc-close-btn'));
+    }
+
+    // ---- Row B: only controls the selected engine genuinely supports ----
     const bar2 = document.createElement('div');
     bar2.className = 'fb-doc-toolbar fb-doc-toolbar2';
-    bar2.style.cssText = 'flex:none; display:flex; align-items:center; gap:6px; padding:5px 10px; background:var(--fb-bg-surface,#11141d); border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.78rem; color:var(--fb-text-primary,#dfe4ee); flex-wrap:wrap;';
+    bar2.style.cssText = 'flex:none; display:flex; align-items:center; gap:5px; padding:3px 10px; background:var(--fb-bg-surface,#11141d); border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.76rem; color:var(--fb-text-primary,#dfe4ee); flex-wrap:wrap;';
 
-    bar2.appendChild(mkBtn('\u2039', 'Previous page (Left)', () => this._activeDocViewer?.viewer.prevPage()));
+    const pageNoun = documentKind === 'pptx' ? 'slide' : documentKind === 'xlsx' ? 'sheet' : 'page';
     const pageInput = document.createElement('input');
     pageInput.type = 'number';
     pageInput.className = 'fb-doc-page-input';
     pageInput.min = '1';
-    pageInput.setAttribute('aria-label', 'Page number');
+    pageInput.setAttribute('aria-label', `${pageNoun[0].toUpperCase()}${pageNoun.slice(1)} number`);
     pageInput.style.cssText = 'width:52px; padding:4px 6px; border-radius:6px; border:1px solid var(--fb-border-glass,rgba(255,255,255,0.12)); background:var(--fb-bg-glass-input,#101218); color:inherit; font-size:0.78rem; text-align:center;';
     const pageLabel = document.createElement('span');
     pageLabel.className = 'fb-doc-page-label';
@@ -13262,48 +19458,73 @@ export class BrowserShell {
     pageLabel.textContent = '/ -';
     const gotoPage = () => {
       const n = parseInt(pageInput.value, 10);
-      if (Number.isFinite(n)) this._activeDocViewer?.viewer.setPage(n);
+      if (Number.isFinite(n)) activeViewer()?.setPage?.(n);
     };
     pageInput.addEventListener('change', gotoPage);
     pageInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { gotoPage(); wrap.focus?.(); } });
-    bar2.appendChild(pageInput);
-    bar2.appendChild(pageLabel);
-    bar2.appendChild(mkBtn('\u203a', 'Next page (Right)', () => this._activeDocViewer?.viewer.nextPage()));
+    if (capabilities.pageNavigation) {
+      bar2.appendChild(mkBtn('\u2039', `Previous ${pageNoun} (Left)`, () => activeViewer()?.prevPage?.()));
+      bar2.appendChild(pageInput);
+      bar2.appendChild(pageLabel);
+      bar2.appendChild(mkBtn('\u203a', `Next ${pageNoun} (Right)`, () => activeViewer()?.nextPage?.()));
+    }
+    if (capabilities.view && capabilities.presentation) {
+      const showNoun = documentKind === 'pptx' ? 'slideshow' : 'PDF presentation';
+      const currentLabel = documentKind === 'pptx' ? '\u25b6 From current slide' : '\u25b6 From current page';
+      bar2.appendChild(mkBtn(currentLabel, `Start ${showNoun} from the selected ${pageNoun} (Shift+F5)`, () => {
+        this.startDocumentSlideshow(tab.id);
+      }, 'fb-doc-btn-present-current'));
+    }
 
-    bar2.appendChild(mkBtn('\u2212', 'Zoom out (-)', () => this._activeDocViewer?.viewer.setZoom((tab.docState?.zoom || 1.25) - 0.25)));
     const zoomLabel = document.createElement('span');
     zoomLabel.className = 'fb-doc-zoom-label';
     zoomLabel.style.cssText = 'min-width:40px; text-align:center; color:var(--fb-text-secondary,#9aa3b2);';
-    bar2.appendChild(zoomLabel);
-    bar2.appendChild(mkBtn('+', 'Zoom in (+)', () => this._activeDocViewer?.viewer.setZoom((tab.docState?.zoom || 1.25) + 0.25)));
-
-    bar2.appendChild(mkBtn('\u2194 Fit', 'Fit the page to the window width (F)', () => this._activeDocViewer?.viewer.fitToWidth(), 'fb-doc-btn-fitw'));
-    bar2.appendChild(mkBtn('\u29c9 Page', 'Show the whole page at once', () => this._activeDocViewer?.viewer.fitToPage(), 'fb-doc-btn-fitp'));
-    bar2.appendChild(mkBtn('\u21bb', 'Rotate 90\u00b0 (R)', () => this._activeDocViewer?.viewer.rotate(90), 'fb-doc-btn-rotate'));
-    bar2.appendChild(mkBtn('\u263d', 'Night reading mode - invert colors (N)', () => { this._activeDocViewer?.viewer.setNight(!tab.docState?.night); }, 'fb-doc-btn-night'));
-    bar2.appendChild(mkBtn('\u2630', 'Outline and page thumbnails', () => {
-      tab.docState.sidebarOpen = !tab.docState.sidebarOpen;
-      if (this._activeDocViewer && this._activeDocViewer.tabId === tab.id) this._activeDocViewer.rerenderSidebar?.();
-      else this.render();
-    }, 'fb-doc-btn-outline'));
+    if (capabilities.zoom) {
+      bar2.appendChild(mkBtn('\u2212', 'Zoom out (-)', () => activeViewer()?.setZoom?.((tab.docState?.zoom || 1.25) - 0.25)));
+      bar2.appendChild(zoomLabel);
+      bar2.appendChild(mkBtn('+', 'Zoom in (+)', () => activeViewer()?.setZoom?.((tab.docState?.zoom || 1.25) + 0.25)));
+      bar2.appendChild(mkBtn('\u2194 Fit', `Fit the ${pageNoun} to the window width (F)`, () => activeViewer()?.fitToWidth?.(), 'fb-doc-btn-fitw'));
+      bar2.appendChild(mkBtn('\u29c9 Page', `Show the whole ${pageNoun} at once`, () => activeViewer()?.fitToPage?.(), 'fb-doc-btn-fitp'));
+    }
+    if (capabilities.rotate) bar2.appendChild(mkBtn('\u21bb', 'Rotate 90\u00b0 (R)', () => activeViewer()?.rotate?.(90), 'fb-doc-btn-rotate'));
+    if (capabilities.nightMode) bar2.appendChild(mkBtn('\u263d', 'Night reading mode (N)', () => { activeViewer()?.setNight?.(!tab.docState?.night); }, 'fb-doc-btn-night'));
+    if (capabilities.outline || capabilities.thumbnails) {
+      bar2.appendChild(mkBtn('\u2630', documentKind === 'pptx' ? 'Slide thumbnails' : 'Outline and page thumbnails', () => {
+        tab.docState.sidebarOpen = !tab.docState.sidebarOpen;
+        if (this._activeDocViewer?.tabId === tab.id) this._activeDocViewer.rerenderSidebar?.();
+        else this.render();
+      }, 'fb-doc-btn-outline'));
+    }
+    if (capabilities.notes) {
+      bar2.appendChild(mkBtn('Notes', 'Show or hide PowerPoint speaker notes', () => activeViewer()?.toggleNotes?.(), 'fb-doc-btn-notes'));
+    }
 
     const searchInput = document.createElement('input');
     searchInput.type = 'text';
     searchInput.className = 'fb-doc-search-input';
-    searchInput.placeholder = 'Find in document (Ctrl+F)';
-    searchInput.setAttribute('aria-label', 'Find in document');
-    searchInput.style.cssText = 'width:160px; padding:5px 9px; border-radius:7px; border:1px solid var(--fb-border-glass,rgba(255,255,255,0.12)); background:var(--fb-bg-glass-input,#101218); color:inherit; font-size:0.78rem;';
+    searchInput.placeholder = documentKind === 'xlsx' ? 'Find in sheet (Ctrl+F)' : `Find in ${pageNoun === 'slide' ? 'presentation' : 'document'} (Ctrl+F)`;
+    searchInput.setAttribute('aria-label', searchInput.placeholder);
+    searchInput.style.cssText = 'width:174px; padding:5px 9px; border-radius:7px; border:1px solid var(--fb-border-glass,rgba(255,255,255,0.12)); background:var(--fb-bg-glass-input,#101218); color:inherit; font-size:0.78rem;';
     let searchTimer = null;
     searchInput.addEventListener('input', () => {
       if (searchTimer) clearTimeout(searchTimer);
-      searchTimer = setTimeout(() => { this._activeDocViewer?.viewer.search(searchInput.value); }, 350);
+      searchTimer = setTimeout(() => { activeViewer()?.search?.(searchInput.value); }, 300);
     });
-    bar2.appendChild(searchInput);
     const matchLabel = document.createElement('span');
     matchLabel.className = 'fb-doc-match-label';
     matchLabel.title = 'Show the list of matches';
     matchLabel.style.cssText = 'min-width:56px; color:var(--fb-text-secondary,#9aa3b2); font-size:0.72rem; cursor:pointer;';
-    bar2.appendChild(matchLabel);
+    if (capabilities.search) {
+      bar2.appendChild(searchInput);
+      bar2.appendChild(matchLabel);
+    }
+    if (!capabilities.view) {
+      const honest = document.createElement('span');
+      honest.className = 'fb-doc-limitations';
+      honest.textContent = documentRoute.limitations;
+      honest.style.cssText = 'color:var(--fb-text-secondary,#9aa3b2);line-height:1.35;';
+      bar2.appendChild(honest);
+    }
 
     // ---- Sidebar: outline + thumbnails ---------------------------------
     const sidebar = document.createElement('div');
@@ -13323,8 +19544,8 @@ export class BrowserShell {
       });
       return b;
     };
-    sidebarTabs.appendChild(mkTabBtn('Outline', 'outline'));
-    sidebarTabs.appendChild(mkTabBtn('Pages', 'thumbnails'));
+    if (capabilities.outline) sidebarTabs.appendChild(mkTabBtn('Outline', 'outline'));
+    if (capabilities.thumbnails) sidebarTabs.appendChild(mkTabBtn(documentKind === 'pptx' ? 'Slides' : 'Pages', 'thumbnails'));
     const sidebarBody = document.createElement('div');
     sidebarBody.className = 'fb-doc-sidebar-body';
     sidebar.appendChild(sidebarTabs);
@@ -13332,11 +19553,31 @@ export class BrowserShell {
 
     // ---- Host + status --------------------------------------------------
     const host = document.createElement('div');
-    host.className = 'fb-doc-host';
+    host.className = `fb-doc-host fb-doc-host-${documentKind}`;
     host.style.cssText = 'flex:1; min-height:0; overflow:auto; display:flex; flex-direction:column; align-items:center; gap:12px; padding:16px;';
     const statusEl = document.createElement('div');
     statusEl.className = 'fb-doc-status';
+    statusEl.setAttribute('role', 'status');
+    statusEl.setAttribute('aria-live', 'polite');
     statusEl.style.cssText = 'position:absolute; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center; gap:10px; background:var(--fb-bg-app,#191c23); color:var(--fb-text-primary,#d7dbe3); text-align:center; padding:24px; font-size:0.9rem; z-index:2;';
+    const statusMessage = document.createElement('div');
+    statusMessage.className = 'fb-doc-status-message';
+    const progressTrack = document.createElement('div');
+    progressTrack.className = 'fb-doc-progress-track';
+    progressTrack.style.cssText = 'width:min(320px,80%); height:4px; overflow:hidden; border-radius:999px; background:rgba(255,255,255,0.12); display:none;';
+    const progressFill = document.createElement('div');
+    progressFill.className = 'fb-doc-progress-fill';
+    progressFill.style.cssText = 'height:100%; width:0; border-radius:inherit; background:var(--fb-accent-primary,#6d5df2); transition:width 120ms linear;';
+    progressTrack.appendChild(progressFill);
+    const retryBtn = document.createElement('button');
+    retryBtn.type = 'button';
+    retryBtn.className = 'fb-doc-retry-btn';
+    retryBtn.textContent = 'Try again';
+    retryBtn.style.cssText = 'display:none; padding:7px 14px; border:0; border-radius:8px; background:var(--fb-accent-primary,#6d5df2); color:#fff; cursor:pointer; font-weight:600;';
+    retryBtn.addEventListener('click', () => this.retryDocumentViewer(tab.id));
+    statusEl.appendChild(statusMessage);
+    statusEl.appendChild(progressTrack);
+    statusEl.appendChild(retryBtn);
 
     // ---- Match list panel ----------------------------------------------
     const matchPanel = document.createElement('div');
@@ -13359,27 +19600,41 @@ export class BrowserShell {
     viewport.appendChild(wrap);
     try { wrap.focus?.(); } catch { /* shim */ }
 
-    const doc = this.documentStore.get(tab.docId);
-    const state = tab.docState || (tab.docState = createDocumentViewerState());
     // Fresh mounts of an old tab state get the new fields.
-    for (const [k, v] of Object.entries(createDocumentViewerState())) {
+    for (const [k, v] of Object.entries(createDocumentViewerState(documentKind))) {
       if (state[k] === undefined) state[k] = v;
     }
 
+    let sidebarStructureKey = '';
     const renderSidebar = () => {
-      sidebarBody.innerHTML = '';
       try {
-        sidebar.style.display = state.sidebarOpen ? 'block' : 'none';
-        if (!state.sidebarOpen) return;
+        const canShowSidebar = capabilities.outline || capabilities.thumbnails;
+        sidebar.style.display = canShowSidebar && state.sidebarOpen ? 'block' : 'none';
+        if (!canShowSidebar || !state.sidebarOpen) {
+          sidebarStructureKey = '';
+          sidebarBody.innerHTML = '';
+          return;
+        }
+        const nextStructureKey = `${state.sidebarTab}|${state.numPages}|${state.outline.length}|${documentKind}`;
+        if (sidebarStructureKey === nextStructureKey && state.sidebarTab === 'thumbnails') {
+          for (const tile of sidebarBody.querySelectorAll('.fb-doc-thumb')) {
+            tile.style.borderColor = Number(tile.dataset.page) === Number(state.page)
+              ? 'var(--fb-accent-primary,#6d5df2)'
+              : 'var(--fb-border-glass,rgba(255,255,255,0.12))';
+          }
+          return;
+        }
+        sidebarStructureKey = nextStructureKey;
+        sidebarBody.innerHTML = '';
         for (const b of sidebarTabs.querySelectorAll('.fb-doc-sidebar-tab')) {
           b.style.background = 'var(--fb-bg-glass-input,rgba(255,255,255,0.07))';
         }
         const activeTabBtn = sidebarTabs.querySelector(`.fb-doc-sidebar-tab-${state.sidebarTab}`);
         if (activeTabBtn) activeTabBtn.style.background = 'rgba(109,93,242,0.35)';
         if (state.sidebarTab === 'thumbnails') {
-          const count = Math.min(state.numPages || 0, 60);
+          const count = state.numPages || 0;
           if (!count) {
-            sidebarBody.innerHTML = '<div style="color:var(--fb-text-secondary,#9aa3b2); padding:8px;">No pages yet.</div>';
+            sidebarBody.innerHTML = `<div style="color:var(--fb-text-secondary,#9aa3b2); padding:8px;">No ${documentKind === 'pptx' ? 'slides' : 'pages'} yet.</div>`;
             return;
           }
           for (let p = 1; p <= count; p += 1) {
@@ -13387,14 +19642,26 @@ export class BrowserShell {
             thumb.className = 'fb-doc-thumb';
             thumb.dataset.page = String(p);
             thumb.setAttribute('role', 'button');
-            thumb.setAttribute('aria-label', `Go to page ${p}`);
-            thumb.style.cssText = `margin:0 auto 10px; width:130px; padding:4px; border:1px solid ${p === state.page ? 'var(--fb-accent-primary,#6d5df2)' : 'var(--fb-border-glass,rgba(255,255,255,0.12))'}; border-radius:6px; cursor:pointer; text-align:center; background:var(--fb-bg-glass-input,#0e111a);`;
+            thumb.setAttribute('aria-label', `Go to ${pageNoun} ${p}`);
+            thumb.style.cssText = `margin:0 auto 10px; width:140px; min-height:44px; padding:4px; border:1px solid ${p === state.page ? 'var(--fb-accent-primary,#6d5df2)' : 'var(--fb-border-glass,rgba(255,255,255,0.12))'}; border-radius:7px; cursor:pointer; text-align:center; background:var(--fb-bg-glass-input,#0e111a); overflow:hidden;`;
             const label = document.createElement('div');
-            label.textContent = String(p);
-            label.style.cssText = 'padding:2px 0; color:var(--fb-text-secondary,#9aa3b2); font-size:0.7rem;';
+            label.textContent = `${documentKind === 'pptx' ? 'Slide ' : ''}${p}`;
+            label.style.cssText = 'padding:3px 0; color:var(--fb-text-secondary,#9aa3b2); font-size:0.7rem;';
             thumb.appendChild(label);
-            thumb.addEventListener('click', () => this._activeDocViewer?.viewer.setPage(p));
+            thumb.addEventListener('click', () => activeViewer()?.setPage?.(p));
             sidebarBody.appendChild(thumb);
+            const renderPreview = () => activeViewer()?.renderThumbnail?.(p, thumb);
+            if (typeof IntersectionObserver === 'function') {
+              const observer = new IntersectionObserver((entries) => {
+                if (entries.some((entry) => entry.isIntersecting)) {
+                  observer.disconnect();
+                  renderPreview();
+                }
+              }, { root: sidebar, rootMargin: '320px 0px' });
+              observer.observe(thumb);
+            } else if (count <= 24 || Math.abs(p - (state.page || 1)) <= 6) {
+              renderPreview();
+            }
           }
           return;
         }
@@ -13408,7 +19675,7 @@ export class BrowserShell {
           row.textContent = item.title;
           if (item.page) {
             row.title = `Go to page ${item.page}`;
-            row.addEventListener('click', () => this._activeDocViewer?.viewer.setPage(item.page));
+            row.addEventListener('click', () => activeViewer()?.setPage?.(item.page));
           }
           row.style.cssText = `padding:6px 8px; margin-bottom:2px; border-radius:6px; cursor:${item.page ? 'pointer' : 'default'}; background:${item.page ? 'rgba(255,255,255,0.04)' : 'transparent'}; color:${item.page ? 'var(--fb-text-primary,#dfe4ee)' : 'var(--fb-text-secondary,#9aa3b2)'}; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-left:${(item.depth || 0) * 12}px;`;
           sidebarBody.appendChild(row);
@@ -13420,20 +19687,48 @@ export class BrowserShell {
       try {
         pageInput.value = String(state.page || 1);
         pageInput.max = String(state.numPages || 1);
-        pageLabel.textContent = `/ ${state.numPages || '-'}`;
+        const sheetName = documentKind === 'xlsx' ? state.sheetNames?.[(state.page || 1) - 1] : '';
+        pageLabel.textContent = sheetName ? `${sheetName} · ${state.page} / ${state.numPages}` : `/ ${state.numPages || '-'}`;
         zoomLabel.textContent = `${Math.round((state.zoom || 1) * 100)}%`;
-        matchLabel.textContent = state.query
-          ? (state.matches.length ? `${state.matches.length} found \u25be` : '0 found')
-          : '';
+        matchLabel.textContent = state.searchPending
+          ? (Number.isFinite(state.searchProgress) ? `Searching ${state.searchProgress}%` : 'Searching…')
+          : state.query
+            ? (state.matches.length ? `${state.matches.length} found \u25be` : '0 found')
+            : '';
         const nightBtn = bar2.querySelector('.fb-doc-btn-night');
         if (nightBtn) nightBtn.style.background = state.night ? 'rgba(109,93,242,0.45)' : 'rgba(255,255,255,0.07)';
-        if (state.status === 'ready') { statusEl.style.display = 'none'; }
-        else {
-          statusEl.style.display = 'flex';
-          statusEl.textContent = state.status === 'loading'
-            ? 'Opening document...'
-            : (state.error || 'This document can\u2019t be displayed.');
+        const notesBtn = bar2.querySelector('.fb-doc-btn-notes');
+        if (notesBtn) notesBtn.style.background = state.showNotes ? 'rgba(109,93,242,0.45)' : 'rgba(255,255,255,0.07)';
+        if (notesColorControl && notesColorInput) {
+          const color = normalizePptxNotesColor(state.notesColor);
+          state.notesColor = color;
+          notesColorInput.value = color;
+          notesColorInput.setAttribute('aria-valuetext', color);
+          notesColorInput.title = `Speaker notes text colour: ${color}`;
+          notesColorControl.title = notesColorInput.title;
+          notesColorControl.dataset.notesColor = color;
+          notesColorControl.hidden = !state.showNotes;
+          notesColorControl.style.display = state.showNotes ? 'inline-flex' : 'none';
+          if (notesColorSwatch) notesColorSwatch.style.backgroundColor = color;
         }
+        const isLoading = state.status === 'loading' || state.printPending === true;
+        const activeProgress = state.printPending ? state.printProgress : state.progress;
+        const hasError = state.status === 'error' || state.status === 'password';
+        statusEl.style.display = state.status === 'ready' && !state.printPending ? 'none' : 'flex';
+        statusEl.setAttribute('role', hasError ? 'alert' : 'status');
+        if (isLoading) {
+          const stage = state.loadingStage || (state.printPending ? 'Preparing document for print…' : 'Opening document…');
+          statusMessage.textContent = Number.isFinite(activeProgress)
+            ? `${stage} ${Math.max(0, Math.min(100, activeProgress))}%`
+            : stage;
+        } else {
+          statusMessage.textContent = state.error || (state.status === 'idle'
+            ? `Preparing the ${documentRoute.shortLabel} viewer…`
+            : 'This document can’t be displayed.');
+        }
+        progressTrack.style.display = isLoading && Number.isFinite(activeProgress) ? 'block' : 'none';
+        progressFill.style.width = `${Math.max(0, Math.min(100, Number(activeProgress) || 0))}%`;
+        retryBtn.style.display = state.status === 'error' ? 'inline-flex' : 'none';
         // Match list panel.
         if (state.showMatchList && state.matches.length) {
           matchPanel.style.display = 'block';
@@ -13446,8 +19741,14 @@ export class BrowserShell {
             const row = document.createElement('div');
             row.className = 'fb-doc-match-row';
             row.style.cssText = `padding:6px 8px; margin-bottom:4px; border-radius:6px; cursor:pointer; background:${i === state.matchIndex ? 'rgba(109,93,242,0.35)' : 'rgba(255,255,255,0.04)'}; line-height:1.4;`;
-            row.innerHTML = `<strong style="color:var(--fb-text-secondary,#9aa3b2);">p.${m.page}</strong> \u2014 ${String(m.snippet || '').slice(0, 90)}`;
-            row.addEventListener('click', () => { this._activeDocViewer?.viewer.setPage(m.page); });
+            const pageNumber = document.createElement('strong');
+            pageNumber.style.cssText = 'color:var(--fb-text-secondary,#9aa3b2);';
+            pageNumber.textContent = `${documentKind === 'pptx' ? 'slide' : documentKind === 'xlsx' ? 'sheet' : 'p.'}${m.page}`;
+            const snippet = document.createElement('span');
+            snippet.textContent = ` \u2014 ${String(m.snippet || '').slice(0, 90)}`;
+            row.appendChild(pageNumber);
+            row.appendChild(snippet);
+            row.addEventListener('click', () => { activeViewer()?.setPage?.(m.page); });
             matchPanel.appendChild(row);
           });
         } else {
@@ -13463,9 +19764,9 @@ export class BrowserShell {
 
     // Keyboard: page/zoom/rotate/night/fit + Ctrl+F focus search.
     wrap.addEventListener('keydown', (e) => {
-      const active = this._activeDocViewer;
-      if (!active || active.tabId !== tab.id) return;
-      const action = active.viewer.handleKeydown(e);
+      const viewer = activeViewer();
+      if (!viewer || typeof viewer.handleKeydown !== 'function') return;
+      const action = viewer.handleKeydown(e);
       if (action === 'focus-search') {
         if (typeof e.preventDefault === 'function') e.preventDefault();
         searchInput.focus?.();
@@ -13484,35 +19785,767 @@ export class BrowserShell {
       return;
     }
 
-    // The engine (vendored PDF.js, or a test-injected fake) resolves
-    // asynchronously; the toolbar buttons drive whatever viewer is bound
-    // to THIS tab once it is ready.
-    (async () => {
-      const engine = this._docEngineOverride || await this._pdfjsModule();
-      if (this._activeDocViewer?.tabId === tab.id) return; // a newer render won
-      const viewer = createPdfViewer({ pdfjs: engine, container: host, state, onStateChange: sync });
-      this._activeDocViewer = { tabId: tab.id, viewer, sync, rerenderSidebar: renderSidebar };
-      await viewer.load(doc.bytes);
-      // Table of contents (when the PDF carries one) + first sidebar paint.
-      await viewer.loadOutline();
+    const sessions = this._documentViewerSessions || (this._documentViewerSessions = new Map());
+    let session = sessions.get(tab.id);
+    if (session && session.docId !== tab.docId) {
+      session.disposed = true;
+      try { session.viewer?.destroy(); } catch { /* already gone */ }
+      sessions.delete(tab.id);
+      session = null;
+    }
+    if (!session) {
+      session = {
+        tabId: tab.id,
+        docId: tab.docId,
+        state,
+        host,
+        sync,
+        rerenderSidebar: renderSidebar,
+        openOriginal,
+        downloadOriginal,
+        viewer: null,
+        loadPromise: null,
+        disposed: false
+      };
+      sessions.set(tab.id, session);
+    } else {
+      // BrowserShell reconstructs the viewport on ordinary renders. Move the
+      // current canvas and replace the state callback; do not start a second
+      // PDF.js worker/load for the same document.
+      session.host = host;
+      session.sync = sync;
+      session.rerenderSidebar = renderSidebar;
+      session.openOriginal = openOriginal;
+      session.downloadOriginal = downloadOriginal;
+      session.state = state;
+      session.viewer?.attach(host, () => {
+        if (!session.disposed) session.sync?.();
+      });
+    }
+    this._activeDocViewer = session;
+    sync();
+
+    if (!doc) {
+      state.status = 'error';
+      state.error = 'This document is no longer available (it was closed or the app restarted). Open it again from the menu.';
       sync();
-    })();
+      return;
+    }
+    if (!session.viewer && !session.loadPromise) this._startDocumentViewerLoad(session, doc);
   }
 
-  getTabFavicon(tab) {
+  // Compatibility entry points remain for integrations that adopted the
+  // original PPTX-only API. Both now delegate to one format-neutral show.
+  async startPptxSlideshow(tabId, options = {}) {
+    return this.startDocumentSlideshow(tabId, options);
+  }
+
+  async startPdfSlideshow(tabId, options = {}) {
+    return this.startDocumentSlideshow(tabId, options);
+  }
+
+  async startDocumentSlideshow(tabId, { fromBeginning = false } = {}) {
+    const activeShow = this._documentSlideshow || this._pptxSlideshow;
+    if (activeShow?.active) {
+      activeShow.overlay?.focus?.();
+      if (fromBeginning) void activeShow.viewer?.setPage?.(1);
+      return true;
+    }
+    const tab = this.state.tabs.find((item) => item.id === tabId);
+    const doc = tab?.docId ? this.documentStore?.get(tab.docId) : null;
+    const session = this._documentViewerSessions?.get(tabId);
+    const viewer = session?.viewer;
+    const documentKind = doc?.type;
+    const isPowerPoint = documentKind === 'pptx';
+    const isPdf = documentKind === 'pdf';
+    if (!tab || (!isPowerPoint && !isPdf) || !viewer || session.state?.status !== 'ready') {
+      this.showTransientNotice('Wait for the PDF or presentation to finish opening, then choose Present.');
+      return false;
+    }
+    if (typeof document === 'undefined' || !document.body) return false;
+    const pageNoun = isPowerPoint ? 'slide' : 'page';
+    const pageNounTitle = isPowerPoint ? 'Slide' : 'Page';
+
+    const overlay = document.createElement('div');
+    // Keep the established PPTX class as a styling/integration alias while
+    // the generic class identifies both PDF and PowerPoint projector modes.
+    overlay.className = `fb-document-slideshow fb-pptx-slideshow is-${documentKind}`;
+    overlay.id = isPowerPoint ? 'yayra-pptx-slideshow' : 'yayra-pdf-slideshow';
+    overlay.tabIndex = -1;
+    overlay.setAttribute('role', 'application');
+    overlay.setAttribute('aria-roledescription', isPowerPoint ? 'PowerPoint slideshow' : 'PDF page show');
+    overlay.setAttribute('aria-label', `${doc.name} ${isPowerPoint ? 'slideshow' : 'PDF presentation'}`);
+
+    const surface = document.createElement('div');
+    surface.className = 'fb-pptx-slideshow-surface';
+    const host = document.createElement('div');
+    host.className = 'fb-document-slideshow-host fb-pptx-slideshow-host';
+    const blank = document.createElement('div');
+    blank.className = 'fb-pptx-slideshow-blank';
+    blank.hidden = true;
+    blank.setAttribute('aria-hidden', 'true');
+    const ink = document.createElement('canvas');
+    ink.className = 'fb-pptx-slideshow-ink';
+    ink.setAttribute('aria-label', `${pageNounTitle} presentation pen canvas`);
+    const laser = document.createElement('span');
+    laser.className = 'fb-pptx-slideshow-laser';
+    laser.hidden = true;
+    laser.setAttribute('aria-hidden', 'true');
+    surface.appendChild(host);
+    surface.appendChild(ink);
+    surface.appendChild(laser);
+    surface.appendChild(blank);
+
+    const top = document.createElement('div');
+    top.className = 'fb-pptx-slideshow-top fb-pptx-slideshow-chrome';
+    const title = document.createElement('span');
+    title.className = 'fb-pptx-slideshow-title';
+    title.textContent = doc.name;
+    const count = document.createElement('span');
+    count.className = 'fb-pptx-slideshow-count';
+    count.setAttribute('aria-live', 'polite');
+    const jumpHint = document.createElement('span');
+    jumpHint.className = 'fb-pptx-slideshow-jump-hint';
+    jumpHint.hidden = true;
+    top.appendChild(title);
+    top.appendChild(count);
+    top.appendChild(jumpHint);
+
+    const controls = document.createElement('div');
+    controls.className = 'fb-pptx-slideshow-controls fb-pptx-slideshow-chrome';
+    controls.setAttribute('role', 'toolbar');
+    controls.setAttribute('aria-label', 'Slideshow controls');
+    const controlButton = (label, titleText, handler, className = '') => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = `fb-pptx-slideshow-button ${className}`.trim();
+      button.textContent = label;
+      button.title = titleText;
+      button.setAttribute('aria-label', titleText);
+      button.addEventListener('click', (event) => {
+        event.stopPropagation();
+        handler(event);
+      });
+      return button;
+    };
+    const previousButton = controlButton('\u2039', `Previous ${pageNoun} (Left, P, Page Up)`, () => viewer.prevPage?.());
+    const nextButton = controlButton('\u203a', `Next ${pageNoun} (Right, N, Space, Page Down)`, () => viewer.nextPage?.());
+    const slideForm = document.createElement('form');
+    slideForm.className = 'fb-pptx-slideshow-slide-form';
+    slideForm.setAttribute('aria-label', `Jump to ${pageNoun}`);
+    const slideInput = document.createElement('input');
+    slideInput.type = 'number';
+    slideInput.min = '1';
+    slideInput.max = String(session.state.numPages || 1);
+    slideInput.setAttribute('aria-label', `${pageNounTitle} number`);
+    const slideTotal = document.createElement('span');
+    slideTotal.textContent = `/ ${session.state.numPages || 1}`;
+    slideForm.appendChild(slideInput);
+    slideForm.appendChild(slideTotal);
+    slideForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const page = Number(slideInput.value);
+      if (Number.isFinite(page)) void viewer.setPage?.(page);
+      overlay.focus?.();
+    });
+    const notesButton = isPowerPoint
+      ? controlButton('Notes', 'Toggle speaker notes (S or Alt+F5)', () => viewer.toggleNotes?.(), 'fb-pptx-slideshow-notes')
+      : null;
+    const blackButton = controlButton('Black', 'Toggle black screen (B or period)', () => setBlank(show.blankMode || 'black'));
+    const pointerButton = controlButton('Laser', 'Toggle laser pointer (Ctrl+L)', () => setPointerMode(show.pointerMode === 'laser' ? 'pointer' : 'laser'), 'fb-pptx-slideshow-pointer');
+    const penButton = controlButton('Pen', `Draw on the ${pageNoun} show (Ctrl+P); E clears ink`, () => setPointerMode(show.pointerMode === 'pen' ? 'pointer' : 'pen'), 'fb-pptx-slideshow-pen');
+    const navigatorButton = controlButton(isPowerPoint ? 'Slides' : 'Pages', `See all ${pageNoun}s (G or minus)`, () => toggleNavigator(), 'fb-pptx-slideshow-navigator-button');
+    const helpButton = controlButton('?', 'Slideshow shortcuts (F1)', () => toggleHelp(), 'fb-pptx-slideshow-help-button');
+    const fullscreenButton = controlButton('Fullscreen', 'Enter or leave projector fullscreen', () => togglePresentationFullscreen(), 'fb-pptx-slideshow-fullscreen');
+    const exitButton = controlButton('Exit', `End ${isPowerPoint ? 'slideshow' : 'PDF presentation'} (Esc)`, () => this.exitDocumentSlideshow(), 'fb-pptx-slideshow-exit');
+    for (const control of [previousButton, slideForm, nextButton, notesButton, blackButton, pointerButton, penButton, navigatorButton, helpButton, fullscreenButton, exitButton].filter(Boolean)) {
+      controls.appendChild(control);
+    }
+
+    const help = document.createElement('section');
+    help.className = 'fb-pptx-slideshow-dialog fb-pptx-slideshow-help';
+    help.hidden = true;
+    help.setAttribute('role', 'dialog');
+    help.setAttribute('aria-modal', 'false');
+    help.setAttribute('aria-label', 'Slideshow keyboard shortcuts');
+    help.innerHTML = `
+      <div class="fb-pptx-slideshow-dialog-head"><strong>${isPowerPoint ? 'Slideshow' : 'PDF presentation'} shortcuts</strong><button type="button" aria-label="Close shortcut help">\u2715</button></div>
+      <div class="fb-pptx-shortcut-grid">
+        <span>Next ${pageNoun}</span><kbd>N</kbd><kbd>Enter</kbd><kbd>Space</kbd><kbd>\u2192</kbd><kbd>\u2193</kbd><kbd>PgDn</kbd>
+        <span>Previous ${pageNoun}</span><kbd>P</kbd><kbd>Backspace</kbd><kbd>\u2190</kbd><kbd>\u2191</kbd><kbd>PgUp</kbd>
+        <span>First / last ${pageNoun}</span><kbd>Home</kbd><kbd>End</kbd>
+        <span>Jump to ${pageNoun}</span><kbd>number</kbd><kbd>Enter</kbd>
+        <span>Black / white screen</span><kbd>B</kbd><kbd>.</kbd><kbd>W</kbd><kbd>,</kbd>
+        ${isPowerPoint ? '<span>Speaker notes</span><kbd>S</kbd><kbd>Alt+F5</kbd><kbd>Ctrl+Shift+N</kbd>' : ''}
+        <span>Laser / pen / arrow</span><kbd>Ctrl+L</kbd><kbd>Ctrl+P</kbd><kbd>Ctrl+A</kbd>
+        <span>Hide pointer / erase ink</span><kbd>Ctrl+H</kbd><kbd>E</kbd>
+        <span>All ${pageNoun}s / help</span><kbd>G</kbd><kbd>-</kbd><kbd>F1</kbd>
+        <span>End show</span><kbd>Esc</kbd>
+      </div>`;
+    help.querySelector('button')?.addEventListener('click', () => toggleHelp(false));
+
+    const navigator = document.createElement('section');
+    navigator.className = 'fb-pptx-slideshow-dialog fb-pptx-slideshow-navigator';
+    navigator.hidden = true;
+    navigator.setAttribute('role', 'dialog');
+    navigator.setAttribute('aria-label', `Choose a ${pageNoun}`);
+    const navigatorHead = document.createElement('div');
+    navigatorHead.className = 'fb-pptx-slideshow-dialog-head';
+    navigatorHead.innerHTML = `<strong>All ${pageNoun}s</strong>`;
+    const navigatorClose = document.createElement('button');
+    navigatorClose.type = 'button';
+    navigatorClose.textContent = '\u2715';
+    navigatorClose.setAttribute('aria-label', `Close ${pageNoun} navigator`);
+    navigatorClose.addEventListener('click', () => toggleNavigator(false));
+    navigatorHead.appendChild(navigatorClose);
+    const navigatorGrid = document.createElement('div');
+    navigatorGrid.className = 'fb-pptx-slideshow-navigator-grid';
+    for (let page = 1; page <= Number(session.state.numPages || 0); page += 1) {
+      const choice = document.createElement('button');
+      choice.type = 'button';
+      choice.className = 'fb-pptx-slideshow-slide-choice';
+      choice.dataset.slide = String(page);
+      choice.textContent = isPowerPoint ? String(page) : `Page ${page}`;
+      choice.setAttribute('aria-label', `Go to ${pageNoun} ${page}`);
+      choice.addEventListener('click', () => {
+        void viewer.setPage?.(page);
+        toggleNavigator(false);
+      });
+      navigatorGrid.appendChild(choice);
+    }
+    navigator.appendChild(navigatorHead);
+    navigator.appendChild(navigatorGrid);
+
+    overlay.appendChild(surface);
+    overlay.appendChild(top);
+    overlay.appendChild(controls);
+    overlay.appendChild(help);
+    overlay.appendChild(navigator);
+    document.body.appendChild(overlay);
+
+    const show = {
+      active: true,
+      overlay,
+      surface,
+      host,
+      ink,
+      laser,
+      blank,
+      controls,
+      top,
+      help,
+      navigator,
+      viewer,
+      session,
+      tabId,
+      documentKind,
+      isPowerPoint,
+      pageNoun,
+      restoreHost: session.host,
+      restoreFocus: document.activeElement,
+      restoreZoom: session.state.zoom,
+      restoreZoomMode: session.state.zoomMode,
+      restoreNotes: isPowerPoint ? Boolean(session.state.showNotes) : null,
+      pointerMode: 'pointer',
+      blankMode: null,
+      digitBuffer: '',
+      lastPage: session.state.page,
+      hideTimer: null,
+      resizeTimer: null,
+      jumpTimer: null,
+      wheelAt: 0,
+      enteredFullscreen: false,
+      suppressFullscreenExit: false,
+      drawing: false,
+      lastPoint: null,
+      cleanup: []
+    };
+    this._documentSlideshow = show;
+    this._pptxSlideshow = show; // compatibility alias for earlier integrations
+    tab.docState.slideshowMode = true;
+
+    const fullscreenWanted = this.state.settings.pptxSlideshowFullscreen !== false;
+    let fullscreenPromise = null;
+    if (fullscreenWanted && typeof overlay.requestFullscreen === 'function') {
+      try {
+        fullscreenPromise = Promise.resolve(overlay.requestFullscreen({ navigationUI: 'hide' }))
+          .catch(() => overlay.requestFullscreen?.())
+          .catch(() => null);
+      } catch { fullscreenPromise = null; }
+    }
+
+    const clearInk = () => {
+      const context = ink.getContext?.('2d');
+      if (context) context.clearRect(0, 0, ink.width || 0, ink.height || 0);
+    };
+    const sizeInk = () => {
+      const rect = surface.getBoundingClientRect?.() || { width: surface.clientWidth || 1, height: surface.clientHeight || 1 };
+      const ratio = Math.max(1, Math.min(2, Number(window.devicePixelRatio) || 1));
+      ink.width = Math.max(1, Math.floor((rect.width || 1) * ratio));
+      ink.height = Math.max(1, Math.floor((rect.height || 1) * ratio));
+      ink.style.width = `${Math.max(1, rect.width || 1)}px`;
+      ink.style.height = `${Math.max(1, rect.height || 1)}px`;
+      const context = ink.getContext?.('2d');
+      context?.setTransform?.(ratio, 0, 0, ratio, 0, 0);
+      if (context) {
+        context.strokeStyle = '#ef4444';
+        context.lineWidth = 3;
+        context.lineCap = 'round';
+        context.lineJoin = 'round';
+      }
+    };
+    const syncSlideshow = () => {
+      if (!show.active) return;
+      const page = Number(session.state.page || 1);
+      count.textContent = `${pageNounTitle} ${page} of ${session.state.numPages || 1}`;
+      slideInput.value = String(page);
+      slideInput.max = String(session.state.numPages || 1);
+      slideTotal.textContent = `/ ${session.state.numPages || 1}`;
+      previousButton.disabled = page <= 1;
+      nextButton.disabled = page >= Number(session.state.numPages || 1);
+      notesButton?.classList?.toggle('is-active', Boolean(session.state.showNotes));
+      notesButton?.setAttribute?.('aria-pressed', String(Boolean(session.state.showNotes)));
+      if (show.lastPage !== page) {
+        show.lastPage = page;
+        clearInk();
+      }
+      for (const choice of navigatorGrid.querySelectorAll?.('.fb-pptx-slideshow-slide-choice') || []) {
+        const current = Number(choice.dataset.slide) === page;
+        choice.classList.toggle('is-active', current);
+        choice.setAttribute('aria-current', current ? 'true' : 'false');
+      }
+    };
+    show.sync = syncSlideshow;
+
+    function revealControls() {
+      if (!show.active) return;
+      overlay.classList.remove('is-controls-hidden');
+      if (show.hideTimer) clearTimeout(show.hideTimer);
+      if (show.jumpTimer) { /* jump hint owns its own timer */ }
+      if (this.state.settings.pptxSlideshowAutoHideControls !== false && show.help.hidden && show.navigator.hidden) {
+        show.hideTimer = setTimeout(() => {
+          if (show.active && show.help.hidden && show.navigator.hidden && document.activeElement !== slideInput) {
+            overlay.classList.add('is-controls-hidden');
+          }
+        }, 3200);
+      }
+    }
+    const reveal = revealControls.bind(this);
+
+    function setPointerMode(mode) {
+      show.pointerMode = mode === 'laser' || mode === 'pen' || mode === 'hidden' ? mode : 'pointer';
+      laser.hidden = show.pointerMode !== 'laser';
+      ink.style.pointerEvents = show.pointerMode === 'pen' ? 'auto' : 'none';
+      pointerButton.classList.toggle('is-active', show.pointerMode === 'laser');
+      penButton.classList.toggle('is-active', show.pointerMode === 'pen');
+      pointerButton.setAttribute('aria-pressed', String(show.pointerMode === 'laser'));
+      penButton.setAttribute('aria-pressed', String(show.pointerMode === 'pen'));
+      overlay.classList.toggle('is-pointer-hidden', show.pointerMode === 'hidden');
+      if (show.pointerMode === 'hidden') overlay.style.setProperty('cursor', 'none', 'important');
+      else if (typeof overlay.style.removeProperty === 'function') overlay.style.removeProperty('cursor');
+      else overlay.style.setProperty('cursor', '');
+      reveal();
+    }
+
+    function setBlank(mode) {
+      const next = show.blankMode === mode ? null : mode;
+      show.blankMode = next;
+      blank.hidden = !next;
+      blank.style.background = next === 'white' ? '#fff' : '#000';
+      blackButton.classList.toggle('is-active', Boolean(next));
+      blackButton.setAttribute('aria-pressed', String(Boolean(next)));
+      blackButton.textContent = next === 'white' ? 'White' : 'Black';
+      blackButton.title = next ? `Resume the ${pageNoun} show` : 'Toggle black screen (B or period)';
+      blackButton.setAttribute('aria-label', blackButton.title);
+      reveal();
+    }
+
+    function toggleHelp(force) {
+      const open = typeof force === 'boolean' ? force : help.hidden;
+      help.hidden = !open;
+      if (open) {
+        navigator.hidden = true;
+        navigatorButton.classList.remove('is-active');
+      }
+      helpButton.classList.toggle('is-active', open);
+      reveal();
+      if (open) help.querySelector('button')?.focus?.(); else overlay.focus?.();
+    }
+
+    function toggleNavigator(force) {
+      const open = typeof force === 'boolean' ? force : navigator.hidden;
+      navigator.hidden = !open;
+      if (open) {
+        help.hidden = true;
+        helpButton.classList.remove('is-active');
+      }
+      navigatorButton.classList.toggle('is-active', open);
+      reveal();
+      if (open) navigatorGrid.querySelector(`[data-slide="${session.state.page || 1}"]`)?.focus?.(); else overlay.focus?.();
+    }
+
+    async function togglePresentationFullscreen() {
+      try {
+        if (document.fullscreenElement === overlay) {
+          // The toolbar's Window action intentionally keeps the full-window
+          // show alive. A browser/OS Escape from fullscreen ends the show.
+          show.suppressFullscreenExit = true;
+          await document.exitFullscreen?.();
+        } else {
+          await overlay.requestFullscreen?.({ navigationUI: 'hide' });
+        }
+      } catch { /* fixed overlay remains a full-window presentation surface */ }
+      reveal();
+    }
+
+    show.setPointerMode = setPointerMode;
+    show.setBlank = setBlank;
+    show.toggleHelp = toggleHelp;
+    show.toggleNavigator = toggleNavigator;
+    show.clearInk = clearInk;
+
+    const onPointerMove = (event) => {
+      reveal();
+      if (show.pointerMode === 'laser') {
+        laser.hidden = false;
+        laser.style.left = `${event.clientX}px`;
+        laser.style.top = `${event.clientY}px`;
+      }
+    };
+    const localInkPoint = (event) => {
+      const rect = ink.getBoundingClientRect?.() || { left: 0, top: 0 };
+      return { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    };
+    const onInkDown = (event) => {
+      if (show.pointerMode !== 'pen' || event.button !== 0) return;
+      show.drawing = true;
+      show.lastPoint = localInkPoint(event);
+      ink.setPointerCapture?.(event.pointerId);
+      event.preventDefault();
+    };
+    const onInkMove = (event) => {
+      if (!show.drawing || show.pointerMode !== 'pen') return;
+      const next = localInkPoint(event);
+      const context = ink.getContext?.('2d');
+      if (context && show.lastPoint) {
+        context.beginPath();
+        context.moveTo(show.lastPoint.x, show.lastPoint.y);
+        context.lineTo(next.x, next.y);
+        context.stroke();
+      }
+      show.lastPoint = next;
+      event.preventDefault();
+    };
+    const stopInk = (event) => {
+      show.drawing = false;
+      show.lastPoint = null;
+      try { ink.releasePointerCapture?.(event?.pointerId); } catch { /* not captured */ }
+    };
+    ink.addEventListener('pointerdown', onInkDown);
+    ink.addEventListener('pointermove', onInkMove);
+    ink.addEventListener('pointerup', stopInk);
+    ink.addEventListener('pointercancel', stopInk);
+
+    let touchStart = null;
+    const onTouchStart = (event) => {
+      const point = event.touches?.[0];
+      if (point) touchStart = { x: point.clientX, y: point.clientY };
+    };
+    const onTouchEnd = (event) => {
+      if (!touchStart || show.pointerMode === 'pen') return;
+      const point = event.changedTouches?.[0];
+      if (!point) return;
+      const dx = point.clientX - touchStart.x;
+      const dy = point.clientY - touchStart.y;
+      touchStart = null;
+      if (Math.abs(dx) > 55 && Math.abs(dx) > Math.abs(dy)) {
+        if (dx < 0) void viewer.nextPage?.(); else void viewer.prevPage?.();
+      }
+    };
+    surface.addEventListener('touchstart', onTouchStart, { passive: true });
+    surface.addEventListener('touchend', onTouchEnd, { passive: true });
+    surface.addEventListener('click', (event) => {
+      if (event.defaultPrevented) return;
+      if (show.blankMode) {
+        setBlank(show.blankMode); // PowerPoint: click resumes from a blank screen.
+        return;
+      }
+      if (show.pointerMode !== 'pointer') return;
+      if (event.target?.closest?.('video,audio,button,a,input,textarea,select,[contenteditable="true"]')) return;
+      const selection = typeof window.getSelection === 'function' ? window.getSelection() : null;
+      if (selection && selection.isCollapsed === false && String(selection).trim()) return;
+      void viewer.nextPage?.();
+    });
+    surface.addEventListener('wheel', (event) => {
+      if (Math.abs(event.deltaY) < 16 || Date.now() - show.wheelAt < 350) return;
+      show.wheelAt = Date.now();
+      event.preventDefault();
+      if (event.deltaY > 0) void viewer.nextPage?.(); else void viewer.prevPage?.();
+    }, { passive: false });
+    overlay.addEventListener('contextmenu', (event) => { event.preventDefault(); reveal(); });
+
+    const showDigitBuffer = () => {
+      if (show.jumpTimer) clearTimeout(show.jumpTimer);
+      jumpHint.textContent = show.digitBuffer ? `Go to ${pageNoun} ${show.digitBuffer} — press Enter` : '';
+      jumpHint.hidden = !show.digitBuffer;
+      if (show.digitBuffer) {
+        show.jumpTimer = setTimeout(() => {
+          show.digitBuffer = '';
+          jumpHint.hidden = true;
+        }, 3500);
+      }
+    };
+    const onKeyDown = (event) => {
+      if (!show.active) return;
+      if (event.key === 'Escape' && (!show.help.hidden || !show.navigator.hidden)) {
+        event.preventDefault();
+        event.stopImmediatePropagation?.();
+        if (!show.help.hidden) toggleHelp(false);
+        if (!show.navigator.hidden) toggleNavigator(false);
+        return;
+      }
+      const resolved = resolveDocumentSlideshowShortcut(event, { digitBuffer: show.digitBuffer });
+      if (!resolved) return;
+      if (resolved.action === 'notes' && !isPowerPoint) {
+        // PDF has no notes, but do not let Alt+F5 reload the app or
+        // Ctrl+Shift+N open a browser window behind a running show.
+        if (event.altKey || event.ctrlKey || event.metaKey) {
+          event.preventDefault();
+          event.stopImmediatePropagation?.();
+        }
+        return;
+      }
+      event.preventDefault();
+      event.stopImmediatePropagation?.();
+      show.digitBuffer = resolved.digitBuffer ?? show.digitBuffer;
+      if (resolved.action === 'exit') { void this.exitDocumentSlideshow(); return; }
+      if (resolved.action === 'next') void viewer.nextPage?.();
+      else if (resolved.action === 'previous') void viewer.prevPage?.();
+      else if (resolved.action === 'first') void viewer.setPage?.(1);
+      else if (resolved.action === 'last') void viewer.setPage?.(session.state.numPages || 1);
+      else if (resolved.action === 'jump' && Number.isFinite(resolved.slide)) void viewer.setPage?.(resolved.slide);
+      else if (resolved.action === 'black') setBlank('black');
+      else if (resolved.action === 'white') setBlank('white');
+      else if (resolved.action === 'laser') setPointerMode('laser');
+      else if (resolved.action === 'pen') setPointerMode('pen');
+      else if (resolved.action === 'pointer') setPointerMode('pointer');
+      else if (resolved.action === 'hide-pointer') setPointerMode('hidden');
+      else if (resolved.action === 'erase') clearInk();
+      else if (resolved.action === 'notes') void viewer.toggleNotes?.();
+      else if (resolved.action === 'help') toggleHelp();
+      else if (resolved.action === 'navigator') toggleNavigator();
+      showDigitBuffer();
+      reveal();
+    };
+    show.handleKeyDown = onKeyDown;
+    document.addEventListener?.('keydown', onKeyDown, true);
+
+    const onResize = () => {
+      sizeInk();
+      if (show.resizeTimer) clearTimeout(show.resizeTimer);
+      show.resizeTimer = setTimeout(() => { if (show.active) void viewer.fitToPage?.(); }, 90);
+    };
+    const onFullscreenChange = () => {
+      const active = document.fullscreenElement === overlay;
+      if (active) {
+        show.enteredFullscreen = true;
+      } else if (show.active && show.enteredFullscreen) {
+        if (show.suppressFullscreenExit) show.suppressFullscreenExit = false;
+        else {
+          // Browser fullscreen consumes Escape before page keyboard handlers
+          // on some platforms. Treat that fullscreen exit as ending the show
+          // so one Escape still behaves like PowerPoint.
+          void this.exitDocumentSlideshow();
+          return;
+        }
+      }
+      fullscreenButton.textContent = active ? 'Window' : 'Fullscreen';
+      fullscreenButton.setAttribute('aria-label', active ? 'Leave projector fullscreen' : 'Enter projector fullscreen');
+      onResize();
+    };
+    window.addEventListener?.('resize', onResize);
+    document.addEventListener?.('fullscreenchange', onFullscreenChange);
+    overlay.addEventListener('pointermove', onPointerMove, { passive: true });
+    controls.addEventListener('pointerenter', reveal);
+    top.addEventListener('pointerenter', reveal);
+    show.cleanup.push(
+      () => document.removeEventListener?.('keydown', onKeyDown, true),
+      () => document.removeEventListener?.('fullscreenchange', onFullscreenChange),
+      () => window.removeEventListener?.('resize', onResize),
+      () => overlay.removeEventListener?.('pointermove', onPointerMove),
+      () => { if (show.hideTimer) clearTimeout(show.hideTimer); },
+      () => { if (show.resizeTimer) clearTimeout(show.resizeTimer); },
+      () => { if (show.jumpTimer) clearTimeout(show.jumpTimer); }
+    );
+
+    await viewer.attach(host, syncSlideshow);
+    if (fromBeginning) await viewer.setPage?.(1);
+    // PowerPoint projectors start with a clean slide. Notes remain one
+    // click/shortcut away and the reader's previous choice is restored on
+    // exit. PDFs have no synthetic notes control.
+    if (isPowerPoint) await viewer.toggleNotes?.(false);
+    await viewer.fitToPage?.();
+    sizeInk();
+    syncSlideshow();
+    reveal();
+    overlay.focus?.();
+    await fullscreenPromise;
+    onFullscreenChange();
+    return true;
+  }
+
+  async exitDocumentSlideshow() {
+    return this.exitPptxSlideshow();
+  }
+
+  async exitPptxSlideshow() {
+    const show = this._documentSlideshow || this._pptxSlideshow;
+    if (!show?.active) return false;
+    show.active = false;
+    this._documentSlideshow = null;
+    this._pptxSlideshow = null;
+    for (const cleanup of show.cleanup || []) {
+      try { cleanup(); } catch { /* teardown is best effort */ }
+    }
+    try {
+      if (typeof document !== 'undefined' && document.fullscreenElement === show.overlay) {
+        await document.exitFullscreen?.();
+      }
+    } catch { /* fullscreen may already be leaving */ }
+    const tab = this.state.tabs.find((item) => item.id === show.tabId);
+    if (tab?.docState) tab.docState.slideshowMode = false;
+    try {
+      await show.viewer?.attach?.(show.session?.host || show.restoreHost, () => {
+        if (!show.session?.disposed) show.session?.sync?.();
+      });
+      if (show.isPowerPoint) await show.viewer?.toggleNotes?.(show.restoreNotes);
+      if (show.restoreZoomMode === 'fit-width') await show.viewer?.fitToWidth?.();
+      else if (show.restoreZoomMode === 'custom') await show.viewer?.setZoom?.(show.restoreZoom || 1);
+      else await show.viewer?.fitToPage?.();
+      // Re-anchor continuous PDF reading to the page that was on the
+      // projector; a fresh normal host has no inherited scroll position.
+      await show.viewer?.setPage?.(show.session?.state?.page || show.lastPage || 1);
+    } catch { /* tab may have closed while the projector disconnected */ }
+    try { show.overlay?.remove?.(); } catch { /* already removed */ }
+    try { show.session?.sync?.(); } catch { /* stale tab */ }
+    const restoreFocus = show.restoreFocus;
+    const canRestoreFocus = Boolean(restoreFocus && (restoreFocus.isConnected === true
+      || (restoreFocus.isConnected === undefined && restoreFocus.parentElement)));
+    if (canRestoreFocus) restoreFocus.focus?.();
+    else (show.session?.host?.closest?.('.fb-doc-viewer') || this.rootElement?.querySelector?.('.fb-doc-viewer'))?.focus?.();
+    return true;
+  }
+
+  _startDocumentViewerLoad(session, doc) {
+    if (!session || session.disposed || session.loadPromise) return session?.loadPromise || null;
+    const isCurrent = () => !session.disposed
+      && this._documentViewerSessions?.get(session.tabId) === session;
+    const route = routeDocument(doc.type);
+    Object.assign(session.state, {
+      viewer: doc.type,
+      status: 'loading',
+      progress: null,
+      loadingStage: `Preparing ${route.shortLabel} viewer…`,
+      error: null
+    });
+    session.sync?.();
+
+    const loadPromise = (async () => {
+      try {
+        let viewer;
+        if (doc.type === 'pdf') {
+          const engine = this._docEngineOverride || await this._pdfjsModule();
+          if (!isCurrent()) return;
+          viewer = createPdfViewer({
+            pdfjs: engine,
+            container: session.host,
+            state: session.state,
+            onStateChange: () => { if (isCurrent()) session.sync?.(); }
+          });
+        } else {
+          const override = this._documentEngineOverrides?.[doc.type];
+          viewer = createViewerForKind(doc.type, {
+            container: session.host,
+            state: session.state,
+            fileName: doc.name,
+            onOpenOriginal: () => session.openOriginal?.(),
+            onStateChange: () => { if (isCurrent()) session.sync?.(); },
+            ...(override ? { moduleLoader: async () => override } : {})
+          });
+        }
+        if (!isCurrent()) { viewer?.destroy?.(); return; }
+        session.viewer = viewer;
+        if (this.state.activeTabId === session.tabId) this._activeDocViewer = session;
+        await viewer.load(doc.bytes);
+        if (!isCurrent()) {
+          viewer.destroy();
+          return;
+        }
+        session.sync?.();
+        // A PDF's first painted page and a PPTX's first materialised slide are
+        // the priority. Optional navigation metadata is loaded afterwards.
+        if (doc.type === 'pdf' && session.state.status === 'ready') {
+          Promise.resolve(viewer.loadOutline())
+            .then(() => { if (isCurrent()) session.sync?.(); })
+            .catch(() => {});
+        }
+      } catch (error) {
+        console.error?.(`[yayra:${doc.type}] viewer startup failed`, error);
+        if (!isCurrent()) return;
+        Object.assign(session.state, {
+          status: 'error',
+          progress: null,
+          loadingStage: '',
+          error: doc.type === 'pdf'
+            ? 'Yayra could not start the PDF reader. Try again, or open the unchanged original file instead.'
+            : `Yayra could not start the ${route.shortLabel} viewer. Try again, or open the unchanged original file instead.`
+        });
+        session.sync?.();
+      }
+    })();
+    session.loadPromise = loadPromise;
+    loadPromise.finally(() => {
+      if (session.loadPromise === loadPromise) session.loadPromise = null;
+    }).catch(() => {});
+    return loadPromise;
+  }
+
+  retryDocumentViewer(tabId) {
+    const session = this._documentViewerSessions?.get(tabId);
+    const tab = this.state.tabs.find((item) => item.id === tabId);
+    const doc = tab && this.documentStore?.get(tab.docId);
+    if (!session || !tab || !doc || session.disposed || session.loadPromise) return false;
+    try { session.viewer?.destroy(); } catch { /* retry owns a fresh controller */ }
+    session.viewer = null;
+    Object.assign(session.state, {
+      status: 'loading',
+      progress: null,
+      loadingStage: `Retrying ${routeDocument(doc.type).shortLabel} viewer…`,
+      error: null
+    });
+    session.sync?.();
+    this._startDocumentViewerLoad(session, doc);
+    return true;
+  }
+
+  getTabFavicon(tab, { showLoading = true } = {}) {
     if (!tab) return Icons.globe;
-    // Document tabs carry the document glyph, never a web favicon.
-    if (tab.isDocument) return Icons.document;
+    // A document tab carries its glyph only while it is actually displaying
+    // the local document route; navigating away keeps the PDF available for
+    // Back, but the current web page should use its own site icon.
+    if (tab.isDocument && String(tab.url || '').startsWith('yayra://doc/')) return Icons.document;
     // "Time sign" while the page is loading: the tab's icon slot becomes
     // an animated hourglass the moment loading starts, and flips back to
     // the real favicon when the page is fully loaded. Updated in place by
     // refreshLoadingUi() - never via a flickery full re-render.
-    if (tab.isLoading) return `<span class="fb-tab-loading-hourglass">${Icons.hourglass}</span>`;
+    if (showLoading && tab.isLoading) return `<span class="fb-tab-loading-hourglass">${Icons.hourglass}</span>`;
     const url = tab.url || '';
     if (url.startsWith('yayra://settings')) return Icons.settings;
     if (url.startsWith('yayra://history')) return Icons.history;
     if (url.startsWith('yayra://bookmarks')) return Icons.bookmark;
     if (url.startsWith('yayra://downloads')) return Icons.download;
+    if (url.startsWith('yayra://documents')) return Icons.document;
     if (url.startsWith('yayra://passwords')) return Icons.lock;
     if (url.startsWith('yayra://extensions')) return Icons.shield;
     if (url.startsWith('yayra://permissions')) return Icons.lock;
@@ -13641,10 +20674,31 @@ export class BrowserShell {
     }
     if (this._renderFramePending) return;
     this._renderFramePending = true;
-    window.requestAnimationFrame(() => {
+    const flush = () => {
+      if (!this._renderFramePending) return;
       this._renderFramePending = false;
+      if (this._renderFallbackTimer) clearTimeout(this._renderFallbackTimer);
+      this._renderFallbackTimer = null;
+      this._renderFrameHandle = null;
       this.render();
-    });
+    };
+    // Arm the independent deadline BEFORE asking for a frame: even an
+    // embedder whose rAF implementation throws or (incorrectly) invokes the
+    // callback synchronously cannot strand the pending latch.
+    this._renderFrameHandle = null;
+    this._renderFallbackTimer = setTimeout(flush, 120);
+    this._renderFallbackTimer?.unref?.();
+    try {
+      const frameHandle = window.requestAnimationFrame(flush);
+      if (this._renderFramePending) this._renderFrameHandle = frameHandle;
+    } catch {
+      flush();
+    }
+    // A suspended/missed rAF used to leave _renderFramePending=true forever,
+    // so all future native navigation updates were ignored and the top
+    // chrome looked frozen. The shell is backgroundThrottling:false on
+    // desktop, but this deadline guarantees the invariant in every embedder.
+    // The guard in flush keeps it exactly-once.
   }
 
   /**
@@ -13658,6 +20712,10 @@ export class BrowserShell {
    */
   dismissAllOverlays() {
     let dismissed = false;
+    if ((this._documentSlideshow || this._pptxSlideshow)?.active) {
+      void this.exitDocumentSlideshow();
+      dismissed = true;
+    }
     const s = this.state;
     if (s.isSideDrawerOpen) { s.isSideDrawerOpen = false; dismissed = true; }
     if (s.activeModal) { this.closeModal(); dismissed = true; }
@@ -13681,9 +20739,18 @@ export class BrowserShell {
       // Tab-strip right-click menu + its scrim (state lives outside render()).
       detach(document.body.querySelector('.fb-tab-context-menu'), 'tab context menu');
       detach(document.body.querySelector('.fb-dropdown-scrim'), 'dropdown scrim');
-      // Body-appended dialogs (each also has its own close button).
-      detach(document.getElementById('yayra-reader-overlay'), 'reader');
-      detach(document.getElementById('yayra-taskmgr-overlay'), 'task manager');
+      // Body-appended dialogs (each also has its own close button). Run
+      // their cleanup hooks so speech and periodic metric refreshes stop too.
+      const readerDialog = document.getElementById('yayra-reader-overlay');
+      if (readerDialog && typeof readerDialog._yayraFinish === 'function') {
+        readerDialog._yayraFinish();
+        dismissed = true;
+      } else detach(readerDialog, 'reader');
+      const taskManagerDialog = document.getElementById('yayra-taskmgr-overlay');
+      if (taskManagerDialog && typeof taskManagerDialog._yayraFinish === 'function') {
+        taskManagerDialog._yayraFinish();
+        dismissed = true;
+      } else detach(taskManagerDialog, 'task manager');
       detach(document.getElementById('yayra-url-qr-overlay'), 'QR dialog');
       const installDialog = document.getElementById('yayra-install-app-overlay');
       if (installDialog) {
@@ -13715,8 +20782,16 @@ export class BrowserShell {
   }
 
   handleGlobalKeyDown(e) {
+    const activeDocumentTab = this.getActiveTab();
+    const activeDocument = activeDocumentTab?.docId ? this.documentStore?.get(activeDocumentTab.docId) : null;
+    // Presentation start keys own F5 while a PPTX or PDF tab is active.
+    // Shift+F5 begins at the current slide/page; plain F5 begins at 1.
+    if (e.key === 'F5' && !e.ctrlKey && !e.metaKey && !e.altKey && ['pptx', 'pdf'].includes(activeDocument?.type)) {
+      e.preventDefault();
+      this.startDocumentSlideshow(activeDocumentTab.id, { fromBeginning: !e.shiftKey });
+    }
     // Ctrl+T: New Tab
-    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 't') {
+    else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 't') {
       e.preventDefault();
       this.createNewTab();
     }
@@ -13780,6 +20855,11 @@ export class BrowserShell {
       e.preventDefault();
       this.openInternalPage('yayra://downloads');
     }
+    // Ctrl+O: standard desktop "Open file" route into Documents.
+    else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'o') {
+      e.preventDefault();
+      this.openDocument();
+    }
     // Ctrl+F: Find in Page
     else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
       e.preventDefault();
@@ -13834,14 +20914,52 @@ export class BrowserShell {
     }
     // Esc: Close Overlays
     else if (e.key === 'Escape') {
-      // FREEZE RECOVERY: one key gives the whole UI back - every state
-      // overlay AND every body-appended dialog (see dismissAllOverlays).
+      // FREEZE RECOVERY first: close any open chrome. With no overlay, Esc
+      // follows browser convention and stops the active site's real load.
       const dismissed = this.dismissAllOverlays();
-      if (dismissed && typeof e.preventDefault === 'function') e.preventDefault();
+      const shouldStop = !dismissed && Boolean(this.getActiveTab()?.isLoading);
+      if (shouldStop) this.stopLoading();
+      if ((dismissed || shouldStop) && typeof e.preventDefault === 'function') e.preventDefault();
     }
   }
 
   destroy() {
+    this._destroyed = true;
+    for (const [target, type, listener, options] of this._selectionActionBindings || []) {
+      try { target.removeEventListener?.(type, listener, options); } catch { /* target already gone */ }
+    }
+    this._selectionActionBindings = [];
+    this._selectionActionsInstalled = false;
+    for (const handle of [this._selectionUpdateFrame, this._textPointerFrame]) {
+      if (handle === null || handle === undefined) continue;
+      try { if (typeof window !== 'undefined') window.cancelAnimationFrame?.(handle); } catch { /* not an animation frame */ }
+      try { clearTimeout(handle); } catch { /* browser handle */ }
+    }
+    this._selectionUpdateFrame = null;
+    this._textPointerFrame = null;
+    this._pendingTextPointerEvent = null;
+    this.dismissSelectionToolbar({ rememberSelection: false });
+    this._clearSelectableTextCursor();
+    // Cancel connectivity callbacks and every tab-scoped retry generation
+    // before any rendering/native bridges are dismantled.
+    if (this._connectivityListeners && typeof window !== 'undefined') {
+      try { window.removeEventListener?.('offline', this._connectivityListeners.onOffline); } catch { /* already gone */ }
+      try { window.removeEventListener?.('online', this._connectivityListeners.onOnline); } catch { /* already gone */ }
+    }
+    this._connectivityListeners = null;
+    for (const tabId of Array.from(this._siteFailures?.keys?.() || [])) this._clearSiteFailure(tabId);
+    // A shell may be torn down after its source tab/handle was replaced but
+    // before pointerup. End every renderer-only gesture and release its IPC
+    // session/global fallback listeners synchronously.
+    this.cancelActivePointerGestures('shell destroy');
+    this.retireSearchSuggestionsForNavigation({ restoreSurface: false });
+    for (const [target, type, listener, options] of this._topChromeRecoveryBindings || []) {
+      try { target.removeEventListener?.(type, listener, options); } catch { /* target already gone */ }
+    }
+    this._topChromeRecoveryBindings = [];
+    this._topChromeRecoveryInstalled = false;
+    try { this._unsubscribeTopChromeRecovery?.(); } catch { /* native bridge already gone */ }
+    this._unsubscribeTopChromeRecovery = null;
     if (typeof window !== 'undefined') {
       window.removeEventListener('resize', this.boundResizeHandler);
       window.removeEventListener('keydown', this.boundKeyHandler);
@@ -13855,6 +20973,15 @@ export class BrowserShell {
     }
     this.stopBackgroundUpdateChecks();
     this.stopBackgroundRefresh();
+    if (this._renderFallbackTimer) {
+      clearTimeout(this._renderFallbackTimer);
+      this._renderFallbackTimer = null;
+    }
+    if (this._renderFrameHandle && typeof window !== 'undefined' && typeof window.cancelAnimationFrame === 'function') {
+      try { window.cancelAnimationFrame(this._renderFrameHandle); } catch { /* already fired */ }
+    }
+    this._renderFrameHandle = null;
+    this._renderFramePending = false;
     if (this._loadingWatchdogTimer && typeof window !== 'undefined' && typeof window.clearInterval === 'function') {
       window.clearInterval(this._loadingWatchdogTimer);
       this._loadingWatchdogTimer = null;
@@ -13863,11 +20990,38 @@ export class BrowserShell {
       clearTimeout(this._sessionSnapshotTimer);
       this._sessionSnapshotTimer = null;
     }
+    if (this._documentsSearchTimer) {
+      clearTimeout(this._documentsSearchTimer);
+      this._documentsSearchTimer = null;
+    }
+    // A dying shell does not need to restore the normal document mount; tear
+    // any PDF/PowerPoint projector down before its viewer is destroyed.
+    const activeDocumentShow = this._documentSlideshow || this._pptxSlideshow;
+    if (activeDocumentShow) {
+      activeDocumentShow.active = false;
+      for (const cleanup of activeDocumentShow.cleanup || []) { try { cleanup(); } catch { /* best effort */ } }
+      try { activeDocumentShow.overlay?.remove?.(); } catch { /* detached */ }
+      try {
+        if (typeof document !== 'undefined' && document.fullscreenElement === activeDocumentShow.overlay) void document.exitFullscreen?.();
+      } catch { /* already exiting */ }
+      this._documentSlideshow = null;
+      this._pptxSlideshow = null;
+    }
+    for (const session of this._documentViewerSessions?.values?.() || []) {
+      session.disposed = true;
+      try { session.viewer?.destroy(); } catch { /* already gone */ }
+    }
+    this._documentViewerSessions?.clear?.();
+    this._activeDocViewer = null;
+    // PDF bytes are intentionally session-memory only; release them with the
+    // shell so an unmounted/closed window cannot retain an open document.
+    for (const doc of this.documentStore?.list?.() || []) this.documentStore.remove(doc.id);
     // Android overlay-permission grant watcher (poll + listeners).
     if (this._stopOverlayGrantWatch) {
       try { this._stopOverlayGrantWatch(); } catch { /* already stopped */ }
       this._stopOverlayGrantWatch = null;
     }
+    this._inAppOnlyGoogleTabs?.clear?.();
     if (this.webFrameLayer) {
       this.webFrameLayer.remove();
       this.webFrameLayer = null;
@@ -13883,6 +21037,10 @@ export class BrowserShell {
       this._unsubscribeAuthBridge();
       this._unsubscribeAuthBridge = null;
     }
+    if (this._unsubscribeUpdatesBridge) {
+      this._unsubscribeUpdatesBridge();
+      this._unsubscribeUpdatesBridge = null;
+    }
     for (const tabId of Array.from(this._nativeWebviewTabIds || [])) {
       this.destroyNativeWebview(tabId);
     }
@@ -13892,6 +21050,10 @@ export class BrowserShell {
     if (this._unsubscribeTabWebEvents) { this._unsubscribeTabWebEvents(); this._unsubscribeTabWebEvents = null; }
     if (this._unsubscribeAndroidBackButton) { this._unsubscribeAndroidBackButton(); this._unsubscribeAndroidBackButton = null; }
     if (this._unsubscribeOpenPdfFile) { try { this._unsubscribeOpenPdfFile(); } catch { /* gone */ } this._unsubscribeOpenPdfFile = null; }
+    if (this._docFileInput) {
+      try { this._docFileInput.remove?.(); } catch { /* already detached */ }
+      this._docFileInput = null;
+    }
     if (this._pdfDropHandlers && typeof document !== 'undefined') {
       document.removeEventListener?.('dragover', this._pdfDropHandlers.dragover);
       document.removeEventListener?.('drop', this._pdfDropHandlers.drop);
@@ -13900,6 +21062,10 @@ export class BrowserShell {
     this._pdfDropArmed = false;
     if (this.bubbleOverlay) {
       this.bubbleOverlay.remove();
+    }
+    if (typeof document !== 'undefined') {
+      document.getElementById('yayra-floating-popup-window')?.remove();
+      document.querySelectorAll?.('.fb-duplicate-popup-window')?.forEach?.((win) => win.remove());
     }
     const persistentBubble = typeof document !== 'undefined' ? (document.getElementById('yayra-persistent-assistive-bubble') || document.getElementById('yayra-floating-bubble-persistent')) : null;
     if (persistentBubble) {

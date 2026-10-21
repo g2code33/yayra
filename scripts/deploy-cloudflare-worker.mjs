@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { spawnSync } from 'node:child_process';
 import path from 'node:path';
+import { runCommandWithRetry } from './lib/retry-command.mjs';
 
 const root = process.cwd();
 const token = process.env.CLOUDFLARE_API_TOKEN;
@@ -34,7 +34,7 @@ if (!existsSync(sourceManifest)) {
 
 const manifest = JSON.stringify(JSON.parse(await readFile(sourceManifest, 'utf8')));
 const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-const result = spawnSync(npx, [
+const result = await runCommandWithRetry(npx, [
   '--yes', 'wrangler@4', 'deploy', entry,
   '--config', config,
   '--name', workerName,
@@ -46,11 +46,11 @@ const result = spawnSync(npx, [
     ...(accountId ? { CLOUDFLARE_ACCOUNT_ID: accountId } : {}),
     ...(token ? { CLOUDFLARE_API_TOKEN: token } : {})
   },
-  stdio: 'inherit'
+  label: 'Cloudflare API Worker deployment',
+  maxAttempts: Number(process.env.CLOUDFLARE_DEPLOY_ATTEMPTS || 5)
 });
 
-if (result.error) {
-  console.error(`Could not start Wrangler: ${result.error.message}`);
-  process.exit(1);
+if (result.status !== 0) {
+  console.error(`Cloudflare API Worker deployment failed after ${result.attempts} attempt(s).`);
 }
 process.exit(result.status ?? 1);

@@ -9,7 +9,7 @@
  * the same dependency-injection + factory pattern as createWebviewBridge in
  * electron/webviewBridge.cjs so it stays unit-testable without a real
  * Electron runtime, a real browser, or live network access to Google - see
- * tests/google-oauth.test.mjs and tests/electron-auth-bridge.test.mjs.
+ * tests/google-oauth.test.mjs and tests/google-auth-bridge.test.mjs.
  *
  * IMPORTANT: this requires a real Google Cloud "Desktop app" OAuth Client ID
  * AND Client Secret that only the person deploying Yayra can create (see
@@ -51,6 +51,9 @@ function createAuthBridge({
       const { profile, tokens } = await signInImpl({
         clientId,
         clientSecret,
+        // RFC 8252 requires the OS external user-agent. A BrowserWindow is
+        // still controlled by Electron and can be rejected as an embedded
+        // browser even when it occupies a separate top-level window.
         openExternal: (url) => shell.openExternal(url),
         ...(fetchImpl ? { fetchImpl } : {}),
         logger
@@ -81,11 +84,9 @@ function createAuthBridge({
   }
 
   /**
-   * Opens Google's own account-management page in the user's system
-   * browser (never embedded - that's where the user's real Google session
-   * actually lives, since sign-in itself is handled by the system browser).
-   * Deliberately hardcoded to this single trusted URL rather than exposing
-   * a generic "open any URL" bridge to the renderer.
+   * Opens one hardcoded Google account-management URL in the system browser.
+   * This is not a generic renderer-controlled external-URL capability, and no
+   * browser cookies or bearer credentials are copied back into Yayra.
    */
   async function handleOpenAccountPage() {
     try {

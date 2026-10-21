@@ -32,12 +32,7 @@ if (!exists) {
 }
 
 run('npm', ['run', 'build:web']);
-run(process.platform === 'win32' ? 'npx.cmd' : 'npx', [
-  '--yes', 'wrangler@4', 'pages', 'deploy', 'dist',
-  '--project-name', projectName,
-  '--branch', 'main',
-  '--commit-dirty=true'
-]);
+run(process.execPath, ['scripts/deploy-cloudflare-pages.mjs', 'dist']);
 run(process.execPath, ['scripts/deploy-cloudflare-worker.mjs']);
 
 const repo = run('gh', ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'], { capture: true }).trim();

@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 import { execFileSync, spawnSync } from 'node:child_process';
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { dimensions } from './lib/png.mjs';
+import { inspectAsarPackage } from './lib/asar-package.mjs';
+import { findPackagedWindowsExecutable } from './lib/windows-package-layout.mjs';
 
 const root = process.cwd();
 const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
@@ -51,34 +53,85 @@ assert(nativeIos.includes(`<string>${pkg.version}</string>`), 'iOS CFBundleShort
 assert(webManifest.version === pkg.version && webManifest.cacheVersion === pkg.version, 'web manifest version/cacheVersion mismatch package.json');
 assert(JSON.parse(await readFile(path.join(root, 'electron/app-version.json'), 'utf8')).version === pkg.version, 'electron app-version mismatch package.json');
 
-const unpacked = path.join(root, 'release/linux-unpacked');
-if (existsSync(unpacked)) {
-  assert(existsSync(path.join(unpacked, 'resources/app.asar')), 'linux-unpacked app.asar missing');
-  const asar = spawnSync(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['asar', 'list', path.join(unpacked, 'resources/app.asar')], { cwd: root, encoding: 'utf8' });
-  assert(asar.status === 0, `asar listing failed: ${asar.stderr || asar.stdout}`);
-  assert(asar.stdout.includes('/dist/index.html'), 'asar listing did not include dist/index.html');
-} else {
-  console.log('packaging layout note: release/linux-unpacked not present; run npm run package:linux:dir to inspect real asar contents');
+// Document engines are loaded lazily at runtime, so ordinary static imports
+// cannot save them from an over-aggressive packaging filter. Verify the
+// builder input, every generated engine, and strict .mjs MIME handling.
+assert(build.files?.includes('dist/**/*'), 'Electron builder must include the complete dist tree (including lazy document modules)');
+const electronMain = await readFile(path.join(root, 'electron/main.cjs'), 'utf8');
+assert(electronMain.includes("lower.endsWith('.mjs')"), 'yayra:// MIME map must recognize .mjs');
+assert(electronMain.includes("headers.set('content-type', type)"), 'yayra:// responses must set deterministic asset Content-Type headers');
+const builtDocumentAssets = [
+  ['dist/packages/shared-ui/src/vendor/pdfjs/pdf.mjs', 100_000],
+  ['dist/packages/shared-ui/src/vendor/pdfjs/pdf.worker.mjs', 100_000],
+  ['dist/packages/shared-ui/src/vendor/documents/pptxRenderer.mjs', 150_000],
+  ['dist/packages/shared-ui/src/vendor/documents/docxPreview.mjs', 200_000],
+  ['dist/packages/shared-ui/src/vendor/documents/xlsx.mjs', 700_000],
+  ['dist/packages/shared-ui/src/vendor/documents/manifest.json', 100]
+];
+if (existsSync(path.join(root, 'dist'))) {
+  for (const [asset, minimumBytes] of builtDocumentAssets) {
+    const absolute = path.join(root, asset);
+    assert(existsSync(absolute), `${asset} missing from built desktop input`);
+    if (existsSync(absolute)) assert((await stat(absolute)).size > minimumBytes, `${asset} is unexpectedly truncated`);
+  }
 }
 
-const builtExe = await findBuiltExe(path.join(root, 'release'));
+// Inspect every unpacked desktop target that is present. Runtime GUI smoke is
+// useful diagnostics but can depend on the CI display/console environment;
+// app.asar contents are deterministic and therefore remain the release gate.
+const packagedAsars = [
+  ['linux-unpacked', path.join(root, 'release/linux-unpacked/resources/app.asar')],
+  ['win-unpacked', path.join(root, 'release/win-unpacked/resources/app.asar')],
+  ['mac', path.join(root, 'release/mac/yayra.app/Contents/Resources/app.asar')]
+].filter(([, asarPath]) => existsSync(asarPath));
+if (packagedAsars.length) {
+  for (const [target, asarPath] of packagedAsars) {
+    const asar = inspectAsarPackage(asarPath);
+    assert(asar.ok, `${target} app.asar listing failed: ${asar.error}`);
+    if (!asar.ok) continue;
+    assert(asar.entries.has('dist/index.html'), `${target} app.asar did not include dist/index.html`);
+    for (const [asset] of builtDocumentAssets) {
+      assert(asar.entries.has(asset), `${target} app.asar did not include ${asset}`);
+    }
+  }
+} else {
+  console.log('packaging layout note: no unpacked desktop app is present; package a desktop target to inspect its real app.asar contents');
+}
+
+// Version-check the configured application executable only. A Windows
+// electron-builder layout also contains helpers such as elevate.exe; selecting
+// the first recursive .exe makes their unrelated ProductVersion fail an
+// otherwise valid release after packaging has already succeeded.
+const builtExe = await findPackagedWindowsExecutable(path.join(root, 'release'), build.executableName);
 if (builtExe) {
   if (process.platform === 'win32') {
-    const out = execFileSync('powershell', ['-NoProfile', '-Command', `(Get-Item '${builtExe.replaceAll("'", "''")}').VersionInfo.ProductVersion`], { encoding: 'utf8' }).trim();
-    assert(out.startsWith(pkg.version), `built exe ProductVersion ${out} does not match package.json ${pkg.version}`);
+    try {
+      const out = execFileSync('powershell', ['-NoProfile', '-Command', `(Get-Item '${builtExe.replaceAll("'", "''")}').VersionInfo.ProductVersion`], { encoding: 'utf8' }).trim();
+      assert(out.startsWith(pkg.version), `packaged ${path.basename(builtExe)} ProductVersion ${out} does not match package.json ${pkg.version}`);
+    } catch (error) {
+      assert(false, `could not read packaged ${path.basename(builtExe)} ProductVersion: ${String(error?.message || error).slice(0, 300)}`);
+    }
   } else {
     console.log(`windows version resource check deferred on non-Windows host for ${path.relative(root, builtExe)}; CI Windows runs scripts/assert-windows-version.mjs`);
   }
 } else {
-  console.log('windows version resource check deferred: no built .exe present in release/');
+  console.log(`windows version resource check deferred: no unpacked ${build.executableName}.exe is present in release/`);
 }
 
 if (failures.length) {
   console.error('packaging verification failed:');
-  for (const failure of failures) console.error(` - ${failure}`);
+  for (const failure of failures) {
+    console.error(` - ${failure}`);
+    // Actions log archives can be inaccessible after a failed matrix job.
+    // Emit the actual verifier reason as a check annotation as well, so the
+    // next failure is diagnosable from GitHub's always-available job API.
+    if (process.env.GITHUB_ACTIONS === 'true') {
+      console.error(`::error title=Packaging verification::${escapeWorkflowCommand(failure)}`);
+    }
+  }
   process.exit(1);
 }
-console.log('packaging verification passed: NSIS/Linux config, hook syntax, desktop/icon mapping, and version lockstep are valid');
+console.log('packaging verification passed: desktop config, offline document engines, hook syntax, icons, and version lockstep are valid');
 
 function assert(condition, message) { if (!condition) failures.push(message); }
 function parseDesktop(text) {
@@ -89,15 +142,6 @@ function parseDesktop(text) {
   }
   return out;
 }
-async function findBuiltExe(dir) {
-  if (!existsSync(dir)) return null;
-  for (const entry of await readdir(dir)) {
-    const absolute = path.join(dir, entry);
-    const info = await stat(absolute);
-    if (info.isDirectory()) {
-      const nested = await findBuiltExe(absolute);
-      if (nested) return nested;
-    } else if (/\.exe$/i.test(entry)) return absolute;
-  }
-  return null;
+function escapeWorkflowCommand(value) {
+  return String(value).replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
 }

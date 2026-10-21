@@ -68,6 +68,14 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - run: npm run package:linux
       - run: npm run verify:packaging
+      - name: Prepare Chromium sandbox helper for packaged diagnostic
+        run: |
+          test -f release/linux-unpacked/chrome-sandbox
+          sudo chown root:root release/linux-unpacked/chrome-sandbox
+          sudo chmod 4755 release/linux-unpacked/chrome-sandbox
+      - name: Diagnose packaged Linux shell and PDF.js worker
+        continue-on-error: true
+        run: npm run smoke:desktop
 
   desktop-win:
     name: windows NSIS and portable build-only
@@ -98,6 +106,10 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
       - run: npm run package:win
+      - run: npm run verify:packaging
+      - name: Diagnose packaged Windows shell and PDF.js worker
+        continue-on-error: true
+        run: npm run smoke:desktop
       - name: Verify Windows executables
         shell: pwsh
         run: |
@@ -205,4 +217,6 @@ jobs:
           fi
       - run: node scripts/ensure-capacitor-platform.mjs ios
       - run: npx cap sync ios
-      - run: xcodebuild -workspace ios/App/App.xcworkspace -scheme App -configuration Release -destination generic/platform=iOS CODE_SIGNING_ALLOWED=NO archive -archivePath build/yayra.xcarchive
+      # Capacitor 8 generates an Xcode project backed by Swift Package Manager;
+      # it does not generate the old CocoaPods App.xcworkspace.
+      - run: xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Release -destination generic/platform=iOS CODE_SIGNING_ALLOWED=NO archive -archivePath build/yayra.xcarchive

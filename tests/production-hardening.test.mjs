@@ -14,10 +14,10 @@ import { BrowserShell } from '../packages/shared-ui/src/components/BrowserShell.
  *     running. Cleaned up on destroy.
  *  2. Render coalescing - bursts of renders within one animation frame
  *     collapse into ONE rebuild (startup/session-restore/navigation
- *     storms); synchronous fallback where rAF doesn't exist, so behaviour
- *     is identical everywhere.
- *  3. Electron freeze guards - a renderer crash auto-reloads the window
- *     (rate-limited, no crash-loop spin); unresponsive is survivable.
+ *     storms); synchronous fallback where rAF doesn't exist and a deadline
+ *     fallback where a scheduled rAF is lost.
+ *  3. Electron freeze guards - renderer crashes and a genuinely stuck shell
+ *     auto-reload the chrome (rate-limited, no recovery loop).
  *  4. No full-viewport backdrop blur behind modals (the most expensive
  *     paint on low-end Android).
  */
@@ -89,6 +89,23 @@ test('RENDER COALESCING: without rAF it renders synchronously (identical behavio
   }
 });
 
+test('RENDER COALESCING: a throwing rAF falls back immediately and never latches', async () => {
+  const { shell } = await makeShell({ storage: makeStorage() });
+  globalThis.window.requestAnimationFrame = () => { throw new Error('frame scheduler unavailable'); };
+  try {
+    let renders = 0;
+    const original = shell.render.bind(shell);
+    shell.render = (...args) => { renders += 1; return original(...args); };
+    assert.doesNotThrow(() => shell.requestRender());
+    assert.equal(renders, 1);
+    assert.equal(shell._renderFramePending, false);
+  } finally {
+    delete globalThis.window.requestAnimationFrame;
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
 test('RENDER COALESCING: with rAF, a burst of requests collapses into ONE rebuild', async () => {
   const { shell, container } = await makeShell({ storage: makeStorage() });
   const frames = [];
@@ -116,12 +133,43 @@ test('RENDER COALESCING: with rAF, a burst of requests collapses into ONE rebuil
   }
 });
 
-test('ELECTRON GUARDS (source pin): renderer crash auto-reloads + unresponsive stays alive', () => {
+test('RENDER COALESCING: a lost rAF cannot permanently latch the chrome scheduler', async () => {
+  const { shell } = await makeShell({ storage: makeStorage() });
+  const frames = [];
+  globalThis.window.requestAnimationFrame = (cb) => { frames.push(cb); return frames.length; };
+  try {
+    let renders = 0;
+    const original = shell.render.bind(shell);
+    shell.render = (...args) => { renders += 1; return original(...args); };
+
+    shell.requestRender();
+    assert.equal(shell._renderFramePending, true);
+    assert.equal(frames.length, 1);
+    await new Promise((resolve) => setTimeout(resolve, 170));
+    assert.equal(renders, 1, 'deadline renders even though the browser never delivered its frame');
+    assert.equal(shell._renderFramePending, false, 'future native navigation updates are no longer suppressed');
+
+    frames[0]();
+    assert.equal(renders, 1, 'a late stale frame cannot render twice');
+    shell.requestRender();
+    assert.equal(frames.length, 2, 'scheduler re-arms after deadline recovery');
+  } finally {
+    delete globalThis.window.requestAnimationFrame;
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('ELECTRON GUARDS (source pin): crashed or genuinely stuck shell auto-recovers safely', () => {
   const src = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
-  assert.match(src, /webContents\.on\('render-process-gone'/, 'renderer-crash handler registered');
-  assert.match(src, /webContents\.on\('unresponsive'/, 'unresponsive handler registered');
-  assert.match(src, /rendererReloads > 5/, 'auto-reload is rate-limited (no crash-loop spin)');
-  assert.match(src, /win\.webContents\.reload\(\)/, 'the crash handler actually reloads');
+  assert.match(src, /contents\.on\('render-process-gone'/, 'renderer-crash handler registered');
+  assert.match(src, /contents\.on\('unresponsive'/, 'unresponsive handler registered');
+  assert.match(src, /crashReloads > 5/, 'crash auto-reload is rate-limited');
+  assert.match(src, /recoveryReloads > 3/, 'unresponsive recovery is independently rate-limited');
+  assert.match(src, /unresponsiveTimer = setTimeout[\s\S]{0,900}win\.webContents\.reload\(\)/, 'a shell that stays stuck past its grace period reloads');
+  assert.match(src, /installShellFreezeRecovery\(win, 'profile shell'\)/, 'profile shells get the same recovery guard');
+  assert.match(src, /installShellFreezeRecovery\(win, 'main shell'\)/, 'the main shell gets the recovery guard');
+  assert.match(src, /backgroundThrottling:\s*false/, 'shell renderers are not timer/rAF-throttled behind native views');
   assert.match(src, /process\.on\('uncaughtException'/, 'main-process exception handler stays');
 });
 

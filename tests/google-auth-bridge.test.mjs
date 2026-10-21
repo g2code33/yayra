@@ -123,6 +123,55 @@ test('authBridge: sign-in passes the Client Secret and a custom fetchImpl throug
   assert.equal(receivedArgs.fetchImpl, customFetch);
 });
 
+test('authBridge: app-level Google OAuth always uses the OS external user-agent', async () => {
+  const ipcMain = fakeIpcMain();
+  const win = fakeWindow();
+  const authStore = fakeAuthStore();
+  const opened = [];
+  const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?client_id=x';
+  const signInImpl = async (args) => {
+    assert.equal('signal' in args, false, 'the system browser is not controlled by an Electron-window abort signal');
+    await args.openExternal(authUrl);
+    return { profile: { sub: '1', email: 'external@yayra.test' }, tokens: { access_token: 'private' } };
+  };
+
+  createAuthBridge({
+    ipcMain,
+    shell: { openExternal: async (url) => { opened.push(url); } },
+    getMainWindow: () => win,
+    authStore,
+    clientId: 'c',
+    clientSecret: 's',
+    signInImpl
+  });
+  const result = await ipcMain.invoke('yayra:auth-sign-in');
+  assert.equal(result.ok, true);
+  assert.deepEqual(opened, [authUrl]);
+});
+
+test('authBridge: a system-browser launch failure is reported without persisting a session', async () => {
+  const ipcMain = fakeIpcMain();
+  const win = fakeWindow();
+  const authStore = fakeAuthStore();
+  const signInImpl = async (args) => {
+    await args.openExternal('https://accounts.google.com/o/oauth2/v2/auth');
+    throw new Error('must_not_reach');
+  };
+  createAuthBridge({
+    ipcMain,
+    shell: { openExternal: async () => { throw new Error('no system browser'); } },
+    getMainWindow: () => win,
+    authStore,
+    clientId: 'c',
+    clientSecret: 's',
+    signInImpl,
+    logger: { error() {} }
+  });
+  const result = await ipcMain.invoke('yayra:auth-sign-in');
+  assert.deepEqual(result, { ok: false, error: 'no system browser' });
+  assert.deepEqual(await ipcMain.invoke('yayra:auth-get-session'), { signedIn: false });
+});
+
 test('authBridge: a second concurrent sign-in call is rejected while one is already in progress', async () => {
   const ipcMain = fakeIpcMain();
   const win = fakeWindow();
@@ -159,7 +208,7 @@ test('authBridge: sign-out clears the stored session and emits signed-out', asyn
   assert.deepEqual(events, ['signed-out']);
 });
 
-test('authBridge: open-account-page opens Google account management in the system browser, never embedded', async () => {
+test('authBridge: Google account management always opens the one hardcoded URL in the system browser', async () => {
   const ipcMain = fakeIpcMain();
   const win = fakeWindow();
   const authStore = fakeAuthStore();

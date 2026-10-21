@@ -210,7 +210,9 @@ test('main.cjs (source pin): the Wayland self-heal handover CARRIES the --app ur
 test('main.cjs (source pin): launching the same installed app again FOCUSES its window instead of stacking duplicates', () => {
   const src = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
   const start = src.indexOf('const appModeWindows = new Map()');
-  const block = src.slice(start, start + 2000);
+  // The media-compatibility setup deliberately lives inside this constructor,
+  // so keep the source window wide enough to include the close cleanup too.
+  const block = src.slice(start, start + 2800);
   assert.ok(start > -1, 'app windows are tracked');
   assert.match(block, /const existing = appModeWindows\.get\(normalized\);/, 'looked up by normalized url');
   assert.match(block, /existing\.isMinimized\(\)\) existing\.restore\(\)/, 'restored when minimized');

@@ -186,6 +186,19 @@ test('capacitor sign-in rejects a state mismatch without calling the worker', as
   await assert.rejects(() => pending, /state_mismatch/);
 });
 
+test('capacitor sign-in rejects any callback that carries bearer tokens in the custom-scheme URL', async () => {
+  const cap = fakeCapacitor();
+  const pending = signInWithGoogleCapacitor({
+    clientId: CLIENT_ID, platform: 'android', exchangeUrl: EXCHANGE_URL,
+    openBrowser: cap.openBrowser, onUrlOpen: cap.onUrlOpen,
+    fetchImpl: async () => { throw new Error('must not fetch'); }
+  });
+  await waitFor(() => cap.opened.length === 1);
+  const state = new URL(cap.opened[0]).searchParams.get('state');
+  cap.deliverUrl(`${DEFAULT_MOBILE_REDIRECT_URI}?access_token=secret-bearer&state=${state}`);
+  await assert.rejects(() => pending, /token_in_callback_rejected/);
+});
+
 test('capacitor sign-in validates state on OAuth error callbacks before surfacing the provider error', async () => {
   const cap = fakeCapacitor();
   const pending = signInWithGoogleCapacitor({
@@ -254,7 +267,21 @@ test('capacitor sign-in fails fast when unconfigured and reports worker exchange
   await waitFor(() => cap.opened.length === 1);
   const state = new URL(cap.opened[0]).searchParams.get('state');
   cap.deliverUrl(`${DEFAULT_MOBILE_REDIRECT_URI}?code=c&state=${state}`);
-  await assert.rejects(() => pending, /exchange_failed:502/);
+  await assert.rejects(() => pending, /exchange_failed:502:invalid_grant/);
+
+  const hostile = fakeCapacitor();
+  const hostilePending = signInWithGoogleCapacitor({
+    clientId: CLIENT_ID, platform: 'android', exchangeUrl: EXCHANGE_URL,
+    openBrowser: hostile.openBrowser, onUrlOpen: hostile.onUrlOpen,
+    fetchImpl: async () => new Response('<html>refresh_token=do-not-echo</html>', { status: 502 })
+  });
+  await waitFor(() => hostile.opened.length === 1);
+  const hostileState = new URL(hostile.opened[0]).searchParams.get('state');
+  hostile.deliverUrl(`${DEFAULT_MOBILE_REDIRECT_URI}?code=c&state=${hostileState}`);
+  await assert.rejects(
+    () => hostilePending,
+    (error) => error.message === 'exchange_failed:502:upstream_error' && !error.message.includes('do-not-echo')
+  );
 });
 
 // --- the authBridge-shaped adapter ------------------------------------------

@@ -33,10 +33,10 @@ function makeStorage() {
   };
 }
 
-async function makeShell({ storage } = {}) {
+async function makeShell({ storage, ...options } = {}) {
   if (storage) globalThis.localStorage = storage;
   const container = document.createElement('div');
-  const shell = new BrowserShell({ container, isMobile: false });
+  const shell = new BrowserShell({ container, isMobile: false, ...options });
   await shell.initialize();
   shell.render(container);
   return { shell, container };
@@ -321,6 +321,10 @@ test('TAB GROUPS: real create / group / ungroup with colour dots in the tab stri
     assert.ok(groupIcon, 'tab-group icon is present beside the site connection control');
     groupIcon.click();
     assert.equal(shell.state.activeModal, 'tab-groups', 'group icon opens the group picker');
+    assert.ok(container.querySelector('.fb-tab-groups-popover-backdrop'),
+      'tab groups uses a transparent click-away popover layer instead of the dimmed full-screen modal');
+    assert.ok(container.querySelector('.fb-tab-groups-popover'),
+      'tab groups renders as the compact top-left toolbar panel');
     const groupChoice = container.querySelector('.fb-tab-group-picker-item');
     assert.ok(groupChoice, 'the picker lists open groups');
     groupChoice.click();
@@ -345,6 +349,200 @@ test('TAB GROUPS: real create / group / ungroup with colour dots in the tab stri
     assert.ok(shell.state.tabs.every((t) => !t.group), 'all tabs ungrouped');
     shell.render(container);
     assert.equal(container.querySelectorAll('.fb-tab-group-dot').length, 0, 'dots disappear after ungrouping');
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('TAB GROUP PICKER: New group opens a visible, keyboard-ready prompt and publishes a clickable group', async () => {
+  const { shell, container } = await makeShell();
+  try {
+    shell.state.tabs[0].url = 'https://example.com/';
+    shell.openModal('tab-groups');
+    container.querySelector('.fb-tab-groups-create-btn').click();
+
+    const overlay = document.body.querySelector('.fb-text-prompt-overlay');
+    assert.ok(overlay, 'New group opens the custom prompt instead of silently doing nothing');
+    assert.ok(overlay.classList.contains('fb-text-prompt-tab-groups'),
+      'the group-name prompt stays in the compact upper-left tab-group position');
+    assert.ok(overlay.querySelector('.fb-text-prompt-dialog'),
+      'the prompt uses the theme-safe opaque dialog surface');
+    assert.equal(overlay.querySelector('[role="dialog"]')?.getAttribute('aria-modal'), 'true', 'the prompt exposes an accessible modal dialog');
+    assert.equal(shell.state.isPageObscured, true, 'the renderer marks the prompt as a blocking overlay');
+    assert.equal(shell.healStuckPageSurface(), false, 'render-time surface healing keeps the live prompt in front');
+
+    const input = overlay.querySelector('input');
+    input.value = 'Research';
+    input.dispatchEvent({ type: 'keydown', key: 'Enter' });
+    await flush();
+
+    assert.equal(document.body.querySelector('.fb-text-prompt-overlay'), null, 'Enter accepts and closes the prompt');
+    assert.equal(shell.state.isPageObscured, false, 'the page is restored after the prompt closes');
+    const group = shell.getTabGroups().find((candidate) => candidate.name === 'Research');
+    assert.ok(group, 'the requested group was created');
+    assert.equal(group.tabs.length, 2, 'the current tab and a fresh tab are both in the group');
+
+    shell.openModal('tab-groups');
+    const entry = container.querySelector('.fb-tab-group-picker-item');
+    assert.ok(entry, 'the new group appears immediately in the group picker');
+    assert.match(entry.getAttribute('aria-label'), /Research group \(2 tabs\)/);
+    entry.click();
+    assert.equal(shell.state.tabs.filter((tab) => tab.group?.name === 'Research').length, 2, 'opening a group keeps every group tab open');
+    assert.ok(shell.getActiveTab().group?.name === 'Research', 'the group click activates one of its member tabs');
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('TAB GROUP DRAWER: prompt actions dismiss the drawer cleanly, including on Cancel', async () => {
+  const { shell } = await makeShell();
+  try {
+    shell.state.isSideDrawerOpen = true;
+    shell.render();
+    shell.rootElement.querySelector('.fb-dr-tg-new').click();
+    assert.equal(shell.rootElement.querySelector('.fb-side-drawer-menu'), null, 'New tab group closes the drawer before opening its prompt');
+    let overlay = document.body.querySelector('.fb-text-prompt-overlay');
+    assert.ok(overlay, 'the new-group prompt is visible');
+    [...overlay.querySelectorAll('button')].find((button) => button.textContent === 'Cancel').click();
+    await flush();
+    assert.equal(document.body.querySelector('.fb-text-prompt-overlay'), null, 'Cancel closes the prompt');
+    assert.equal(shell.state.isSideDrawerOpen, false, 'Cancel does not leave stale drawer chrome visible');
+    assert.equal(shell.state.tabs.some((tab) => tab.group), false, 'cancelling leaves tabs unchanged');
+
+    shell.state.isSideDrawerOpen = true;
+    shell.render();
+    shell.rootElement.querySelector('.fb-dr-tg-add').click();
+    assert.equal(shell.rootElement.querySelector('.fb-side-drawer-menu'), null, 'Group current tab also closes the drawer first');
+    overlay = document.body.querySelector('.fb-text-prompt-overlay');
+    [...overlay.querySelectorAll('button')].find((button) => button.textContent === 'Cancel').click();
+    await flush();
+    assert.equal(shell.state.tabs.some((tab) => tab.group), false, 'cancelling group current tab leaves the tab ungrouped');
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('TAB GROUP RESTORE: selecting a previous-session group opens every saved member without replacing the current tab', async () => {
+  const sessionTabs = [
+    { url: 'https://alpha.example/', title: 'Alpha', group: { name: 'Launch', color: '#3b82f6' } },
+    { url: 'https://beta.example/docs', title: 'Beta Docs', group: { name: 'Launch', color: '#3b82f6' } },
+    { url: 'https://private.example/', title: 'Private', isPrivate: true, group: { name: 'Incognito', color: '#ef4444' } }
+  ];
+  const sessionRepo = {
+    getLastSession: async () => ({ tabs: sessionTabs, savedAt: 123 }),
+    saveSession: async () => {}
+  };
+  const { shell } = await makeShell({ storage: makeStorage(), sessionRepo });
+  try {
+    const originalTabId = shell.getActiveTab().id;
+    const savedGroup = shell.getTabGroups().find((candidate) => candidate.name === 'Launch');
+    assert.ok(savedGroup, 'recoverable grouped tabs appear before the group is restored');
+    assert.equal(savedGroup.tabs.length, 2, 'the full saved group is available even though the Continue card is capped');
+    assert.equal(shell.getTabGroups().some((candidate) => candidate.name === 'Incognito'), false, 'private session rows never reappear as normal-profile groups');
+
+    assert.equal(shell.openTabGroup(savedGroup.id), true);
+    const opened = shell.state.tabs.filter((tab) => tab.group?.name === 'Launch');
+    assert.equal(opened.length, 2, 'one click opens all saved group members');
+    assert.deepEqual(opened.map((tab) => tab.url), sessionTabs.slice(0, 2).map((tab) => tab.url));
+    assert.notEqual(shell.state.activeTabId, originalTabId, 'the original new-tab remains open; it is not overwritten');
+    assert.equal(shell.getActiveTab().url, sessionTabs[0].url, 'the first tab in the chosen group becomes active');
+    assert.equal(shell.state.continueTabs.length, 0, 'restored group members leave the Continue list');
+    assert.ok(shell.getTabGroups().some((candidate) => candidate.name === 'Launch'), 'the live group remains selectable');
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('TAB RIGHT-CLICK: group, move, open, and remove actions work for the tab under the pointer', async () => {
+  const { shell } = await makeShell();
+  try {
+    const target = shell.getActiveTab();
+    target.url = 'https://target.example/';
+    const grouped = shell.createNewTab();
+    grouped.url = 'https://grouped.example/';
+    grouped.group = { name: 'Work', color: '#10b981' };
+    shell.render();
+
+    shell.renderTabContextMenu(40, 40, target);
+    let buttons = [...document.body.querySelectorAll('.fb-tab-context-menu-item')];
+    const addTo = buttons.find((button) => button.textContent === 'Add to…');
+    assert.ok(addTo, 'the context menu keeps group actions concise behind Add to…');
+    const submenu = document.body.querySelector('.fb-tab-context-submenu');
+    assert.equal(submenu.style.display, 'none', 'the group list is collapsed until requested');
+    addTo.click();
+    assert.equal(submenu.style.display, 'flex', 'selecting Add to… reveals the available tab groups');
+    const addToWork = submenu.querySelectorAll('.fb-tab-context-submenu-item').find((button) => button.textContent === 'Work');
+    assert.ok(addToWork, 'the submenu lists the existing group');
+    addToWork.click();
+    assert.equal(target.group?.name, 'Work', 'the right-clicked tab, not only the active tab, joins the selected group');
+
+    shell.renderTabContextMenu(40, 40, target);
+    buttons = [...document.body.querySelectorAll('.fb-tab-context-menu-item')];
+    assert.ok(buttons.some((button) => button.textContent === 'Open “Work” group'), 'a grouped tab can open its whole group');
+    const remove = buttons.find((button) => button.textContent === 'Remove from “Work”');
+    assert.ok(remove, 'a grouped tab can be removed from its group');
+    remove.click();
+    assert.equal(target.group, null, 'remove action ungroups the selected tab');
+
+    // The Yayra drawer also exposes the saved/live group as a one-click
+    // entry instead of requiring the user to open Settings or the picker.
+    shell.state.isSideDrawerOpen = true;
+    shell.render();
+    const drawerEntry = shell.rootElement.querySelector('.fb-dr-tg-open');
+    assert.ok(drawerEntry, 'existing groups are selectable from the Tab groups submenu');
+    drawerEntry.click();
+    assert.equal(shell.state.isSideDrawerOpen, false, 'choosing a group closes the drawer');
+    assert.equal(shell.getActiveTab().group?.name, 'Work', 'the drawer entry opens the selected group');
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('LINKS: a tab opened by a page is inserted beside its source and keeps its privacy/group context', async () => {
+  const { shell } = await makeShell();
+  try {
+    const first = shell.getActiveTab();
+    first.url = 'https://first.example/';
+    const source = shell.createNewTab();
+    source.url = 'https://source.example/';
+    source.group = { name: 'Research', color: '#3b82f6' };
+    const trailing = shell.createNewTab();
+    trailing.url = 'https://trailing.example/';
+    shell.selectTab(source.id);
+
+    shell.handleNativeWebviewEvent({
+      tabId: source.id,
+      type: 'new-window-request',
+      url: 'https://child.example/'
+    });
+    const child = shell.getActiveTab();
+    const sourceIndex = shell.state.tabs.findIndex((tab) => tab.id === source.id);
+    assert.equal(child.url, 'https://child.example/');
+    assert.equal(shell.state.tabs.indexOf(child), sourceIndex + 1, 'the new link tab sits directly after its source, not at the strip end');
+    assert.equal(shell.state.tabs.indexOf(trailing), sourceIndex + 2, 'existing tabs remain in order after the insertion');
+    assert.equal(child.group?.name, 'Research', 'a link opened from a group remains in that group');
+
+    const privateSource = shell.createNewTab(true);
+    privateSource.url = 'https://private.example/';
+    const privateTrailing = shell.createNewTab(true);
+    privateTrailing.url = 'https://private-trailing.example/';
+    shell.selectTab(privateSource.id);
+    shell.handleNativeWebviewEvent({
+      tabId: privateSource.id,
+      type: 'new-window-request',
+      url: 'https://private-child.example/'
+    });
+    const privateChild = shell.getActiveTab();
+    const privateSourceIndex = shell.state.tabs.findIndex((tab) => tab.id === privateSource.id);
+    assert.equal(privateChild.isPrivate, true, 'a private source opens a private child tab');
+    assert.equal(shell.state.tabs.indexOf(privateChild), privateSourceIndex + 1);
+    assert.equal(shell.state.tabs.indexOf(privateTrailing), privateSourceIndex + 2);
+    assert.equal(shell.state.tabs.indexOf(first), 0, 'unrelated normal tabs stay in place');
   } finally {
     shell.destroy();
     delete globalThis.localStorage;
@@ -401,7 +599,7 @@ test('KOTTON (Kotlin pin): the Android plugin really implements installSiteAsApp
   assert.ok(ensure.includes('com.android.launcher.permission.INSTALL_SHORTCUT'), 'manifest permission injected for legacy devices');
 });
 
-test('SUBMENUS: every submenu parent opens on click, lists its items, and closes again', async () => {
+test('SUBMENUS: every submenu parent opens on hover, stays reachable, and keeps its options clickable', async () => {
   const { shell, container } = await makeShell({ storage: makeStorage() });
   try {
     shell._textPromptDialog = async () => 'G';
@@ -412,13 +610,34 @@ test('SUBMENUS: every submenu parent opens on click, lists its items, and closes
     const parents = Array.from(container.querySelectorAll('.fb-drawer-item-has-submenu'));
     assert.ok(parents.length >= 7, `all submenu groups present (${parents.length} found)`);
     const drawer = container.querySelector('.fb-side-drawer-menu');
-    const hoverParent = parents[0];
-    const hoverFlyout = hoverParent.querySelector('.fb-drawer-submenu');
-    hoverParent.dispatchEvent({ type: 'pointerenter', pointerType: 'mouse', relatedTarget: null });
-    assert.equal(hoverParent.classList.contains('open'), true, 'desktop hover opens the lateral flyout');
-    assert.equal(hoverFlyout.parentElement, drawer, 'the hover flyout is outside the scrolling list');
-    hoverParent.dispatchEvent({ type: 'pointerleave', relatedTarget: null });
-    assert.equal(hoverParent.classList.contains('open'), false, 'the hover flyout closes when the pointer leaves');
+    for (const parent of parents) {
+      const flyout = parent.querySelector('.fb-drawer-submenu');
+      parent.dispatchEvent({ type: 'pointerenter', pointerType: 'mouse', relatedTarget: null });
+      assert.equal(parent.classList.contains('open'), true, 'desktop hover opens each lateral flyout without clicking');
+      assert.equal(parent.querySelector('.fb-drawer-item').getAttribute('aria-expanded'), 'true');
+      assert.equal(flyout.parentElement, drawer, 'the hover flyout is outside the scrolling list');
+
+      // relatedTarget is sometimes null while the flyout is reparented. The
+      // grace period keeps it open long enough for the pointer to enter.
+      parent.dispatchEvent({ type: 'pointerleave', relatedTarget: null });
+      assert.equal(parent.classList.contains('open'), true, 'leaving the parent does not immediately collapse the flyout');
+      flyout.dispatchEvent({ type: 'pointerenter', pointerType: 'mouse', relatedTarget: parent });
+      await new Promise((resolve) => setTimeout(resolve, 180));
+      assert.equal(parent.classList.contains('open'), true, 'entering the flyout cancels its pending close');
+      flyout.dispatchEvent({ type: 'pointerleave', pointerType: 'mouse', relatedTarget: null });
+      await new Promise((resolve) => setTimeout(resolve, 180));
+      assert.equal(parent.classList.contains('open'), false, 'the flyout closes after the pointer leaves the whole submenu');
+    }
+
+    const touchParent = parents[0];
+    const touchButton = touchParent.querySelector('.fb-drawer-item');
+    touchParent.dispatchEvent({ type: 'pointerenter', pointerType: 'touch', relatedTarget: null });
+    assert.equal(touchParent.classList.contains('open'), false, 'touch does not depend on hover to reveal a submenu');
+    touchButton.click();
+    assert.equal(touchParent.classList.contains('open'), true, 'touch users can open the submenu with a tap');
+    touchButton.click();
+    assert.equal(touchParent.classList.contains('open'), false, 'the tap control can close it again');
+
     for (const parent of parents) {
       const button = parent.querySelector('.fb-drawer-item');
       const items = parent.querySelectorAll('.fb-drawer-item');
@@ -434,6 +653,16 @@ test('SUBMENUS: every submenu parent opens on click, lists its items, and closes
         await flush();
       }
     }
+
+    // Exercise a real option from a hover-opened flyout without clicking its
+    // parent first; this is the exact mouse interaction requested.
+    shell.closeModal();
+    shell.state.isSideDrawerOpen = true;
+    shell.render(container);
+    const historyParent = container.querySelector('.fb-dr-history-parent').parentElement;
+    historyParent.dispatchEvent({ type: 'pointerenter', pointerType: 'mouse', relatedTarget: null });
+    historyParent.querySelector('.fb-dr-tabsearch').click();
+    assert.equal(shell.state.activeModal, 'tab-switcher', 'a submenu option remains actionable after hover opens its parent');
   } finally {
     shell.destroy();
     delete globalThis.localStorage;

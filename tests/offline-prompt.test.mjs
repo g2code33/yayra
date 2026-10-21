@@ -18,8 +18,9 @@ import { BrowserShell } from '../packages/shared-ui/src/components/BrowserShell.
  *  2. A page that is ALREADY LOADED stays live offline (the loaded-page
  *     contract is untouched).
  *  3. Going offline / coming back online is announced; the online event
- *     heals offline cards automatically WITHOUT reloading live pages
- *     (pooled live frames survive re-renders).
+ *     immediately retries only the active failed page. The recovery card
+ *     remains until positive load completion; healthy live pages are never
+ *     reloaded.
  */
 
 function setOnline(v) {
@@ -42,7 +43,7 @@ test('OFFLINE: a NEW page shows the honest offline card - never a blank frame', 
     const card = shell.viewportElement.querySelector('.fb-offline-fallback');
     assert.ok(card, 'the offline card is shown in place of the page');
     assert.equal(shell.viewportElement.querySelector('iframe'), null, 'no blank iframe is created');
-    assert.match(card.querySelector('.fb-offline-retry-btn').textContent, /Retry/);
+    assert.match(card.querySelector('.fb-offline-retry-btn').textContent, /Try again/);
     assert.match(card.textContent, /offline/i);
   } finally {
     setOnline(true);
@@ -71,15 +72,17 @@ test('OFFLINE: a page that already LOADED keeps its live frame when the connecti
   }
 });
 
-test('OFFLINE -> ONLINE: the offline card heals automatically, without touching live pages', async () => {
+test('OFFLINE -> ONLINE: the failed page retries immediately and stays covered until success', async () => {
   setOnline(false);
   const listeners = {};
   const origAdd = globalThis.window.addEventListener;
   globalThis.window.addEventListener = (type, fn) => { listeners[type] = fn; };
   let renders = 0;
+  let shell = null;
   try {
     const container = document.createElement('div');
-    const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+    shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+    shell.showTransientNotice = () => {};
     await shell.initialize();
     shell.state.tabs[0].url = 'https://example.com/page';
     const realRender = shell.render.bind(shell);
@@ -90,11 +93,17 @@ test('OFFLINE -> ONLINE: the offline card heals automatically, without touching 
 
     setOnline(true);
     listeners.online(); // the connection returns
-    assert.ok(renders >= 1, 'a heal re-render was triggered');
+    assert.ok(renders >= 2, 'the failed destination starts a retry immediately');
+    assert.ok(shell.viewportElement.querySelector('.fb-offline-fallback'),
+      'the card remains visible while the hidden retry is still loading');
+    const frame = shell.webFrames.get(shell.state.activeTabId);
+    assert.ok(frame?.iframe, 'the retained URL is retrying in its persistent frame');
+    frame.iframe.dispatchEvent({ type: 'load', target: frame.iframe });
+    shell.render(container);
     assert.equal(shell.viewportElement.querySelector('.fb-offline-fallback'), null,
-      'the offline card is gone once back online');
-    shell.destroy();
+      'only positive load completion reveals the website');
   } finally {
+    shell?.destroy();
     globalThis.window.addEventListener = origAdd;
     setOnline(true);
   }
@@ -123,18 +132,22 @@ test('OFFLINE EVENTS: dropping offline and coming back are announced to the user
   }
 });
 
-test('SOURCE PIN: offline wins over every other frame strategy, and the retry path is wired', () => {
+test('SOURCE PIN: offline wins over every other frame strategy, and tab-scoped retry is wired', () => {
   const src = readFileSync(new URL('../packages/shared-ui/src/components/BrowserShell.js', import.meta.url), 'utf8');
   const fnStart = src.indexOf('createWebContentFrame(url, { frameClassName');
-  const fn = src.slice(fnStart, src.indexOf('\n  }', fnStart));
-  const offlineAt = fn.indexOf('buildOfflineFallback(url)');
+  const fn = src.slice(fnStart, src.indexOf('NATIVE WEBSITE-RENDERING ENGINE', fnStart));
+  const offlineAt = fn.indexOf('buildOfflineFallback(url, { tabId, failure })');
   assert.ok(offlineAt > -1, 'the offline card exists in the frame pipeline');
   assert.ok(fn.indexOf('isKnownFrameBlockedUrl(url)') > offlineAt,
     'the offline check runs BEFORE the blocked-hosts strategy - no blank page can win');
   assert.ok(fn.indexOf('getSearchIntent(url)') > offlineAt,
     'the offline check runs BEFORE the search handoff');
   const pooled = src.indexOf('mountPooledWebFrame(webViewContainer, tab) {');
-  const pooledFn = src.slice(pooled, pooled + 900);
+  const pooledFn = src.slice(pooled, pooled + 1100);
   assert.match(pooledFn, /!this\._onLine\(\).*webFrames\?\.has\(tab\.id\)\) return false/,
     'offline blocks NEW pooled frames but never reuses-blocks LOADED ones');
+  assert.match(src, /_retrySiteRecovery\(activeFailure\.tabId, \{ reason: 'online' \}\)/,
+    'connectivity restoration immediately retries only recorded failure state');
+  assert.match(src, /const delays = \[1500, 3000, 6000, 12000, 20000, 30000\]/,
+    'automatic retries use bounded backoff');
 });

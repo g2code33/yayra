@@ -14,6 +14,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -46,8 +47,9 @@ import org.json.JSONObject
  * activity content view (0/0 in the normal case).
  *
  * Events flow back to JS as "tabWebEvent" notifications:
- *   { id, type: 'loading-start' | 'loading-stop' | 'navigated' |
- *               'title-updated' | 'engine-error', url?, title?,
+ *   { id, type: 'loading-start' | 'loading-stop' | 'load-succeeded' |
+ *               'fail-load' | 'navigated' | 'title-updated' |
+ *               'engine-error', url?, title?,
  *               canGoBack?, canGoForward?, isLoading?, error? }
  * and are normalized into the SAME shapes the desktop engine emits
  * (handleNativeWebviewEvent in BrowserShell.js handles both).
@@ -63,17 +65,23 @@ class YayraTabWebviewManager(
 
     private companion object {
         // Keep in sync with BrowserShell.isSystemBrowserAuthHost() and
-        // electron/webviewBridge.cjs. Google account browsing is allowed in
-        // the native view; only Google sign-in/OAuth URL paths are routed out.
+        // electron/webviewBridge.cjs. OAuth and interactive Google Account
+        // sign-in routes use the OS browser; account management and ordinary
+        // Google product navigation stay in the native view.
         val SYSTEM_BROWSER_AUTH_HOSTS = setOf(
             "appleid.apple.com",
             "login.live.com",
             "login.microsoftonline.com"
         )
-        val GOOGLE_SIGN_IN_PATH = Regex(
-            "^/(?:o/oauth2(?:/|$)|oauth2(?:/|$)|signin(?:/|$)|servicelogin(?:/|$)|accountchooser(?:/|$)|v\\d+/signin(?:/|$)|gsi/select(?:/|$))",
+        val GOOGLE_AUTH_PATH = Regex(
+            "^/(?:o/oauth2(?:/|$)|oauth2(?:/|$)|signin/oauth(?:/|$)|gsi/select(?:/|$)|signin/(?:v2|challenge|identifier|rejected)(?:/|$)|v3/signin(?:/|$)|ServiceLogin(?:/|$)|InteractiveLogin(?:/|$)|AccountChooser(?:/|$)|AddSession(?:/|$))",
             RegexOption.IGNORE_CASE
         )
+        val GOOGLE_REJECTED_SIGNIN_PATH = Regex(
+            "^/(?:signin/rejected|v3/signin/rejected)(?:/|$)",
+            RegexOption.IGNORE_CASE
+        )
+        const val MAX_AUTH_HANDOFF_URL_LENGTH = 8192
     }
 
     private class TabEntry(val id: String) {
@@ -81,23 +89,46 @@ class YayraTabWebviewManager(
         lateinit var snapshot: ImageView
         var currentUrl: String? = null
         var lastReportedUrl: String? = null
+        var mainFrameFailed: Boolean = false
         var pointerTheme: String = "system"
         var pointerSize: String = "normal"
     }
 
     private fun isSystemBrowserAuthUrl(uri: Uri): Boolean {
+        if (uri.toString().length > MAX_AUTH_HANDOFF_URL_LENGTH) return false
         if (!uri.scheme.equals("https", ignoreCase = true) && !uri.scheme.equals("http", ignoreCase = true)) return false
+        if (!uri.userInfo.isNullOrEmpty()) return false
         val host = uri.host?.lowercase() ?: return false
-        if (host == "accounts.google.com") return GOOGLE_SIGN_IN_PATH.containsMatchIn(uri.encodedPath ?: "/")
+        if (host == "accounts.google.com") return GOOGLE_AUTH_PATH.containsMatchIn(uri.encodedPath ?: "/")
         return SYSTEM_BROWSER_AUTH_HOSTS.any { host == it || host.endsWith(".$it") }
     }
 
     private fun secureSystemBrowserAuthUrl(uri: Uri): String {
-        return if (uri.scheme.equals("http", ignoreCase = true)) {
-            uri.buildUpon().scheme("https").build().toString()
-        } else {
-            uri.toString()
+        if (!isSystemBrowserAuthUrl(uri)) return uri.toString()
+        val host = uri.host?.lowercase()
+        val path = uri.encodedPath ?: "/"
+        if (host == "accounts.google.com" && GOOGLE_REJECTED_SIGNIN_PATH.containsMatchIn(path)) {
+            val builder = Uri.Builder()
+                .scheme("https")
+                .authority("accounts.google.com")
+                .appendPath("ServiceLogin")
+            val continuation = try { uri.getQueryParameter("continue") } catch (_: Exception) { null }
+            if (!continuation.isNullOrEmpty() && continuation.length <= 4096) {
+                val destination = try { Uri.parse(continuation) } catch (_: Exception) { null }
+                if (destination != null
+                    && destination.scheme.equals("https", ignoreCase = true)
+                    && !destination.host.isNullOrEmpty()
+                    && destination.userInfo.isNullOrEmpty()) {
+                    builder.appendQueryParameter("continue", destination.buildUpon().fragment(null).build().toString())
+                }
+            }
+            val language = try { uri.getQueryParameter("hl") } catch (_: Exception) { null }
+            if (!language.isNullOrEmpty() && Regex("^[A-Za-z]{2,3}(?:-[A-Za-z]{2,4})?$").matches(language)) {
+                builder.appendQueryParameter("hl", language)
+            }
+            return builder.build().toString()
         }
+        return uri.buildUpon().scheme("https").fragment(null).build().toString()
     }
 
     private fun emitEvent(id: String, type: String, extra: (JSObject) -> Unit = {}) {
@@ -170,8 +201,12 @@ class YayraTabWebviewManager(
                                 val targetUri = request?.url ?: return false
                                 if (request.isForMainFrame && isSystemBrowserAuthUrl(targetUri)) {
                                     // Cancel before the provider page is loaded.
-                                    // JS opens it with Capacitor Browser, leaving
-                                    // this native tab and its history untouched.
+                                    // A canceled WebView navigation is not
+                                    // guaranteed to produce onPageFinished,
+                                    // so stop the Yayra loader explicitly.
+                                    // JS opens it with Capacitor Browser,
+                                    // leaving this tab and history untouched.
+                                    emitEvent(id, "loading-stop")
                                     emitEvent(id, "auth-navigation-blocked") { d -> d.put("url", secureSystemBrowserAuthUrl(targetUri)) }
                                     return true
                                 }
@@ -183,17 +218,37 @@ class YayraTabWebviewManager(
                             }
 
                             override fun onPageStarted(view: WebView?, target: String?, favicon: Bitmap?) {
+                                tabs[id]?.mainFrameFailed = false
                                 emitEvent(id, "loading-start") { d -> d.put("url", target ?: "") }
                             }
 
+                            override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                                if (request?.isForMainFrame != true) return
+                                val failedUrl = request.url?.toString() ?: view?.url ?: ""
+                                tabs[id]?.mainFrameFailed = true
+                                emitEvent(id, "fail-load") { d ->
+                                    d.put("url", failedUrl)
+                                    d.put("errorCode", error?.errorCode ?: -1)
+                                    d.put("errorDescription", error?.description?.toString() ?: "net::ERR_FAILED")
+                                }
+                            }
+
                             override fun onPageFinished(view: WebView?, target: String?) {
-                                tabs[id]?.let { applyPointerThemeToPage(it) }
+                                val entryNow = tabs[id]
+                                entryNow?.let { applyPointerThemeToPage(it) }
                                 emitEvent(id, "loading-stop")
+                                val finishedUrl = view?.url ?: target ?: ""
+                                // Publish the final redirected URL first. BrowserShell can then
+                                // validate the positive completion against that destination
+                                // instead of mistaking a legitimate redirect for stale success.
                                 emitEvent(id, "navigated") { d ->
-                                    d.put("url", view?.url ?: target ?: "")
+                                    d.put("url", finishedUrl)
                                     d.put("canGoBack", view?.canGoBack() ?: false)
                                     d.put("canGoForward", view?.canGoForward() ?: false)
                                     d.put("isLoading", false)
+                                }
+                                if (entryNow?.mainFrameFailed != true) {
+                                    emitEvent(id, "load-succeeded") { d -> d.put("url", finishedUrl) }
                                 }
                                 val title = view?.title
                                 if (!title.isNullOrBlank()) {
@@ -220,8 +275,9 @@ class YayraTabWebviewManager(
                         webChromeClient = object : WebChromeClient() {
                             override fun onCreateWindow(parent: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message?): Boolean {
                                 // Mirror Electron: user-initiated ordinary popups
-                                // become Yayra tabs; identity-provider sign-in
-                                // popups are handed to the secure browser.
+                                // become Yayra tabs; matching Google OAuth and
+                                // existing Apple/Microsoft auth popups are sent
+                                // to the secure browser.
                                 if (!isUserGesture || resultMsg == null) return false
                                 var routed = false
                                 lateinit var popup: WebView
@@ -335,18 +391,62 @@ class YayraTabWebviewManager(
         val handSvg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"$dimension\" height=\"$dimension\" viewBox=\"0 0 24 24\"><path d=\"M9 11V4.5a1.5 1.5 0 0 1 3 0V10l4.6.9c1.1.2 1.9 1.2 1.9 2.3v3.3c0 2.5-2 4.5-4.5 4.5h-3.4c-1.3 0-2.6-.6-3.4-1.7L4 15.5c-.6-.9-.4-2 .5-2.6.8-.5 1.9-.3 2.5.5l2 2.6z\" fill=\"$color\" stroke=\"$outline\" stroke-width=\"$handStroke\" stroke-linejoin=\"round\"/></svg>"
         val arrowCursor = cursorData(arrowSvg, (4 * scale).toInt(), (2 * scale).toInt(), "auto")
         val handCursor = cursorData(handSvg, (9 * scale).toInt(), (2 * scale).toInt(), "pointer")
+        val interactiveSelector = ":where(" + listOf(
+            "a", "area[href]", "button",
+            "input[type='button']", "input[type='submit']", "input[type='reset']", "input[type='image']",
+            "input[type='checkbox']", "input[type='radio']", "input[type='range']", "input[type='file']", "input[type='color']",
+            "select", "option", "summary", "label",
+            "[role='button']", "[role='link']", "[role='tab']", "[role='menuitem']", "[role='menuitemcheckbox']", "[role='menuitemradio']",
+            "[role='combobox']", "[role='listbox']", "[role='option']", "[role='checkbox']", "[role='radio']", "[role='switch']", "[role='slider']", "[role='treeitem']", "[role='gridcell']",
+            "[aria-haspopup]", "[onclick]", "[tabindex]:not([tabindex='-1'])"
+        ).joinToString(", ") + ")"
+        // :not(html) gives this hand rule the same specificity as body * in
+        // the arrow rule, without defeating the native text-cursor rules.
+        val handTargetSelector = "$interactiveSelector:not(html)"
         return "html, body, body * { cursor: $arrowCursor !important; }\n" +
-            "button, a, [role='button'], [role='tab'], [role='menuitem'], select, summary, input[type='button'], input[type='submit'], input[type='reset'] { cursor: $handCursor !important; }\n" +
-            "input:not([type]), input[type='text'], input[type='search'], input[type='url'], input[type='email'], input[type='password'], input[type='number'], textarea, [contenteditable='true'], [role='textbox'] { cursor: text !important; }"
+            "$handTargetSelector, $handTargetSelector * { cursor: $handCursor !important; }\n" +
+            "input:not([type]), input[type='text'], input[type='search'], input[type='url'], input[type='email'], input[type='tel'], input[type='password'], input[type='number'], input[type='date'], input[type='time'], input[type='datetime-local'], input[type='month'], input[type='week'], textarea, [contenteditable]:not([contenteditable='false']), [role='textbox'] { cursor: text !important; }\n" +
+            "[data-yayra-selectable-text='true'] { cursor: text !important; user-select: text !important; -webkit-user-select: text !important; }"
+    }
+
+    /**
+     * CSS cannot distinguish glyphs from blank padding inside a text-bearing
+     * element. Hit-test the actual caret position so mouse/stylus users get an
+     * I-beam and touch pointerdown can begin native WebView selection. Android
+     * then supplies its standard contextual Copy/Cut/Share action mode.
+     */
+    private fun pointerTextScript(enabled: Boolean): String {
+        if (!enabled) {
+            return "(function(){try{window.__yayraTextPointerCleanup&&window.__yayraTextPointerCleanup();}catch(e){}})();"
+        }
+        val interactive = JSONObject.quote(listOf(
+            "a", "area[href]", "button",
+            "input[type='button']", "input[type='submit']", "input[type='reset']", "input[type='image']",
+            "input[type='checkbox']", "input[type='radio']", "input[type='range']", "input[type='file']", "input[type='color']",
+            "select", "option", "summary", "label",
+            "[role='button']", "[role='link']", "[role='tab']", "[role='menuitem']", "[role='combobox']",
+            "[role='checkbox']", "[role='radio']", "[role='switch']", "[aria-haspopup]", "[onclick]", "[tabindex]:not([tabindex='-1'])"
+        ).joinToString(", "))
+        return "(function(){try{" +
+            "window.__yayraTextPointerCleanup&&window.__yayraTextPointerCleanup();" +
+            "var attr='data-yayra-selectable-text',selector=$interactive,current=null;" +
+            "var clear=function(){try{current&&current.removeAttribute(attr);}catch(e){}current=null;};" +
+            "var interactiveTarget=function(target){var el=target&&target.nodeType===1?target:target&&target.parentElement;try{while(el){if(el.closest&&el.closest(selector))return true;var root=el.getRootNode&&el.getRootNode();el=root&&root.host?root.host:null;}}catch(e){}return false;};" +
+            "var hit=function(ev){if(!ev)return;if(ev.pointerType==='touch'&&ev.type!=='pointerdown')return;if(interactiveTarget(ev.target)){clear();return;}var range=null;try{if(document.caretRangeFromPoint)range=document.caretRangeFromPoint(ev.clientX,ev.clientY);else if(document.caretPositionFromPoint){var p=document.caretPositionFromPoint(ev.clientX,ev.clientY);if(p&&p.offsetNode){range=document.createRange();range.setStart(p.offsetNode,p.offset);range.collapse(true);}}}catch(e){}var node=range&&range.startContainer,el=node&&node.nodeType===3?node.parentElement:null;if(!el||!String(node.nodeValue||'').trim()||interactiveTarget(el)){clear();return;}try{var check=document.createRange();check.selectNodeContents(node);var rects=check.getClientRects(),ok=false;for(var i=0;i<rects.length;i++){var r=rects[i];if(ev.clientX>=r.left&&ev.clientX<=r.right&&ev.clientY>=r.top&&ev.clientY<=r.bottom){ok=true;break;}}if(!ok){clear();return;}}catch(e){clear();return;}if(el===current)return;clear();try{el.setAttribute(attr,'true');current=el;}catch(e){}};" +
+            "document.addEventListener('pointermove',hit,true);document.addEventListener('pointerdown',hit,true);" +
+            "window.__yayraTextPointerCleanup=function(){document.removeEventListener('pointermove',hit,true);document.removeEventListener('pointerdown',hit,true);clear();try{delete window.__yayraTextPointerCleanup;}catch(e){}};" +
+            "}catch(e){}})();"
     }
 
     private fun applyPointerThemeToPage(entry: TabEntry) {
-        val script = if (entry.pointerTheme == "system") {
+        val customTheme = entry.pointerTheme != "system"
+        val styleScript = if (!customTheme) {
             "(function(){try{window.__yayraPointerThemeObserver?.disconnect();delete window.__yayraPointerThemeObserver;document.getElementById('yayra-custom-pointer-theme')?.remove();}catch(e){}})();"
         } else {
             val css = JSONObject.quote(pointerCss(entry.pointerTheme, entry.pointerSize))
             "(function(){try{var id='yayra-custom-pointer-theme',css=$css;try{window.__yayraPointerThemeObserver?.disconnect();}catch(e){};var install=function(){var root=document.documentElement;if(!root)return;var style=document.getElementById(id);if(!style){style=document.createElement('style');style.id=id;}var nonceNode=root.querySelector('style[nonce],script[nonce]'),nonce=nonceNode&&(nonceNode.nonce||nonceNode.getAttribute('nonce'));if(nonce&&style.getAttribute('nonce')!==nonce)style.setAttribute('nonce',nonce);if(style.textContent!==css)style.textContent=css;var parent=document.head||root;if(style.parentNode!==parent)parent.appendChild(style);};install();if(typeof MutationObserver==='function'&&document.documentElement){var observer=new MutationObserver(install);observer.observe(document.documentElement,{childList:true,subtree:true});window.__yayraPointerThemeObserver=observer;}}catch(e){}})();"
         }
+        val script = styleScript + pointerTextScript(customTheme)
         try { entry.webView.evaluateJavascript(script, null) } catch (_: Exception) { /* best-effort styling only */ }
     }
 
@@ -409,9 +509,21 @@ class YayraTabWebviewManager(
         }
     }
 
-    fun reload(id: String) {
+    fun reload(id: String, retainedUrl: String? = null) {
         main.post {
-            tabs[id]?.webView?.reload()
+            val entry = tabs[id] ?: return@post
+            val target = retainedUrl?.takeIf { it.startsWith("https://") || it.startsWith("http://") }
+            if (target != null) {
+                // Like desktop Chromium, Android WebView is not guaranteed to
+                // commit a disconnected navigation. Retry the JS-retained URL
+                // explicitly instead of risking reload() of the prior page.
+                entry.currentUrl = target
+                entry.lastReportedUrl = target
+                entry.mainFrameFailed = false
+                entry.webView.loadUrl(target)
+            } else {
+                entry.webView.reload()
+            }
         }
     }
 

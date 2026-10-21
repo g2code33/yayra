@@ -274,9 +274,30 @@ test('Shell: AI row honours the enabled + suggestInOmnibox config flags', async 
   assert.equal(container.querySelector('.fb-ai-suggestion'), null, 'no AI row when turned off');
 });
 
-test('Shell: new tab shows the "Ask Yayra AI" chip; Settings has the Yayra AI section', () => {
+test('Shell: Google owns in-pill AI Mode while Ask Yayra AI stays separate; Settings has the Yayra AI section', () => {
   const { shell, container } = makeShell();
-  assert.ok(container.querySelector('.fb-newtab-ai-chip'), 'newtab AI chip');
+  const searchbox = container.querySelector('.fb-newtab-searchbox');
+  const googleAiMode = searchbox?.querySelector('.fb-newtab-google-ai-btn');
+  const yayraAi = container.querySelector('.fb-newtab-ai-chip');
+  assert.ok(googleAiMode, 'Google AI Mode is integrated into the Google search pill');
+  assert.match(googleAiMode.textContent, /AI Mode/);
+  assert.ok(yayraAi && !searchbox.querySelector('.fb-newtab-ai-chip'), 'Ask Yayra AI is a separate control below the pill');
+  assert.match(yayraAi.textContent, /Ask Yayra AI/);
+
+  const searchInput = searchbox.querySelector('.fb-newtab-search-input');
+  searchInput.value = 'compare browsers';
+  let navigated = null;
+  shell.navigateActiveTab = (url) => { navigated = url; };
+  googleAiMode.click();
+  const aiModeUrl = new URL(navigated);
+  assert.equal(aiModeUrl.origin, 'https://www.google.com');
+  assert.equal(aiModeUrl.searchParams.get('udm'), '50');
+  assert.equal(aiModeUrl.searchParams.get('q'), 'compare browsers');
+
+  let aiQuery = null;
+  shell.openAiPage = (query) => { aiQuery = query; };
+  yayraAi.click();
+  assert.equal(aiQuery, 'compare browsers', 'separate Yayra button still uses the typed question');
 
   shell.state.tabs[0].url = 'yayra://settings';
   shell.state.settingsActiveCategory = 'ai';

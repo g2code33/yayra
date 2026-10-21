@@ -127,6 +127,39 @@ test('Native engine PRESENT (Electron desktop): external navigation NEVER create
   }
 });
 
+test('Native page yields to the tab-group name prompt and returns after Save', async () => {
+  const { calls, uninstall } = installFakeNativeWebview();
+  try {
+    const container = document.createElement('div');
+    const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+    await shell.initialize();
+    const tab = shell.getActiveTab();
+    shell.navigateActiveTab('https://example.com/');
+    shell.render(container);
+    calls.setVisible.length = 0;
+
+    const prompt = shell._textPromptDialog({ title: 'New tab group', placeholder: 'Research' });
+    const overlay = document.body.querySelector('.fb-text-prompt-overlay');
+    assert.ok(overlay, 'the accessible prompt is mounted in the document');
+    assert.equal(shell.state.isPageObscured, true, 'native content is marked as obscured');
+    assert.ok(calls.setVisible.some((call) => call.tabId === tab.id && call.visible === false), 'native page hides so the prompt can receive clicks');
+
+    shell.render(container);
+    assert.equal(shell.healStuckPageSurface(), false, 'a live text prompt prevents the stuck-surface healer from uncovering the page');
+    assert.equal(shell.state.isPageObscured, true);
+
+    const input = overlay.querySelector('input');
+    input.value = 'Research';
+    [...overlay.querySelectorAll('button')].find((button) => button.textContent === 'Save').click();
+    assert.equal(await prompt, 'Research');
+    assert.equal(shell.state.isPageObscured, false, 'native page is restored after Save');
+    assert.ok(calls.setVisible.some((call) => call.tabId === tab.id && call.visible === true), 'the live website comes back after the overlay is removed');
+    shell.destroy();
+  } finally {
+    uninstall();
+  }
+});
+
 test('Native engine: closing a tab destroys its native view', async () => {
   const { calls, uninstall } = installFakeNativeWebview();
   try {
@@ -255,12 +288,12 @@ test('Native engine: a "navigated" event from the main process updates tab URL, 
   }
 });
 
-test('Native engine: Google sign-in handoff preserves tab id, URL, active selection, history and a visible fallback', async () => {
+test('Native engine: direct Google auth system-browser flow preserves tab id, URL, active selection, history and fallback', async () => {
   const { fake, calls, uninstall } = installFakeNativeWebview();
   try {
     fake.ensure = (tabId, url) => {
       calls.ensure.push({ tabId, url });
-      return Promise.resolve({ handedOffToSystemBrowser: url.includes('accounts.google.com') });
+      return Promise.resolve({ handedOffToSystemBrowser: true });
     };
     const container = document.createElement('div');
     const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
@@ -269,7 +302,7 @@ test('Native engine: Google sign-in handoff preserves tab id, URL, active select
     const tabId = tab.id;
 
     shell.navigateActiveTab('https://example.com/before-sign-in');
-    shell.navigateActiveTab('https://accounts.google.com/signin/v2/identifier');
+    shell.navigateActiveTab('https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client');
     const originalHistory = [...tab.navigationState.historyStack];
     const originalIndex = tab.navigationState.currentIndex;
     shell.render(container);
@@ -279,14 +312,118 @@ test('Native engine: Google sign-in handoff preserves tab id, URL, active select
     await Promise.resolve();
 
     assert.equal(tab.id, tabId);
-    assert.equal(tab.url, 'https://accounts.google.com/signin/v2/identifier');
+    assert.equal(tab.url, 'https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client');
     assert.equal(shell.state.activeTabId, tabId);
     assert.deepEqual(tab.navigationState.historyStack, originalHistory);
     assert.equal(tab.navigationState.currentIndex, originalIndex);
     assert.equal(tab.canGoBack, true);
-    assert.ok(shell.rootElement.querySelector('.fb-auth-handoff-fallback'), 'the tab explains why sign-in is external');
+    const authCard = shell.rootElement.querySelector('.fb-auth-handoff-fallback');
+    assert.ok(authCard, 'the source tab explains the secure external-user-agent flow');
+    assert.match(authCard.textContent, /secure system browser/i);
+    assert.match(authCard.textContent, /never copies browser cookies/i);
     assert.equal(calls.ensure.filter((call) => call.url === tab.url).length, 1, 're-rendering does not reopen the same auth URL');
     assert.ok(calls.setVisible.some((call) => call.tabId === tabId && call.visible === false), 'any previous native page surface is hidden, not painted over the fallback');
+  } finally {
+    uninstall();
+  }
+});
+
+test('Yayra account UI explains the secure external user-agent and turns cancellation into clear live copy', async () => {
+  const { uninstall } = installFakeNativeWebview();
+  try {
+    const container = document.createElement('div');
+    const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+    await shell.initialize();
+    window.yayra.auth = {};
+    shell.state.googleAccount = { status: 'signing-in' };
+    const waiting = shell.renderGoogleAccountSectionHtml();
+    assert.match(waiting, /secure browser page/i);
+    assert.match(waiting, /verified callback/i);
+    assert.match(waiting, /update automatically/i);
+
+    shell.state.googleAccount = { status: 'error', error: 'sign_in_cancelled' };
+    const cancelled = shell.renderGoogleAccountSectionHtml();
+    assert.match(cancelled, /closed before it finished/i);
+    assert.doesNotMatch(cancelled, /sign_in_cancelled/);
+    shell.destroy();
+  } finally {
+    uninstall();
+  }
+});
+
+test('Google profile fields are escaped before account HTML and avatar markup are rendered', async () => {
+  const { uninstall } = installFakeNativeWebview();
+  try {
+    const container = document.createElement('div');
+    const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+    await shell.initialize();
+    window.yayra.auth = {};
+    shell.state.googleAccount = {
+      status: 'signed-in',
+      profile: {
+        sub: '1',
+        name: '<img src=x onerror=alert(1)>',
+        email: 'attacker@example.com<script>',
+        picture: 'javascript:alert(2)'
+      }
+    };
+    const html = shell.renderGoogleAccountSectionHtml();
+    assert.doesNotMatch(html, /<img src=x onerror/);
+    assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+    assert.doesNotMatch(html, /onerror=alert\(2\)/);
+    shell.destroy();
+  } finally {
+    uninstall();
+  }
+});
+
+test('Native engine: Google account browsing stays in-app while interactive sign-in is handed off', async () => {
+  const { calls, uninstall } = installFakeNativeWebview();
+  try {
+    const container = document.createElement('div');
+    const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+    await shell.initialize();
+    const tab = shell.getActiveTab();
+    const accountUrls = [
+      'https://accounts.google.com/',
+      'https://accounts.google.com/ManageAccount'
+    ];
+
+    for (const url of accountUrls) {
+      shell.navigateActiveTab(url);
+      assert.equal(shell.isSystemBrowserAuthHost(url), false);
+      assert.equal(shell.rootElement.querySelector('.fb-auth-handoff-fallback'), null);
+    }
+    const signInUrl = 'https://accounts.google.com/signin/v2/identifier';
+    shell.navigateActiveTab(signInUrl);
+    assert.equal(shell.isSystemBrowserAuthHost(signInUrl), true);
+    assert.ok(shell.rootElement.querySelector('.fb-auth-handoff-fallback'));
+
+    assert.deepEqual(calls.ensure.map((call) => call.url), [...accountUrls, signInUrl]);
+    assert.ok(shell._nativeWebviewTabIds.has(tab.id), 'the prior account page view is retained but hidden behind the handoff card');
+  } finally {
+    uninstall();
+  }
+});
+
+test('Native engine: system-browser Google auth clears the canceled embedded load without resetting the source tab', async () => {
+  const { fake, uninstall } = installFakeNativeWebview();
+  try {
+    const container = document.createElement('div');
+    const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+    await shell.initialize();
+    const tab = shell.getActiveTab();
+    shell.navigateActiveTab('https://mail.google.com/');
+    assert.equal(tab.isLoading, true, 'omnibox navigation starts the loader');
+
+    fake.emit({ tabId: tab.id, type: 'loading-start' });
+    fake.emit({ tabId: tab.id, type: 'loading-stop' });
+    fake.emit({ tabId: tab.id, type: 'system-browser-handoff', provider: 'google', reason: 'navigation' });
+
+    assert.equal(tab.isLoading, false, 'the main-process cancellation event clears the loader even if Chromium emits no did-stop-loading');
+    assert.equal(tab.url, 'https://mail.google.com/', 'the source URL is preserved');
+    assert.equal(shell.state.activeTabId, tab.id);
+    assert.ok(shell._nativeWebviewTabIds.has(tab.id), 'the source WebContentsView remains associated with the tab');
   } finally {
     uninstall();
   }

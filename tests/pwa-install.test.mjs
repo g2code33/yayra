@@ -304,4 +304,5 @@ test('WIRING (source pin): preview IPC + preload bridge + nameOverride honored i
   assert.match(mainSrc, /extractIconLink\(html, url\)/, 'non-PWA sites get their own <link rel=icon> logo');
   const preloadSrc = readFileSync(new URL('../electron/preload.cjs', import.meta.url), 'utf8');
   assert.match(preloadSrc, /installPageAsAppPreview/, 'the renderer can call the preview');
+  assert.match(preloadSrc, /installPageAsApp:\s*\(\{\s*url,\s*title,\s*nameOverride\s*\}\s*=\s*\{\}\)\s*=> ipcRenderer\.invoke\('yayra:install-page-as-app',\s*\{\s*url,\s*title,\s*nameOverride\s*\}\)/s, 'the editable name override reaches the desktop installer');
 });
