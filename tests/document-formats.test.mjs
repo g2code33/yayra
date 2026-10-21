@@ -68,6 +68,7 @@ const {
   createViewerForKind
 } = await import('../packages/shared-ui/src/services/documentViewers.js');
 const pptxEngine = await import('../packages/shared-ui/src/vendor/documents/pptxRenderer.mjs');
+const { renderPptxSlide } = await import('../packages/shared-ui/src/services/pptxDomRenderer.js');
 
 function mount(width = 1100, height = 760) {
   const host = document.createElement('div');
@@ -149,6 +150,43 @@ test('FORMAT ROUTING: signatures outrank spoofed names; MIME and OOXML parts fil
   assert.equal(stored.type, 'pptx');
   assert.equal(stored.route.viewer, 'pptx');
   assert.strictEqual(stored.bytes, pptx, 'the original byte buffer is retained unchanged');
+});
+
+test('PPTX PROJECTOR COLOURS: tables with automatic text never inherit the white slideshow chrome', () => {
+  const host = mount(960, 540);
+  host.style.color = '#f8fafc'; // projector chrome deliberately uses a light foreground
+  try {
+    const slide = {
+      slideNumber: 1,
+      background: '#ffffff',
+      shapes: [{
+        type: 'table', x: 40, y: 40, w: 700, h: 240,
+        table: {
+          cells: [[
+            { text: 'Automatic on slide' },
+            { text: 'Automatic on white cell', fill: '#ffffff' },
+            { text: 'Automatic on dark cell', fill: '#111827' },
+            { text: 'Automatic on mid cell', fill: '#777777' }
+          ]]
+        }
+      }]
+    };
+    const rendered = renderPptxSlide(host, { slide, width: 960, height: 540 });
+    assert.match(rendered.canvas.getAttribute('style') || '', /color:\s*#000000/i,
+      'the light slide owns a black automatic-text fallback instead of inheriting projector white');
+    const cells = host.querySelectorAll('td');
+    assert.equal(cells[0].style.color, '', 'an unfilled cell inherits from the authored slide canvas');
+    assert.equal(cells[1].style.color, '#000000', 'a light filled cell receives readable dark text');
+    assert.equal(cells[2].style.color, '#ffffff', 'a dark filled cell receives readable light text');
+    assert.equal(cells[3].style.color, '#000000', 'mid-tone fills choose the higher WCAG-contrast foreground');
+
+    slide.background = '#111827';
+    renderPptxSlide(host, { slide, width: 960, height: 540 });
+    assert.match(host.querySelector('.fb-pptx-slide-canvas').getAttribute('style') || '', /color:\s*#ffffff/i,
+      'automatic text also remains readable on genuinely dark authored slides');
+  } finally {
+    removeMount(host);
+  }
 });
 
 test('PPTX REAL ENGINE: PowerPoint geometry, themes, image crop, merged table, notes and text index survive', async () => {

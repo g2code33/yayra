@@ -346,7 +346,7 @@ test('capacitor auth bridge reports sign-in errors through the event channel wit
   assert.deepEqual(events.map((e) => e.type), ['signing-in', 'error']);
 });
 
-test('capacitor auth bridge openAccountPage opens only the hardcoded Google account URL in the system browser', async () => {
+test('capacitor auth bridge opens only trusted account and sanitized product destinations', async () => {
   const cap = fakeCapacitor();
   const bridge = createCapacitorAuthBridge({
     clientId: CLIENT_ID, platform: 'android', exchangeUrl: EXCHANGE_URL,
@@ -354,7 +354,9 @@ test('capacitor auth bridge openAccountPage opens only the hardcoded Google acco
     openBrowser: cap.openBrowser, onUrlOpen: cap.onUrlOpen
   });
   assert.deepEqual(await bridge.openAccountPage(), { ok: true });
-  assert.deepEqual(cap.opened, ['https://myaccount.google.com/']);
+  assert.deepEqual(await bridge.openGoogleProduct('https://mail.google.com/mail/u/0/?private=x'), { ok: true });
+  assert.deepEqual(await bridge.openGoogleProduct('https://mail.google.com.evil.example/'), { ok: false, error: 'invalid_google_product_origin' });
+  assert.deepEqual(cap.opened, ['https://myaccount.google.com/', 'https://mail.google.com/']);
 });
 
 // --- config resolution --------------------------------------------------------

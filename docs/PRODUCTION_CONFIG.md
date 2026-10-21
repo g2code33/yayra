@@ -8,6 +8,13 @@ environment, gitignored local config files, or GitHub Actions secrets.
 
 ## 1. Google Sign-In (app-level account feature)
 
+Published desktop builds must provide both desktop OAuth values. Google
+Account navigation now intentionally enters Yayra's callback-returning sign-in
+loop; releasing without its client configuration would replace a dead provider
+page with a deterministic `not_configured` error instead of completing the
+priority flow. Release CI therefore treats missing desktop values as a
+publishing error (local/machine config remains supported for development).
+
 | Name | Where set | Used by | Notes |
 | --- | --- | --- | --- |
 | `YAYRA_GOOGLE_CLIENT_ID` | env var (dev) | `electron/googleAuthConfig.cjs` | "Desktop app" OAuth client ID. See `docs/GOOGLE_SIGNIN.md`. |

@@ -20,6 +20,27 @@ function geometryRadius(geometry) {
   return '';
 }
 
+/**
+ * OOXML can leave “automatic” text without a concrete run colour. Keep that
+ * fallback tied to the authored slide/cell surface rather than inheriting the
+ * surrounding Yayra theme (the projector chrome intentionally uses white).
+ */
+function readableForeground(background, fallback = '#000000') {
+  const match = String(background || '').trim().match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+  if (!match) return fallback;
+  const raw = match[1].length === 3
+    ? Array.from(match[1], (value) => `${value}${value}`).join('')
+    : match[1];
+  const channels = [0, 2, 4].map((offset) => parseInt(raw.slice(offset, offset + 2), 16) / 255);
+  const linear = channels.map((value) => value <= 0.04045
+    ? value / 12.92
+    : ((value + 0.055) / 1.055) ** 2.4);
+  const luminance = (0.2126 * linear[0]) + (0.7152 * linear[1]) + (0.0722 * linear[2]);
+  // 0.179 is the crossover at which WCAG contrast against black becomes
+  // greater than contrast against white; choose the stronger of the two.
+  return luminance < 0.179 ? '#ffffff' : '#000000';
+}
+
 function symbolText(text, font, helpers) {
   const symbol = helpers?.isSymbolBulletFont?.(font);
   if (!symbol) return text;
@@ -168,7 +189,7 @@ function renderTable(doc, shape) {
         'padding:2px 5px',
         `font-size:${(cell.sizePt || 14) * PT_TO_PX * (shape.textScale || 1)}px`,
         cell.bold ? 'font-weight:700' : '',
-        cell.color ? `color:${cell.color}` : '',
+        cell.color ? `color:${cell.color}` : (cell.fill ? `color:${readableForeground(cell.fill)}` : ''),
         'vertical-align:middle',
         'overflow:hidden'
       ].filter(Boolean).join(';');
@@ -307,6 +328,7 @@ function renderShape(doc, shape, helpers, showImages, thumbnail) {
     shapeBase(shape),
     'overflow:hidden',
     shape.fill ? `background:${shape.fill}` : '',
+    shape.fill ? `color:${readableForeground(shape.fill)}` : '',
     shape.borderColor ? `border:${Math.max(1, shape.borderWidth || 1)}px solid ${shape.borderColor}` : '',
     geometryRadius(shape.geom) ? `border-radius:${geometryRadius(shape.geom)}` : '',
     'cursor:text',
@@ -357,6 +379,11 @@ export function renderPptxSlide(container, {
     `transform:scale(${scale})`,
     'transform-origin:top left',
     `background:${slide.background || '#fff'}`,
+    // PowerPoint's unresolved/automatic text defaults to the slide canvas,
+    // not to Yayra's surrounding chrome. Pin a surface-aware default so
+    // tables and runs without an explicit OOXML colour cannot inherit the
+    // white text used by the projector overlay.
+    `color:${readableForeground(slide.background)}`,
     slide.backgroundImageUrl ? `background-image:url(${JSON.stringify(slide.backgroundImageUrl)})` : '',
     slide.backgroundImageUrl ? 'background-size:cover;background-position:center' : '',
     `font-family:${FONT_STACK}`,

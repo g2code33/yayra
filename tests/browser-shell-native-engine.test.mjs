@@ -18,7 +18,7 @@ import { BrowserShell } from '../packages/shared-ui/src/components/BrowserShell.
  *    drives the injected native bridge mock.
  */
 
-function installFakeNativeWebview() {
+function installFakeNativeWebview({ auth = null } = {}) {
   const calls = { ensure: [], setBounds: [], setVisible: [], capture: [], destroy: [], goBack: [], goForward: [], reload: [], stop: [] };
   let eventListener = null;
   const fake = {
@@ -34,7 +34,7 @@ function installFakeNativeWebview() {
     onEvent: (cb) => { eventListener = cb; return () => { eventListener = null; }; },
     emit: (evt) => { if (eventListener) eventListener(evt); }
   };
-  globalThis.window.yayra = { webview: fake };
+  globalThis.window.yayra = { webview: fake, ...(auth ? { auth } : {}) };
   return { fake, calls, uninstall: () => { delete globalThis.window.yayra; } };
 }
 
@@ -377,37 +377,74 @@ test('Google profile fields are escaped before account HTML and avatar markup ar
   }
 });
 
-test('Native engine: Google account browsing stays in-app while interactive sign-in is handed off', async () => {
-  const { calls, uninstall } = installFakeNativeWebview();
+test('Native engine: Google Account navigation completes Yayra OAuth and replaces the dead embedded page with connected state', async () => {
+  const listeners = new Set();
+  let signInCalls = 0;
+  const profile = { sub: 'g-1', email: 'connected@example.com', name: 'Connected User' };
+  const auth = {
+    getSession: async () => ({ signedIn: false }),
+    onEvent: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
+    signIn: async () => {
+      signInCalls += 1;
+      for (const listener of listeners) listener({ type: 'signing-in' });
+      for (const listener of listeners) listener({ type: 'signed-in', profile });
+      return { ok: true, profile };
+    },
+    signOut: async () => ({ ok: true }),
+    openAccountPage: async () => ({ ok: true }),
+    openGoogleProduct: async () => ({ ok: true })
+  };
+  const { calls, uninstall } = installFakeNativeWebview({ auth });
+  let persistedTabs = null;
+  const sessionRepo = {
+    getLastSession: async () => ({ tabs: [], savedAt: null }),
+    saveSession: async (tabs) => { persistedTabs = tabs; }
+  };
   try {
     const container = document.createElement('div');
-    const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+    const shell = new BrowserShell({ container, platform: 'linux', isMobile: false, sessionRepo });
     await shell.initialize();
-    const tab = shell.getActiveTab();
-    const accountUrls = [
-      'https://accounts.google.com/',
-      'https://accounts.google.com/ManageAccount'
-    ];
 
-    for (const url of accountUrls) {
-      shell.navigateActiveTab(url);
-      assert.equal(shell.isSystemBrowserAuthHost(url), false);
-      assert.equal(shell.rootElement.querySelector('.fb-auth-handoff-fallback'), null);
-    }
-    const signInUrl = 'https://accounts.google.com/signin/v2/identifier';
-    shell.navigateActiveTab(signInUrl);
-    assert.equal(shell.isSystemBrowserAuthHost(signInUrl), true);
-    assert.ok(shell.rootElement.querySelector('.fb-auth-handoff-fallback'));
+    shell.navigateActiveTab('https://accounts.google.com/');
+    assert.ok(shell.rootElement.querySelector('.fb-google-account-connection'), 'the account tab gets a first-party connection surface');
+    assert.equal(shell.rootElement.querySelector('.fb-auth-handoff-fallback'), null, 'the old callback-less handoff card is gone');
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
 
-    assert.deepEqual(calls.ensure.map((call) => call.url), [...accountUrls, signInUrl]);
-    assert.ok(shell._nativeWebviewTabIds.has(tab.id), 'the prior account page view is retained but hidden behind the handoff card');
+    assert.equal(signInCalls, 1, 'typed account navigation starts the callback-returning flow once');
+    assert.ok(persistedTabs?.some((entry) => entry.url === 'https://accounts.google.com/'),
+      'the account tab is persisted before a Web/PWA full-page OAuth redirect can replace the document');
+    assert.equal(shell.state.googleAccount.signedIn, true);
+    assert.equal(shell.state.googleAccount.profile.email, profile.email);
+    assert.equal(calls.ensure.some((call) => call.url.includes('accounts.google.com')), false,
+      'the Google Account page that cannot receive Chrome cookies is never loaded in WebContentsView');
+    assert.match(shell.rootElement.querySelector('.fb-google-account-connection').textContent, /Google is connected to Yayra/);
+
+    shell.render();
+    shell.render();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(signInCalls, 1, 'chrome re-renders never reopen OAuth');
+
+    shell.navigateActiveTab('https://accounts.google.com/ManageAccount');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(signInCalls, 1, 'an already-connected profile is shown immediately without another consent loop');
   } finally {
     uninstall();
   }
 });
 
-test('Native engine: system-browser Google auth clears the canceled embedded load without resetting the source tab', async () => {
-  const { fake, uninstall } = installFakeNativeWebview();
+test('Native engine: Google product login redirect starts Yayra connection and clears the canceled embedded load', async () => {
+  const listeners = new Set();
+  let continuedOrigin = null;
+  const auth = {
+    getSession: async () => ({ signedIn: false }),
+    onEvent: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
+    signIn: async () => ({ ok: true, pending: true }),
+    signOut: async () => ({ ok: true }),
+    openAccountPage: async () => ({ ok: true }),
+    openGoogleProduct: async (origin) => { continuedOrigin = origin; return { ok: true }; }
+  };
+  const { fake, uninstall } = installFakeNativeWebview({ auth });
   try {
     const container = document.createElement('div');
     const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
@@ -418,12 +455,21 @@ test('Native engine: system-browser Google auth clears the canceled embedded loa
 
     fake.emit({ tabId: tab.id, type: 'loading-start' });
     fake.emit({ tabId: tab.id, type: 'loading-stop' });
-    fake.emit({ tabId: tab.id, type: 'system-browser-handoff', provider: 'google', reason: 'navigation' });
+    fake.emit({ tabId: tab.id, type: 'google-account-auth-required', provider: 'google', reason: 'navigation' });
+    shell.render();
 
-    assert.equal(tab.isLoading, false, 'the main-process cancellation event clears the loader even if Chromium emits no did-stop-loading');
-    assert.equal(tab.url, 'https://mail.google.com/', 'the source URL is preserved');
+    assert.equal(tab.isLoading, false, 'the canceled ServiceLogin cannot leave the source tab spinner stuck');
+    assert.equal(tab.url, 'https://mail.google.com/', 'the product URL is preserved for secure continuation');
     assert.equal(shell.state.activeTabId, tab.id);
-    assert.ok(shell._nativeWebviewTabIds.has(tab.id), 'the source WebContentsView remains associated with the tab');
+    assert.ok(shell._nativeWebviewTabIds.has(tab.id), 'the source WebContentsView remains associated for cleanup');
+    assert.ok(shell.rootElement.querySelector('.fb-google-account-connection'), 'the stale product surface is hidden by connection state');
+
+    for (const listener of listeners) listener({ type: 'signed-in', profile: { sub: 'g-product', email: 'person@example.com' } });
+    shell.rootElement.querySelector('.fb-google-account-continue-btn')?.click();
+    await Promise.resolve();
+    assert.equal(continuedOrigin, 'https://mail.google.com/',
+      'continuation passes only the credential-free product origin to the native bridge');
+    assert.ok(fake, 'native event source remains alive');
   } finally {
     uninstall();
   }

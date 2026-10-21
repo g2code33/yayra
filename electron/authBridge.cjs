@@ -21,11 +21,30 @@
  */
 
 const AUTH_EVENT_CHANNEL = 'yayra:auth-event';
+const MAX_GOOGLE_PRODUCT_ORIGIN_LENGTH = 512;
+
+/**
+ * Renderer requests may open only a credential-free HTTPS Google product
+ * origin. Paths, queries, fragments, URL credentials, lookalike hosts, and
+ * provider auth endpoints are never accepted across this convenience IPC.
+ */
+function normalizeGoogleProductOrigin(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > MAX_GOOGLE_PRODUCT_ORIGIN_LENGTH) return null;
+  let parsed;
+  try { parsed = new URL(value); } catch { return null; }
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password) return null;
+  const host = parsed.hostname.toLowerCase();
+  const googleOwned = host === 'google.com' || host.endsWith('.google.com')
+    || host === 'youtube.com' || host.endsWith('.youtube.com');
+  if (!googleOwned || host === 'accounts.google.com' || parsed.port) return null;
+  return `${parsed.origin}/`;
+}
 
 function createAuthBridge({
   ipcMain,
   shell,
   getMainWindow,
+  getWindowForWebContents,
   authStore,
   clientId,
   clientSecret,
@@ -35,18 +54,31 @@ function createAuthBridge({
 }) {
   let signingIn = false;
 
-  function send(type, payload = {}) {
-    const win = getMainWindow?.();
-    if (!win || win.isDestroyed()) return;
-    win.webContents.send(AUTH_EVENT_CHANNEL, { type, ...payload });
+  function resolveRequestWindow(event) {
+    try {
+      const win = event?.sender && getWindowForWebContents?.(event.sender);
+      if (win && !win.isDestroyed?.()) return win;
+    } catch { /* detached/closing renderer: fall back to the main window */ }
+    return getMainWindow?.() || null;
   }
 
-  async function handleSignIn() {
+  function send(type, payload = {}, preferredWindow = null) {
+    const windows = [];
+    if (preferredWindow && !preferredWindow.isDestroyed?.()) windows.push(preferredWindow);
+    const mainWindow = getMainWindow?.();
+    if (mainWindow && !mainWindow.isDestroyed?.() && !windows.includes(mainWindow)) windows.push(mainWindow);
+    for (const win of windows) {
+      win.webContents?.send?.(AUTH_EVENT_CHANNEL, { type, ...payload });
+    }
+  }
+
+  async function handleSignIn(event) {
     if (signingIn) return { ok: false, error: 'sign_in_already_in_progress' };
     if (!clientId || !clientSecret) return { ok: false, error: 'not_configured' };
 
     signingIn = true;
-    send('signing-in');
+    const requestWindow = resolveRequestWindow(event);
+    send('signing-in', {}, requestWindow);
     try {
       const { profile, tokens } = await signInImpl({
         clientId,
@@ -59,21 +91,31 @@ function createAuthBridge({
         logger
       });
       authStore.save({ profile, tokens });
-      send('signed-in', { profile });
+      send('signed-in', { profile }, requestWindow);
+      // The verified loopback callback means the browser ceremony is done.
+      // Bring the Yayra window that initiated it back so detached/profile
+      // windows update themselves instead of sending the result elsewhere.
+      const win = requestWindow && !requestWindow.isDestroyed?.()
+        ? requestWindow
+        : getMainWindow?.();
+      if (win && !win.isDestroyed?.()) {
+        try { win.show?.(); } catch { /* platform/window may not expose show */ }
+        try { win.focus?.(); } catch { /* best effort only */ }
+      }
       return { ok: true, profile };
     } catch (err) {
       const message = err && err.message ? err.message : String(err);
       logger?.error?.(`[yayra:auth] sign-in failed: ${message}`);
-      send('error', { message });
+      send('error', { message }, requestWindow);
       return { ok: false, error: message };
     } finally {
       signingIn = false;
     }
   }
 
-  async function handleSignOut() {
+  async function handleSignOut(event) {
     authStore.clear();
-    send('signed-out');
+    send('signed-out', {}, resolveRequestWindow(event));
     return { ok: true };
   }
 
@@ -99,12 +141,26 @@ function createAuthBridge({
     }
   }
 
+  async function handleOpenGoogleProduct(_event, { origin } = {}) {
+    const safeOrigin = normalizeGoogleProductOrigin(origin);
+    if (!safeOrigin) return { ok: false, error: 'invalid_google_product_origin' };
+    try {
+      await shell.openExternal(safeOrigin);
+      return { ok: true };
+    } catch (err) {
+      const message = err && err.message ? err.message : String(err);
+      logger?.error?.(`[yayra:auth] failed to open Google product: ${message}`);
+      return { ok: false, error: message };
+    }
+  }
+
   ipcMain.handle('yayra:auth-sign-in', handleSignIn);
   ipcMain.handle('yayra:auth-sign-out', handleSignOut);
   ipcMain.handle('yayra:auth-get-session', handleGetSession);
   ipcMain.handle('yayra:auth-open-account-page', handleOpenAccountPage);
+  ipcMain.handle('yayra:auth-open-google-product', handleOpenGoogleProduct);
 
-  return { handleSignIn, handleSignOut, handleGetSession, handleOpenAccountPage };
+  return { handleSignIn, handleSignOut, handleGetSession, handleOpenAccountPage, handleOpenGoogleProduct };
 }
 
-module.exports = { createAuthBridge, AUTH_EVENT_CHANNEL };
+module.exports = { createAuthBridge, AUTH_EVENT_CHANNEL, normalizeGoogleProductOrigin };

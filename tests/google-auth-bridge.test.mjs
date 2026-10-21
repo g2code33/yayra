@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createAuthBridge, AUTH_EVENT_CHANNEL } from '../electron/authBridge.cjs';
+import { createAuthBridge, AUTH_EVENT_CHANNEL, normalizeGoogleProductOrigin } from '../electron/authBridge.cjs';
 
 function fakeIpcMain() {
   const handlers = new Map();
@@ -13,7 +13,11 @@ function fakeIpcMain() {
 function fakeWindow() {
   const sent = [];
   return {
+    shown: 0,
+    focused: 0,
     isDestroyed: () => false,
+    show() { this.shown += 1; },
+    focus() { this.focused += 1; },
     webContents: { send: (channel, payload) => sent.push({ channel, payload }) },
     sent
   };
@@ -39,6 +43,8 @@ test('authBridge: sign-in success persists the session and emits signed-in with 
 
   const result = await ipcMain.invoke('yayra:auth-sign-in');
   assert.deepEqual(result, { ok: true, profile: { sub: '1', email: 'a@b.com' } });
+  assert.equal(win.shown, 1, 'Yayra is restored after the verified callback');
+  assert.equal(win.focused, 1, 'the connected account is brought back in front of the system browser');
 
   const events = win.sent.filter((e) => e.channel === AUTH_EVENT_CHANNEL).map((e) => e.payload.type);
   assert.deepEqual(events, ['signing-in', 'signed-in']);
@@ -49,6 +55,31 @@ test('authBridge: sign-in success persists the session and emits signed-in with 
 
   const session = await ipcMain.invoke('yayra:auth-get-session');
   assert.deepEqual(session, { signedIn: true, profile: { sub: '1', email: 'a@b.com' }, savedAt: '2026-01-01T00:00:00.000Z' });
+});
+
+test('authBridge: sign-in returns to the detached/profile window that initiated it', async () => {
+  const ipcMain = fakeIpcMain();
+  const mainWindow = fakeWindow();
+  const requestWindow = fakeWindow();
+  const sender = { id: 77 };
+  createAuthBridge({
+    ipcMain,
+    shell: { openExternal: async () => {} },
+    getMainWindow: () => mainWindow,
+    getWindowForWebContents: (webContents) => webContents === sender ? requestWindow : null,
+    authStore: fakeAuthStore(),
+    clientId: 'client-123',
+    clientSecret: 'secret-123',
+    signInImpl: async () => ({ profile: { sub: 'detached' }, tokens: { access_token: 'private' } })
+  });
+
+  const result = await ipcMain.invoke('yayra:auth-sign-in', { sender });
+  assert.equal(result.ok, true);
+  assert.deepEqual(mainWindow.sent.map((entry) => entry.payload.type), ['signing-in', 'signed-in'],
+    'the shared main account state stays synchronized too');
+  assert.deepEqual(requestWindow.sent.map((entry) => entry.payload.type), ['signing-in', 'signed-in']);
+  assert.equal(requestWindow.shown, 1);
+  assert.equal(requestWindow.focused, 1);
 });
 
 test('authBridge: sign-in failure emits an error event and does not persist a session', async () => {
@@ -233,6 +264,46 @@ test('authBridge: open-account-page reports an error instead of throwing when sh
   const result = await ipcMain.invoke('yayra:auth-open-account-page');
   assert.equal(result.ok, false);
   assert.match(result.error, /no handler registered/);
+});
+
+test('authBridge: Google product continuation accepts only credential-free owned HTTPS origins', () => {
+  assert.equal(normalizeGoogleProductOrigin('https://mail.google.com/mail/u/0/?secret=x#inbox'), 'https://mail.google.com/');
+  assert.equal(normalizeGoogleProductOrigin('https://drive.google.com/drive/my-drive'), 'https://drive.google.com/');
+  assert.equal(normalizeGoogleProductOrigin('https://www.youtube.com/watch?v=x'), 'https://www.youtube.com/');
+  for (const unsafe of [
+    'http://mail.google.com/',
+    'https://accounts.google.com/ServiceLogin',
+    'https://google.com.evil.example/',
+    'https://user:pass@mail.google.com/',
+    'https://mail.google.com:444/'
+  ]) assert.equal(normalizeGoogleProductOrigin(unsafe), null, unsafe);
+});
+
+test('authBridge: product continuation strips paths and rejects arbitrary renderer URLs', async () => {
+  const ipcMain = fakeIpcMain();
+  const win = fakeWindow();
+  const authStore = fakeAuthStore();
+  const opened = [];
+  createAuthBridge({
+    ipcMain,
+    shell: { openExternal: async (url) => { opened.push(url); } },
+    getMainWindow: () => win,
+    authStore,
+    clientId: 'c',
+    clientSecret: 's',
+    signInImpl: async () => ({})
+  });
+
+  assert.deepEqual(
+    await ipcMain.invoke('yayra:auth-open-google-product', null, { origin: 'https://mail.google.com/mail/u/0/?token=private' }),
+    { ok: true }
+  );
+  assert.deepEqual(opened, ['https://mail.google.com/']);
+  assert.deepEqual(
+    await ipcMain.invoke('yayra:auth-open-google-product', null, { origin: 'https://evil.example/' }),
+    { ok: false, error: 'invalid_google_product_origin' }
+  );
+  assert.deepEqual(opened, ['https://mail.google.com/']);
 });
 
 test('authBridge: get-session reflects no prior session as signedIn: false', async () => {

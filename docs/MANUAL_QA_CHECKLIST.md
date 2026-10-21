@@ -43,19 +43,23 @@ this list is the reality check.
 
 ## 1a. Google Account, Gmail, and product browsing (separate from app OAuth)
 
-- [ ] **Electron:** account home and `/ManageAccount` may remain in the native
-  website view. `/signin/v2/...`, `/v3/signin/...`, `/ServiceLogin`, OAuth
-  routes, and provider popups must be canceled before loading and opened once
-  in the OS default browser. The source Yayra tab, URL, and history stay intact.
+- [ ] **Electron priority return loop:** type `accounts.google.com`. No native
+  `ERR_FAILED` page may appear. The OS browser must run Yayra OAuth once; after
+  loopback, Yayra comes to the front, its avatar/profile updates, and the tab
+  says “Google is connected to Yayra”. Re-renders/Retry must not reopen OAuth.
+- [ ] **Gmail/product redirect:** from signed-out Gmail, let Google request
+  `/ServiceLogin`. The raw login URL must not be opened with no return channel.
+  Yayra OAuth returns the profile while preserving the Gmail tab URL/history;
+  its connected card continues only to `https://mail.google.com/`.
 - [ ] **Android/iOS:** repeat from Gmail and Google Account in the native
-  website engine. Interactive sign-in must use Custom Tabs/the secure browser
-  surface; the source website tab remains unchanged.
+  website engine. WebView cancels interactive sign-in, the platform OAuth
+  adapter returns by exact app deep link, and the Yayra avatar/card updates.
 - [ ] Open a captured `https://accounts.google.com/v3/signin/rejected?...`
-  URL. The browser must receive clean HTTPS `/ServiceLogin`, not the rejected
-  URL; only a safe HTTPS continuation may survive.
-- [ ] Trigger **Continue with Google** on a third-party website. Verify Yayra
-  honestly explains that the external browser owns its cookies. Do not expect
-  or fake cookie transfer into the untouched embedded tab.
+  URL. It must enter Yayra's connection surface, not reopen the rejection or a
+  callback-less ServiceLogin. Only a safe Google-product origin may survive.
+- [ ] Trigger **Continue with Google** on a third-party website. Its original
+  client ID/callback must remain external and must not be replaced with Yayra
+  OAuth. Do not expect or fake cookie transfer into the untouched embedded tab.
 - [ ] Confirm no auth event/renderer log contains authorization URL state, an
   access token, refresh token, ID token, or PKCE verifier.
 - [ ] **Electron live-surface regression:** on an already-open website, focus
@@ -158,6 +162,13 @@ this list is the reality check.
   readable on its dark surface. Hover/focus **Desktop app** and neighboring
   actions: no large native tooltip may cover another row. Screen-reader output
   must still announce each action and its longer explanation.
+- [ ] Hover, keyboard-focus, and press **Download**, both **Present** controls,
+  and **Print** in both themes. Every label must stay fully opaque and readable;
+  no accent/selected state may become dark-on-dark or washed out.
+- [ ] Compare a light-background slide containing an uncoloured table in normal
+  view and slideshow view. Every table heading/cell must remain equally visible.
+  Repeat with a dark slide and light/dark filled cells to confirm automatic text
+  receives a readable fallback without changing explicitly authored colours.
 - [ ] Exercise Present from beginning, visible Download and Print, Desktop app,
   Close presentation, notes colour, slide navigation, search, zoom, thumbnails,
   notes, and projector mode to confirm the density/contrast change did not

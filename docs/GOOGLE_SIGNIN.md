@@ -52,22 +52,37 @@ Yayra handles the problem as follows:
   sign-in routes such as `/o/oauth2/...`, `/oauth2/...`, `/signin/oauth/...`,
   `/gsi/select/...`, `/signin/v2/...`, `/v3/signin/...`, `/ServiceLogin`,
   `/InteractiveLogin`, `/AccountChooser`, and `/AddSession`.
-- Main-frame navigations, redirects, and popups to those routes are canceled
-  before they load in the embedded website engine and are opened in the
-  system browser (or Capacitor Browser surface on Android/iOS).
-- A Google `/signin/rejected` or `/v3/signin/rejected` URL is not reopened as
-  the same dead-end error page. Yayra creates a clean HTTPS `/ServiceLogin`
-  entry point and preserves only a bounded, credential-free HTTPS `continue`
-  destination.
-- The originating Yayra tab and history remain unchanged. Authorization URLs
-  are not echoed from the Electron main process to renderer IPC or logs.
+- Google-owned account entry (`accounts.google.com/`, `ManageAccount`,
+  `myaccount.google.com`, and first-party interactive sign-in) now starts
+  **Yayra's own callback-returning OAuth connection**. The external user-agent
+  performs consent, the verified callback returns the sanitized profile, and
+  the Yayra account button/tab updates automatically. Returning from the
+  browser no longer leaves an `ERR_FAILED` account page retrying forever.
+- A Gmail or other Google product redirect into first-party `ServiceLogin` is
+  canceled before it loads. Yayra keeps the product URL, runs the same account
+  connection, then shows a connected-state card with a safe continuation to
+  that product's credential-free HTTPS origin.
+- Third-party `/o/oauth2`, `/signin/oauth`, and `/gsi/select` requests are not
+  replaced by Yayra OAuth. Their original relying-party client ID and callback
+  continue in the external browser exactly as requested.
+- A Google `/signin/rejected` or `/v3/signin/rejected` URL is never reopened as
+  the same dead-end page. First-party rejection enters the Yayra connection
+  flow; a bounded HTTPS Google-product continuation is retained only for the
+  post-connection action.
+- The originating Yayra tab/history stay intact. Captured first-party account
+  URLs are not echoed from Electron main-process events or Android native
+  events into renderer JavaScript or logs; only provider/reason metadata is
+  returned. After a successful desktop callback, the initiating Yayra window
+  is shown and focused so the connected state is immediately visible.
 
 The Google product remains signed in in the external browser that created the
 cookie. There is no provider-supported way to import that cookie into an
-Electron/Android embedded page. Consequently, a third-party website OAuth
-flow opened externally may finish in the external browser rather than signing
-in the untouched Yayra website tab. Yayra states this honestly in the handoff
-card instead of pretending that app OAuth tokens create a website session.
+Electron/Android embedded page. Yayra therefore transfers the **verified
+Google identity/profile**, not a browser cookie: the Yayra avatar and account
+state are connected, while Google Account/Gmail continuation opens at a
+sanitized Google-owned origin in the secure browser where its session exists.
+A third-party website OAuth flow may likewise finish in that browser because
+its callback belongs to the relying website, not to Yayra.
 
 ## Electron desktop: Yayra app identity
 
@@ -275,11 +290,20 @@ Live Google consent cannot be completed in headless CI. Before release, verify:
    its address should become `/complete`, and Yayra should show the profile.
 4. Cancel, alter state, wait past timeout, and launch with no default browser;
    each path must fail clearly without creating a session.
-5. In a normal tab, trigger Google OAuth and direct Google Account sign-in.
-   Confirm the source tab stays unchanged and the system browser opens once.
-6. Open a captured `/v3/signin/rejected?...continue=...` URL. Confirm Yayra
-   opens clean `/ServiceLogin` in the browser and preserves only a safe HTTPS
+5. Type `accounts.google.com` in a normal Yayra tab. Confirm no native
+   `ERR_FAILED` page appears: the system browser performs Yayra OAuth once,
+   returns through loopback, focuses Yayra, updates the account avatar, and
+   changes the tab card to “Google is connected to Yayra”.
+6. From a signed-out Gmail tab, trigger its `/ServiceLogin` redirect. Confirm
+   the source product URL/history stays unchanged, the raw ServiceLogin URL is
+   not reopened, and successful Yayra OAuth offers a credential-free Gmail
    continuation.
+7. Trigger a third-party Google OAuth URL with its own `client_id`. Confirm it
+   still opens unchanged in the system browser and is not replaced by Yayra's
+   first-party callback.
+8. Open a captured `/v3/signin/rejected?...continue=...` URL. Confirm it enters
+   the Yayra connection surface and retains only a safe Google-product origin
+   for continuation, never the rejected page or its opaque path/query.
 
 ### Web / PWA
 
@@ -297,8 +321,9 @@ Live Google consent cannot be completed in headless CI. Before release, verify:
 3. Test wrong-state, prefix-confusable, duplicate, token-bearing, unrelated,
    canceled, and timed-out callbacks.
 4. Navigate to Gmail/Google Account sign-in from a native website tab. Confirm
-   the WebView cancels the interactive route and the secure browser surface
-   opens, while the original Yayra tab/history stays unchanged.
+   the WebView cancels the interactive route, the platform OAuth adapter
+   returns the verified profile by deep link, the Yayra avatar/card updates,
+   and the original product URL/history stays unchanged.
 
 Automated coverage is in `tests/google-oauth.test.mjs`,
 `tests/google-auth-bridge.test.mjs`, `tests/google-auth-web.test.mjs`,

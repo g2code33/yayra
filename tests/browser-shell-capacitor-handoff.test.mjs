@@ -86,7 +86,7 @@ test('Capacitor: HTTP Google OAuth authorization is upgraded before it opens ext
   }
 });
 
-test('Capacitor: Google embedded-browser rejection is reopened as a clean HTTPS ServiceLogin URL', async () => {
+test('Capacitor: Google embedded-browser rejection becomes Yayra account connection, never another callback-less ServiceLogin', async () => {
   const { opened, uninstall } = installFakeCapacitorBrowser();
   try {
     const container = document.createElement('div');
@@ -97,10 +97,10 @@ test('Capacitor: Google embedded-browser rejection is reopened as a clean HTTPS 
     shell.navigateActiveTab(rejected.toString());
     await Promise.resolve();
     await Promise.resolve();
-    assert.equal(opened.length, 1);
-    const repaired = new URL(opened[0]);
-    assert.equal(repaired.pathname, '/ServiceLogin');
-    assert.equal(repaired.searchParams.get('continue'), 'https://mail.google.com/mail/u/0/');
+    assert.deepEqual(opened, [], 'the rejected provider page is not reopened without a return channel');
+    assert.ok(shell.rootElement.querySelector('.fb-google-account-connection'));
+    assert.match(shell.rootElement.querySelector('.fb-google-account-connection').textContent, /Google connection did not finish|Connect Google to Yayra/);
+    assert.equal(shell._googleConnectionProductOrigin(shell._googleAccountConnections.get(shell.getActiveTab().id)), 'https://mail.google.com/');
   } finally {
     uninstall();
   }

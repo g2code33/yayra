@@ -13,6 +13,7 @@ import {
   generatePkcePair,
   generateState,
   loadProfile,
+  normalizeGoogleProductOrigin,
   parseCallbackParams,
   saveProfile
 } from '../src/services/googleAuthWeb.js';
@@ -395,6 +396,15 @@ test('web auth bridge openAccountPage only ever opens the single hardcoded Googl
   const { bridge, windows } = makeBridge();
   assert.deepEqual(await bridge.openAccountPage(), { ok: true });
   assert.deepEqual(windows, ['https://myaccount.google.com/']);
+});
+
+test('web auth bridge opens only sanitized Google product origins', async () => {
+  const { bridge, windows } = makeBridge();
+  assert.equal(normalizeGoogleProductOrigin('https://mail.google.com/mail/u/0/?auth=private'), 'https://mail.google.com/');
+  assert.deepEqual(await bridge.openGoogleProduct('https://mail.google.com/mail/u/0/?auth=private'), { ok: true });
+  assert.deepEqual(windows, ['https://mail.google.com/']);
+  assert.deepEqual(await bridge.openGoogleProduct('https://google.com.evil.example/'), { ok: false, error: 'invalid_google_product_origin' });
+  assert.deepEqual(windows, ['https://mail.google.com/']);
 });
 
 test('web auth bridge onEvent unsubscribe stops delivery and a throwing listener cannot break others', async () => {

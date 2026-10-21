@@ -62,6 +62,18 @@ export const GOOGLE_AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/aut
 export const DEFAULT_SCOPES = ['openid', 'email', 'profile'];
 export const CALLBACK_PATH = '/auth/callback';
 export const PENDING_KEY = 'yayra:google-auth:pending';
+
+export function normalizeGoogleProductOrigin(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 512) return null;
+  let parsed;
+  try { parsed = new URL(value); } catch { return null; }
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.port) return null;
+  const host = parsed.hostname.toLowerCase();
+  const googleOwned = host === 'google.com' || host.endsWith('.google.com')
+    || host === 'youtube.com' || host.endsWith('.youtube.com');
+  if (!googleOwned || host === 'accounts.google.com') return null;
+  return `${parsed.origin}/`;
+}
 export const PROFILE_KEY = 'yayra:google-account';
 export const PENDING_MAX_AGE_MS = 10 * 60 * 1000;
 const MAX_CALLBACK_QUERY_LENGTH = 8192;
@@ -432,6 +444,12 @@ export function createWebAuthBridge({
     // generic "open any URL" capability.
     async openAccountPage() {
       openWindow('https://myaccount.google.com/');
+      return { ok: true };
+    },
+    async openGoogleProduct(originValue) {
+      const safeOrigin = normalizeGoogleProductOrigin(originValue);
+      if (!safeOrigin) return { ok: false, error: 'invalid_google_product_origin' };
+      openWindow(safeOrigin);
       return { ok: true };
     }
   };

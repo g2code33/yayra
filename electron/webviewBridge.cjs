@@ -40,16 +40,19 @@ const { buildMediaCompatibilityScript, installMediaCompatibility } = require('./
  * A separate Electron BrowserWindow is still controlled by the app, so it is
  * not the OS external user-agent required by that policy. Yayra therefore
  * cancels recognized OAuth and interactive Google Account sign-in routes
- * before they enter a WebContentsView and opens them in the user's default
- * secure browser. The source Yayra tab and its profile remain unchanged;
- * browser cookies are never copied or imported.
+ * before they enter a WebContentsView. Third-party OAuth requests continue in
+ * the user's default secure browser. First-party Google Account entry/sign-in
+ * instead requests Yayra's own Authorization Code + PKCE connection flow, so
+ * the verified callback can actually update Yayra's account state rather than
+ * abandoning the user on a dead embedded page. Browser cookies are never
+ * copied or imported.
  *
- * This classifier is deliberately route-scoped on the exact
- * accounts.google.com host. Ordinary Google Search, Gmail content, account
- * management, logout, and other product navigation are not hijacked. Apple
- * and Microsoft retain the same external-browser handoff. App-level Yayra
- * identity has a separate Authorization Code + PKCE loop and returns through
- * its registered callback; arbitrary website sessions do not.
+ * This classifier is deliberately route-scoped to trusted Google account
+ * entry points. Ordinary Search, Gmail content, logout, and other product
+ * navigation are not hijacked. Apple and Microsoft retain the same external-
+ * browser handoff. A third-party website's OAuth callback remains owned by
+ * that website; Yayra's first-party identity callback returns only Yayra's
+ * sanitized Google profile.
  */
 
 // Identity-provider endpoints that cannot safely complete in an embedded
@@ -62,6 +65,7 @@ const SYSTEM_BROWSER_AUTH_HOSTS = Object.freeze([
 ]);
 const GOOGLE_OAUTH_PATH = /^\/(?:o\/oauth2(?:\/|$)|oauth2(?:\/|$)|signin\/oauth(?:\/|$)|gsi\/select(?:\/|$))/i;
 const GOOGLE_INTERACTIVE_SIGNIN_PATH = /^\/(?:signin\/(?:v2|challenge|identifier|rejected)(?:\/|$)|v3\/signin(?:\/|$)|ServiceLogin(?:\/|$)|InteractiveLogin(?:\/|$)|AccountChooser(?:\/|$)|AddSession(?:\/|$))/i;
+const GOOGLE_ACCOUNT_PORTAL_PATH = /^\/(?:ManageAccount(?:\/|$)|signin\/?$)?$/i;
 const GOOGLE_REJECTED_SIGNIN_PATH = /^\/(?:signin\/rejected|v3\/signin\/rejected)(?:\/|$)/i;
 const MAX_AUTH_HANDOFF_URL_LENGTH = 8192;
 
@@ -1025,9 +1029,30 @@ function isGoogleOAuthAuthorizationUrl(rawUrl) {
 }
 
 /**
+ * Google-owned account entry points for which Yayra can complete its own
+ * verified OAuth loop. This is intentionally disjoint from third-party OAuth
+ * authorization URLs: those must preserve the relying party's client_id and
+ * callback in the external browser. Account root/management and Google's
+ * first-party interactive login routes otherwise cannot establish cookies in
+ * an Electron partition, so loading or merely reopening them externally would
+ * leave Yayra signed out forever.
+ */
+function requiresYayraGoogleAccountConnection(rawUrl) {
+  const parsed = parseBoundedAuthUrl(rawUrl);
+  if (!parsed) return false;
+  const hostname = parsed.hostname.toLowerCase();
+  if (hostname === 'myaccount.google.com') return true;
+  if (hostname !== 'accounts.google.com' || GOOGLE_OAUTH_PATH.test(parsed.pathname)) return false;
+  return GOOGLE_ACCOUNT_PORTAL_PATH.test(parsed.pathname)
+    || GOOGLE_INTERACTIVE_SIGNIN_PATH.test(parsed.pathname);
+}
+
+/**
  * Exact Google identity routes that require an external user-agent. This is
- * intentionally narrower than accounts.google.com as a whole: ManageAccount,
- * logout, and product/account browsing remain ordinary web navigation.
+ * intentionally narrower than accounts.google.com as a whole: logout and
+ * ordinary product browsing remain ordinary web navigation. First-party
+ * account routes are connected through Yayra OAuth by the separate predicate
+ * above, while third-party OAuth remains an exact external handoff.
  */
 function isGoogleInteractiveAuthenticationUrl(rawUrl) {
   const parsed = parseBoundedAuthUrl(rawUrl);
@@ -1442,9 +1467,21 @@ function createWebviewBridge({
   }
 
   /**
-   * Open a recognized auth URL in the OS external user-agent. Only provider
-   * metadata crosses IPC afterwards; the authorization URL (which can contain
-   * state and a PKCE challenge) is not echoed to renderer code or logs.
+   * Ask the renderer to start Yayra's own verified Google OAuth loop. Only
+   * provider/reason metadata crosses IPC: a captured ServiceLogin URL may
+   * carry opaque continuation data and is never echoed into renderer events.
+   */
+  function requestYayraGoogleAccountConnection(entry, reason = 'navigation') {
+    if (!entry) return false;
+    sendTo(entry, 'google-account-auth-required', { provider: 'google', reason });
+    return true;
+  }
+
+  /**
+   * Open a recognized third-party auth URL in the OS external user-agent.
+   * Only provider metadata crosses IPC afterwards; the authorization URL
+   * (which can contain state and a PKCE challenge) is not echoed to renderer
+   * code or logs.
    */
   async function openAuthInSystemBrowser(entry, rawUrl, reason = 'navigation') {
     if (!entry || !requiresSystemBrowserAuth(rawUrl, authHosts)) return false;
@@ -1459,6 +1496,14 @@ function createWebviewBridge({
       sendTo(entry, 'system-browser-handoff-failed', { provider, reason });
       return false;
     }
+  }
+
+  async function routeAuthentication(entry, rawUrl, reason = 'navigation') {
+    if (requiresYayraGoogleAccountConnection(rawUrl)) {
+      requestYayraGoogleAccountConnection(entry, reason);
+      return 'yayra-google-account';
+    }
+    return (await openAuthInSystemBrowser(entry, rawUrl, reason)) ? 'external' : 'failed';
   }
 
   function entryForWebAuthnFrame(ses, frame) {
@@ -1913,15 +1958,17 @@ function createWebviewBridge({
       const isMainFrame = typeof details?.isMainFrame === 'boolean'
         ? details.isMainFrame
         : (typeof args[3] === 'boolean' ? args[3] : true);
-      if (!isMainFrame || !requiresSystemBrowserAuth(url, authHosts)) return;
+      if (!isMainFrame || (!requiresSystemBrowserAuth(url, authHosts)
+        && !requiresYayraGoogleAccountConnection(url))) return;
 
       event?.preventDefault?.();
       // Prevent the canceled navigation from leaving a stale loading spinner
       // in the original tab. No URL/history event is emitted: the in-app page
-      // stays where it was before the provider redirect. The external browser
-      // owns the complete interactive provider flow.
+      // stays where it was before the provider redirect. Third-party OAuth is
+      // external; first-party Google account entry starts Yayra's callback-
+      // returning OAuth loop instead of abandoning the app session.
       sendTo(entry, 'loading-stop');
-      void openAuthInSystemBrowser(entry, url, 'navigation');
+      void routeAuthentication(entry, url, 'navigation');
     };
     wc.on('will-navigate', handoffAuthNavigation);
     wc.on('will-redirect', handoffAuthNavigation);
@@ -1971,8 +2018,8 @@ function createWebviewBridge({
         sendTo(entry, 'system-browser-handoff', { url: externalTarget });
         return { action: 'deny' };
       }
-      if (requiresSystemBrowserAuth(url, authHosts)) {
-        void openAuthInSystemBrowser(entry, url, 'popup');
+      if (requiresSystemBrowserAuth(url, authHosts) || requiresYayraGoogleAccountConnection(url)) {
+        void routeAuthentication(entry, url, 'popup');
         return { action: 'deny' };
       }
       // Let the renderer decide (usually: open as a new Yayra tab).
@@ -2065,12 +2112,21 @@ function createWebviewBridge({
     const win = (hostWin && !hostWin.isDestroyed?.()) ? hostWin : getMainWindow();
     if (!win || win.isDestroyed() || !tabId || !url) return { handedOffToSystemBrowser: false };
 
+    if (requiresYayraGoogleAccountConnection(url)) {
+      // Root/Manage Account/first-party login cannot establish a Google
+      // website cookie in this isolated partition. Request Yayra's callback-
+      // returning OAuth flow instead; unlike the old raw ServiceLogin handoff,
+      // this can update the account avatar/session when the user comes back.
+      requestYayraGoogleAccountConnection({ tabId, hostWc }, 'direct-navigation');
+      return { handedOffToSystemBrowser: false, googleAccountConnectionRequired: true };
+    }
+
     if (requiresSystemBrowserAuth(url, authHosts)) {
       // No native website view is needed merely to launch the provider. Use a
       // minimal entry-shaped target so the completion event returns only to
       // the shell window that requested this tab.
-      const handedOff = await openAuthInSystemBrowser({ tabId, hostWc }, url, 'direct-navigation');
-      return { handedOffToSystemBrowser: handedOff };
+      const mode = await routeAuthentication({ tabId, hostWc }, url, 'direct-navigation');
+      return { handedOffToSystemBrowser: mode === 'external' };
     }
 
     let entry = views.get(key);
@@ -2902,6 +2958,7 @@ module.exports = {
   OPEN_EXTERNAL_SCHEME,
   isGoogleOAuthAuthorizationUrl,
   isGoogleInteractiveAuthenticationUrl,
+  requiresYayraGoogleAccountConnection,
   requiresSystemBrowserAuth,
   secureSystemBrowserAuthUrl,
   decodeOpenExternalRequest,

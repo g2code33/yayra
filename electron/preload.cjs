@@ -129,6 +129,9 @@ const api = {
     signOut: () => ipcRenderer.invoke('yayra:auth-sign-out'),
     getSession: () => ipcRenderer.invoke('yayra:auth-get-session'),
     openAccountPage: () => ipcRenderer.invoke('yayra:auth-open-account-page'),
+    // Credential-free product origins only; main validates exact HTTPS Google
+    // ownership before invoking the OS browser.
+    openGoogleProduct: (origin) => ipcRenderer.invoke('yayra:auth-open-google-product', { origin }),
     onEvent: (callback) => {
       const listener = (_event, payload) => callback(payload);
       ipcRenderer.on(AUTH_EVENT_CHANNEL, listener);

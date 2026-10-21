@@ -1261,6 +1261,7 @@ function registerIpcBridges() {
     ipcMain,
     shell,
     getMainWindow: () => mainWindow,
+    getWindowForWebContents: (wc) => BrowserWindow.fromWebContents(wc),
     authStore,
     clientId: resolveGoogleClientId(),
     clientSecret: resolveGoogleClientSecret(),

@@ -144,4 +144,6 @@ test('RELEASE PIPELINE: release.yml injects the Google config from repo secrets 
   assert.equal(injections >= 2, true, 'linux and windows jobs each inject google-auth.config.json before packaging');
   assert.equal(yml.includes('YAYRA_GOOGLE_CLIENT_ID'), true, 'reads the client id from repo secrets');
   assert.equal(yml.includes('YAYRA_GOOGLE_CLIENT_SECRET'), true, 'reads the client secret from repo secrets');
+  assert.equal((yml.match(/Published desktop builds require YAYRA_GOOGLE_CLIENT_ID/g) || []).length >= 2, true,
+    'both publishing jobs fail closed instead of shipping a callback flow with no client configuration');
 });

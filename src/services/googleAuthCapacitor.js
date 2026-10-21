@@ -59,6 +59,7 @@ import {
   generatePkcePair,
   generateState,
   loadProfile,
+  normalizeGoogleProductOrigin,
   readBoundedExchangeResponse,
   safeExchangeErrorCode,
   sanitizeGoogleProfile,
@@ -284,6 +285,12 @@ export function createCapacitorAuthBridge({
     // Same single hardcoded trusted URL as every other platform's bridge.
     async openAccountPage() {
       await openBrowser({ url: 'https://myaccount.google.com/' });
+      return { ok: true };
+    },
+    async openGoogleProduct(originValue) {
+      const safeOrigin = normalizeGoogleProductOrigin(originValue);
+      if (!safeOrigin) return { ok: false, error: 'invalid_google_product_origin' };
+      await openBrowser({ url: safeOrigin });
       return { ok: true };
     }
   };

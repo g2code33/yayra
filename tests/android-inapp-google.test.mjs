@@ -178,26 +178,82 @@ test('ANDROID: a native-page OAuth redirect is canceled, opened with Browser, an
   }
 });
 
-test('ANDROID: account browsing stays native while interactive Google sign-in uses the secure browser', async () => {
+test('ANDROID: first-party ServiceLogin redirect connects Yayra instead of opening a raw browser page with no return', async () => {
   const android = fakeAndroid();
+  const listeners = new Set();
+  let signInCalls = 0;
+  window.yayra = {
+    auth: {
+      getSession: async () => ({ signedIn: false }),
+      onEvent: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
+      signIn: async () => {
+        signInCalls += 1;
+        return { ok: true, pending: true };
+      },
+      signOut: async () => ({ ok: true }),
+      openAccountPage: async () => ({ ok: true })
+    }
+  };
   const { shell } = await makeShell();
   try {
-    const browsingUrls = [
-      'https://accounts.google.com/',
-      'https://accounts.google.com/ManageAccount'
-    ];
-    for (const [index, url] of browsingUrls.entries()) {
-      const { iframe } = shell.createWebContentFrame(url, { tabId: `tab-account-${index}`, allowNative: false });
-      assert.equal(iframe, null, `${url} uses the in-app native WebView, not an iframe`);
-    }
-    const signInUrl = 'https://accounts.google.com/signin/v2/identifier';
-    const { iframe } = shell.createWebContentFrame(signInUrl, { tabId: 'tab-account-signin', allowNative: false });
-    assert.equal(iframe, null);
+    shell.navigateActiveTab('https://mail.google.com/');
+    const tab = shell.getActiveTab();
+    android.deliverEvent({ id: tab.id, type: 'loading-stop' });
+    android.deliverEvent({
+      id: tab.id,
+      type: 'google-account-auth-required',
+      reason: 'android-navigation'
+    });
     await flush();
-    assert.deepEqual(android.calls.attach.map((call) => call.url), browsingUrls);
-    assert.deepEqual(android.calls.browserOpen, [signInUrl]);
+
+    assert.equal(signInCalls, 1);
+    assert.deepEqual(android.calls.browserOpen, [], 'the raw ServiceLogin URL is not opened');
+    assert.equal(tab.url, 'https://mail.google.com/', 'the original product remains the continuation target');
+    assert.ok(shell.rootElement.querySelector('.fb-google-account-connection'));
   } finally {
     shell.destroy();
+    delete window.yayra;
+    delete window.Capacitor;
+    delete globalThis.localStorage;
+  }
+});
+
+test('ANDROID: Google Account entry uses callback-returning app identity instead of a cookie-less native/raw handoff', async () => {
+  const android = fakeAndroid();
+  const listeners = new Set();
+  let signInCalls = 0;
+  const profile = { sub: 'android-google', email: 'mobile@example.com', name: 'Mobile User' };
+  window.yayra = {
+    auth: {
+      getSession: async () => ({ signedIn: false }),
+      onEvent: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
+      signIn: async () => {
+        signInCalls += 1;
+        for (const listener of listeners) listener({ type: 'signing-in' });
+        for (const listener of listeners) listener({ type: 'signed-in', profile });
+        return { ok: true, profile };
+      },
+      signOut: async () => ({ ok: true }),
+      openAccountPage: async () => ({ ok: true })
+    }
+  };
+  const { shell } = await makeShell();
+  try {
+    shell.navigateActiveTab('https://accounts.google.com/');
+    await flush();
+    assert.equal(signInCalls, 1, 'the native external-user-agent OAuth adapter starts once');
+    assert.equal(shell.state.googleAccount.profile.email, profile.email);
+    assert.ok(shell.rootElement.querySelector('.fb-google-account-connection'));
+    assert.match(shell.rootElement.querySelector('.fb-google-account-connection').textContent, /Google is connected to Yayra/);
+    assert.deepEqual(android.calls.attach, [], 'accounts.google.com is never loaded into Android WebView');
+    assert.deepEqual(android.calls.browserOpen, [], 'Browser.open is owned by the auth adapter, not a raw ServiceLogin handoff');
+
+    shell.navigateActiveTab('https://accounts.google.com/ManageAccount');
+    await flush();
+    assert.equal(signInCalls, 1, 'connected account management does not reopen consent');
+  } finally {
+    shell.destroy();
+    delete window.yayra;
     delete window.Capacitor;
     delete globalThis.localStorage;
   }
@@ -390,8 +446,9 @@ test('KOTLIN PIN: the native tab engine exists, is safe, and reports through tab
   assert.ok(manager.includes('settings.allowFileAccess = false'), 'file access OFF');
   assert.ok(manager.includes('settings.allowContentAccess = false'), 'content access OFF');
   assert.ok(manager.includes('isSystemBrowserAuthUrl(uri)'), 'Google auth is path-classified rather than all of accounts.google.com');
-  assert.ok(manager.includes('val GOOGLE_AUTH_PATH = Regex(') && manager.includes('signin/oauth'), 'Android hands off explicit OAuth routes');
-  assert.ok(manager.includes('v3/signin') && manager.includes('ServiceLogin'), 'interactive Google Account sign-in also uses the external user-agent');
+  assert.ok(manager.includes('val GOOGLE_OAUTH_PATH = Regex(') && manager.includes('signin/oauth'), 'Android hands off explicit third-party OAuth routes');
+  assert.ok(manager.includes('val GOOGLE_INTERACTIVE_SIGNIN_PATH = Regex(') && manager.includes('v3/signin') && manager.includes('ServiceLogin'),
+    'interactive Google Account sign-in is classified separately for Yayra connection');
   assert.equal(manager.includes('|signin(?:/|$)'), false, 'a broad /signin prefix is not enough to trigger handoff');
   assert.ok(manager.includes('GOOGLE_REJECTED_SIGNIN_PATH') && manager.includes('appendPath("ServiceLogin")'), 'embedded-browser rejection is repaired before system-browser launch');
   assert.ok(manager.includes('request.isForMainFrame && isSystemBrowserAuthUrl(targetUri)'), 'top-level provider redirects are stopped before loading');
@@ -400,10 +457,18 @@ test('KOTLIN PIN: the native tab engine exists, is safe, and reports through tab
     manager.indexOf('val target = targetUri.toString()')
   );
   assert.ok(authNavigationGuard.includes('emitEvent(id, "loading-stop")'), 'a canceled native OAuth navigation clears the loader even when onPageFinished will not fire');
-  assert.ok(manager.includes('auth-navigation-blocked'), 'the shell receives a safe handoff request');
+  assert.ok(authNavigationGuard.includes('emitEvent(id, "google-account-auth-required")'),
+    'first-party ServiceLogin emits metadata rather than its captured URL');
+  const firstPartySignal = authNavigationGuard.slice(
+    authNavigationGuard.indexOf('if (isYayraGoogleAccountConnectionUrl(targetUri))'),
+    authNavigationGuard.indexOf('} else {')
+  );
+  assert.equal(firstPartySignal.includes('put("url"'), false, 'captured first-party auth URLs never cross the native bridge');
+  assert.ok(authNavigationGuard.includes('emitEvent(id, "auth-navigation-blocked")'), 'third-party OAuth retains its URL handoff');
   assert.ok(manager.includes('secureSystemBrowserAuthUrl(targetUri)'), 'HTTP provider endpoints are upgraded before handoff');
   assert.ok(manager.includes('uri.buildUpon().scheme("https")'), 'the native helper never opens auth over plaintext HTTP');
   assert.ok(manager.includes('onCreateWindow'), 'OAuth popups are routed instead of silently failing in the native view');
+  assert.ok(manager.includes('d.put("reason", "android-popup")'), 'first-party auth popups also emit only connection metadata');
   assert.ok(manager.includes('setSupportMultipleWindows(true)'), 'user-initiated popups reach the routing callback');
 
   const plugin = readFileSync(new URL('../packages/floating-android/src/kotlin/com/yayra/floating/android/YayraOverlayPlugin.kt', import.meta.url), 'utf8');

@@ -9275,6 +9275,11 @@ button.fb-site-passkey-indicator {
 }
 
 .fb-pptx-slide-canvas {
+  /* The live canvas is moved into a white-foreground projector overlay.
+     Unresolved PowerPoint “automatic” text must stay slide-coloured instead
+     of inheriting that chrome colour; the renderer supplies a contrast-aware
+     inline value and this black is the safe legacy/default fallback. */
+  color: #000;
   color-scheme: light;
 }
 
@@ -9819,10 +9824,35 @@ button.fb-site-passkey-indicator {
   background: rgba(239, 68, 68, .13) !important;
 }
 
-.fb-doc-btn-present {
-  background: linear-gradient(135deg, var(--fb-accent-primary, #6d5df2), #4f46e5) !important;
+/* The actual first-slide and current-slide controls use separate classes.
+   Keep both unmistakably actionable; the previous singular selector matched
+   neither control, allowing the generic hover wash to produce dark-on-dark
+   text in light-theme document chrome. */
+.fb-doc-btn-present-first,
+.fb-doc-btn-present-current {
+  background: linear-gradient(135deg, #2563eb, #4f46e5) !important;
   color: #fff !important;
   font-weight: 750 !important;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, .28);
+}
+
+.fb-doc-toolbar .fb-doc-download-btn:hover:not(:disabled),
+.fb-doc-toolbar .fb-doc-download-btn:focus-visible:not(:disabled),
+.fb-doc-toolbar .fb-doc-download-btn:active:not(:disabled),
+.fb-doc-toolbar .fb-doc-btn-print:hover:not(:disabled),
+.fb-doc-toolbar .fb-doc-btn-print:focus-visible:not(:disabled),
+.fb-doc-toolbar .fb-doc-btn-print:active:not(:disabled),
+.fb-doc-toolbar .fb-doc-btn-present-first:hover:not(:disabled),
+.fb-doc-toolbar .fb-doc-btn-present-first:focus-visible:not(:disabled),
+.fb-doc-toolbar .fb-doc-btn-present-first:active:not(:disabled),
+.fb-doc-toolbar .fb-doc-btn-present-current:hover:not(:disabled),
+.fb-doc-toolbar .fb-doc-btn-present-current:focus-visible:not(:disabled),
+.fb-doc-toolbar .fb-doc-btn-present-current:active:not(:disabled) {
+  background: linear-gradient(135deg, #1d4ed8, #4338ca) !important;
+  color: #fff !important;
+  opacity: 1 !important;
+  filter: brightness(1.08);
+  box-shadow: 0 0 0 2px rgba(147, 197, 253, .9), 0 5px 14px rgba(30, 64, 175, .35);
 }
 
 .fb-pptx-slideshow {
@@ -10181,4 +10211,56 @@ button.fb-site-passkey-indicator {
     max-height: 30vh !important;
   }
   .fb-pptx-shortcut-grid { grid-template-columns: minmax(130px, 1fr) repeat(3, auto); }
+}
+
+/* Callback-returning Google account connection surface. */
+.fb-google-account-connection-mark {
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  border-radius: 16px;
+  background: conic-gradient(from -45deg, #4285f4 0 25%, #34a853 0 50%, #fbbc05 0 75%, #ea4335 0);
+  color: #fff;
+  font: 750 1.45rem/1 system-ui, sans-serif;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, .16);
+}
+
+.fb-google-account-connection-title {
+  font-size: clamp(1.12rem, 2vw, 1.45rem);
+}
+
+.fb-google-account-connection-copy {
+  width: min(560px, 100%);
+  color: var(--fb-text-secondary, #526075);
+  font-size: .9rem;
+  line-height: 1.6;
+}
+
+.fb-google-account-connection-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 9px;
+}
+
+.fb-google-account-connection-actions .fb-btn {
+  min-height: 38px;
+}
+
+@media (max-width: 560px) {
+  .fb-google-account-connection {
+    justify-content: flex-start !important;
+    overflow: auto;
+    padding: 38px 18px 24px !important;
+  }
+
+  .fb-google-account-connection-actions {
+    width: min(360px, 100%);
+    flex-direction: column;
+  }
+
+  .fb-google-account-connection-actions .fb-btn {
+    width: 100%;
+  }
 }

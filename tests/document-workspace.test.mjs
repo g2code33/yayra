@@ -960,6 +960,21 @@ test('PDF SLIDESHOW: live PDF pages use the projector, show one fitted page, and
   }
 });
 
+test('DOCUMENT TOOLBAR CONTRAST: Download, Present and Print stay readable on hover, focus and press', () => {
+  const css = readFileSync(new URL('../packages/shared-ui/src/theme/design-system.css', import.meta.url), 'utf8');
+  assert.match(css, /\.fb-doc-btn-present-first,\s*\n\.fb-doc-btn-present-current\s*\{[\s\S]*?color:\s*#fff !important;/,
+    'both real Present controls receive the intended high-contrast treatment');
+  for (const className of ['fb-doc-download-btn', 'fb-doc-btn-print', 'fb-doc-btn-present-first', 'fb-doc-btn-present-current']) {
+    assert.match(css, new RegExp(`\\.fb-doc-toolbar \\.${className}:hover:not\\(:disabled\\)`),
+      `${className} has an explicit readable hover state`);
+  }
+  const actionStates = css.slice(css.indexOf('.fb-doc-toolbar .fb-doc-download-btn:hover:not(:disabled)'), css.indexOf('.fb-pptx-slideshow {'));
+  assert.match(actionStates, /background:\s*linear-gradient\([^;]+\) !important;/);
+  assert.match(actionStates, /color:\s*#fff !important;/);
+  assert.match(actionStates, /opacity:\s*1 !important;/,
+    'interactive document actions cannot inherit a dimmed selected state');
+});
+
 test('PPTX NOTES COLOUR: compact responsive styling keeps the native control keyboard-visible', () => {
   const css = readFileSync(new URL('../packages/shared-ui/src/theme/design-system.css', import.meta.url), 'utf8');
   assert.match(css, /\.fb-doc-notes-color-control\s*\{[\s\S]*?flex:\s*0 0 34px;[\s\S]*?height:\s*30px;/,

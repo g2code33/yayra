@@ -49,7 +49,8 @@ import org.json.JSONObject
  * Events flow back to JS as "tabWebEvent" notifications:
  *   { id, type: 'loading-start' | 'loading-stop' | 'load-succeeded' |
  *               'fail-load' | 'navigated' | 'title-updated' |
- *               'engine-error', url?, title?,
+ *               'google-account-auth-required' |
+ *               'auth-navigation-blocked' | 'engine-error', url?, title?,
  *               canGoBack?, canGoForward?, isLoading?, error? }
  * and are normalized into the SAME shapes the desktop engine emits
  * (handleNativeWebviewEvent in BrowserShell.js handles both).
@@ -65,16 +66,21 @@ class YayraTabWebviewManager(
 
     private companion object {
         // Keep in sync with BrowserShell.isSystemBrowserAuthHost() and
-        // electron/webviewBridge.cjs. OAuth and interactive Google Account
-        // sign-in routes use the OS browser; account management and ordinary
-        // Google product navigation stay in the native view.
+        // electron/webviewBridge.cjs. Third-party OAuth uses the OS browser;
+        // first-party interactive Google Account entry is canceled here and
+        // BrowserShell starts Yayra's callback-returning native OAuth bridge.
+        // Ordinary Google product navigation stays in the native view.
         val SYSTEM_BROWSER_AUTH_HOSTS = setOf(
             "appleid.apple.com",
             "login.live.com",
             "login.microsoftonline.com"
         )
-        val GOOGLE_AUTH_PATH = Regex(
-            "^/(?:o/oauth2(?:/|$)|oauth2(?:/|$)|signin/oauth(?:/|$)|gsi/select(?:/|$)|signin/(?:v2|challenge|identifier|rejected)(?:/|$)|v3/signin(?:/|$)|ServiceLogin(?:/|$)|InteractiveLogin(?:/|$)|AccountChooser(?:/|$)|AddSession(?:/|$))",
+        val GOOGLE_OAUTH_PATH = Regex(
+            "^/(?:o/oauth2(?:/|$)|oauth2(?:/|$)|signin/oauth(?:/|$)|gsi/select(?:/|$))",
+            RegexOption.IGNORE_CASE
+        )
+        val GOOGLE_INTERACTIVE_SIGNIN_PATH = Regex(
+            "^/(?:signin/(?:v2|challenge|identifier|rejected)(?:/|$)|v3/signin(?:/|$)|ServiceLogin(?:/|$)|InteractiveLogin(?:/|$)|AccountChooser(?:/|$)|AddSession(?:/|$))",
             RegexOption.IGNORE_CASE
         )
         val GOOGLE_REJECTED_SIGNIN_PATH = Regex(
@@ -94,12 +100,22 @@ class YayraTabWebviewManager(
         var pointerSize: String = "normal"
     }
 
+    private fun isYayraGoogleAccountConnectionUrl(uri: Uri): Boolean {
+        if (uri.toString().length > MAX_AUTH_HANDOFF_URL_LENGTH) return false
+        if (!uri.scheme.equals("https", ignoreCase = true) && !uri.scheme.equals("http", ignoreCase = true)) return false
+        if (!uri.userInfo.isNullOrEmpty() || !uri.host.equals("accounts.google.com", ignoreCase = true)) return false
+        return GOOGLE_INTERACTIVE_SIGNIN_PATH.containsMatchIn(uri.encodedPath ?: "/")
+    }
+
     private fun isSystemBrowserAuthUrl(uri: Uri): Boolean {
         if (uri.toString().length > MAX_AUTH_HANDOFF_URL_LENGTH) return false
         if (!uri.scheme.equals("https", ignoreCase = true) && !uri.scheme.equals("http", ignoreCase = true)) return false
         if (!uri.userInfo.isNullOrEmpty()) return false
         val host = uri.host?.lowercase() ?: return false
-        if (host == "accounts.google.com") return GOOGLE_AUTH_PATH.containsMatchIn(uri.encodedPath ?: "/")
+        if (host == "accounts.google.com") {
+            val path = uri.encodedPath ?: "/"
+            return GOOGLE_OAUTH_PATH.containsMatchIn(path) || GOOGLE_INTERACTIVE_SIGNIN_PATH.containsMatchIn(path)
+        }
         return SYSTEM_BROWSER_AUTH_HOSTS.any { host == it || host.endsWith(".$it") }
     }
 
@@ -204,10 +220,21 @@ class YayraTabWebviewManager(
                                     // A canceled WebView navigation is not
                                     // guaranteed to produce onPageFinished,
                                     // so stop the Yayra loader explicitly.
-                                    // JS opens it with Capacitor Browser,
-                                    // leaving this tab and history untouched.
+                                    // JS either preserves a third-party OAuth
+                                    // URL in Capacitor Browser or starts
+                                    // Yayra's own callback-returning Google
+                                    // connection, leaving tab history intact.
                                     emitEvent(id, "loading-stop")
-                                    emitEvent(id, "auth-navigation-blocked") { d -> d.put("url", secureSystemBrowserAuthUrl(targetUri)) }
+                                    if (isYayraGoogleAccountConnectionUrl(targetUri)) {
+                                        // The raw ServiceLogin URL can contain
+                                        // opaque continuation data. JS only
+                                        // needs a first-party signal; never
+                                        // send that captured URL across the
+                                        // native bridge.
+                                        emitEvent(id, "google-account-auth-required") { d -> d.put("reason", "android-navigation") }
+                                    } else {
+                                        emitEvent(id, "auth-navigation-blocked") { d -> d.put("url", secureSystemBrowserAuthUrl(targetUri)) }
+                                    }
                                     return true
                                 }
                                 val target = targetUri.toString()
@@ -285,7 +312,9 @@ class YayraTabWebviewManager(
                                     if (target.equals("about:blank", ignoreCase = true) || routed) return
                                     routed = true
                                     val uri = try { Uri.parse(target) } catch (_: Exception) { null }
-                                    if (uri != null && isSystemBrowserAuthUrl(uri)) {
+                                    if (uri != null && isYayraGoogleAccountConnectionUrl(uri)) {
+                                        emitEvent(id, "google-account-auth-required") { d -> d.put("reason", "android-popup") }
+                                    } else if (uri != null && isSystemBrowserAuthUrl(uri)) {
                                         emitEvent(id, "auth-navigation-blocked") { d -> d.put("url", secureSystemBrowserAuthUrl(uri)) }
                                     } else if (target.startsWith("http://", true) || target.startsWith("https://", true)) {
                                         emitEvent(id, "new-window-request") { d -> d.put("url", target) }

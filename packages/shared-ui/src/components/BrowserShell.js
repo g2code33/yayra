@@ -155,10 +155,12 @@ const FRAME_EMBEDDING_BLOCKED_HOSTS = [
 
 // Keep in sync with the exact Google predicates in electron/webviewBridge.cjs
 // and YayraTabWebviewManager.kt. OAuth plus interactive account sign-in routes
-// require an OS external user-agent; account management, logout, Search, Gmail
-// content, and other product routes are intentionally not broad-matched.
+// require an OS external user-agent. First-party account entry/management uses
+// Yayra's callback-returning OAuth connection; logout, Search, Gmail content,
+// and other product routes are intentionally not broad-matched.
 const GOOGLE_OAUTH_PATH = /^\/(?:o\/oauth2(?:\/|$)|oauth2(?:\/|$)|signin\/oauth(?:\/|$)|gsi\/select(?:\/|$))/i;
 const GOOGLE_INTERACTIVE_SIGNIN_PATH = /^\/(?:signin\/(?:v2|challenge|identifier|rejected)(?:\/|$)|v3\/signin(?:\/|$)|ServiceLogin(?:\/|$)|InteractiveLogin(?:\/|$)|AccountChooser(?:\/|$)|AddSession(?:\/|$))/i;
+const GOOGLE_ACCOUNT_PORTAL_PATH = /^\/(?:ManageAccount(?:\/|$)|signin\/?$)?$/i;
 const GOOGLE_REJECTED_SIGNIN_PATH = /^\/(?:signin\/rejected|v3\/signin\/rejected)(?:\/|$)/i;
 const MAX_AUTH_HANDOFF_URL_LENGTH = 8192;
 
@@ -592,6 +594,12 @@ export class BrowserShell {
     // Keeping it here prevents chrome re-renders from reopening the provider
     // surface while the original tab URL/history remain intact.
     this._systemBrowserHandoffs = new Map();
+    // First-party Google Account entry is different from an arbitrary website
+    // OAuth handoff: it runs Yayra's own callback-returning OAuth flow so the
+    // account avatar/session can update after the user comes back. Records are
+    // tab-scoped to prevent render loops and restored tabs from launching a
+    // browser without a fresh user action.
+    this._googleAccountConnections = new Map();
     // Voice Search and Lens are Google features, but their pages/results
     // must remain in Yayra's own site engine. This tab-scoped marker also
     // suppresses web/PWA window.open fallbacks so these controls can never
@@ -629,6 +637,11 @@ export class BrowserShell {
         .then((session) => {
           if (session?.signedIn) {
             this.state.googleAccount = { status: 'signed-in', signedIn: true, profile: session.profile, error: null, savedAt: session.savedAt || null };
+            for (const record of this._googleAccountConnections.values()) {
+              record.status = 'connected';
+              record.error = null;
+              record.autoStart = false;
+            }
             this.handleAccountSignal(session.profile?.email, { source: 'yayra-account' });
             this.render();
           }
@@ -793,17 +806,175 @@ export class BrowserShell {
     );
   }
 
+  isGoogleAccountConnectionUrl(url) {
+    const parsed = this._parseBoundedAuthUrl(url);
+    if (!parsed) return false;
+    const hostname = parsed.hostname.toLowerCase();
+    if (hostname === 'myaccount.google.com') return true;
+    if (hostname !== 'accounts.google.com' || GOOGLE_OAUTH_PATH.test(parsed.pathname)) return false;
+    return GOOGLE_ACCOUNT_PORTAL_PATH.test(parsed.pathname)
+      || GOOGLE_INTERACTIVE_SIGNIN_PATH.test(parsed.pathname);
+  }
+
+  _safeGoogleProductOrigin(value) {
+    const parsed = this._parseBoundedAuthUrl(value);
+    if (!parsed || parsed.protocol !== 'https:' || parsed.port) return null;
+    const host = parsed.hostname.toLowerCase();
+    const googleOwned = host === 'google.com' || host.endsWith('.google.com')
+      || host === 'youtube.com' || host.endsWith('.youtube.com');
+    if (!googleOwned || host === 'accounts.google.com' || host === 'myaccount.google.com') return null;
+    return `${parsed.origin}/`;
+  }
+
+  _googleConnectionProductOrigin(record) {
+    const candidates = [record?.sourceUrl, record?.requestedUrl];
+    for (const raw of candidates) {
+      const direct = this._safeGoogleProductOrigin(raw);
+      if (direct) return direct;
+      const parsed = this._parseBoundedAuthUrl(raw);
+      const continuation = parsed?.searchParams?.get('continue');
+      const continued = this._safeGoogleProductOrigin(continuation);
+      if (continued) return continued;
+    }
+    return null;
+  }
+
+  _ensureGoogleAccountConnection(tabId, url, { autoStart = false, reason = 'account-navigation' } = {}) {
+    if (!tabId) return null;
+    let record = this._googleAccountConnections.get(tabId);
+    if (!record) {
+      record = {
+        requestedUrl: url,
+        sourceUrl: url,
+        reason,
+        status: this.state.googleAccount?.signedIn ? 'connected' : 'idle',
+        autoStart: Boolean(autoStart),
+        scheduled: false,
+        error: null
+      };
+      this._googleAccountConnections.set(tabId, record);
+    } else {
+      if (url && !record.requestedUrl) record.requestedUrl = url;
+      if (reason) record.reason = reason;
+      if (autoStart && !this.state.googleAccount?.signedIn && record.status === 'idle') record.autoStart = true;
+      if (this.state.googleAccount?.signedIn) record.status = 'connected';
+    }
+    return record;
+  }
+
+  _scheduleGoogleAccountConnection(tabId) {
+    const record = this._googleAccountConnections.get(tabId);
+    if (!record || record.scheduled || !record.autoStart || record.status !== 'idle') return;
+    record.scheduled = true;
+    Promise.resolve().then(() => {
+      const current = this._googleAccountConnections.get(tabId);
+      if (current !== record) return;
+      record.scheduled = false;
+      if (!record.autoStart || record.status !== 'idle') return;
+      record.autoStart = false;
+      this.startGoogleAccountConnection(tabId).catch(() => {});
+    });
+  }
+
+  requestGoogleAccountConnection(tabId, { sourceUrl = null, reason = 'navigation' } = {}) {
+    const tab = this.state.tabs.find((item) => item.id === tabId);
+    if (!tab) return;
+    const record = {
+      requestedUrl: sourceUrl || tab.url,
+      sourceUrl: tab.url,
+      reason,
+      status: this.state.googleAccount?.signedIn ? 'connected' : 'idle',
+      autoStart: !this.state.googleAccount?.signedIn,
+      scheduled: false,
+      error: null
+    };
+    this._googleAccountConnections.set(tabId, record);
+    this._clearSiteFailure(tabId);
+    this.updateTabLoading(tabId, false);
+    if (tabId === this.state.activeTabId) this.requestRender();
+    this._scheduleGoogleAccountConnection(tabId);
+  }
+
+  async startGoogleAccountConnection(tabId, { force = false } = {}) {
+    const tab = this.state.tabs.find((item) => item.id === tabId);
+    if (!tab) return { ok: false, error: 'tab_closed' };
+    const record = this._ensureGoogleAccountConnection(tabId, tab.url);
+    if (!record) return { ok: false, error: 'tab_closed' };
+    if (this.state.googleAccount?.signedIn && !force) {
+      record.status = 'connected';
+      record.error = null;
+      this.render();
+      return { ok: true, profile: this.state.googleAccount.profile };
+    }
+    if (!this.authBridge) {
+      record.status = 'unavailable';
+      record.error = 'not_configured';
+      this.render();
+      return { ok: false, error: 'not_configured' };
+    }
+    if (record.status === 'signing-in' || this.state.googleAccount?.status === 'signing-in') {
+      record.status = 'signing-in';
+      return { ok: true, pending: true };
+    }
+
+    record.status = 'signing-in';
+    record.error = null;
+    record.autoStart = false;
+    this.render();
+    const result = await this.signInWithGoogle();
+    if (this._googleAccountConnections.get(tabId) !== record) return result;
+    if (!result?.ok && result?.error === 'sign_in_already_in_progress') {
+      record.status = 'signing-in';
+    } else if (!result?.ok) {
+      record.status = 'error';
+      record.error = result?.error || 'sign_in_failed';
+      this.render();
+    } else if (!result.pending && this.state.googleAccount?.signedIn) {
+      record.status = 'connected';
+      this.render();
+    }
+    return result;
+  }
+
+  async openGoogleConnectionDestination(tabId) {
+    const record = this._googleAccountConnections.get(tabId);
+    const origin = this._googleConnectionProductOrigin(record);
+    if (origin && typeof this.authBridge?.openGoogleProduct === 'function') {
+      return this.authBridge.openGoogleProduct(origin);
+    }
+    if (origin) return this.openExternally(origin);
+    if (typeof this.authBridge?.openAccountPage === 'function') return this.openGoogleAccountPage();
+    return this.openExternally('https://myaccount.google.com/');
+  }
+
+  async _persistTabsBeforeGoogleRedirect() {
+    if (!this.sessionRepo || typeof this.sessionRepo.saveSession !== 'function') return;
+    const tabs = (this.state.tabs || [])
+      .filter((tab) => tab && !tab.isPrivate && /^https?:\/\//i.test(String(tab.url || '')))
+      .map((tab) => {
+        const group = this.sanitizeTabGroup(tab.group);
+        return { url: tab.url, title: tab.title || tab.url, ...(group ? { group } : {}) };
+      });
+    try { await this.sessionRepo.saveSession(tabs); } catch { /* OAuth can proceed without tab recovery */ }
+  }
+
   async signInWithGoogle() {
-    if (!this.authBridge) return;
+    if (!this.authBridge) return { ok: false, error: 'not_configured' };
     this.state.googleAccount = { ...this.state.googleAccount, status: 'signing-in', error: null };
     this.render();
+    // Web/PWA uses a full-page provider redirect. Persist the current tab
+    // snapshot first so the account/product tab remains recoverable after the
+    // callback reload rather than leaving an older snapshot on disk.
+    await this._persistTabsBeforeGoogleRedirect();
     const result = await this.authBridge.signIn();
-    if (!result?.ok) {
+    if (!result?.ok && result?.error !== 'sign_in_already_in_progress') {
       this.state.googleAccount = { status: 'error', signedIn: false, profile: null, error: result?.error || 'sign_in_failed', savedAt: null };
       this.render();
     }
     // On success the 'signed-in' event from handleGoogleAuthEvent() already
-    // updates state + re-renders; nothing further to do here.
+    // updates state + re-renders; web/PWA returns { pending:true } while its
+    // full-page provider redirect is underway.
+    return result;
   }
 
   // "Switch account" reuses the exact same sign-in flow: the authorization
@@ -841,16 +1012,31 @@ export class BrowserShell {
     switch (evt.type) {
       case 'signing-in':
         this.state.googleAccount = { ...this.state.googleAccount, status: 'signing-in', error: null };
+        for (const record of this._googleAccountConnections.values()) {
+          record.status = 'signing-in';
+          record.error = null;
+        }
         break;
       case 'signed-in':
         this.state.googleAccount = { status: 'signed-in', signedIn: true, profile: evt.profile, error: null, savedAt: new Date().toISOString() };
+        for (const record of this._googleAccountConnections.values()) {
+          record.status = 'connected';
+          record.error = null;
+          record.autoStart = false;
+        }
         this.handleAccountSignal(evt.profile?.email, { source: 'yayra-account' });
+        this.showTransientNotice(`Google connected to Yayra${evt.profile?.email ? ` as ${evt.profile.email}` : ''}.`);
         break;
       case 'signed-out':
         this.state.googleAccount = { status: 'idle', signedIn: false, profile: null, error: null, savedAt: null };
+        for (const record of this._googleAccountConnections.values()) record.status = 'idle';
         break;
       case 'error':
         this.state.googleAccount = { status: 'error', signedIn: false, profile: null, error: evt.message || 'sign_in_failed', savedAt: null };
+        for (const record of this._googleAccountConnections.values()) {
+          record.status = 'error';
+          record.error = evt.message || 'sign_in_failed';
+        }
         break;
       default:
         return;
@@ -3355,13 +3541,16 @@ export class BrowserShell {
     // first so the page still appears present underneath the chrome.
     const overlayOpen = this.hasBlockingOverlay();
     const authHandoffOnly = this.isSystemBrowserAuthHost(url);
-    this.syncNativeWebviewVisibility(activeTab.id, !isInternalPage && !overlayOpen && !authHandoffOnly && !siteFailure, {
-      captureActive: overlayOpen && !isInternalPage && !authHandoffOnly && !siteFailure
+    const googleAccountConnectionOnly = this._googleAccountConnections.has(activeTab.id)
+      || this.isGoogleAccountConnectionUrl(url);
+    this.syncNativeWebviewVisibility(activeTab.id, !isInternalPage && !overlayOpen && !authHandoffOnly && !googleAccountConnectionOnly && !siteFailure, {
+      captureActive: overlayOpen && !isInternalPage && !authHandoffOnly && !googleAccountConnectionOnly && !siteFailure
     });
     // Same rule for the Android native tab engine (its hide path captures
     // the page frame natively, so the chrome keeps a page underneath it).
-    // Recognized provider OAuth/auth URLs are rendered as an in-tab handoff card instead.
-    this.syncAndroidTabWebVisibility(activeTab.id, !isInternalPage && !overlayOpen && !authHandoffOnly && !siteFailure);
+    // Recognized provider OAuth/auth URLs and first-party account connection
+    // states are rendered as in-tab cards instead.
+    this.syncAndroidTabWebVisibility(activeTab.id, !isInternalPage && !overlayOpen && !authHandoffOnly && !googleAccountConnectionOnly && !siteFailure);
 
     // LOCAL DOCUMENT TABS (yayra://doc/<id>): the integrated document
     // viewer - never the web frame path, never the native engine. This is
@@ -3654,6 +3843,74 @@ export class BrowserShell {
     return false;
   }
 
+  buildGoogleAccountConnectionFallback(url, { tabId = null } = {}) {
+    const fallback = document.createElement('div');
+    const record = this._ensureGoogleAccountConnection(tabId, url);
+    const account = this.state.googleAccount || { status: 'idle', signedIn: false };
+    const connected = account.signedIn && account.profile;
+    const signingIn = record?.status === 'signing-in' || account.status === 'signing-in';
+    const failed = record?.status === 'error' || record?.status === 'unavailable' || account.status === 'error';
+    const productOrigin = this._googleConnectionProductOrigin(record);
+    let productLabel = 'Google Account';
+    try {
+      const host = productOrigin ? new URL(productOrigin).hostname.toLowerCase() : '';
+      if (host === 'mail.google.com') productLabel = 'Gmail';
+      else if (host === 'drive.google.com') productLabel = 'Google Drive';
+      else if (host === 'calendar.google.com') productLabel = 'Google Calendar';
+      else if (host === 'photos.google.com') productLabel = 'Google Photos';
+      else if (host.endsWith('youtube.com')) productLabel = 'YouTube';
+      else if (host) productLabel = host;
+    } catch { /* trusted default label */ }
+
+    const heading = connected
+      ? 'Google is connected to Yayra'
+      : (signingIn ? 'Finish connecting Google' : (failed ? 'Google connection did not finish' : 'Connect Google to Yayra'));
+    const body = connected
+      ? `${escapeHtml(account.profile.email || account.profile.name || 'Your Google account')} is now your Yayra account. Google keeps ${escapeHtml(productLabel)} website cookies in the secure system browser, while Yayra keeps only the verified profile returned by OAuth.`
+      : (signingIn
+        ? 'Complete the Google consent page in your secure system browser. Its verified one-time callback will return the account to Yayra automatically.'
+        : (failed
+          ? `${escapeHtml(this.formatGoogleSignInError(record?.error || account.error))} You can retry the callback-returning sign-in below.`
+          : 'Google sign-in will open securely in your system browser. After the verified callback, Yayra will update this tab and the account button automatically.'));
+
+    fallback.className = 'fb-frame-blocked-fallback fb-google-account-connection';
+    fallback.setAttribute('role', 'region');
+    fallback.setAttribute('aria-live', 'polite');
+    fallback.style.cssText = 'position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; background:var(--fb-bg-elevated,#f4f7fb); color:var(--fb-text-primary,#172033); text-align:center; padding:28px; z-index:1;';
+    fallback.innerHTML = `
+      <div class="fb-google-account-connection-mark" aria-hidden="true">G</div>
+      <strong class="fb-google-account-connection-title">${heading}</strong>
+      <div class="fb-google-account-connection-copy">${body}</div>
+      <div class="fb-google-account-connection-actions">
+        ${connected
+          ? `<button type="button" class="fb-btn fb-btn-primary fb-google-account-continue-btn">Continue to ${escapeHtml(productLabel)}</button>
+             <button type="button" class="fb-btn fb-btn-secondary fb-google-account-switch-btn">Switch Google account</button>`
+          : `<button type="button" class="fb-btn fb-btn-primary fb-google-account-connect-btn" ${signingIn ? 'disabled' : ''}>${signingIn ? 'Waiting for Google…' : (failed ? 'Try again' : 'Connect with Google')}</button>
+             ${failed ? `<button type="button" class="fb-btn fb-btn-secondary fb-google-account-browser-btn">Open ${escapeHtml(productLabel)} in browser</button>` : ''}`}
+        <button type="button" class="fb-btn fb-btn-secondary fb-google-account-back-btn">Back in Yayra</button>
+      </div>
+    `;
+
+    fallback.querySelector('.fb-google-account-connect-btn')?.addEventListener('click', () => {
+      this.startGoogleAccountConnection(tabId, { force: true }).catch(() => {});
+    });
+    fallback.querySelector('.fb-google-account-switch-btn')?.addEventListener('click', () => {
+      this.startGoogleAccountConnection(tabId, { force: true }).catch(() => {});
+    });
+    fallback.querySelector('.fb-google-account-continue-btn')?.addEventListener('click', () => {
+      this.openGoogleConnectionDestination(tabId).catch(() => {});
+    });
+    fallback.querySelector('.fb-google-account-browser-btn')?.addEventListener('click', () => {
+      this.openGoogleConnectionDestination(tabId).catch(() => {});
+    });
+    fallback.querySelector('.fb-google-account-back-btn')?.addEventListener('click', () => {
+      this._googleAccountConnections.delete(tabId);
+      if (this.goBack()) this.render();
+      else this.navigateActiveTab('yayra://newtab');
+    });
+    return fallback;
+  }
+
   buildSystemBrowserHandoffFallback(url, { tabId = null, native = false } = {}) {
     const fallback = document.createElement('div');
     const googleAuth = this.isGoogleInteractiveAuthenticationUrl(url);
@@ -3685,6 +3942,22 @@ export class BrowserShell {
     wrapper.className = 'fb-webview-frame-wrapper';
     wrapper.style.cssText = 'position:relative; flex:1; width:100%; height:100%; display:flex; min-height:0;';
 
+    // A raw Google Account/ServiceLogin page can authenticate the external
+    // browser but can never transfer that browser's cookie into Electron or
+    // Android. Route first-party account entry through Yayra's own OAuth
+    // callback instead, then render the verified connected state in this tab.
+    // A record may also be installed after Gmail/another product redirects to
+    // ServiceLogin; in that case retain the product URL for the continue
+    // action while replacing the stale embedded surface with this card.
+    const googleConnectionRecord = tabId ? this._googleAccountConnections.get(tabId) : null;
+    if (tabId && (this.isGoogleAccountConnectionUrl(url) || googleConnectionRecord)) {
+      const record = this._ensureGoogleAccountConnection(tabId, url);
+      wrapper.appendChild(this.buildGoogleAccountConnectionFallback(url, { tabId }));
+      if (record?.autoStart) this._scheduleGoogleAccountConnection(tabId);
+      if (typeof onLoaded === 'function') onLoaded();
+      return { wrapper, iframe: null };
+    }
+
     // PRIMARY FIX: on Electron (Linux/Windows desktop builds) real website
     // content is rendered by a native WebContentsView, not an <iframe> -
     // see electron/webviewBridge.cjs for the full rationale. A WebContentsView
@@ -3707,8 +3980,9 @@ export class BrowserShell {
     // nested <iframe> is subject to the exact same framing restrictions a
     // desktop browser tab would see). Matching Google OAuth and interactive
     // account sign-in routes are handed off because provider policy restricts
-    // embedded user agents. Account management and ordinary product routes
-    // are not broad-matched. Apple and Microsoft retain their existing
+    // embedded user agents. First-party account management is handled by the
+    // callback-returning connection branch above; ordinary product routes are
+    // not broad-matched. Apple and Microsoft retain their existing
     // provider handoff behavior. See electron/webviewBridge.cjs.
     if (this.isSystemBrowserAuthHost(url)) {
       let handoff = this._systemBrowserHandoffs.get(tabId);
@@ -3859,8 +4133,9 @@ export class BrowserShell {
     // Matching provider OAuth and interactive sign-in URLs are handled
     // outside the embedded WebContentsView. Electron opens the OS default
     // browser required by RFC 8252 / provider policy; Yayra never imports its
-    // cookies. Account management and ordinary Google product routes remain
-    // in the native view. The record is installed BEFORE IPC so a fast
+    // cookies. First-party Google account entry was handled by the connection
+    // branch before this method; ordinary product routes remain native. The
+    // record is installed BEFORE IPC so a fast
     // re-render cannot open the same auth URL twice.
     if (this.isSystemBrowserAuthHost(url)) {
       let handoff = this._systemBrowserHandoffs.get(tabId);
@@ -4674,12 +4949,21 @@ export class BrowserShell {
         if (tabId === this.state.activeTabId) this.requestRender();
         break;
       }
+      case 'google-account-auth-required': {
+        // Google Account/Gmail redirected into a first-party ServiceLogin
+        // route. A raw external handoff would authenticate only the other
+        // browser and leave Yayra unchanged (the reported priority bug).
+        // Start Yayra's own callback-returning OAuth flow and replace this
+        // stale native surface with a connected-account status card.
+        this.requestGoogleAccountConnection(tabId, { reason: evt.reason || 'navigation' });
+        break;
+      }
       case 'system-browser-handoff': {
-        // Direct auth URLs already have an in-tab explanation card. Popups
-        // and redirects leave the relying site visible and get this notice.
-        // Never claim that browser cookies or website session state are shared.
+        // Third-party OAuth URLs retain their relying-party callback in the
+        // system browser. Never claim those browser cookies or website state
+        // are shared with Yayra.
         if (evt.reason !== 'direct-navigation') {
-          this.showTransientNotice('Sign-in opened securely in your system browser. Yayra did not copy its cookies or credentials.');
+          this.showTransientNotice('Secure sign-in opened in your system browser. A third-party website callback remains in that browser.');
         }
         break;
       }
@@ -4688,12 +4972,14 @@ export class BrowserShell {
         this.showTransientNotice('Yayra could not open your system browser for sign-in. This tab was left unchanged.');
         break;
       case 'auth-navigation-blocked': {
-        // Android's native TabWebView cancels matching provider OAuth/auth
-        // navigations before loading them, then asks the Capacitor Browser
-        // plugin for its secure system-browser surface. The current tab and
-        // its history are deliberately left untouched.
-        if (evt.url && this.isSystemBrowserAuthHost(evt.url)) {
-          this.showTransientNotice('Sign-in opened in a separate browser; this tab may not receive the site’s login state.');
+        // Android's native TabWebView cancels provider auth before loading it.
+        // First-party Google Account entry must use Yayra's own callback so
+        // the app receives the verified profile; third-party OAuth keeps its
+        // original system-browser callback unchanged.
+        if (evt.url && this.isGoogleAccountConnectionUrl(evt.url)) {
+          this.requestGoogleAccountConnection(tabId, { sourceUrl: evt.url, reason: 'android-navigation' });
+        } else if (evt.url && this.isSystemBrowserAuthHost(evt.url)) {
+          this.showTransientNotice('Secure third-party sign-in opened in your browser. Its callback remains there.');
           Promise.resolve(this.openExternally(evt.url)).catch(() => {});
         }
         break;
@@ -16810,6 +17096,7 @@ export class BrowserShell {
     this._clearSiteFailure(tabId);
     this.destroyNativeWebview(tabId);
     this._systemBrowserHandoffs.delete(tabId);
+    this._googleAccountConnections.delete(tabId);
     this._inAppOnlyGoogleTabs.delete(tabId);
     this._pageSnapshots.delete(tabId); // closed tab, dead preview
 
@@ -17162,6 +17449,18 @@ export class BrowserShell {
     // fresh attempt, unlike a render. It may therefore launch the browser once
     // again; passive chrome updates may not.
     this._systemBrowserHandoffs.delete(activeTab.id);
+    this._googleAccountConnections.delete(activeTab.id);
+    if (this.isGoogleAccountConnectionUrl(targetUrl)) {
+      this._googleAccountConnections.set(activeTab.id, {
+        requestedUrl: targetUrl,
+        sourceUrl: targetUrl,
+        reason: 'explicit-navigation',
+        status: this.state.googleAccount?.signedIn ? 'connected' : 'idle',
+        autoStart: !this.state.googleAccount?.signedIn,
+        scheduled: false,
+        error: null
+      });
+    }
     const navigationState = this.ensureNavigationState(activeTab);
     const currentUrl = navigationState.historyStack[navigationState.currentIndex];
     if (currentUrl !== targetUrl) {
@@ -17205,7 +17504,8 @@ export class BrowserShell {
     if (/^https?:\/\//i.test(targetUrl)
       && !googleFeatureInAppOnly
       && !this.nativeWebview && !this.capacitorBrowser && !this.capacitorTabWeb
-      && !this.isSystemBrowserAuthHost(targetUrl) // recognized auth endpoints have their OWN single handoff
+      && !this.isSystemBrowserAuthHost(targetUrl) // recognized third-party auth endpoints have their own handoff
+      && !this.isGoogleAccountConnectionUrl(targetUrl) // first-party account entry uses callback-returning Yayra OAuth
       && typeof window !== 'undefined' && typeof window.open === 'function') {
       const serp = typeof this.getSearchIntent === 'function' ? this.getSearchIntent(targetUrl) : null;
       const blocked = this.isKnownFrameBlockedUrl(targetUrl);
@@ -17288,6 +17588,7 @@ export class BrowserShell {
     const activeTab = this.getActiveTab();
     if (!activeTab) return false;
     this._systemBrowserHandoffs.delete(activeTab.id);
+    this._googleAccountConnections.delete(activeTab.id);
     // Move the active tab's local history first. A native controller may
     // update its own model synchronously, so delegating before this step can
     // overwrite the shell state or jump straight back to the new-tab page.
@@ -17315,6 +17616,7 @@ export class BrowserShell {
     const activeTab = this.getActiveTab();
     if (!activeTab) return false;
     this._systemBrowserHandoffs.delete(activeTab.id);
+    this._googleAccountConnections.delete(activeTab.id);
     const navigationState = this.ensureNavigationState(activeTab);
     if (navigationState.currentIndex >= navigationState.historyStack.length - 1) return false;
     navigationState.currentIndex += 1;
@@ -17347,6 +17649,18 @@ export class BrowserShell {
     if (this._siteFailureFor(activeTab.id)) {
       this._retrySiteRecovery(activeTab.id, { reason: 'manual' });
       this.requestRender();
+      return;
+    }
+    if (this._googleAccountConnections.has(activeTab.id) || this.isGoogleAccountConnectionUrl(activeTab.url)) {
+      const record = this._ensureGoogleAccountConnection(activeTab.id, activeTab.url);
+      if (!this.state.googleAccount?.signedIn) {
+        record.status = 'idle';
+        record.error = null;
+        record.autoStart = true;
+        this._scheduleGoogleAccountConnection(activeTab.id);
+      }
+      activeTab.isLoading = false;
+      this.render();
       return;
     }
     if (this.nativeWebview && this._nativeWebviewTabIds.has(activeTab.id)
@@ -17385,6 +17699,10 @@ export class BrowserShell {
     const activeTab = this.getActiveTab();
     if (!activeTab) return;
     this._systemBrowserHandoffs.delete(activeTab.id);
+    if (this._googleAccountConnections.has(activeTab.id) || this.isGoogleAccountConnectionUrl(activeTab.url)) {
+      this.reload();
+      return;
+    }
     if (this.isSystemBrowserAuthHost(activeTab.url)) {
       this.render(); // auth tabs retry the secure browser, never reload a hidden previous page
       return;
@@ -21022,6 +21340,7 @@ export class BrowserShell {
       this._stopOverlayGrantWatch = null;
     }
     this._inAppOnlyGoogleTabs?.clear?.();
+    this._googleAccountConnections?.clear?.();
     if (this.webFrameLayer) {
       this.webFrameLayer.remove();
       this.webFrameLayer = null;

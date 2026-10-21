@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { runInNewContext } from 'node:vm';
 import {
+  requiresYayraGoogleAccountConnection,
   requiresSystemBrowserAuth,
   secureSystemBrowserAuthUrl,
   sanitizeBounds,
@@ -30,17 +31,37 @@ test('requiresSystemBrowserAuth: hands off Google OAuth and interactive sign-in 
   assert.equal(requiresSystemBrowserAuth('https://sub.login.microsoftonline.com/'), true);
 });
 
-test('requiresSystemBrowserAuth: ordinary Google browsing/account pages stay in Yayra', () => {
+test('requiresSystemBrowserAuth: ordinary Google browsing/account pages are not mistaken for third-party OAuth', () => {
   assert.equal(requiresSystemBrowserAuth('https://www.google.com/search?q=ghana'), false);
   assert.equal(requiresSystemBrowserAuth('https://mail.google.com/mail/u/0/'), false);
   assert.equal(requiresSystemBrowserAuth('https://accounts.google.com/'), false);
   assert.equal(requiresSystemBrowserAuth('https://accounts.google.com/ManageAccount'), false);
   assert.equal(requiresSystemBrowserAuth('https://accounts.google.com/Logout'), false);
-  assert.equal(requiresSystemBrowserAuth('https://accounts.google.com/signin'), false, 'a broad signin prefix is not enough');
+  assert.equal(requiresSystemBrowserAuth('https://accounts.google.com/signin'), false, 'a broad signin prefix is not third-party OAuth');
   assert.equal(requiresSystemBrowserAuth('https://myaccount.google.com/security'), false);
   assert.equal(requiresSystemBrowserAuth('https://accounts.google.com.evil.example/signin'), false);
   assert.equal(requiresSystemBrowserAuth('https://www.youtube.com/'), false);
   assert.equal(requiresSystemBrowserAuth('not a url'), false);
+});
+
+test('requiresYayraGoogleAccountConnection: account portals and first-party login return to Yayra, never hijacking OAuth clients', () => {
+  for (const url of [
+    'https://accounts.google.com/',
+    'https://accounts.google.com/ManageAccount',
+    'https://accounts.google.com/signin',
+    'https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fmail.google.com%2F',
+    'https://accounts.google.com/v3/signin/challenge/pwd',
+    'https://myaccount.google.com/security'
+  ]) assert.equal(requiresYayraGoogleAccountConnection(url), true, url);
+
+  for (const url of [
+    'https://accounts.google.com/o/oauth2/v2/auth?client_id=third-party',
+    'https://accounts.google.com/signin/oauth?client_id=third-party',
+    'https://accounts.google.com/gsi/select?client_id=third-party',
+    'https://accounts.google.com/Logout',
+    'https://mail.google.com/',
+    'https://accounts.google.com.evil.example/ServiceLogin'
+  ]) assert.equal(requiresYayraGoogleAccountConnection(url), false, url);
 });
 
 test('secureSystemBrowserAuthUrl: upgrades exact auth routes and repairs Google embedded-browser rejection URLs', () => {
@@ -480,20 +501,24 @@ test('webview bridge: recovery timer is canceled if the site becomes responsive 
   }
 });
 
-test('webview bridge: Google account home and management pages stay in the native in-app view', async () => {
-  const { handlers, views, externalCalls } = makeHarness();
-  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-google-home', url: 'https://accounts.google.com/' });
-  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-google-account', url: 'https://accounts.google.com/ManageAccount' });
-  assert.equal(views.length, 2, 'both ordinary Google account URLs create an in-app WebContentsView');
-  assert.deepEqual(externalCalls, []);
+test('webview bridge: Google account home and management request callback-returning Yayra connection without loading or raw handoff', async () => {
+  const { handlers, views, externalCalls, sentEvents } = makeHarness();
+  const home = await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-google-home', url: 'https://accounts.google.com/' });
+  const management = await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-google-account', url: 'https://accounts.google.com/ManageAccount' });
+  assert.deepEqual(home, { handedOffToSystemBrowser: false, googleAccountConnectionRequired: true });
+  assert.deepEqual(management, { handedOffToSystemBrowser: false, googleAccountConnectionRequired: true });
+  assert.equal(views.length, 0, 'a partition that cannot receive the system-browser cookie is never loaded');
+  assert.deepEqual(externalCalls, [], 'the raw account URL is not opened because it has no callback to Yayra');
+  const requests = sentEvents.filter((event) => event.payload.type === 'google-account-auth-required');
+  assert.equal(requests.length, 2);
+  assert.equal(requests.every((event) => !('url' in event.payload)), true, 'captured account URLs never cross IPC');
 });
 
-test('webview bridge: accounts.google.com redirect to interactive sign-in is canceled into the system browser', async () => {
+test('webview bridge: Google product redirect to first-party login requests Yayra OAuth and preserves the source view', async () => {
   const { handlers, views, fakeWin, sentEvents, externalCalls } = makeHarness();
-  const homeUrl = 'https://accounts.google.com/';
+  const productUrl = 'https://mail.google.com/';
   const signInUrl = 'https://accounts.google.com/signin/v2/identifier';
-  const result = await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-google-root-redirect', url: homeUrl });
-  assert.deepEqual(result, { handedOffToSystemBrowser: false });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-google-root-redirect', url: productUrl });
   assert.equal(views.length, 1);
   const wc = views[0].webContents;
   const redirect = { prevented: false, preventDefault() { this.prevented = true; } };
@@ -503,17 +528,17 @@ test('webview bridge: accounts.google.com redirect to interactive sign-in is can
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(redirect.prevented, true, 'interactive account sign-in never commits in the embedded surface');
-  assert.deepEqual(externalCalls, [signInUrl]);
-  assert.equal(fakeWin.contentView.children[0], views[0], 'the source view remains attached and unchanged');
+  assert.deepEqual(externalCalls, [], 'Yayra OAuth, not a callback-less raw ServiceLogin, owns the external launch');
+  assert.equal(fakeWin.contentView.children[0], views[0], 'the source view remains attached for lifecycle cleanup');
   assert.equal(wc.isDestroyed(), false);
   assert.ok(sentEvents.some((event) => event.payload.type === 'loading-stop'));
-  const handoff = sentEvents.find((event) => event.payload.type === 'system-browser-handoff');
-  assert.deepEqual(handoff.payload, {
+  const request = sentEvents.find((event) => event.payload.type === 'google-account-auth-required');
+  assert.deepEqual(request.payload, {
     tabId: 'tab-google-root-redirect',
-    type: 'system-browser-handoff',
+    type: 'google-account-auth-required',
     provider: 'google',
     reason: 'navigation'
-  }, 'renderer receives metadata only, never the authorization URL');
+  }, 'renderer receives metadata only, never the captured login URL');
 });
 
 test('webview bridge: user-origin pointer styles bypass site CSP, style child frames best-effort, and update live', async () => {
@@ -615,7 +640,7 @@ test('webview bridge: a failed system-browser launch creates no provider view an
   });
   const result = await handlers.get('yayra:webview-ensure')(null, {
     tabId: 'tab-auth-failed',
-    url: 'https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fmail.google.com%2F'
+    url: 'https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client'
   });
   assert.deepEqual(result, { handedOffToSystemBrowser: false });
   assert.equal(views.length, 0);
@@ -628,16 +653,16 @@ test('webview bridge: a failed system-browser launch creates no provider view an
   });
 });
 
-test('webview bridge: direct Google account sign-in pages use the system browser, while account management stays in Yayra', async () => {
-  const { handlers, externalCalls, views } = makeHarness();
+test('webview bridge: direct Google first-party sign-in and account management both request Yayra connection', async () => {
+  const { handlers, externalCalls, views, sentEvents } = makeHarness();
   const signInUrl = 'https://accounts.google.com/signin/v2/identifier';
   const result = await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-account-signin', url: signInUrl });
-  assert.equal(result.handedOffToSystemBrowser, true);
-  assert.deepEqual(externalCalls, [signInUrl]);
-  assert.equal(views.length, 0);
   const management = await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-account-management', url: 'https://accounts.google.com/ManageAccount' });
-  assert.equal(management.handedOffToSystemBrowser, false);
-  assert.equal(views.length, 1);
+  assert.equal(result.googleAccountConnectionRequired, true);
+  assert.equal(management.googleAccountConnectionRequired, true);
+  assert.deepEqual(externalCalls, []);
+  assert.equal(views.length, 0);
+  assert.equal(sentEvents.filter((event) => event.payload.type === 'google-account-auth-required').length, 2);
 });
 
 test('webview bridge: direct HTTP Google OAuth is upgraded before opening in the system browser', async () => {
@@ -658,7 +683,7 @@ test('webview bridge: popups to an identity-provider sign-in host from an alread
   assert.deepEqual(externalCalls, ['https://appleid.apple.com/auth/authorize']);
 });
 
-test('webview bridge: Google OAuth and account sign-in popups use the system browser', async () => {
+test('webview bridge: third-party Google OAuth popup stays external while first-party account popup returns to Yayra', async () => {
   const { handlers, views, externalCalls, sentEvents } = makeHarness();
   await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-1', url: 'https://mail.google.com/' });
   const guestWebContents = views[0].webContents;
@@ -668,8 +693,9 @@ test('webview bridge: Google OAuth and account sign-in popups use the system bro
   assert.deepEqual(guestWebContents._simulateWindowOpen({ url: oauthUrl }), { action: 'deny' });
   assert.deepEqual(guestWebContents._simulateWindowOpen({ url: accountUrl }), { action: 'deny' });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(externalCalls, [oauthUrl, accountUrl]);
-  assert.equal(sentEvents.filter((event) => event.payload.type === 'system-browser-handoff').length, 2);
+  assert.deepEqual(externalCalls, [oauthUrl]);
+  assert.equal(sentEvents.filter((event) => event.payload.type === 'system-browser-handoff').length, 1);
+  assert.equal(sentEvents.filter((event) => event.payload.type === 'google-account-auth-required').length, 1);
   assert.equal(sentEvents.some((event) => event.payload.type === 'new-window-request'), false);
 });
 
@@ -700,7 +726,10 @@ test('webview bridge: top-level Google OAuth and account sign-in redirects are c
   wc.emit('will-navigate', signInEvent);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(signInEvent.prevented, true);
-  assert.deepEqual(externalCalls, [authUrl, signInUrl]);
+  assert.deepEqual(externalCalls, [authUrl], 'raw first-party login is replaced by Yayra OAuth');
+  assert.ok(sentEvents.some((e) => e.payload.type === 'google-account-auth-required'
+    && e.payload.provider === 'google'
+    && !('url' in e.payload)));
 
   // Legacy positional signature still ignores subframe provider navigation.
   const subframe = { prevented: false, preventDefault() { this.prevented = true; } };
@@ -710,7 +739,7 @@ test('webview bridge: top-level Google OAuth and account sign-in redirects are c
   const ordinaryGoogle = { prevented: false, preventDefault() { this.prevented = true; } };
   wc.emit('will-redirect', ordinaryGoogle, { url: 'https://www.google.com/search?q=ghana', isMainFrame: true });
   assert.equal(ordinaryGoogle.prevented, false, 'ordinary Google search is not rerouted by auth handling');
-  assert.deepEqual(externalCalls, [authUrl, signInUrl]);
+  assert.deepEqual(externalCalls, [authUrl]);
 });
 
 test('webview bridge: HTTP Google auth redirects are upgraded before the system browser opens', async () => {

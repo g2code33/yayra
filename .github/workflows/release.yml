@@ -164,17 +164,21 @@ jobs:
           else
             echo "signed=true" >> "$GITHUB_OUTPUT"
           fi
-      - name: Inject Google sign-in config from repo secrets (optional)
+      - name: Inject Google sign-in config from repo secrets (required for publish)
         shell: bash
         env:
           YAYRA_GOOGLE_CLIENT_ID: ${{ secrets.YAYRA_GOOGLE_CLIENT_ID }}
           YAYRA_GOOGLE_CLIENT_SECRET: ${{ secrets.YAYRA_GOOGLE_CLIENT_SECRET }}
+          RELEASE_REQUIRES_GOOGLE_AUTH: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish == true) }}
         run: |
           if [ -n "$YAYRA_GOOGLE_CLIENT_ID" ] && [ -n "$YAYRA_GOOGLE_CLIENT_SECRET" ]; then
             node -e "require('fs').writeFileSync('electron/google-auth.config.json', JSON.stringify({ clientId: process.env.YAYRA_GOOGLE_CLIENT_ID.trim(), clientSecret: process.env.YAYRA_GOOGLE_CLIENT_SECRET.trim() }))"
             echo "Google sign-in config baked into this build."
+          elif [ "$RELEASE_REQUIRES_GOOGLE_AUTH" = "true" ]; then
+            echo "::error:: Published desktop builds require YAYRA_GOOGLE_CLIENT_ID and YAYRA_GOOGLE_CLIENT_SECRET so Google Account return-to-Yayra can complete"
+            exit 1
           else
-            echo "::warning:: YAYRA_GOOGLE_CLIENT_ID / YAYRA_GOOGLE_CLIENT_SECRET repo secrets not set - installed builds will show 'Google sign-in isn't configured' until users drop google-auth.config.json into their yayra config directory."
+            echo "::warning:: Google sign-in config absent in this non-publishing diagnostic build."
           fi
       - run: npm run package:linux
       - run: npm run verify:packaging
@@ -256,17 +260,21 @@ jobs:
             "CSC_IDENTITY_AUTO_DISCOVERY=false" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             "signed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           }
-      - name: Inject Google sign-in config from repo secrets (optional)
+      - name: Inject Google sign-in config from repo secrets (required for publish)
         shell: bash
         env:
           YAYRA_GOOGLE_CLIENT_ID: ${{ secrets.YAYRA_GOOGLE_CLIENT_ID }}
           YAYRA_GOOGLE_CLIENT_SECRET: ${{ secrets.YAYRA_GOOGLE_CLIENT_SECRET }}
+          RELEASE_REQUIRES_GOOGLE_AUTH: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish == true) }}
         run: |
           if [ -n "$YAYRA_GOOGLE_CLIENT_ID" ] && [ -n "$YAYRA_GOOGLE_CLIENT_SECRET" ]; then
             node -e "require('fs').writeFileSync('electron/google-auth.config.json', JSON.stringify({ clientId: process.env.YAYRA_GOOGLE_CLIENT_ID.trim(), clientSecret: process.env.YAYRA_GOOGLE_CLIENT_SECRET.trim() }))"
             echo "Google sign-in config baked into this build."
+          elif [ "$RELEASE_REQUIRES_GOOGLE_AUTH" = "true" ]; then
+            echo "::error:: Published desktop builds require YAYRA_GOOGLE_CLIENT_ID and YAYRA_GOOGLE_CLIENT_SECRET so Google Account return-to-Yayra can complete"
+            exit 1
           else
-            echo "::warning:: YAYRA_GOOGLE_CLIENT_ID / YAYRA_GOOGLE_CLIENT_SECRET repo secrets not set - installed builds will show 'Google sign-in isn't configured' until users drop google-auth.config.json into their yayra config directory."
+            echo "::warning:: Google sign-in config absent in this non-publishing diagnostic build."
           fi
       - run: npm run package:win
       - run: npm run verify:packaging
