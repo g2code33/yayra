@@ -25,6 +25,129 @@ const EMAIL_SUGGESTIONS_CHANNEL = 'yayra:email-suggestions';
 const SITE_PASSKEY_REQUEST_CHANNEL = 'yayra:site-passkey-request';
 const SITE_PASSKEY_CONTROL_CHANNEL = 'yayra:site-passkey-control';
 
+// Install media recovery in the page's MAIN world at document start, before a
+// React/Vue image onError handler can unmount a failed full-screen backdrop.
+// The fuller dom-ready compatibility script adds low-contrast verification;
+// this early gate owns only the decode retry and broken-backdrop fallback.
+if (contextBridge && typeof contextBridge.executeInMainWorld === 'function') {
+  try {
+    contextBridge.executeInMainWorld({
+      func: () => {
+        try {
+          const installKey = '__yayraEarlyMediaCompatibilityV2';
+          if (window[installKey]) return;
+          const attempts = new WeakMap();
+
+          const jpegCloudinaryUrl = (rawUrl) => {
+            let parsed;
+            try { parsed = new URL(String(rawUrl || '')); } catch { return rawUrl; }
+            const marker = '/image/upload/';
+            if (!/^https?:$/.test(parsed.protocol)
+                || parsed.hostname.toLowerCase() !== 'res.cloudinary.com'
+                || !parsed.pathname.includes(marker)) return rawUrl;
+            if (parsed.pathname.split('/').some((part) => /^s--[A-Za-z0-9_-]+--$/.test(part))) return rawUrl;
+            const markerIndex = parsed.pathname.indexOf(marker);
+            const prefix = parsed.pathname.slice(0, markerIndex + marker.length);
+            const delivery = parsed.pathname.slice(markerIndex + marker.length);
+            let compatible = delivery.replace(
+              /(^|[,/])f_(?:auto(?::[^,/]+)?|webp)(?=,|\/|$)/gi,
+              (_match, boundary) => `${boundary}f_jpg`
+            );
+            if (/\.(?:heic|heif)$/i.test(compatible)) compatible = compatible.replace(/\.(?:heic|heif)$/i, '');
+            if (compatible === delivery && /\.(?:heic|heif)$/i.test(delivery)) {
+              compatible = `q_auto,f_jpg/${delivery.replace(/\.(?:heic|heif)$/i, '')}`;
+            }
+            if (compatible === delivery) return rawUrl;
+            parsed.pathname = `${prefix}${compatible}`;
+            return parsed.toString();
+          };
+
+          const siteThemeColor = () => {
+            try {
+              const metas = Array.from(document.querySelectorAll('meta[name="theme-color"]'));
+              const selected = metas.find((meta) => {
+                const media = meta.getAttribute('media');
+                return !media || !window.matchMedia || window.matchMedia(media).matches;
+              }) || metas[0];
+              return String(selected?.getAttribute('content') || '').trim();
+            } catch { return ''; }
+          };
+          const coversViewport = (element) => {
+            try {
+              const rect = element.getBoundingClientRect();
+              const width = Math.max(document.documentElement?.clientWidth || 0, window.innerWidth || 0);
+              const height = Math.max(document.documentElement?.clientHeight || 0, window.innerHeight || 0);
+              return width > 0 && height > 0 && rect.width >= width * 0.7 && rect.height >= height * 0.7;
+            } catch { return false; }
+          };
+          const retireFailedBackdrop = (image) => {
+            const color = siteThemeColor();
+            let target = image.parentElement;
+            let hints = '';
+            try {
+              const className = typeof image.className === 'string' ? image.className : image.className?.baseVal || '';
+              hints = [className, image.id, image.getAttribute('alt'), image.getAttribute('role')].join(' ').toLowerCase();
+            } catch { /* use geometry only */ }
+            let backdrop = coversViewport(image)
+              || /(?:background|backdrop|wallpaper|hero|object-cover|inset-0|h-full|w-full)/.test(hints);
+            for (let depth = 0; target && depth < 6; depth += 1, target = target.parentElement) {
+              if (coversViewport(target)) { backdrop = true; break; }
+            }
+            if (backdrop && color) {
+              const appRoot = document.getElementById('root');
+              const roots = [target, image.parentElement, document.documentElement, document.body, appRoot, appRoot?.firstElementChild];
+              for (const root of roots) {
+                if (!root || (root !== target && root !== image.parentElement && !coversViewport(root))) continue;
+                try { root.style.setProperty('background-color', color, 'important'); } catch { /* detached */ }
+              }
+            }
+            if (!String(image.getAttribute('alt') || '').trim() || backdrop) {
+              try {
+                image.style.setProperty('visibility', 'hidden', 'important');
+                image.setAttribute('data-yayra-media-failed', 'true');
+              } catch { /* detached */ }
+            }
+          };
+
+          window.addEventListener('error', (event) => {
+            const image = event?.target;
+            if (!image || String(image.tagName || '').toLowerCase() !== 'img') return;
+            const source = String(image.currentSrc || image.src || image.getAttribute('src') || '');
+            const prior = attempts.get(image);
+            if (!prior || (prior.source !== source && prior.retry !== source)) {
+              const retry = jpegCloudinaryUrl(source);
+              if (retry && retry !== source) {
+                attempts.set(image, { source, retry });
+                try {
+                  image.removeAttribute('srcset');
+                  image.removeAttribute('sizes');
+                  image.src = retry;
+                  event.preventDefault?.();
+                  event.stopImmediatePropagation?.();
+                  event.stopPropagation?.();
+                  return;
+                } catch { /* fall through to site-owned fallback */ }
+              }
+            }
+            retireFailedBackdrop(image);
+          }, true);
+
+          window.addEventListener('load', (event) => {
+            const image = event?.target;
+            if (!image || String(image.tagName || '').toLowerCase() !== 'img') return;
+            attempts.delete(image);
+            if (image.getAttribute('data-yayra-media-failed') === 'true') {
+              image.removeAttribute('data-yayra-media-failed');
+              image.style.removeProperty('visibility');
+            }
+          }, true);
+          window[installKey] = { version: 2 };
+        } catch { /* media compatibility must never affect page startup */ }
+      }
+    });
+  } catch { /* older Electron: dom-ready fallback remains active */ }
+}
+
 function createSitePasskeyControlToken() {
   try {
     const bytes = new Uint8Array(32);
