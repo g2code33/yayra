@@ -36,22 +36,23 @@ const { buildMediaCompatibilityScript, installMediaCompatibility } = require('./
  * -----------------------------------------
  * Google's OAuth policy prohibits authorization requests in embedded user
  * agents (see https://developers.google.com/identity/protocols/oauth2/policies#embedded-webviews).
- * Yayra therefore hands off explicit Google OAuth authorization endpoints to
- * the system browser. Ordinary account pages, including the accounts.google.com
- * landing page and direct account sign-in routes, are allowed to render in the
- * WebContentsView; Google may still reject an interactive sign-in there, and
- * Yayra does not bypass that policy or transfer the system browser's cookies.
- * The app's own Google sign-in uses its separate external-browser + PKCE flow.
+ * Yayra therefore lifts explicit Google OAuth endpoints into a standalone,
+ * top-level BrowserWindow—never an iframe/WebContentsView. That window shares
+ * the exact Session of the originating tab, so provider cookies and callback
+ * state remain in that Yayra profile; after callback completion, the original
+ * tab resumes automatically. This mirrors RX Store's proven full-window
+ * behavior while fixing its native-shell return gap.
  *
- * Apple and Microsoft keep their existing system-browser handoff behavior.
- * `buildBrowserUserAgent()` remains a general site-compatibility setting only;
- * it is not used to spoof browser identity or defeat provider checks.
+ * Ordinary account pages, including accounts.google.com landing/basic sign-in
+ * routes, may still render in the WebContentsView. Apple and Microsoft keep
+ * their existing system-browser handoff behavior. `buildBrowserUserAgent()`
+ * remains a general compatibility setting, not browser-identity spoofing.
  */
 
-// Identity-provider endpoints that must be completed in the user's default
-// system browser. Google is deliberately OAuth-path-scoped: account browsing
-// and basic sign-in routes stay in the native view, while authorization paths
-// are handed off. Keep this predicate in sync with BrowserShell and Android.
+// Identity-provider endpoints that cannot complete inside an embedded page.
+// Desktop Google is OAuth-path-scoped and moves to a top-level Yayra window;
+// Apple/Microsoft and mobile Google retain secure system-browser handoff.
+// Keep this predicate in sync with BrowserShell and Android.
 const SYSTEM_BROWSER_AUTH_HOSTS = Object.freeze([
   'accounts.google.com',
   'appleid.apple.com',
@@ -750,6 +751,14 @@ function reloadActionForInput(input = {}) {
   return null;
 }
 
+function isGoogleOAuthAuthorizationUrl(rawUrl) {
+  let parsed;
+  try { parsed = new URL(rawUrl); } catch { return false; }
+  return (parsed.protocol === 'https:' || parsed.protocol === 'http:')
+    && parsed.hostname.toLowerCase() === 'accounts.google.com'
+    && GOOGLE_OAUTH_PATH.test(parsed.pathname);
+}
+
 function requiresSystemBrowserAuth(rawUrl, hosts = SYSTEM_BROWSER_AUTH_HOSTS) {
   let parsed;
   try { parsed = new URL(rawUrl); } catch { return false; }
@@ -759,7 +768,7 @@ function requiresSystemBrowserAuth(rawUrl, hosts = SYSTEM_BROWSER_AUTH_HOSTS) {
   return hosts.some((host) => {
     const normalizedHost = String(host).toLowerCase();
     if (normalizedHost === 'accounts.google.com') {
-      return hostname === normalizedHost && GOOGLE_OAUTH_PATH.test(parsed.pathname);
+      return hostname === normalizedHost && isGoogleOAuthAuthorizationUrl(rawUrl);
     }
     return hostname === normalizedHost || hostname.endsWith(`.${normalizedHost}`);
   });
@@ -928,6 +937,12 @@ function createWebviewBridge({
   ipcMain,
   shell,
   getMainWindow,
+  // Desktop Google OAuth runs in a separate top-level Yayra BrowserWindow
+  // that shares the source tab's Session. This keeps provider callbacks and
+  // resulting cookies inside the originating Yayra profile instead of losing
+  // them in an unrelated system browser. Apple/Microsoft remain external.
+  openGoogleAuthWindow = null,
+  closeGoogleAuthWindow = null,
   authHosts = SYSTEM_BROWSER_AUTH_HOSTS,
   // Resolves the BrowserWindow that owns a given webContents, so views
   // created by the floating mini-shell window attach to THAT window instead
@@ -1116,6 +1131,49 @@ function createWebviewBridge({
     const win = getMainWindow();
     if (!win || win.isDestroyed()) return;
     win.webContents.send(WEBVIEW_EVENT_CHANNEL, message);
+  }
+
+  function googleAuthWindowKey(entry) {
+    return `google-auth:${entry.key || entry.tabId}`;
+  }
+
+  function openGoogleAuthForEntry(entry, rawUrl, reason = 'navigation') {
+    if (!entry || !isGoogleOAuthAuthorizationUrl(rawUrl) || typeof openGoogleAuthWindow !== 'function') return false;
+    const url = secureSystemBrowserAuthUrl(rawUrl, authHosts);
+    const authKey = googleAuthWindowKey(entry);
+    try {
+      Promise.resolve(openGoogleAuthWindow({
+        key: authKey,
+        url,
+        sourceWebContents: entry.view.webContents,
+        ownerWindow: (entry.hostWin && !entry.hostWin.isDestroyed?.()) ? entry.hostWin : getMainWindow(),
+        partition: entry.isPrivate ? `incognito-${entry.tabId}` : partitionForProfile(entry.profileId),
+        onComplete: ({ url: resumedUrl } = {}) => {
+          sendTo(entry, 'google-auth-window-complete', { url: resumedUrl || null });
+        },
+        onClosed: ({ completed = false, reason: closeReason = 'window-closed' } = {}) => {
+          if (completed) return;
+          if (closeReason === 'load-failed') {
+            sendTo(entry, 'google-auth-window-failed', { reason: closeReason });
+          } else {
+            sendTo(entry, 'google-auth-window-closed', { reason: closeReason });
+          }
+        }
+      })).then((result) => {
+        if (result && result.ok === false) {
+          sendTo(entry, 'google-auth-window-failed', { reason: result.error || 'window-unavailable' });
+        }
+      }).catch((error) => {
+        logger.error?.(`[yayra:webview] failed to open full Google auth window: ${error?.message || error}`);
+        sendTo(entry, 'google-auth-window-failed', { reason: error?.message || 'window-unavailable' });
+      });
+      sendTo(entry, 'google-auth-window-opened', { url, reason });
+      return true;
+    } catch (error) {
+      logger.error?.(`[yayra:webview] failed to open full Google auth window: ${error?.message || error}`);
+      sendTo(entry, 'google-auth-window-failed', { reason: error?.message || 'window-unavailable' });
+      return true;
+    }
   }
 
   function entryForWebAuthnFrame(ses, frame) {
@@ -1541,6 +1599,13 @@ function createWebviewBridge({
 
       event?.preventDefault?.();
       const externalUrl = secureSystemBrowserAuthUrl(url, authHosts);
+      // Google gets a real top-level Yayra BrowserWindow sharing this tab's
+      // Session, so its callback returns to the originating profile/tab.
+      // Apple/Microsoft retain their established system-browser behavior.
+      if (openGoogleAuthForEntry(entry, externalUrl, 'navigation')) {
+        sendTo(entry, 'loading-stop');
+        return;
+      }
       Promise.resolve(shell.openExternal(externalUrl)).catch((err) => logger.error('[yayra:webview] failed to open external auth url', err));
       // Prevent the canceled navigation from leaving a stale loading spinner
       // in the original tab. No URL/history event is emitted: the in-app page
@@ -1597,6 +1662,7 @@ function createWebviewBridge({
       }
       if (requiresSystemBrowserAuth(url, authHosts)) {
         const externalUrl = secureSystemBrowserAuthUrl(url, authHosts);
+        if (openGoogleAuthForEntry(entry, externalUrl, 'popup')) return { action: 'deny' };
         shell.openExternal(externalUrl).catch((err) => logger.error('[yayra:webview] failed to open external auth url', err));
         sendTo(entry, 'system-browser-handoff', { url: externalUrl });
         return { action: 'deny' };
@@ -1644,6 +1710,7 @@ function createWebviewBridge({
       try { view.setBackgroundColor('#101218'); } catch { /* older electron */ }
     }
     const entry = {
+      key,
       view,
       lastUrl: null,
       tabId,
@@ -1689,7 +1756,8 @@ function createWebviewBridge({
     const win = (hostWin && !hostWin.isDestroyed?.()) ? hostWin : getMainWindow();
     if (!win || win.isDestroyed() || !tabId || !url) return { handedOffToSystemBrowser: false };
 
-    if (requiresSystemBrowserAuth(url, authHosts)) {
+    const googleAuthInYayra = isGoogleOAuthAuthorizationUrl(url) && typeof openGoogleAuthWindow === 'function';
+    if (requiresSystemBrowserAuth(url, authHosts) && !googleAuthInYayra) {
       const externalUrl = secureSystemBrowserAuthUrl(url, authHosts);
       shell.openExternal(externalUrl).catch((err) => logger.error('[yayra:webview] failed to open external auth url', err));
       sendTo({ tabId, hostWc }, 'system-browser-handoff', { url: externalUrl });
@@ -1725,6 +1793,15 @@ function createWebviewBridge({
     entry.pointerTheme = nextPointerTheme;
     entry.pointerSize = nextPointerSize;
     if (pointerChanged && entry.lastUrl) applyPointerThemeToPage(entry);
+
+    if (googleAuthInYayra) {
+      entry.requestedUrl = url;
+      const opened = openGoogleAuthForEntry(entry, url, 'direct-navigation');
+      return {
+        handedOffToSystemBrowser: false,
+        openedInYayraAuthWindow: opened
+      };
+    }
 
     // The virtual authenticator must exist before any page JavaScript runs.
     // Loading first creates a race where an early navigator.credentials call
@@ -1926,6 +2003,9 @@ function createWebviewBridge({
       } catch (err) {
         logger.error(`[yayra:webview] failed to detach view for ${key}`, err);
       }
+    }
+    if (typeof closeGoogleAuthWindow === 'function') {
+      try { closeGoogleAuthWindow(googleAuthWindowKey(entry), { focusOwner: false, reason: 'source-tab-closed' }); } catch { /* no auth window */ }
     }
     try { websitePasskeyProvider?.detach?.(entry.view.webContents); } catch { /* view is closing */ }
     if (!entry.view.webContents.isDestroyed()) entry.view.webContents.close();
@@ -2492,6 +2572,7 @@ module.exports = {
   SITE_PASSKEY_REQUEST_CHANNEL,
   SYSTEM_BROWSER_AUTH_HOSTS,
   OPEN_EXTERNAL_SCHEME,
+  isGoogleOAuthAuthorizationUrl,
   requiresSystemBrowserAuth,
   secureSystemBrowserAuthUrl,
   decodeOpenExternalRequest,

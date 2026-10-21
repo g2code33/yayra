@@ -39,7 +39,7 @@ async function makeShell(withBridge = false) {
   if (withBridge) {
     globalThis.window.yayra = {
       webview: {
-        ensure: async () => ({}), setBounds: async () => {},
+        ensure: async () => ({}), setBounds: async (tabId, bounds) => { calls.push(['setBounds', tabId, bounds]); },
         setVisible: async (tabId, visible) => { calls.push(['setVisible', tabId, visible]); },
         stop: async () => {}, goBack: async () => {}, goForward: async () => {},
         reload: async (tabId) => { calls.push(['reload', tabId]); },
@@ -79,6 +79,73 @@ test('LIVE SURFACE: a stuck obscured flag (dead snapshot, dead scrolling) is hea
       'no overlay on screen = no justification for a hidden page');
     const last = lastVisibleCall(calls);
     assert.ok(last && last[2] === true, 'the live native surface is visible again');
+  } finally {
+    shell.destroy();
+    delete globalThis.window.yayra;
+  }
+});
+
+test('SEARCH NAVIGATION: submitting while suggestions are open cannot leave Google behind a static screenshot', async () => {
+  const { shell, calls } = await makeShell(true);
+  try {
+    const list = shell.rootElement.querySelector('.fb-search-suggestions');
+    assert.ok(list, 'desktop omnibox owns a suggestion surface');
+    list.hidden = false;
+    shell.setPageObscured(true);
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(shell.state.isPageObscured, true, 'suggestions temporarily yield the native page');
+
+    shell.navigateActiveTab('icons');
+
+    assert.equal(shell.getActiveTab().url, 'https://www.google.com/search?q=icons');
+    assert.equal(shell.state.isPageObscured, false,
+      'navigation retires the dropdown before its input/render tree disappears');
+    const last = lastVisibleCall(calls);
+    assert.ok(last && last[2] === true, 'the Google destination owns a live, interactive native surface');
+  } finally {
+    shell.destroy();
+    delete globalThis.window.yayra;
+  }
+});
+
+test('ASYNC SUGGESTIONS: a response from a detached omnibox cannot re-freeze the new page', async () => {
+  const { shell, calls } = await makeShell(true);
+  try {
+    let resolveSuggestions;
+    shell.getGoogleSearchSuggestions = () => new Promise((resolve) => { resolveSuggestions = resolve; });
+    const oldInput = shell.rootElement.querySelector('.fb-omnibox-input');
+    oldInput.value = 'icons';
+    oldInput.dispatchEvent({ type: 'input', target: oldInput });
+    await Promise.resolve();
+    assert.equal(typeof resolveSuggestions, 'function', 'old omnibox request is pending');
+
+    shell.navigateActiveTab('icons');
+    const callsAfterNavigation = calls.length;
+    resolveSuggestions(['icons download', 'icons png']);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.equal(shell.state.isPageObscured, false);
+    assert.equal(calls.slice(callsAfterNavigation).some((call) => call[0] === 'setVisible' && call[2] === false), false,
+      'detached async work never hides the destination after navigation');
+  } finally {
+    shell.destroy();
+    delete globalThis.window.yayra;
+  }
+});
+
+test('LOAD COMPLETION: a zero-bounds desync is actively re-shown even when the obscured flag is already false', async () => {
+  const { shell, calls } = await makeShell(true);
+  try {
+    const tabId = shell.state.activeTabId;
+    calls.length = 0;
+    shell.state.isPageObscured = false;
+    shell.handleNativeWebviewEvent({ tabId, type: 'loading-stop' });
+
+    assert.ok(calls.some((call) => call[0] === 'setVisible' && call[1] === tabId && call[2] === true),
+      'loading-stop reasserts the live native surface');
+    assert.ok(calls.some((call) => call[0] === 'setBounds' && call[1] === tabId),
+      'loading-stop re-reports real bounds instead of trusting a stale visibility flag');
   } finally {
     shell.destroy();
     delete globalThis.window.yayra;

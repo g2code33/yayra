@@ -516,8 +516,8 @@ export class BrowserShell {
     // frequent full-DOM re-renders.
     this._nativeWebviewTabIds = new Set();
     // A handoff belongs to a tab and its auth URL, not to the whole shell.
-    // Keeping it here prevents chrome re-renders from reopening the system
-    // browser while the original tab URL/history remain intact.
+    // Keeping it here prevents chrome re-renders from reopening the provider
+    // surface while the original tab URL/history remain intact.
     this._systemBrowserHandoffs = new Map();
     // Voice Search and Lens are Google features, but their pages/results
     // must remain in Yayra's own site engine. This tab-scoped marker also
@@ -967,6 +967,17 @@ export class BrowserShell {
         }
         return hostname === host || hostname.endsWith(`.${host}`);
       });
+    } catch (_err) {
+      return false;
+    }
+  }
+
+  isGoogleOAuthAuthorizationUrl(url) {
+    try {
+      const parsed = new URL(url);
+      return (parsed.protocol === 'https:' || parsed.protocol === 'http:')
+        && parsed.hostname.toLowerCase() === 'accounts.google.com'
+        && GOOGLE_OAUTH_PATH.test(parsed.pathname);
     } catch (_err) {
       return false;
     }
@@ -1440,6 +1451,12 @@ export class BrowserShell {
     } else {
       target.innerHTML = '';
     }
+    // The first truth-check above deliberately runs before teardown so real
+    // overlays remain protected. Check once more now: an omnibox dropdown in
+    // the old render tree has just been detached, so a flag it left behind is
+    // stale and must not turn the destination page into a frozen screenshot.
+    try { this.healStuckPageSurface(); } catch { /* best-effort heal */ }
+
     const activeTab = this.getActiveTab();
     const activeTabWasLoading = Boolean(activeTab?.isLoading);
     const isPrivate = activeTab?.isPrivate;
@@ -1904,6 +1921,7 @@ export class BrowserShell {
       }
     } catch { /* detached render tree */ }
     this.ensureTopChromeHitTesting();
+    try { this.ensureActiveNativeSurfaceLive(); } catch { /* best-effort */ }
     return { cancelled, healed };
   }
 
@@ -3371,16 +3389,21 @@ export class BrowserShell {
 
   buildSystemBrowserHandoffFallback(url, { tabId = null, native = false } = {}) {
     const fallback = document.createElement('div');
+    const googleInYayra = native && this.isGoogleOAuthAuthorizationUrl(url);
+    const description = googleInYayra
+      ? 'Google sign-in opens in a full, separate Yayra window—not an embedded page. It uses this profile’s browsing session, and the provider callback returns here automatically when sign-in finishes.'
+      : 'Identity-provider sign-in opens in a separate secure browser. This Yayra tab and its URL stay intact. Browser cookies are not copied into Yayra, so a third-party site may not reflect the sign-in here unless it completes its own supported callback.';
+    const buttonLabel = googleInYayra ? 'Open Google sign-in window' : 'Open sign-in in browser';
     fallback.className = 'fb-frame-blocked-fallback fb-auth-handoff-fallback';
     fallback.style.cssText = 'position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; background:var(--fb-bg-elevated,#15171c); color:var(--fb-text-primary,#d7dbe3); text-align:center; padding:24px; z-index:1;';
     fallback.innerHTML = `
-      <div style="font-size:0.9rem; max-width:380px; line-height:1.5;">Identity-provider sign-in opens in a separate secure browser. This Yayra tab and its URL stay intact. Browser cookies are not copied into Yayra, so a third-party site may not reflect the sign-in here unless it completes its own supported callback.</div>
-      <button type="button" class="fb-btn fb-auth-handoff-open-btn" style="padding:8px 16px; border-radius:8px; border:none; background:#3b82f6; color:#fff; cursor:pointer; font-size:0.875rem;">Open sign-in in browser</button>
+      <div style="font-size:0.9rem; max-width:430px; line-height:1.5;">${description}</div>
+      <button type="button" class="fb-btn fb-auth-handoff-open-btn" style="padding:8px 16px; border-radius:8px; border:none; background:#3b82f6; color:#fff; cursor:pointer; font-size:0.875rem;">${buttonLabel}</button>
     `;
     fallback.querySelector('.fb-auth-handoff-open-btn')?.addEventListener('click', () => {
       if (native && tabId) {
-        // Re-enter the normal native ensure path to ask the main process to
-        // retry shell.openExternal(), without changing this tab or history.
+        // Re-enter the normal native ensure path to retry the provider's
+        // secure top-level surface without changing this tab or history.
         this._systemBrowserHandoffs.delete(tabId);
         if (this.state.activeTabId === tabId) this.render();
         return;
@@ -3550,12 +3573,12 @@ export class BrowserShell {
     wrapper.className += ' fb-native-webview-slot';
 
     // Matching provider OAuth URLs are handled outside the embedded
-    // WebContentsView. Google account/home/basic sign-in pages that do not
-    // match the explicit OAuth predicate stay in the native view. Keep the
-    // tab and navigationState authoritative; only the recognized provider
-    // URL is sent to Electron for shell.openExternal(). The record is
-    // installed BEFORE the async IPC call so a fast re-render cannot open
-    // another system-browser window for the same tab+URL.
+    // WebContentsView. On Electron, Google gets a full top-level Yayra window
+    // sharing this tab's Session; its callback therefore resumes this tab.
+    // Apple/Microsoft retain system-browser handoff. Google account/home/basic
+    // sign-in pages that do not match the OAuth predicate stay in the native
+    // view. The record is installed BEFORE IPC so a fast re-render cannot
+    // open another auth window for the same tab+URL.
     if (this.isSystemBrowserAuthHost(url)) {
       let handoff = this._systemBrowserHandoffs.get(tabId);
       if (!handoff || handoff.url !== url) {
@@ -3570,13 +3593,13 @@ export class BrowserShell {
         })).then((result) => {
           if (this._systemBrowserHandoffs.get(tabId) !== handoff) return;
           const tab = this.state.tabs.find((item) => item.id === tabId);
-          if (result && result.handedOffToSystemBrowser) {
+          if (result && (result.handedOffToSystemBrowser || result.openedInYayraAuthWindow)) {
             handoff.status = 'opened';
             if (tab && tab.url === url) this.updateTabLoading(tabId, false);
           } else {
             handoff.status = 'failed';
             if (tab && tab.url === url) this.updateTabLoading(tabId, false);
-            this.showTransientNotice('Could not open the sign-in browser. This tab was kept unchanged.');
+            this.showTransientNotice('Could not open the sign-in window. This tab was kept unchanged.');
           }
         }).catch((err) => {
           if (this._systemBrowserHandoffs.get(tabId) === handoff) handoff.status = 'failed';
@@ -4025,8 +4048,33 @@ export class BrowserShell {
         if (typeof document === 'undefined' || document.hidden === true) return;
         this._surfaceHealOnReturnBound = false; // re-arm on the next obscure
         try { this.healStuckPageSurface(); } catch { /* best-effort */ }
+        try { this.ensureActiveNativeSurfaceLive(); } catch { /* best-effort */ }
       });
     } catch { /* embedders/shims without document events */ }
+  }
+
+  /**
+   * Reasserts the live surface itself, not just its state flag. This repairs
+   * the second half of the freeze class: the renderer may say "not obscured"
+   * while a lost/out-of-order bounds update left the native view at 0×0.
+   */
+  ensureActiveNativeSurfaceLive(tabId = this.state.activeTabId) {
+    const tab = this.state.tabs.find((item) => item.id === tabId);
+    if (!tab || tabId !== this.state.activeTabId || !/^https?:\/\//i.test(String(tab.url || ''))) return false;
+    if (this.state.isPageObscured) {
+      try { this.healStuckPageSurface(); } catch { /* best-effort */ }
+    }
+    if (this.hasBlockingOverlay() || this.isSystemBrowserAuthHost(tab.url)) return false;
+    try { this.viewportElement?.querySelectorAll('.fb-page-snapshot-img').forEach((el) => el.remove()); } catch { /* detached */ }
+    if (this.nativeWebview && this._nativeWebviewTabIds.has(tabId)) {
+      try {
+        const shown = this.nativeWebview.setVisible(tabId, true);
+        if (shown && typeof shown.catch === 'function') shown.catch(() => {});
+      } catch { /* bridge unavailable during teardown */ }
+      this.restoreActiveNativeBounds(tabId);
+    }
+    if (this._androidTabWebIds?.has?.(tabId)) this.syncAndroidTabWebVisibility(tabId, true);
+    return true;
   }
 
   restoreActiveNativeBounds(tabId) {
@@ -4218,6 +4266,13 @@ export class BrowserShell {
         break;
       case 'loading-stop':
         this.updateTabLoading(tabId, false);
+        // Final safety net: a completed active page may never remain behind a
+        // stale suggestion snapshot. Genuine visible chrome makes the heal a
+        // no-op; otherwise the live WebContentsView is restored immediately.
+        if (tabId === this.state.activeTabId) {
+          try { this.healStuckPageSurface(); } catch { /* best-effort */ }
+          try { this.ensureActiveNativeSurfaceLive(tabId); } catch { /* best-effort */ }
+        }
         break;
       case 'page-unresponsive':
         if (this.state.settings.performanceIssueAlerts !== false) {
@@ -4314,6 +4369,22 @@ export class BrowserShell {
         }
         break;
       }
+      case 'google-auth-window-opened':
+        this.showTransientNotice('Google sign-in opened in a full Yayra window. This tab will resume automatically after the callback.');
+        this.updateTabLoading(tabId, false);
+        break;
+      case 'google-auth-window-complete':
+        this._systemBrowserHandoffs.delete(tabId);
+        this.showTransientNotice('Google sign-in completed. Returning to this Yayra tab…');
+        break;
+      case 'google-auth-window-closed':
+        this.updateTabLoading(tabId, false);
+        this.showTransientNotice('Google sign-in was closed. This tab was left unchanged.');
+        break;
+      case 'google-auth-window-failed':
+        this.updateTabLoading(tabId, false);
+        this.showTransientNotice('Yayra could not open the Google sign-in window. Please try again.');
+        break;
       case 'system-browser-handoff': {
         // Direct auth URLs have an in-tab fallback card; popups and blocked
         // redirects leave the relying site visible and get this non-blocking
@@ -6363,6 +6434,20 @@ export class BrowserShell {
     return `<span class="fb-avatar" style="position:relative; width:${size}px; height:${size}px; display:inline-flex;">${img}${fallback}</span>`;
   }
 
+  formatGoogleSignInError(error) {
+    const code = String(error || '');
+    if (code === 'not_configured') return 'Google sign-in isn\u2019t configured for this build yet.';
+    if (code === 'sign_in_cancelled') return 'The Google sign-in window was closed before sign-in finished.';
+    if (code === 'google_auth_window_load_failed') return 'The Google sign-in window could not load. Check your connection and try again.';
+    if (code === 'oauth_timeout') return 'Google did not return before the secure sign-in attempt expired. Please try again.';
+    if (code === 'oauth_state_mismatch') return 'The sign-in response could not be verified, so Yayra rejected it for your security.';
+    if (code.includes('access_denied')) return 'Google sign-in was cancelled or declined.';
+    if (code.startsWith('token_exchange_failed')) return 'Google returned to Yayra, but the secure sign-in exchange failed. Please try again.';
+    if (code.startsWith('userinfo_failed')) return 'Yayra signed in but could not read your basic Google profile. Please try again.';
+    if (/fetch failed|network/i.test(code)) return 'Yayra could not reach Google. Check your connection and try again.';
+    return 'Please try again.';
+  }
+
   renderGoogleAccountSectionHtml() {
     if (!this.authBridge) {
       return `
@@ -6374,8 +6459,8 @@ export class BrowserShell {
 
     if (account.status === 'signing-in') {
       return `
-        <p>Continue in the browser window that just opened to finish signing in to Google.</p>
-        <button class="fb-btn fb-btn-secondary" disabled>Waiting for sign-in&hellip;</button>
+        <p>Continue in the full Google window opened by Yayra. This page will update automatically when Google returns.</p>
+        <button class="fb-btn fb-btn-secondary" disabled>Waiting for Google&hellip;</button>
       `;
     }
 
@@ -6402,11 +6487,11 @@ export class BrowserShell {
     }
 
     const errorNote = account.status === 'error'
-      ? `<p class="fb-settings-error-note" style="color:#f66;">Couldn't sign in: ${account.error === 'not_configured' ? 'Google sign-in isn\u2019t configured for this build yet.' : (account.error || 'please try again.')}</p>`
+      ? `<p class="fb-settings-error-note" style="color:#f66;">${this.formatGoogleSignInError(account.error)}</p>`
       : '';
 
     return `
-      <p>Sign in with your Google account to personalize Yayra. Sign-in opens in your default browser for security, per Google's own policy.</p>
+      <p>Sign in with your Google account to personalize Yayra. Google opens in its own full Yayra window and returns here automatically.</p>
       ${errorNote}
       <button class="fb-btn fb-btn-primary fb-in-google-signin-btn" style="align-self:flex-start;">Sign in with Google</button>
     `;
@@ -12417,7 +12502,7 @@ export class BrowserShell {
     } else {
       const isSigningIn = account.status === 'signing-in';
       const errorNote = account.status === 'error'
-        ? `<p style="margin:0; color:#f66; font-size:0.8rem;">Couldn't sign in: ${account.error === 'not_configured' ? 'Google sign-in isn\u2019t configured for this build yet.' : (account.error || 'please try again.')}</p>`
+        ? `<p style="margin:0; color:#f66; font-size:0.8rem;">${this.formatGoogleSignInError(account.error)}</p>`
         : '';
       dropdown.innerHTML = `
         <div class="fb-account-dropdown-header">
@@ -14838,6 +14923,31 @@ export class BrowserShell {
     return [...new Set([...remembered, ...common].filter((item) => String(item).toLowerCase().includes(normalized)))].slice(0, 8);
   }
 
+  /**
+   * Ends every suggestion request/dropdown before a navigation replaces its
+   * input. Without this boundary an old async suggestion response can finish
+   * after render() detached the omnibox, set isPageObscured back to true, and
+   * leave the newly loaded native page hidden behind a static screenshot.
+   */
+  retireSearchSuggestionsForNavigation({ restoreSurface = true } = {}) {
+    this._suggestionGeneration = (this._suggestionGeneration || 0) + 1;
+    if (this._suggestionsDebounceTimer) clearTimeout(this._suggestionsDebounceTimer);
+    this._suggestionsDebounceTimer = null;
+    try { this._suggestionsDebounceResolve?.(); } catch { /* already settled */ }
+    this._suggestionsDebounceResolve = null;
+    try { this.searchSuggestionController?.abort(); } catch { /* already settled */ }
+    this.searchSuggestionController = null;
+    if (typeof document !== 'undefined') {
+      try {
+        for (const list of document.querySelectorAll('.fb-search-suggestions') || []) list.hidden = true;
+      } catch { /* detached shell */ }
+    }
+    if (restoreSurface && this.state.isPageObscured) {
+      try { this.setPageObscured(false); }
+      catch { this.state.isPageObscured = false; }
+    }
+  }
+
   async getGoogleSearchSuggestions(query) {
     const raw = String(query || '').trim();
     const generation = (this._suggestionGeneration || 0) + 1;
@@ -14903,6 +15013,28 @@ export class BrowserShell {
     list.hidden = true;
     host.appendChild(list);
 
+    // Async responses belong only to the render tree that requested them.
+    // `isConnected` is authoritative in browsers; root containment also
+    // keeps detached DOM test hosts valid while rejecting an old omnibox
+    // after BrowserShell.render() has replaced it.
+    const surfaceIsCurrent = () => {
+      try {
+        const isWithinCurrentRoot = (element) => {
+          let node = element;
+          for (let depth = 0; node && depth < 64; depth += 1) {
+            if (node === this.rootElement) return true;
+            node = node.parentElement || node.parentNode || null;
+          }
+          return false;
+        };
+        if (isWithinCurrentRoot(input) && isWithinCurrentRoot(list)) return true;
+        if (typeof input.isConnected === 'boolean' || typeof list.isConnected === 'boolean') {
+          return input.isConnected === true && list.isConnected === true;
+        }
+        return false;
+      } catch { return false; }
+    };
+
     let activeIndex = -1;
     let requestId = 0;
     const hide = () => {
@@ -14941,7 +15073,7 @@ export class BrowserShell {
       }
       const currentRequest = ++requestId;
       const suggestions = await this.getGoogleSearchSuggestions(query);
-      if (currentRequest !== requestId || input.value.trim() !== query) return;
+      if (!surfaceIsCurrent() || currentRequest !== requestId || input.value.trim() !== query) return;
       list.innerHTML = '';
       // Optional Yayra entry for the browser omnibox. The Google-owned
       // new-tab pill opts out and keeps its separate Ask Yayra AI button.
@@ -15728,6 +15860,11 @@ export class BrowserShell {
 
     const query = (rawInput || '').trim();
     if (!query) return;
+
+    // Navigation is a hard lifecycle boundary for autocomplete. Retire the
+    // old dropdown and its async request BEFORE replacing the omnibox; an old
+    // response must never hide the destination's live native surface.
+    this.retireSearchSuggestionsForNavigation();
 
     const targetUrl = this.interpretUrl(query);
     const googleFeatureInAppOnly = this.isGoogleFeatureInAppOnly(activeTab.id, targetUrl);
@@ -18266,6 +18403,7 @@ export class BrowserShell {
     // before pointerup. End every renderer-only gesture and release its IPC
     // session/global fallback listeners synchronously.
     this.cancelActivePointerGestures('shell destroy');
+    this.retireSearchSuggestionsForNavigation({ restoreSurface: false });
     for (const [target, type, listener, options] of this._topChromeRecoveryBindings || []) {
       try { target.removeEventListener?.(type, listener, options); } catch { /* target already gone */ }
     }

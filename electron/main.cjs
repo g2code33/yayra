@@ -16,6 +16,7 @@ const { createAuthBridge } = require('./authBridge.cjs');
 const { createAuthStore } = require('./authStore.cjs');
 const { signInWithGoogle } = require('./googleAuth.cjs');
 const { resolveGoogleClientId, resolveGoogleClientSecret } = require('./googleAuthConfig.cjs');
+const { APP_GOOGLE_AUTH_PARTITION, createGoogleAuthWindowManager } = require('./googleAuthWindow.cjs');
 const { createDownloadsStore } = require('./downloadsStore.cjs');
 const { createDownloadsBridge } = require('./downloadsBridge.cjs');
 const { createPasskeyBridge } = require('./passkeyBridge.cjs');
@@ -47,6 +48,7 @@ let downloadsBridge = null;
 const profileWindows = new Set();
 let overlayBridge = null;
 let webviewBridge = null;
+let googleAuthWindowManager = null;
 let globalHotkeys = null;
 let trayController = null;
 let windowDragController = null;
@@ -695,6 +697,8 @@ app.whenReady().then(async () => {
 }).catch((err) => reportStartupFailure('startup-sequence', err));
 
 app.on('will-quit', () => {
+  try { googleAuthWindowManager?.closeAll(); } catch { /* exiting */ }
+  googleAuthWindowManager = null;
   try { globalHotkeys?.detach(); } catch { /* exiting */ }
   try { windowDragController?.destroy(); } catch { /* exiting */ }
   windowDragController = null;
@@ -853,7 +857,11 @@ function registerIpcBridges() {
   // live profile/incognito partition. Returns the real byte count freed.
   ipcMain.handle('yayra:clear-browsing-data', async (_event, { cache = true, cookies = false } = {}) => {
     try {
-      const sessions = new Set([session.defaultSession, session.fromPartition('persist:yayra-webview')]);
+      const sessions = new Set([
+        session.defaultSession,
+        session.fromPartition('persist:yayra-webview'),
+        session.fromPartition(APP_GOOGLE_AUTH_PARTITION)
+      ]);
       for (const wc of (typeof webContents.getAllWebContents === 'function' ? webContents.getAllWebContents() : [])) {
         try { if (wc.session) sessions.add(wc.session); } catch { /* destroyed */ }
       }
@@ -1098,6 +1106,19 @@ function registerIpcBridges() {
     logger: console
   });
 
+  // Full top-level Google auth windows. RX Store's working desktop flow
+  // demonstrates the important distinction: the provider owns an entire
+  // BrowserWindow, not an embedded page surface. Yayra additionally shares
+  // the originating tab Session and resumes that tab after the callback, so
+  // the redirect and resulting login state never disappear into Chrome.
+  googleAuthWindowManager = createGoogleAuthWindowManager({
+    BrowserWindow,
+    getMainWindow: () => mainWindow,
+    buildUserAgent: () => buildBrowserUserAgent({ platform: process.platform, chromeVersion: process.versions.chrome }),
+    iconPath: resolveTrayIconPath(),
+    logger: console
+  });
+
   // Native website-rendering engine bridge (replaces <iframe>-based rendering
   // so real sites with X-Frame-Options/frame-ancestors - Google, GitHub,
   // etc. - actually load). See electron/webviewBridge.cjs for the full
@@ -1107,6 +1128,8 @@ function registerIpcBridges() {
     WebContentsView,
     ipcMain,
     shell,
+    openGoogleAuthWindow: (options) => googleAuthWindowManager.openWebsiteAuth(options),
+    closeGoogleAuthWindow: (key, options) => googleAuthWindowManager.close(key, options),
     Menu,
     clipboard,
     dialog,
@@ -1121,7 +1144,7 @@ function registerIpcBridges() {
 
   // "Sign in with Google" for Yayra's own app-level identity. See
   // electron/googleAuth.cjs + electron/authBridge.cjs for the full
-  // architecture rationale (RFC 8252 loopback + PKCE, system-browser-only).
+  // architecture rationale (RFC 8252 loopback + PKCE in a full Yayra window).
   const authStore = createAuthStore({
     fs,
     safeStorageImpl: safeStorage,
@@ -1144,7 +1167,8 @@ function registerIpcBridges() {
     // worked fine. net.fetch is proxy- and OS-cert-aware the same way the
     // browser is, so it succeeds in those environments too.
     fetchImpl: typeof net.fetch === 'function' ? net.fetch : undefined,
-    signInImpl: signInWithGoogle
+    signInImpl: signInWithGoogle,
+    googleAuthWindow: googleAuthWindowManager
   });
 
   // Real file-download tracking (replaces the old hardcoded fake "Downloads"

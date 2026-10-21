@@ -9,7 +9,7 @@
  * the same dependency-injection + factory pattern as createWebviewBridge in
  * electron/webviewBridge.cjs so it stays unit-testable without a real
  * Electron runtime, a real browser, or live network access to Google - see
- * tests/google-oauth.test.mjs and tests/electron-auth-bridge.test.mjs.
+ * tests/google-oauth.test.mjs and tests/google-auth-bridge.test.mjs.
  *
  * IMPORTANT: this requires a real Google Cloud "Desktop app" OAuth Client ID
  * AND Client Secret that only the person deploying Yayra can create (see
@@ -31,6 +31,7 @@ function createAuthBridge({
   clientSecret,
   fetchImpl,
   signInImpl,
+  googleAuthWindow = null,
   logger = console
 }) {
   let signingIn = false;
@@ -47,23 +48,47 @@ function createAuthBridge({
 
     signingIn = true;
     send('signing-in');
+    const abortController = new AbortController();
+    let openedInYayra = false;
+    let authWindowClosed = false;
+    let authWindowFailure = null;
     try {
       const { profile, tokens } = await signInImpl({
         clientId,
         clientSecret,
-        openExternal: (url) => shell.openExternal(url),
+        openExternal: (url) => {
+          if (googleAuthWindow && typeof googleAuthWindow.openAppAuth === 'function') {
+            openedInYayra = true;
+            return googleAuthWindow.openAppAuth(url, {
+              onClosed: ({ reason } = {}) => {
+                if (reason === 'load-failed') authWindowFailure = 'google_auth_window_load_failed';
+                else authWindowClosed = true;
+                abortController.abort();
+              }
+            });
+          }
+          return shell.openExternal(url);
+        },
+        signal: abortController.signal,
         ...(fetchImpl ? { fetchImpl } : {}),
         logger
       });
+      if (abortController.signal.aborted) throw new Error('oauth_window_closed');
       authStore.save({ profile, tokens });
       send('signed-in', { profile });
       return { ok: true, profile };
     } catch (err) {
-      const message = err && err.message ? err.message : String(err);
+      const rawMessage = err && err.message ? err.message : String(err);
+      const message = authWindowFailure || (authWindowClosed || rawMessage === 'oauth_window_closed'
+        ? 'sign_in_cancelled'
+        : rawMessage);
       logger?.error?.(`[yayra:auth] sign-in failed: ${message}`);
       send('error', { message });
       return { ok: false, error: message };
     } finally {
+      if (openedInYayra && googleAuthWindow && typeof googleAuthWindow.close === 'function') {
+        try { googleAuthWindow.close(undefined, { reason: 'sign-in-finished' }); } catch { /* already closed */ }
+      }
       signingIn = false;
     }
   }
@@ -81,15 +106,19 @@ function createAuthBridge({
   }
 
   /**
-   * Opens Google's own account-management page in the user's system
-   * browser (never embedded - that's where the user's real Google session
-   * actually lives, since sign-in itself is handled by the system browser).
-   * Deliberately hardcoded to this single trusted URL rather than exposing
-   * a generic "open any URL" bridge to the renderer.
+   * Opens Google's own account-management page in the same full, top-level
+   * Yayra auth window used for sign-in. Its persistent auth Session remembers
+   * the selected Google account without exposing a generic URL bridge to the
+   * renderer. Older hosts without the window manager retain system-browser
+   * fallback behavior.
    */
   async function handleOpenAccountPage() {
     try {
-      await shell.openExternal('https://myaccount.google.com/');
+      if (googleAuthWindow && typeof googleAuthWindow.openGoogleAccount === 'function') {
+        await googleAuthWindow.openGoogleAccount('https://myaccount.google.com/');
+      } else {
+        await shell.openExternal('https://myaccount.google.com/');
+      }
       return { ok: true };
     } catch (err) {
       const message = err && err.message ? err.message : String(err);

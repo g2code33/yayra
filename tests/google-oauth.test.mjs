@@ -179,10 +179,32 @@ test('fetchUserProfile: throws on a non-OK response', async () => {
   await assert.rejects(() => fetchUserProfile({ accessToken: 'bad', fetchImpl: fakeFetch }), /userinfo_failed:401/);
 });
 
+test('token and profile requests stop if the user closes the top-level auth window after callback', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  let fetchCalls = 0;
+  const fakeFetch = async () => { fetchCalls += 1; throw new Error('should not be called'); };
+
+  await assert.rejects(() => exchangeCodeForTokens({
+    clientId: 'c',
+    code: 'x',
+    codeVerifier: 'v',
+    redirectUri: 'http://127.0.0.1/callback',
+    fetchImpl: fakeFetch,
+    signal: controller.signal
+  }), /oauth_window_closed/);
+  await assert.rejects(() => fetchUserProfile({
+    accessToken: 'token',
+    fetchImpl: fakeFetch,
+    signal: controller.signal
+  }), /oauth_window_closed/);
+  assert.equal(fetchCalls, 0);
+});
+
 // --- Full signInWithGoogle flow (real loopback socket, fake browser+fetch) -
 
 function openExternalThatHitsCallback(query) {
-  // Simulates the user completing consent in their real system browser by
+  // Simulates the user completing consent in Yayra's top-level auth window by
   // issuing the exact redirect request Google would send, against whatever
   // ephemeral port the loopback server actually bound to.
   return async (authUrl) => {
@@ -259,6 +281,21 @@ test('signInWithGoogle: rejects on timeout if the browser never completes the re
   await assert.rejects(
     () => signInWithGoogle({ clientId: 'c', openExternal, fetchImpl: async () => { throw new Error('should not be called'); }, timeoutMs: 50 }),
     /oauth_timeout/
+  );
+});
+
+test('signInWithGoogle: closing Yayra\'s full auth window aborts the loopback wait immediately', async () => {
+  const controller = new AbortController();
+  const openExternal = async () => { controller.abort(); };
+  await assert.rejects(
+    () => signInWithGoogle({
+      clientId: 'c',
+      openExternal,
+      signal: controller.signal,
+      fetchImpl: async () => { throw new Error('should not be called'); },
+      timeoutMs: 5000
+    }),
+    /oauth_window_closed/
   );
 });
 

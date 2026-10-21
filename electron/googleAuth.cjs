@@ -3,22 +3,22 @@
 /**
  * Yayra "Sign in with Google" - Electron desktop OAuth 2.0 client
  * ----------------------------------------------------------------
- * This is a SEPARATE concern from electron/webviewBridge.cjs's embedded-auth
- * handoff. That file stops Yayra from ever trying (and failing) to complete
- * a Google sign-in INSIDE the embedded browsing surface, because Google
- * actively refuses that for any embedded webview - see the comment at the
- * top of webviewBridge.cjs and
+ * This is a SEPARATE concern from electron/webviewBridge.cjs's website-auth
+ * routing. Both avoid completing Google OAuth INSIDE an embedded page surface,
+ * because Google actively refuses that class of user agent; both now use a
+ * dedicated top-level BrowserWindow owned by Yayra. See webviewBridge.cjs and
  * https://developers.google.com/identity/protocols/oauth2/policies#embedded-webviews.
  *
- * This file is how Yayra ITSELF authenticates a user against their Google
- * account for its own app-level features (not for browsing Google services
- * logged in inside the embedded view - that is never possible, by Google's
- * own design, from ANY embedded browser surface, and this file does not
- * attempt it). It implements the OAuth 2.0 flow Google explicitly recommends
+ * This file authenticates a user against Google for Yayra's own app-level
+ * features. It keeps the established loopback callback + PKCE security model;
+ * the only transport change is that the complete Google UI and loopback result
+ * now stay in Yayra's top-level auth window. It implements the OAuth 2.0 flow
+ * Google explicitly recommends
  * for native/installed apps per RFC 8252 ("OAuth 2.0 for Native Apps"):
  *
- *   1. Open the user's real SYSTEM browser to Google's consent screen
- *      (shell.openExternal - never an embedded view).
+ *   1. Open a dedicated, top-level Yayra BrowserWindow to Google's consent
+ *      screen. It is a complete browser window—not a WebContentsView/iframe—
+ *      and mirrors the working full-window flow used by RX Store.
  *   2. Use the Authorization Code + PKCE flow. Google's docs call "Desktop
  *      app" OAuth clients public/non-confidential, but Google's token
  *      endpoint still rejects the code exchange without a client_secret in
@@ -118,17 +118,17 @@ function parseCallbackUrl(requestUrl) {
 
 const SUCCESS_HTML = `<!doctype html><html><head><meta charset="utf-8"><title>Yayra sign-in complete</title></head>
 <body style="font-family:system-ui,sans-serif;background:#0b0d12;color:#e7e9ee;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
-<div style="text-align:center;"><h2>Signed in to Yayra</h2><p>You can close this tab and return to the Yayra app.</p></div>
+<div style="text-align:center;"><h2>Signed in to Yayra</h2><p>Finishing securely. This window will close automatically.</p></div>
 </body></html>`;
 
 const FAILURE_HTML = (reason) => `<!doctype html><html><head><meta charset="utf-8"><title>Yayra sign-in failed</title></head>
 <body style="font-family:system-ui,sans-serif;background:#0b0d12;color:#e7e9ee;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
-<div style="text-align:center;"><h2>Sign-in did not complete</h2><p>${reason}</p><p>You can close this tab and return to the Yayra app.</p></div>
+<div style="text-align:center;"><h2>Sign-in did not complete</h2><p>${reason}</p><p>Returning to Yayra…</p></div>
 </body></html>`;
 
 /**
- * Starts the one-shot loopback HTTP server, opens the user's system browser
- * to Google's consent screen once the server's real assigned port is known
+ * Starts the one-shot loopback HTTP server, opens the injected top-level auth
+ * surface to Google's consent screen once the server's assigned port is known
  * (needed to build the exact redirect_uri), and resolves with the
  * authorization code once Google redirects back. Rejects on state mismatch,
  * an error param from Google (e.g. the user clicked "Cancel"), or timeout.
@@ -142,10 +142,12 @@ function runLoopbackAuthorization({
   httpModule = http,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   logger = console,
-  onRedirectUriKnown
+  onRedirectUriKnown,
+  signal = null
 }) {
   return new Promise((resolve, reject) => {
     let settled = false;
+    let abortHandler = null;
     const timer = setTimeout(() => finish(new Error('oauth_timeout')), timeoutMs);
     timer.unref?.();
 
@@ -174,19 +176,32 @@ function runLoopbackAuthorization({
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      server.close();
+      if (abortHandler && signal?.removeEventListener) {
+        try { signal.removeEventListener('abort', abortHandler); } catch { /* optional signal shim */ }
+      }
+      try { server.close(); } catch { /* server may not have started yet */ }
       if (err) reject(err);
       else resolve(code);
     }
 
+    if (signal) {
+      abortHandler = () => finish(new Error('oauth_window_closed'));
+      if (signal.aborted) {
+        finish(new Error('oauth_window_closed'));
+        return;
+      }
+      try { signal.addEventListener('abort', abortHandler, { once: true }); } catch { /* optional signal shim */ }
+    }
+
     server.on('error', finish);
     server.listen(0, '127.0.0.1', async () => {
+      if (settled) return;
       try {
         const { port } = server.address();
         const redirectUri = `http://127.0.0.1:${port}${CALLBACK_PATH}`;
         onRedirectUriKnown?.(redirectUri);
         const authUrl = buildAuthorizationUrl({ clientId, redirectUri, state, codeChallenge, scopes });
-        logger?.info?.(`[yayra:auth] opening system browser for Google sign-in (redirect ${redirectUri})`);
+        logger?.info?.(`[yayra:auth] opening top-level Google sign-in window (redirect ${redirectUri})`);
         await openExternal(authUrl);
       } catch (err) {
         finish(err);
@@ -196,7 +211,7 @@ function runLoopbackAuthorization({
 }
 
 
-async function exchangeCodeForTokens({ clientId, clientSecret, code, codeVerifier, redirectUri, fetchImpl = globalThis.fetch }) {
+async function exchangeCodeForTokens({ clientId, clientSecret, code, codeVerifier, redirectUri, fetchImpl = globalThis.fetch, signal = null }) {
   const body = new URLSearchParams({
     client_id: clientId,
     code,
@@ -207,11 +222,14 @@ async function exchangeCodeForTokens({ clientId, clientSecret, code, codeVerifie
   // Google requires this for Desktop-app clients despite PKCE - see the
   // file header comment above for why this is still safe to send.
   if (clientSecret) body.set('client_secret', clientSecret);
-  const response = await fetchImpl(GOOGLE_TOKEN_ENDPOINT, {
+  if (signal?.aborted) throw new Error('oauth_window_closed');
+  const request = {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: body.toString()
-  });
+  };
+  if (signal) request.signal = signal;
+  const response = await fetchImpl(GOOGLE_TOKEN_ENDPOINT, request);
   if (!response.ok) {
     const text = await response.text().catch(() => '');
     throw new Error(`token_exchange_failed:${response.status}:${text}`);
@@ -219,10 +237,11 @@ async function exchangeCodeForTokens({ clientId, clientSecret, code, codeVerifie
   return response.json();
 }
 
-async function fetchUserProfile({ accessToken, fetchImpl = globalThis.fetch }) {
-  const response = await fetchImpl(GOOGLE_USERINFO_ENDPOINT, {
-    headers: { authorization: `Bearer ${accessToken}` }
-  });
+async function fetchUserProfile({ accessToken, fetchImpl = globalThis.fetch, signal = null }) {
+  if (signal?.aborted) throw new Error('oauth_window_closed');
+  const request = { headers: { authorization: `Bearer ${accessToken}` } };
+  if (signal) request.signal = signal;
+  const response = await fetchImpl(GOOGLE_USERINFO_ENDPOINT, request);
   if (!response.ok) {
     throw new Error(`userinfo_failed:${response.status}`);
   }
@@ -238,7 +257,7 @@ async function fetchUserProfile({ accessToken, fetchImpl = globalThis.fetch }) {
 
 /**
  * Runs the full interactive sign-in flow end to end: PKCE/state generation,
- * loopback server + system browser handoff, code-for-token exchange, and
+ * loopback server + injected top-level auth window, code-for-token exchange, and
  * profile fetch. Returns { profile, tokens } on success, where tokens is the
  * raw Google token response ({ access_token, refresh_token?, expires_in,
  * id_token, ... }). Throws on cancellation, state mismatch, timeout, or any
@@ -254,7 +273,8 @@ async function signInWithGoogle({
   fetchImpl = globalThis.fetch,
   randomBytesImpl = crypto.randomBytes,
   timeoutMs = DEFAULT_TIMEOUT_MS,
-  logger = console
+  logger = console,
+  signal = null
 }) {
   if (!clientId) throw new Error('google_oauth_not_configured');
   if (typeof openExternal !== 'function') throw new Error('openExternal_required');
@@ -272,11 +292,12 @@ async function signInWithGoogle({
     httpModule,
     timeoutMs,
     logger,
+    signal,
     onRedirectUriKnown: (uri) => { capturedRedirectUri = uri; }
   });
 
-  const tokens = await exchangeCodeForTokens({ clientId, clientSecret, code, codeVerifier, redirectUri: capturedRedirectUri, fetchImpl });
-  const profile = await fetchUserProfile({ accessToken: tokens.access_token, fetchImpl });
+  const tokens = await exchangeCodeForTokens({ clientId, clientSecret, code, codeVerifier, redirectUri: capturedRedirectUri, fetchImpl, signal });
+  const profile = await fetchUserProfile({ accessToken: tokens.access_token, fetchImpl, signal });
 
   return { profile, tokens };
 }

@@ -288,12 +288,15 @@ test('Native engine: a "navigated" event from the main process updates tab URL, 
   }
 });
 
-test('Native engine: direct Google OAuth handoff preserves tab id, URL, active selection, history and fallback', async () => {
+test('Native engine: direct Google OAuth full-window flow preserves tab id, URL, active selection, history and fallback', async () => {
   const { fake, calls, uninstall } = installFakeNativeWebview();
   try {
     fake.ensure = (tabId, url) => {
       calls.ensure.push({ tabId, url });
-      return Promise.resolve({ handedOffToSystemBrowser: url.includes('/o/oauth2/') || url.includes('/gsi/select') });
+      return Promise.resolve({
+        handedOffToSystemBrowser: false,
+        openedInYayraAuthWindow: url.includes('/o/oauth2/') || url.includes('/gsi/select')
+      });
     };
     const container = document.createElement('div');
     const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
@@ -317,9 +320,35 @@ test('Native engine: direct Google OAuth handoff preserves tab id, URL, active s
     assert.deepEqual(tab.navigationState.historyStack, originalHistory);
     assert.equal(tab.navigationState.currentIndex, originalIndex);
     assert.equal(tab.canGoBack, true);
-    assert.ok(shell.rootElement.querySelector('.fb-auth-handoff-fallback'), 'the tab explains why sign-in is external');
+    const authCard = shell.rootElement.querySelector('.fb-auth-handoff-fallback');
+    assert.ok(authCard, 'the source tab explains the separate full-window flow');
+    assert.match(authCard.textContent, /full, separate Yayra window/i);
+    assert.doesNotMatch(authCard.textContent, /cookies are not copied/i);
     assert.equal(calls.ensure.filter((call) => call.url === tab.url).length, 1, 're-rendering does not reopen the same auth URL');
     assert.ok(calls.setVisible.some((call) => call.tabId === tabId && call.visible === false), 'any previous native page surface is hidden, not painted over the fallback');
+  } finally {
+    uninstall();
+  }
+});
+
+test('Yayra account UI explains the full Google window and turns cancellation into clear live copy', async () => {
+  const { uninstall } = installFakeNativeWebview();
+  try {
+    const container = document.createElement('div');
+    const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+    await shell.initialize();
+    window.yayra.auth = {};
+    shell.state.googleAccount = { status: 'signing-in' };
+    const waiting = shell.renderGoogleAccountSectionHtml();
+    assert.match(waiting, /full Google window opened by Yayra/i);
+    assert.match(waiting, /update automatically/i);
+    assert.doesNotMatch(waiting, /default browser/i);
+
+    shell.state.googleAccount = { status: 'error', error: 'sign_in_cancelled' };
+    const cancelled = shell.renderGoogleAccountSectionHtml();
+    assert.match(cancelled, /window was closed before sign-in finished/i);
+    assert.doesNotMatch(cancelled, /sign_in_cancelled/);
+    shell.destroy();
   } finally {
     uninstall();
   }
@@ -351,7 +380,7 @@ test('Native engine: Google account home, management, and basic sign-in routes s
   }
 });
 
-test('Native engine: loading-stop clears a canceled OAuth navigation without resetting the source tab', async () => {
+test('Native engine: full-window Google OAuth clears the canceled embedded load without resetting the source tab', async () => {
   const { fake, uninstall } = installFakeNativeWebview();
   try {
     const container = document.createElement('div');
@@ -363,7 +392,7 @@ test('Native engine: loading-stop clears a canceled OAuth navigation without res
 
     fake.emit({ tabId: tab.id, type: 'loading-start' });
     fake.emit({ tabId: tab.id, type: 'loading-stop' });
-    fake.emit({ tabId: tab.id, type: 'system-browser-handoff', url: 'https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client', sourceUrl: tab.url, reason: 'navigation' });
+    fake.emit({ tabId: tab.id, type: 'google-auth-window-opened', url: 'https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client', sourceUrl: tab.url, reason: 'navigation' });
 
     assert.equal(tab.isLoading, false, 'the main-process cancellation event clears the loader even if Chromium emits no did-stop-loading');
     assert.equal(tab.url, 'https://mail.google.com/', 'the source URL is preserved');

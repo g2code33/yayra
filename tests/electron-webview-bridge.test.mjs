@@ -244,7 +244,7 @@ function createFakeWebContentsView() {
   };
 }
 
-function makeHarness({ authHosts, autofillPreloadPath, pageUnresponsiveReloadDelayMs, pageUnresponsiveReloadCooldownMs, webauthnSession, Dialog } = {}) {
+function makeHarness({ authHosts, autofillPreloadPath, pageUnresponsiveReloadDelayMs, pageUnresponsiveReloadCooldownMs, webauthnSession, Dialog, openGoogleAuthWindow: injectedGoogleAuthWindow } = {}) {
   const handlers = new Map();
   const listeners = new Map();
   const ipcMain = {
@@ -264,6 +264,14 @@ function makeHarness({ authHosts, autofillPreloadPath, pageUnresponsiveReloadDel
   };
   const externalCalls = [];
   const shell = { openExternal: async (url) => { externalCalls.push(url); } };
+  const googleAuthWindowCalls = [];
+  const closedGoogleAuthWindows = [];
+  const openGoogleAuthWindow = injectedGoogleAuthWindow === null
+    ? null
+    : (injectedGoogleAuthWindow || (async (options) => {
+        googleAuthWindowCalls.push(options);
+        return { ok: true, key: options.key };
+      }));
   const views = [];
   const WebContentsView = function FakeWebContentsView(opts) {
     const view = createFakeWebContentsView();
@@ -289,6 +297,8 @@ function makeHarness({ authHosts, autofillPreloadPath, pageUnresponsiveReloadDel
     WebContentsView,
     ipcMain,
     shell,
+    openGoogleAuthWindow,
+    closeGoogleAuthWindow: (key, options) => { closedGoogleAuthWindows.push({ key, options }); return true; },
     Menu,
     dialog: Dialog,
     clipboard,
@@ -300,7 +310,10 @@ function makeHarness({ authHosts, autofillPreloadPath, pageUnresponsiveReloadDel
     logger: { error: () => {}, warn: () => {} }
   });
 
-  return { bridge, handlers, listeners, sentEvents, fakeWin, externalCalls, views, clipboardWrites, popupCalls };
+  return {
+    bridge, handlers, listeners, sentEvents, fakeWin, externalCalls, views,
+    clipboardWrites, popupCalls, googleAuthWindowCalls, closedGoogleAuthWindows
+  };
 }
 
 test('webview bridge: creating a tab adds a WebContentsView as a child view and loads the URL', async () => {
@@ -517,14 +530,34 @@ test('webview bridge: existing Apple/Microsoft system-browser handoff behavior r
   assert.equal(handoffEvent.channel, WEBVIEW_EVENT_CHANNEL);
 });
 
-test('webview bridge: direct Google OAuth authorization navigations use the secure system browser', async () => {
-  const { handlers, externalCalls, views } = makeHarness();
+test('webview bridge: direct Google OAuth authorization opens a full Yayra auth window with the source profile view', async () => {
+  const { handlers, externalCalls, views, googleAuthWindowCalls } = makeHarness();
   const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client';
-  const result = await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-auth', url: authUrl });
+  const result = await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-auth', url: authUrl, profileId: 'work' });
 
-  assert.equal(result.handedOffToSystemBrowser, true);
-  assert.deepEqual(externalCalls, [authUrl]);
-  assert.equal(views.length, 0, 'Google OAuth authorization is not embedded');
+  assert.deepEqual(result, { handedOffToSystemBrowser: false, openedInYayraAuthWindow: true });
+  assert.deepEqual(externalCalls, [], 'Google OAuth never escapes into an unrelated system-browser profile');
+  assert.equal(views.length, 1, 'a source profile view is retained for the callback destination');
+  assert.equal(googleAuthWindowCalls.length, 1);
+  assert.equal(googleAuthWindowCalls[0].url, authUrl);
+  assert.equal(googleAuthWindowCalls[0].sourceWebContents, views[0].webContents);
+  assert.equal(googleAuthWindowCalls[0].partition, 'persist:yayra-profile-work');
+});
+
+test('webview bridge: Google auth completion and source-tab closure stay scoped to the originating tab', async () => {
+  const { handlers, googleAuthWindowCalls, sentEvents, closedGoogleAuthWindows } = makeHarness();
+  const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client';
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-auth-scope', url: authUrl });
+  const call = googleAuthWindowCalls[0];
+  call.onComplete({ url: 'https://site.example/account' });
+  assert.ok(sentEvents.some((event) => event.payload.type === 'google-auth-window-complete'
+    && event.payload.tabId === 'tab-auth-scope'
+    && event.payload.url === 'https://site.example/account'));
+  await handlers.get('yayra:webview-destroy')(null, { tabId: 'tab-auth-scope' });
+  assert.deepEqual(closedGoogleAuthWindows, [{
+    key: call.key,
+    options: { focusOwner: false, reason: 'source-tab-closed' }
+  }]);
 });
 
 test('webview bridge: direct Google account sign-in pages are shown in the native view, not auto-routed to Chrome', async () => {
@@ -535,12 +568,13 @@ test('webview bridge: direct Google account sign-in pages are shown in the nativ
   assert.equal(views.length, 1);
 });
 
-test('webview bridge: direct HTTP Google OAuth authorization is upgraded before opening externally', async () => {
-  const { handlers, externalCalls, views } = makeHarness();
+test('webview bridge: direct HTTP Google OAuth is upgraded before opening in the full Yayra window', async () => {
+  const { handlers, externalCalls, views, googleAuthWindowCalls } = makeHarness();
   const result = await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-insecure-auth', url: 'http://accounts.google.com/o/oauth2/v2/auth?client_id=site-client' });
-  assert.equal(result.handedOffToSystemBrowser, true);
-  assert.deepEqual(externalCalls, ['https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client']);
-  assert.equal(views.length, 0);
+  assert.equal(result.openedInYayraAuthWindow, true);
+  assert.deepEqual(externalCalls, []);
+  assert.equal(googleAuthWindowCalls[0].url, 'https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client');
+  assert.equal(views.length, 1);
 });
 
 test('webview bridge: popups to an identity-provider sign-in host from an already-open tab are also handed off externally, not opened as a child view', async () => {
@@ -553,23 +587,25 @@ test('webview bridge: popups to an identity-provider sign-in host from an alread
   assert.deepEqual(externalCalls, ['https://appleid.apple.com/auth/authorize']);
 });
 
-test('webview bridge: Google OAuth popups are handed off, while basic account sign-in popups become Yayra tabs', async () => {
-  const { handlers, views, externalCalls, sentEvents } = makeHarness();
+test('webview bridge: Google OAuth popups use a full Yayra window, while basic account sign-in popups become Yayra tabs', async () => {
+  const { handlers, views, externalCalls, sentEvents, googleAuthWindowCalls } = makeHarness();
   await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-1', url: 'https://mail.google.com/' });
   const guestWebContents = views[0].webContents;
 
   const oauthResponse = guestWebContents._simulateWindowOpen({ url: 'https://accounts.google.com/signin/oauth?client_id=site-client' });
   assert.deepEqual(oauthResponse, { action: 'deny' });
-  assert.deepEqual(externalCalls, ['https://accounts.google.com/signin/oauth?client_id=site-client']);
+  assert.deepEqual(externalCalls, []);
+  assert.equal(googleAuthWindowCalls.length, 1);
+  assert.equal(googleAuthWindowCalls[0].reason, undefined);
 
   const accountResponse = guestWebContents._simulateWindowOpen({ url: 'https://accounts.google.com/signin/v2/identifier' });
   assert.deepEqual(accountResponse, { action: 'deny' });
-  assert.deepEqual(externalCalls, ['https://accounts.google.com/signin/oauth?client_id=site-client'], 'account sign-in pages are not opened in Chrome by the OAuth filter');
+  assert.deepEqual(externalCalls, [], 'ordinary account sign-in pages are never opened in Chrome by the OAuth filter');
   assert.ok(sentEvents.some((event) => event.payload.type === 'new-window-request' && event.payload.url === 'https://accounts.google.com/signin/v2/identifier'), 'the renderer may open the ordinary page in a Yayra tab');
 });
 
-test('webview bridge: top-level OAuth redirects are canceled and handed off without changing the in-app page', async () => {
-  const { handlers, views, sentEvents, externalCalls } = makeHarness();
+test('webview bridge: top-level Google OAuth redirects are canceled into a full Yayra window without changing the source page', async () => {
+  const { handlers, views, sentEvents, externalCalls, googleAuthWindowCalls } = makeHarness();
   await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-site', url: 'https://mail.google.com/' });
   const wc = views[0].webContents;
   const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client';
@@ -578,9 +614,11 @@ test('webview bridge: top-level OAuth redirects are canceled and handed off with
   // Electron 44 details-object signature.
   wc.emit('will-redirect', event, { url: authUrl, isMainFrame: true });
   assert.equal(event.prevented, true);
-  assert.deepEqual(externalCalls, [authUrl]);
+  assert.deepEqual(externalCalls, []);
+  assert.equal(googleAuthWindowCalls.length, 1);
+  assert.equal(googleAuthWindowCalls[0].sourceWebContents, wc, 'the auth window shares the exact source profile Session');
   assert.equal(sentEvents.some((e) => e.payload.type === 'navigated'), false, 'a canceled auth redirect does not rewrite the source tab URL/history');
-  assert.ok(sentEvents.some((e) => e.payload.type === 'system-browser-handoff' && e.payload.url === authUrl));
+  assert.ok(sentEvents.some((e) => e.payload.type === 'google-auth-window-opened' && e.payload.url === authUrl));
   assert.ok(sentEvents.some((e) => e.payload.type === 'loading-stop'), 'canceled navigation clears the loading state');
 
   // A direct basic account sign-in URL is not an OAuth authorization
@@ -593,29 +631,30 @@ test('webview bridge: top-level OAuth redirects are canceled and handed off with
   };
   wc.emit('will-navigate', eventDetails);
   assert.equal(eventDetails.prevented, false);
-  assert.deepEqual(externalCalls, [authUrl]);
+  assert.deepEqual(externalCalls, []);
 
   // Legacy positional signature still guards against subframe OAuth redirects.
   const subframe = { prevented: false, preventDefault() { this.prevented = true; } };
   wc.emit('will-navigate', subframe, authUrl, false, false);
   assert.equal(subframe.prevented, false);
-  assert.deepEqual(externalCalls, [authUrl]);
+  assert.deepEqual(externalCalls, []);
 
   const ordinaryGoogle = { prevented: false, preventDefault() { this.prevented = true; } };
   wc.emit('will-redirect', ordinaryGoogle, { url: 'https://www.google.com/search?q=ghana', isMainFrame: true });
-  assert.equal(ordinaryGoogle.prevented, false, 'ordinary Google search is not sent to the system browser by auth routing');
-  assert.deepEqual(externalCalls, [authUrl], 'basic account navigation stays in the in-app view');
+  assert.equal(ordinaryGoogle.prevented, false, 'ordinary Google search is not rerouted by auth handling');
+  assert.deepEqual(externalCalls, [], 'basic account navigation stays in the in-app view');
 });
 
-test('webview bridge: HTTP auth redirects are canceled and upgraded before handoff', async () => {
-  const { handlers, views, sentEvents, externalCalls } = makeHarness();
+test('webview bridge: HTTP Google auth redirects are upgraded before the full Yayra window opens', async () => {
+  const { handlers, views, sentEvents, externalCalls, googleAuthWindowCalls } = makeHarness();
   await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-source', url: 'https://example.com/' });
   const event = { prevented: false, preventDefault() { this.prevented = true; } };
   const httpOAuthUrl = 'http://accounts.google.com/o/oauth2/v2/auth?client_id=x';
   views[0].webContents.emit('will-redirect', event, { url: httpOAuthUrl, isMainFrame: true });
   assert.equal(event.prevented, true);
-  assert.deepEqual(externalCalls, ['https://accounts.google.com/o/oauth2/v2/auth?client_id=x']);
-  assert.ok(sentEvents.some((e) => e.payload.type === 'system-browser-handoff' && e.payload.url === 'https://accounts.google.com/o/oauth2/v2/auth?client_id=x'));
+  assert.deepEqual(externalCalls, []);
+  assert.equal(googleAuthWindowCalls[0].url, 'https://accounts.google.com/o/oauth2/v2/auth?client_id=x');
+  assert.ok(sentEvents.some((e) => e.payload.type === 'google-auth-window-opened' && e.payload.url === 'https://accounts.google.com/o/oauth2/v2/auth?client_id=x'));
 });
 
 test('webview bridge: every new tab gets a browser-like user agent without the Electron token', async () => {

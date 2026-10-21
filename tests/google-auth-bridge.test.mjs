@@ -123,6 +123,77 @@ test('authBridge: sign-in passes the Client Secret and a custom fetchImpl throug
   assert.equal(receivedArgs.fetchImpl, customFetch);
 });
 
+test('authBridge: app-level Google OAuth opens inside a full Yayra window and closes it after success', async () => {
+  const ipcMain = fakeIpcMain();
+  const win = fakeWindow();
+  const authStore = fakeAuthStore();
+  const calls = [];
+  const googleAuthWindow = {
+    openAppAuth(url, options) {
+      calls.push(['open', url]);
+      this.onClosed = options.onClosed;
+      return { ok: true };
+    },
+    close(_key, options) { calls.push(['close', options.reason]); return true; }
+  };
+  const signInImpl = async (args) => {
+    assert.equal(args.signal.aborted, false);
+    await args.openExternal('https://accounts.google.com/o/oauth2/v2/auth?client_id=x');
+    return { profile: { sub: '1', email: 'inside@yayra.test' }, tokens: { access_token: 'private' } };
+  };
+
+  createAuthBridge({
+    ipcMain,
+    shell: { openExternal: async () => { throw new Error('must stay inside Yayra'); } },
+    getMainWindow: () => win,
+    authStore,
+    clientId: 'c',
+    clientSecret: 's',
+    signInImpl,
+    googleAuthWindow
+  });
+  const result = await ipcMain.invoke('yayra:auth-sign-in');
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, [
+    ['open', 'https://accounts.google.com/o/oauth2/v2/auth?client_id=x'],
+    ['close', 'sign-in-finished']
+  ]);
+});
+
+test('authBridge: closing the full Yayra auth window cancels the pending sign-in without waiting for timeout', async () => {
+  const ipcMain = fakeIpcMain();
+  const win = fakeWindow();
+  const authStore = fakeAuthStore();
+  const googleAuthWindow = {
+    openAppAuth(_url, options) {
+      queueMicrotask(() => options.onClosed());
+      return { ok: true };
+    },
+    close() { return false; }
+  };
+  const signInImpl = async (args) => {
+    await args.openExternal('https://accounts.google.com/o/oauth2/v2/auth');
+    await new Promise((resolve, reject) => {
+      const abortError = () => Object.assign(new Error('This operation was aborted'), { name: 'AbortError' });
+      if (args.signal.aborted) reject(abortError());
+      else args.signal.addEventListener('abort', () => reject(abortError()), { once: true });
+    });
+  };
+  createAuthBridge({
+    ipcMain,
+    shell: { openExternal: async () => {} },
+    getMainWindow: () => win,
+    authStore,
+    clientId: 'c',
+    clientSecret: 's',
+    signInImpl,
+    googleAuthWindow,
+    logger: { error() {} }
+  });
+  const result = await ipcMain.invoke('yayra:auth-sign-in');
+  assert.deepEqual(result, { ok: false, error: 'sign_in_cancelled' });
+});
+
 test('authBridge: a second concurrent sign-in call is rejected while one is already in progress', async () => {
   const ipcMain = fakeIpcMain();
   const win = fakeWindow();
@@ -159,7 +230,30 @@ test('authBridge: sign-out clears the stored session and emits signed-out', asyn
   assert.deepEqual(events, ['signed-out']);
 });
 
-test('authBridge: open-account-page opens Google account management in the system browser, never embedded', async () => {
+test('authBridge: open-account-page reuses the top-level Yayra Google window when available', async () => {
+  const ipcMain = fakeIpcMain();
+  const win = fakeWindow();
+  const authStore = fakeAuthStore();
+  let openedUrl = null;
+  const googleAuthWindow = {
+    openGoogleAccount(url) { openedUrl = url; return { ok: true }; }
+  };
+  createAuthBridge({
+    ipcMain,
+    shell: { openExternal: async () => { throw new Error('must stay in Yayra'); } },
+    getMainWindow: () => win,
+    authStore,
+    clientId: 'c',
+    clientSecret: 's',
+    signInImpl: async () => ({}),
+    googleAuthWindow
+  });
+  const result = await ipcMain.invoke('yayra:auth-open-account-page');
+  assert.deepEqual(result, { ok: true });
+  assert.equal(openedUrl, 'https://myaccount.google.com/');
+});
+
+test('authBridge: older hosts fall back to opening Google account management in the system browser', async () => {
   const ipcMain = fakeIpcMain();
   const win = fakeWindow();
   const authStore = fakeAuthStore();

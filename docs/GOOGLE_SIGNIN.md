@@ -4,16 +4,22 @@
 
 This feature gives **Yayra itself** a real, app-level Google identity (name,
 email, profile picture), so Yayra's own UI can show "Signed in as ..." /
-"Sign out". It is **not** a way to share the system browser's Google session
-with Gmail, Drive, or other pages opened in Yayra. Google documents a
-restriction on OAuth authorization requests in embedded user agents (see
-[Google's policy](https://developers.google.com/identity/protocols/oauth2/policies#embedded-webviews)); it does not classify every `accounts.google.com`
-page as an OAuth endpoint. Yayra hands off known explicit OAuth routes to the
-system browser, while account home, management, and basic sign-in pages are
-allowed to render in the native in-app view. Google may still reject or alter
-an interactive sign-in in an embedded view, so rendering those pages is not a
-promise that the login will complete. Yayra does not bypass provider policy,
-copy system-browser cookies, or spoof browser identity.
+"Sign out". Desktop Yayra also supports Google OAuth initiated by websites in
+a normal browsing tab. These are separate sessions: Yayra never imports or
+copies cookies from Chrome/Firefox.
+
+Google documents a restriction on OAuth authorization requests in embedded
+user agents (see [Google's policy](https://developers.google.com/identity/protocols/oauth2/policies#embedded-webviews)). A website tab is a
+`WebContentsView`, so desktop Yayra lifts recognized Google authorization URLs
+into a **standalone, top-level BrowserWindow**. This is the key behavior proven
+by RX Store: Google owns the whole native browser window, not an iframe or
+embedded page. Yayra then goes further by giving that window the originating
+tab's exact Chromium `Session`; callback cookies/storage remain in the same
+Yayra profile and the source tab resumes automatically.
+
+Account home, management, and basic sign-in pages remain normal in-app pages.
+Yayra does not bypass provider policy or spoof browser identity; the dedicated
+window uses a browser-compatible UA without an Electron product token.
 
 ## Embedded Google browsing is separate from Yayra's own sign-in
 
@@ -22,18 +28,17 @@ navigate to `https://accounts.google.com/`, account-management pages, and basic
 routes such as `/signin/v2/identifier`. The current handoff classifier only
 matches these known OAuth paths on the exact `accounts.google.com` host:
 `/o/oauth2/...`, `/oauth2/...`, `/signin/oauth/...`, and `/gsi/select/...`.
-Those authorization routes are opened in the user's system browser; the
+On Electron desktop those authorization routes open in a full Yayra auth
+window sharing the source profile. Direct OAuth URLs, top-level redirects, and
+provider popups all take that route; the source tab is never replaced by an
+embedded consent page and never loses its callback to another browser. The
 classifier is intentionally not a complete inventory of Google's internal
-URLs and may need maintenance if Google changes its routes. If a basic sign-in
-page later redirects into an OAuth authorization flow, that explicit flow is
-still handed off.
+URLs and may need maintenance if Google changes its routes.
 
 A plain web/PWA page cannot override a remote site's anti-framing headers, so
 Google account pages that refuse iframes use the existing open-in-new-tab
-fallback there. Android's native tab view and Electron's native content view
-are not iframes, but Google can still enforce its embedded-user-agent OAuth
-policy. In all cases the browser profile/cookies are separate; no Chrome
-session is imported into Yayra.
+fallback there. Android/iOS continue to use the platform browser surface plus
+the registered app callback. No Chrome session is imported into Yayra.
 
 The setup and architecture are documented here for Electron desktop, Web/PWA,
 and Android/iOS. The original implementation started with desktop; all three
@@ -45,8 +50,9 @@ listed in "Status by platform" below.
 Yayra uses the OAuth 2.0 flow Google explicitly recommends for native/desktop
 apps (RFC 8252, "OAuth 2.0 for Native Apps"):
 
-1. Yayra opens your **real system browser** (never an embedded view) to
-   Google's consent screen.
+1. Yayra opens a **complete, top-level Google sign-in window** owned by Yayra
+   (never the embedded website view). It has a persistent Google-auth Session,
+   so account choice is remembered and the loopback redirect lands in Yayra.
 2. It uses **Authorization Code + PKCE**. Google calls "Desktop app" OAuth
    clients public/non-confidential, but Google's token endpoint still
    requires the **Client Secret** in the code-exchange request even with
@@ -66,6 +72,10 @@ apps (RFC 8252, "OAuth 2.0 for Native Apps"):
    are never sent to the renderer/web UI process.
 
 Relevant source files:
+- `electron/googleAuthWindow.cjs` — creates the top-level auth window, shares
+  website profile Sessions, tracks the registered callback origin, avoids
+  replaying one-time codes, resumes the source tab, and restores Yayra focus.
+  Tested in `tests/google-auth-window.test.mjs`.
 - `electron/googleAuth.cjs` — the OAuth flow itself (PKCE, loopback server,
   token exchange, userinfo fetch). Fully unit-tested in
   `tests/google-oauth.test.mjs` with a real local socket and a fake Google
@@ -362,7 +372,7 @@ npx wrangler secret put GOOGLE_IOS_CLIENT_ID     --config wrangler.worker.toml
 
 | Platform | Status |
 | --- | --- |
-| Electron desktop (Linux/Windows) | **Implemented**; the live round trip against real Google servers has **not** been run by this agent (no GUI browser or registered Client ID in this sandbox) and must be verified by you on your own machine with your own Client ID. |
+| Electron desktop (Linux/Windows) | **Implemented** (top-level Yayra auth window for app identity and website OAuth; same-profile callback resumption). Unit-tested with BrowserWindow/Session fakes; the live round trip against real Google servers has **not** been run in this sandbox and must be verified on a machine with a real display and configured Client ID. |
 | Web / PWA (`yayra.pages.dev`) | **Implemented** (full-page redirect + Worker-side exchange, see above). Fully unit-tested with mocks (`tests/google-auth-web.test.mjs`, `tests/worker.test.mjs`); the live round trip needs a human with a real "Web application" Client ID, the Worker secrets deployed, and a real browser — see verification steps below. |
 | Android / iOS (Capacitor) | **Implemented** (system browser + custom-scheme deep link + shared Worker exchange, see above). Fully unit-tested with mocks (`tests/google-auth-capacitor.test.mjs`); native deep-link injection verified against freshly generated Capacitor 8 projects in-sandbox. The live round trip needs a human with real "Android"/"iOS" Client IDs, Worker bindings deployed, and a real device/emulator — this sandbox can run neither a mobile emulator nor a consent screen. |
 
@@ -413,10 +423,15 @@ npx wrangler secret put GOOGLE_IOS_CLIENT_ID     --config wrangler.worker.toml
 2. Run the desktop app (`npm run build:web && npx electron .` or your usual
    dev launch command) on a machine with a real display.
 3. Open Settings → Account → "Sign in with Google".
-4. Your default system browser should open to Google's consent screen. Sign
-   in and approve.
-5. Your browser tab should show "Signed in to Yayra — you can close this tab"
-   and Yayra's Settings → Account should now show your name/email.
-6. Confirm "Sign out" clears it, and relaunching Yayra without signing in
-   again still remembers you were signed in (session persistence) until you
-   explicitly sign out.
+4. A separate native window titled **Sign in – Google Accounts** should open
+   inside Yayra. Sign in and approve; Chrome/Firefox must not launch.
+5. Google's loopback result should load in that same window, the window should
+   close automatically, Yayra should regain focus, and Settings → Account
+   should show your name/email.
+6. In a normal Yayra tab, test a website that offers **Continue with Google**
+   (for example GitHub): the same full auth window should open using that
+   Yayra profile. After consent, the website callback must resume the source
+   tab signed in—never remain stranded in another browser.
+7. Close the auth window midway and confirm the source tab remains unchanged
+   with no stuck spinner. Confirm Sign out clears Yayra's app identity, and
+   relaunching without signing in again preserves it until explicit sign-out.

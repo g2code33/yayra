@@ -24,9 +24,11 @@ this list is the reality check.
 
 ## 1. Google sign-in — live round trips (per docs/GOOGLE_SIGNIN.md)
 
-- [ ] **Desktop (Linux + Windows):** sign in via system browser, profile
-  appears, survives relaunch, sign-out clears, "switch account" shows
-  the Google account chooser.
+- [ ] **Desktop (Linux + Windows):** Settings → Account opens a separate,
+  top-level **Sign in – Google Accounts** Yayra window (not Chrome and not the
+  embedded tab). Approve, verify the loopback result closes that window and
+  refocuses Yayra, profile appears, survives relaunch, sign-out clears, and
+  "switch account" shows the Google chooser.
 - [ ] **Web (`yayra.pages.dev`):** worker secrets deployed; sign-in in a
   normal tab AND as installed PWA; cancel-on-consent shows a clear
   message; Back after sign-in does not re-run the callback; private
@@ -45,15 +47,21 @@ this list is the reality check.
   management URL, and `https://accounts.google.com/signin/v2/identifier` in
   the address bar. Confirm each remains in the same Yayra tab and renders in
   the native `WebContentsView` rather than being auto-sent to Chrome.
-- [ ] If Google starts an OAuth authorization flow from one of those pages,
-  confirm that the explicit OAuth request opens in the system browser. A
-  canceled top-level redirect must leave the source tab URL/history intact,
-  clear the loading indicator, and show the non-blocking handoff notice.
-  Returning from the system browser must not reset the Yayra tab or leave a
-  permanent spinner; do not assume its cookies/session transfer to Yayra.
+- [ ] If a website starts Google OAuth, confirm the explicit authorization
+  request opens in a full separate Yayra window. Chrome/Firefox must not open.
+  Complete a real relying-site flow (for example GitHub): the provider
+  callback must return to and resume the original Yayra tab signed in because
+  both surfaces share that profile Session. Closing the auth window midway
+  must preserve URL/history and clear the loading indicator without a spinner.
 - [ ] **Android:** repeat account-home, management, and basic sign-in
   navigation in the native in-app tab WebView. Confirm explicit OAuth routes
   use the system browser and the source tab remains selected.
+- [ ] **Electron live-surface regression:** on an already-open website, focus
+  the address bar, type a Google query, wait until suggestions are visible,
+  then press Enter. Results must remain live and scroll/click immediately;
+  the Google header must never become a static image over a blank body that
+  needs Refresh. Repeat quickly before network suggestions finish to cover a
+  late autocomplete response from the detached old omnibox.
 - [ ] **Web/PWA:** verify the current open-in-new-tab fallback for Google
   account pages that refuse iframe embedding; a web page cannot override the
   remote site's frame policy.
