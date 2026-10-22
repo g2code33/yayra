@@ -212,9 +212,13 @@ test('SHELL INTEGRATION: the pro toolbar (jump-to-page, fit, rotate, night, outl
     shell.addDocumentTab({ name: 'pro.pdf', bytes: new Uint8Array([1, 2, 3]) });
     await flush(25);
     const vp = shell.viewportElement;
-    for (const cls of ['fb-doc-page-input', 'fb-doc-btn-fitw', 'fb-doc-btn-fitp', 'fb-doc-btn-rotate', 'fb-doc-btn-night', 'fb-doc-btn-outline', 'fb-doc-btn-print', 'fb-doc-close-btn']) {
+    for (const cls of ['fb-doc-page-input', 'fb-doc-btn-fitw', 'fb-doc-btn-fitp', 'fb-doc-btn-rotate', 'fb-doc-btn-night', 'fb-doc-btn-outline', 'fb-doc-btn-print', 'fb-doc-overflow-btn']) {
       assert.ok(vp.querySelector(`.${cls}`), `${cls} renders`);
     }
+    const more = vp.querySelector('.fb-doc-overflow-btn');
+    more.click();
+    assert.match(vp.querySelector('.fb-doc-overflow-menu').textContent, /Close PDF/,
+      'PDF uses the same More menu as every other file viewer');
     // Rotate + night work through the buttons.
     vp.querySelector('.fb-doc-btn-rotate').click();
     await flush();

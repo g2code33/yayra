@@ -472,15 +472,19 @@ test('TAB INTEGRATION: navigating from a PDF updates the tab title, Back restore
   }
 });
 
-test('TAB INTEGRATION: the Close button closes the document tab and returns to browsing', async () => {
+test('TAB INTEGRATION: the More menu closes the document tab and returns to browsing', async () => {
   const { shell, container } = await bootShell();
   try {
     shell._docEngineOverride = fakePdfjs();
     const before = shell.state.tabs.length;
     const doc = shell.addDocumentTab({ name: 'close-me.pdf', bytes: new Uint8Array([9]) });
     assert.equal(shell.state.tabs.length, before + 1);
-    const closeBtn = shell.viewportElement.querySelector('.fb-doc-close-btn');
-    assert.ok(closeBtn, 'the dedicated close control exists');
+    const more = shell.viewportElement.querySelector('.fb-doc-overflow-btn');
+    assert.ok(more, 'the shared file More control exists');
+    more.click();
+    const closeBtn = shell.viewportElement.querySelectorAll('.fb-doc-overflow-item')
+      .find((button) => /Close PDF/.test(button.textContent));
+    assert.ok(closeBtn, 'PDF Close lives in the shared More menu');
     closeBtn.click();
     assert.equal(shell.state.tabs.length, before, 'document tab closed');
     assert.equal(shell.state.tabs.every((t) => !t.isDocument), true);
@@ -615,7 +619,7 @@ function fakePptxEngine({ slides = 1 } = {}) {
   };
 }
 
-test('DOCUMENT ACTIONS: PDF, PowerPoint, Word, and PNG viewers expose visible Download and Print buttons', async () => {
+test('DOCUMENT ACTIONS: every file viewer keeps Download/Print visible and uses the shared More menu', async () => {
   const { shell, container } = await bootShell();
   shell._docEngineOverride = fakePdfjs({ pages: 1 });
   shell._documentEngineOverrides = {
@@ -623,16 +627,28 @@ test('DOCUMENT ACTIONS: PDF, PowerPoint, Word, and PNG viewers expose visible Do
     docx: { renderAsync: async () => {} }
   };
   try {
-    for (const [name, bytes] of [
-      ['report.pdf', new Uint8Array([1])],
-      ['slides.pptx', new Uint8Array([2])],
-      ['letter.docx', new Uint8Array([3])],
-      ['photo.png', new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])]
+    for (const [name, bytes, closeLabel, canPrint = true] of [
+      ['report.pdf', new Uint8Array([1]), 'Close PDF'],
+      ['slides.pptx', new Uint8Array([2]), 'Close presentation'],
+      ['letter.docx', new Uint8Array([3]), 'Close Word'],
+      ['sheet.csv', new TextEncoder().encode('Name,Value\nYayra,1'), 'Close Spreadsheet'],
+      ['photo.png', new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), 'Close Image'],
+      ['notes.txt', new TextEncoder().encode('All files use More.'), 'Close Text'],
+      ['legacy.doc', new Uint8Array([0xd0, 0xcf, 0x11, 0xe0]), 'Close Original file', false]
     ]) {
       shell.addDocumentTab({ name, bytes });
       const primary = shell.viewportElement.querySelector('.fb-doc-toolbar-primary');
       assert.ok(primary?.querySelector('.fb-doc-download-btn'), `${name} has a visible Download action`);
-      assert.ok(primary?.querySelector('.fb-doc-btn-print'), `${name} has a visible Print action`);
+      assert.equal(Boolean(primary?.querySelector('.fb-doc-btn-print')), canPrint, `${name} reflects its real Print capability`);
+      const more = primary?.querySelector('.fb-doc-overflow-btn');
+      const menu = primary?.querySelector('.fb-doc-overflow-menu');
+      assert.ok(more && menu, `${name} has the shared More menu`);
+      assert.equal(more.getAttribute('aria-label'), 'More file actions');
+      assert.equal(primary.querySelector('.fb-doc-original-btn'), null, `${name} has no separate Desktop app button`);
+      assert.equal(primary.querySelector('.fb-doc-close-btn'), null, `${name} has no separate Close button`);
+      more.click();
+      assert.equal(menu.hidden, false, `${name} More menu opens`);
+      assert.match(menu.textContent, new RegExp(closeLabel), `${name} Close action is in More`);
     }
     assert.ok(container.querySelector('.fb-doc-viewer'), 'each file remains in Yayra’s integrated viewer');
   } finally {

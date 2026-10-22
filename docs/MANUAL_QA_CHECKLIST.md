@@ -167,8 +167,13 @@ this list is the reality check.
   panels, transparent decorative layers, icons, masks, and hidden accessibility
   content are unchanged. Repeat in Electron and an Android native website tab.
 
-## 1e. PowerPoint compact toolbar and overflow
+## 1e. Document compact toolbar and overflow
 
+- [ ] Open PDF, PPTX, DOCX, spreadsheet, image, and text files. Every top
+  toolbar must show the same three-dot **More** button. Its dark menu must keep
+  **Desktop app** (where available) and the correctly labelled **Close** action;
+  neither may remain as a separate top-row button. Download and Print must stay
+  directly visible.
 - [ ] Open a PPTX in dark and light themes. The first identity row must stay
   approximately 36 px high, the controls row must stay compact, and the slide
   must receive the reclaimed vertical space without clipped controls.

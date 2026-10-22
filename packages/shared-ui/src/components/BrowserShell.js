@@ -19732,64 +19732,61 @@ export class BrowserShell {
       bar.appendChild(mkBtn('Print', printTitle, () => { void this.printActivePage(); }, 'fb-doc-btn-print'));
     }
 
-    if (documentKind === 'pptx') {
-      // Presentation-destructive/escape actions live in one accessible
-      // overflow instead of competing with the slide controls.
-      const overflow = document.createElement('div');
-      overflow.className = 'fb-doc-overflow';
-      overflow.style.cssText = 'position:relative;flex:none;';
-      const overflowButton = mkBtn('\u22ee', 'Presentation menu', () => {}, 'fb-doc-overflow-btn');
-      overflowButton.setAttribute('aria-haspopup', 'menu');
-      overflowButton.setAttribute('aria-expanded', 'false');
-      const menu = document.createElement('div');
-      menu.className = 'fb-doc-overflow-menu';
-      menu.setAttribute('role', 'menu');
+    // Every file viewer uses the same compact More menu. Download, Print, and
+    // Present remain immediate high-value actions; escape/destructive actions
+    // stay out of the way without changing meaning between PDF, PowerPoint,
+    // Word, spreadsheets, images, text, or honest original-file fallbacks.
+    const overflow = document.createElement('div');
+    overflow.className = 'fb-doc-overflow';
+    overflow.style.cssText = 'position:relative;flex:none;';
+    const overflowButton = mkBtn('\u22ee', 'More file actions', () => {}, 'fb-doc-overflow-btn');
+    overflowButton.setAttribute('aria-haspopup', 'menu');
+    overflowButton.setAttribute('aria-expanded', 'false');
+    const menu = document.createElement('div');
+    menu.className = 'fb-doc-overflow-menu';
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-label', `${documentRoute.shortLabel} actions`);
+    menu.hidden = true;
+    // This menu is always a dark elevated surface, even when the active app
+    // theme is light. Give it an explicit foreground too: inheriting the
+    // light theme's dark toolbar text made every action nearly invisible.
+    menu.style.cssText = 'position:absolute;right:0;top:calc(100% + 5px);z-index:20;min-width:220px;padding:6px;border:1px solid rgba(255,255,255,.16);border-radius:10px;background:#171a24;color:#f8fafc;color-scheme:dark;box-shadow:0 18px 45px rgba(0,0,0,.45);';
+    const closeMenu = () => {
       menu.hidden = true;
-      // This menu is always a dark elevated surface, even when the active app
-      // theme is light. Give it an explicit foreground too: inheriting the
-      // light theme's dark toolbar text made every action nearly invisible.
-      menu.style.cssText = 'position:absolute;right:0;top:calc(100% + 5px);z-index:20;min-width:220px;padding:6px;border:1px solid rgba(255,255,255,.16);border-radius:10px;background:#171a24;color:#f8fafc;color-scheme:dark;box-shadow:0 18px 45px rgba(0,0,0,.45);';
-      const closeMenu = () => {
-        menu.hidden = true;
-        overflowButton.setAttribute('aria-expanded', 'false');
-      };
-      const addMenuAction = (label, title, action, { danger = false } = {}) => {
-        const item = document.createElement('button');
-        item.type = 'button';
-        item.role = 'menuitem';
-        item.className = `fb-doc-overflow-item${danger ? ' is-danger' : ''}`;
-        item.textContent = label;
-        // Keep the explanation for assistive technology without invoking the
-        // browser's native `title` bubble. That oversized bubble sat over the
-        // next menu row and made the overflow itself impossible to read.
-        item.setAttribute('aria-label', `${label}. ${title}`);
-        item.style.cssText = `display:block;width:100%;padding:9px 10px;border:0;border-radius:7px;background:transparent;color:${danger ? '#fca5a5' : '#f8fafc'};text-align:left;cursor:pointer;font-size:.78rem;`;
-        item.addEventListener('click', () => { closeMenu(); action(); });
-        menu.appendChild(item);
-      };
-      overflowButton.addEventListener('click', (event) => {
-        event.stopPropagation();
-        menu.hidden = !menu.hidden;
-        overflowButton.setAttribute('aria-expanded', String(!menu.hidden));
-        if (!menu.hidden) menu.querySelector('button')?.focus?.();
-      });
-      overflow.addEventListener('focusout', () => {
-        setTimeout(() => { if (!overflow.contains?.(document.activeElement)) closeMenu(); }, 0);
-      });
-      overflow.addEventListener('keydown', (event) => {
-        if (event.key === 'Escape') { event.preventDefault(); closeMenu(); overflowButton.focus?.(); }
-      });
-      if (hasDesktopDocumentBridge) addMenuAction('Desktop app', originalTitle, openOriginal);
-      addMenuAction('Close presentation', 'Close this presentation tab', () => this.closeTab(tab.id), { danger: true });
-      overflow.appendChild(overflowButton);
-      overflow.appendChild(menu);
-      bar.appendChild(overflow);
-    } else {
-      if (hasDesktopDocumentBridge) {
-        bar.appendChild(mkBtn('Desktop app', originalTitle, openOriginal, 'fb-doc-original-btn'));
-      }
-      bar.appendChild(mkBtn('\u2715 Close', 'Close the document and return to browsing', () => this.closeTab(tab.id), 'fb-doc-close-btn'));
-    }
+      overflowButton.setAttribute('aria-expanded', 'false');
+    };
+    const addMenuAction = (label, title, action, { danger = false } = {}) => {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.role = 'menuitem';
+      item.className = `fb-doc-overflow-item${danger ? ' is-danger' : ''}`;
+      item.textContent = label;
+      // Keep the explanation for assistive technology without invoking the
+      // browser's native `title` bubble. That oversized bubble sat over the
+      // next menu row and made the overflow itself impossible to read.
+      item.setAttribute('aria-label', `${label}. ${title}`);
+      item.style.cssText = `display:block;width:100%;padding:9px 10px;border:0;border-radius:7px;background:transparent;color:${danger ? '#fca5a5' : '#f8fafc'};text-align:left;cursor:pointer;font-size:.78rem;`;
+      item.addEventListener('click', () => { closeMenu(); action(); });
+      menu.appendChild(item);
+    };
+    overflowButton.addEventListener('click', (event) => {
+      event.stopPropagation();
+      menu.hidden = !menu.hidden;
+      overflowButton.setAttribute('aria-expanded', String(!menu.hidden));
+      if (!menu.hidden) menu.querySelector('button')?.focus?.();
+    });
+    overflow.addEventListener('focusout', () => {
+      setTimeout(() => { if (!overflow.contains?.(document.activeElement)) closeMenu(); }, 0);
+    });
+    overflow.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') { event.preventDefault(); closeMenu(); overflowButton.focus?.(); }
+    });
+    if (hasDesktopDocumentBridge) addMenuAction('Desktop app', originalTitle, openOriginal);
+    const closeLabel = documentKind === 'pptx' ? 'Close presentation' : `Close ${documentRoute.shortLabel}`;
+    addMenuAction(closeLabel, `Close this ${documentRoute.label.toLowerCase()} tab`, () => this.closeTab(tab.id), { danger: true });
+    overflow.appendChild(overflowButton);
+    overflow.appendChild(menu);
+    bar.appendChild(overflow);
 
     // ---- Row B: only controls the selected engine genuinely supports ----
     const bar2 = document.createElement('div');

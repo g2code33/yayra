@@ -110,7 +110,8 @@ source bytes—never a screenshot, conversion, or reconstructed copy. Electron
 uses a native Save dialog with the shared 300 MB IPC guard; web/PWA uses a local
 Blob download. `Ctrl+S` invokes the same document path. **Desktop app** remains
 a separate action because opening a temporary/original file is not downloading
-it.
+it; it lives with **Close** in the shared three-dot **More** menu on every file
+viewer.
 
 Every viewable format also has a visible **Print** button and `Ctrl+P` support.
 PDF materialises every evicted page for the print snapshot. PowerPoint lazily
@@ -123,10 +124,10 @@ paged layout; images, text and spreadsheets print their current rendered view.
 PPTX/PPTM tabs expose a top-row **Present** action that always starts at slide
 1, while the lower controls expose **From current slide** beside the selected
 slide number. PDF similarly exposes **From current page**. `F5` starts from page
-or slide 1 and `Shift+F5` starts from the current page or slide. For PowerPoint,
-**Desktop app** and **Close presentation** remain in the accessible three-dot
-menu; Download and Print are visible direct actions rather than hidden menu
-items.
+or slide 1 and `Shift+F5` starts from the current page or slide. The shared
+three-dot menu keeps **Desktop app** and format-specific **Close** actions in the
+same location used by every other file viewer; Download and Print remain visible
+direct actions rather than hidden menu items.
 
 Presentation mode is a dedicated full-window black projector surface, not CSS
 enlargement or a screenshot of the ordinary viewer. It:

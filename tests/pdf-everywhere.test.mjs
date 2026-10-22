@@ -230,15 +230,20 @@ test('OPEN WITH: a pdf pushed by the OS launch ("Open with > yayra") opens in th
   }
 });
 
-test('VIEWER BUTTON: "Desktop app" hands the CURRENT pdf to the OS pdf reader', async () => {
+test('VIEWER MORE MENU: "Desktop app" hands the CURRENT pdf to the OS pdf reader', async () => {
   const calls = fakeDesktop();
   const { shell, container } = await makeShell();
   try {
     shell._docEngineOverride = { getDocument: () => ({ promise: Promise.resolve({ numPages: 1, getPage: async () => ({ getViewport: () => ({ width: 600, height: 800 }), render: () => ({ promise: Promise.resolve() }), getTextContent: async () => ({ items: [] }) }), destroy: () => {} }) }) };
     shell.addDocumentTab({ name: 'in-viewer.pdf', bytes: PDF_BYTES.slice(0) });
-    const btns = Array.from(container.querySelectorAll('.fb-doc-btn'));
-    const desktopBtn = btns.find((b) => (b.textContent || '').includes('Desktop app'));
-    assert.ok(desktopBtn, 'the "use the desktop pdf app instead" button exists');
+    assert.equal(container.querySelector('.fb-doc-original-btn'), null,
+      'PDF no longer exposes a separate Desktop app toolbar button');
+    const more = container.querySelector('.fb-doc-overflow-btn');
+    assert.ok(more, 'PDF has the shared More button');
+    more.click();
+    const desktopBtn = Array.from(container.querySelectorAll('.fb-doc-overflow-item'))
+      .find((button) => (button.textContent || '').includes('Desktop app'));
+    assert.ok(desktopBtn, 'the "use the desktop pdf app instead" action exists in More');
     desktopBtn.click();
     await flush();
     assert.equal(calls.openExternal.length, 1, 'the bytes were handed to the OS');
