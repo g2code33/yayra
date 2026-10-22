@@ -197,9 +197,9 @@ function buildMediaCompatibilityScript() {
   const forceFormatSource = forceCloudinaryImageFormat.toString();
   return `(function () {
     try {
-      var previousInstall = window.__yayraMediaCompatibilityV2 || window.__yayraMediaCompatibilityV1;
+      var previousInstall = window.__yayraMediaCompatibilityV3 || window.__yayraMediaCompatibilityV2 || window.__yayraMediaCompatibilityV1;
       try { if (previousInstall && previousInstall.cleanup) previousInstall.cleanup(); } catch (_err) {}
-      var installKey = '__yayraMediaCompatibilityV3';
+      var installKey = '__yayraMediaCompatibilityV4';
       if (window[installKey]) return;
       var attempts = new WeakMap();
       var forceCloudinaryImageFormat = ${forceFormatSource};
@@ -233,32 +233,45 @@ function buildMediaCompatibilityScript() {
         try {
           var className = typeof image.className === 'string' ? image.className : (image.className && image.className.baseVal) || '';
           var hints = [className, image.id, image.getAttribute('alt'), image.getAttribute('role')].join(' ').toLowerCase();
-          if (/(?:background|backdrop|wallpaper|hero|object-cover|inset-0|h-full|w-full)/.test(hints)) return true;
+          if (/(?:background|backdrop|wallpaper)/.test(hints)) return true;
+          // object-cover/inset-0 are also common inside ordinary cards. They
+          // only prove a page backdrop when the immediate image layer fills a
+          // viewport-sized wrapper and its computed layout agrees.
+          var parentCovers = coversViewport(image.parentElement);
+          if (!parentCovers) return false;
+          if (/\bhero(?:-|\b)/.test(hints)) return true;
           var style = getComputedStyle(image);
           return (style.position === 'fixed' || style.position === 'absolute')
-            && (style.objectFit === 'cover' || style.width === '100%' || style.height === '100%');
+            && (style.objectFit === 'cover' || style.width === '100%' || style.height === '100%'
+              || /(?:object-cover|inset-0)/.test(hints));
         } catch (_err) { return false; }
       };
 
       var applyBackdropFallback = function (image) {
-        var color = themeColor();
-        if (!color) return false;
         try {
           var imageCovers = coversViewport(image);
           var hintedBackdrop = looksLikeBackdrop(image);
+          // A normal failed logo/thumbnail often sits a few levels below a
+          // viewport-sized app shell. That does NOT make it a backdrop. The
+          // old ancestor-only test painted RX Store's #FFD600 browser theme
+          // colour across the whole page when any card image failed.
+          if (!imageCovers && !hintedBackdrop) return false;
+
+          // Never climb from an image-sized wrapper to a page root. A proven
+          // full-screen backdrop's immediate layer remains viewport-sized even
+          // when Chromium collapses the failed image to its tiny glyph.
           var target = image.parentElement;
-          var coveringAncestor = null;
-          for (var depth = 0; target && depth < 4; depth += 1) {
-            if (coversViewport(target)) { coveringAncestor = target; break; }
-            target = target.parentElement;
+
+          // <meta name="theme-color"> primarily colours browser chrome and is
+          // frequently a bright/saturated brand accent, not a page background.
+          // Only a dark, low-chroma theme colour is safe as a missing-backdrop
+          // substitute. Otherwise preserve the site's authored CSS surface.
+          var color = themeColor();
+          var parsed = parseColor(color);
+          var chroma = parsed ? (Math.max(parsed[0], parsed[1], parsed[2]) - Math.min(parsed[0], parsed[1], parsed[2])) / 255 : 1;
+          if (target && parsed && parsed[3] > 0.5 && brightness(parsed) <= 0.42 && chroma <= 0.35) {
+            target.style.setProperty('background-color', color, 'important');
           }
-          // A failed image may collapse to Chromium's tiny glyph even though
-          // its backdrop wrapper still fills the screen. Conversely, when the
-          // image box itself fills the viewport, its nearest parent is the
-          // correct paint layer even if that parent's measured box is odd.
-          target = coveringAncestor || ((imageCovers || hintedBackdrop) ? image.parentElement : null);
-          if (!target) return false;
-          target.style.setProperty('background-color', color, 'important');
           return true;
         } catch (_err) { return false; /* the page replaced the failed node */ }
       };

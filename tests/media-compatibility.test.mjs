@@ -212,6 +212,123 @@ test('media compatibility: failed decorative backdrop retries JPEG, then hides t
   assert.equal(parentStyle.get('background-color'), '#08080c');
 });
 
+test('media compatibility: ordinary failures cannot recolor a viewport ancestor and bright theme accents cannot become backdrops', () => {
+  const runFailure = ({
+    alt,
+    className = '',
+    imageRect,
+    parentRect = { width: 1200, height: 800 },
+    computedPosition = 'static',
+    computedObjectFit = 'contain',
+    themeColor
+  }) => {
+    const listeners = new Map();
+    const imageStyle = new Map();
+    const parentStyle = new Map();
+    const viewportStyle = new Map();
+    const attrs = new Map([['alt', alt], ['src', 'https://assets.example.invalid/missing.png']]);
+    const viewport = {
+      parentElement: null,
+      style: { setProperty(name, value) { viewportStyle.set(name, value); } },
+      getBoundingClientRect: () => ({ width: 1200, height: 800 })
+    };
+    const parent = {
+      parentElement: viewport,
+      style: { setProperty(name, value) { parentStyle.set(name, value); } },
+      getBoundingClientRect: () => parentRect
+    };
+    const image = {
+      tagName: 'IMG',
+      className,
+      parentElement: parent,
+      currentSrc: attrs.get('src'),
+      src: attrs.get('src'),
+      style: {
+        setProperty(name, value) { imageStyle.set(name, value); },
+        removeProperty(name) { imageStyle.delete(name); }
+      },
+      getAttribute(name) { return attrs.get(name) ?? null; },
+      setAttribute(name, value) { attrs.set(name, String(value)); },
+      removeAttribute(name) { attrs.delete(name); },
+      removeEventListener() {},
+      getBoundingClientRect: () => imageRect
+    };
+    const meta = { getAttribute(name) { return name === 'content' ? themeColor : null; } };
+    const documentElement = { clientWidth: 1200, clientHeight: 800, querySelectorAll: () => [] };
+    const document = {
+      documentElement,
+      body: null,
+      getElementById() { return null; },
+      querySelectorAll(selector) {
+        if (selector === 'meta[name="theme-color"]') return [meta];
+        return [];
+      },
+      createElement() { return { style: {} }; }
+    };
+    const window = {
+      innerWidth: 1200,
+      innerHeight: 800,
+      matchMedia: () => ({ matches: true }),
+      addEventListener(type, handler) { listeners.set(type, handler); },
+      removeEventListener(type) { listeners.delete(type); }
+    };
+    window.window = window;
+    window.document = document;
+    class MutationObserver { observe() {} disconnect() {} }
+
+    vm.runInContext(buildMediaCompatibilityScript(), vm.createContext({
+      window,
+      document,
+      URL,
+      MutationObserver,
+      getComputedStyle: () => ({
+        position: computedPosition,
+        objectFit: computedObjectFit,
+        width: computedPosition === 'absolute' ? '100%' : `${imageRect.width}px`,
+        height: computedPosition === 'absolute' ? '100%' : `${imageRect.height}px`,
+        color: 'rgb(15, 23, 42)',
+        backgroundColor: 'rgba(0, 0, 0, 0)'
+      }),
+      setTimeout(callback) { callback(); return 1; },
+      clearTimeout() {}
+    }));
+    listeners.get('error')({ target: image });
+    return { attrs, imageStyle, parentStyle, viewportStyle };
+  };
+
+  const ordinary = runFailure({
+    alt: 'RX Store product icon',
+    className: 'absolute inset-0 w-full h-full object-cover rounded-lg',
+    imageRect: { width: 64, height: 64 },
+    parentRect: { width: 180, height: 180 },
+    computedPosition: 'absolute',
+    computedObjectFit: 'cover',
+    themeColor: '#08080c'
+  });
+  assert.equal(ordinary.parentStyle.has('background-color'), false, 'an ordinary card wrapper stays site-owned');
+  assert.equal(
+    ordinary.viewportStyle.has('background-color'),
+    false,
+    'a failed card image does not inherit backdrop status from its full-screen app shell'
+  );
+  assert.equal(ordinary.imageStyle.has('visibility'), false, 'its meaningful alt fallback remains visible');
+  assert.equal(ordinary.attrs.has('data-yayra-media-failed'), false);
+
+  const brightBackdrop = runFailure({
+    alt: 'Background artwork',
+    className: 'absolute inset-0 object-cover',
+    imageRect: { width: 22, height: 22 },
+    themeColor: '#FFD600'
+  });
+  assert.equal(brightBackdrop.imageStyle.get('visibility'), 'hidden', 'the decorative broken glyph is still retired');
+  assert.equal(brightBackdrop.attrs.get('data-yayra-media-failed'), 'true');
+  assert.equal(
+    brightBackdrop.parentStyle.has('background-color'),
+    false,
+    'a bright browser/brand theme colour is never promoted to a full-page image fallback'
+  );
+});
+
 test('media compatibility: site-declared dark theme heals white-on-white full-page fallback without touching page text', () => {
   const applied = new Map();
   const makeSurface = (name, parentElement = null) => ({
@@ -403,12 +520,19 @@ test('media compatibility: gradient text gets prefixed clipping or a readable so
 
 test('media compatibility: document-start preload catches failures before site frameworks can remove the backdrop', () => {
   const preload = readFileSync(new URL('../electron/autofillPreload.cjs', import.meta.url), 'utf8');
-  const start = preload.indexOf("const installKey = '__yayraEarlyMediaCompatibilityV2'");
+  const start = preload.indexOf("const installKey = '__yayraEarlyMediaCompatibilityV3'");
   const block = preload.slice(start, start + 7000);
   assert.ok(start > -1, 'document-start media guard exists');
   assert.match(block, /context|jpegCloudinaryUrl|f_jpg/);
   assert.match(block, /event\.stopImmediatePropagation\?\.\(\)/, 'the first safe retry survives React/Vue onError unmounting');
-  assert.match(block, /document\.getElementById\('root'\)/, 'full-page site root receives its own theme fallback');
+  assert.match(block, /safeBackdropThemeColor/, 'browser theme colours are screened before becoming page paint');
+  assert.match(block, /brightness <= 0\.42 && chroma <= 0\.35 \? color : ''/, 'only a proven dark, low-chroma theme surface is eligible');
+  assert.doesNotMatch(
+    block,
+    /if \(coversViewport\(target\)\) \{ backdrop = true/,
+    'a generic viewport ancestor cannot promote an ordinary failed image to backdrop status'
+  );
+  assert.doesNotMatch(block, /\|h-full\|w-full/, 'broad sizing utilities are not backdrop evidence');
   assert.match(block, /data-yayra-media-failed/, 'the broken-image glyph is retired');
 });
 

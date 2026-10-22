@@ -34,7 +34,7 @@ if (contextBridge && typeof contextBridge.executeInMainWorld === 'function') {
     contextBridge.executeInMainWorld({
       func: () => {
         try {
-          const installKey = '__yayraEarlyMediaCompatibilityV2';
+          const installKey = '__yayraEarlyMediaCompatibilityV3';
           if (window[installKey]) return;
           const attempts = new WeakMap();
 
@@ -72,6 +72,28 @@ if (contextBridge && typeof contextBridge.executeInMainWorld === 'function') {
               return String(selected?.getAttribute('content') || '').trim();
             } catch { return ''; }
           };
+          const safeBackdropThemeColor = () => {
+            const color = siteThemeColor();
+            const text = String(color || '').trim().toLowerCase();
+            let channels = null;
+            const hex = text.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+            if (hex) {
+              let raw = hex[1];
+              if (raw.length === 3) raw = raw.split('').map((part) => part + part).join('');
+              channels = [
+                Number.parseInt(raw.slice(0, 2), 16),
+                Number.parseInt(raw.slice(2, 4), 16),
+                Number.parseInt(raw.slice(4, 6), 16)
+              ];
+            } else {
+              const rgb = text.match(/^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/);
+              if (rgb) channels = [Number(rgb[1]), Number(rgb[2]), Number(rgb[3])];
+            }
+            if (!channels || channels.some((channel) => !Number.isFinite(channel))) return '';
+            const brightness = (channels[0] * 299 + channels[1] * 587 + channels[2] * 114) / 255000;
+            const chroma = (Math.max(...channels) - Math.min(...channels)) / 255;
+            return brightness <= 0.42 && chroma <= 0.35 ? color : '';
+          };
           const coversViewport = (element) => {
             try {
               const rect = element.getBoundingClientRect();
@@ -81,24 +103,31 @@ if (contextBridge && typeof contextBridge.executeInMainWorld === 'function') {
             } catch { return false; }
           };
           const retireFailedBackdrop = (image) => {
-            const color = siteThemeColor();
-            let target = image.parentElement;
             let hints = '';
             try {
               const className = typeof image.className === 'string' ? image.className : image.className?.baseVal || '';
               hints = [className, image.id, image.getAttribute('alt'), image.getAttribute('role')].join(' ').toLowerCase();
             } catch { /* use geometry only */ }
-            let backdrop = coversViewport(image)
-              || /(?:background|backdrop|wallpaper|hero|object-cover|inset-0|h-full|w-full)/.test(hints);
-            for (let depth = 0; target && depth < 6; depth += 1, target = target.parentElement) {
-              if (coversViewport(target)) { backdrop = true; break; }
-            }
-            if (backdrop && color) {
-              const appRoot = document.getElementById('root');
-              const roots = [target, image.parentElement, document.documentElement, document.body, appRoot, appRoot?.firstElementChild];
-              for (const root of roots) {
-                if (!root || (root !== target && root !== image.parentElement && !coversViewport(root))) continue;
-                try { root.style.setProperty('background-color', color, 'important'); } catch { /* detached */ }
+            // Do not promote an ordinary failed image to "backdrop" merely
+            // because a distant app-shell ancestor fills the viewport. Broad
+            // utilities such as w-full/h-full/object-cover are common on cards.
+            const target = image.parentElement;
+            const semanticBackdrop = /(?:background|backdrop|wallpaper)/.test(hints);
+            let layoutBackdrop = false;
+            try {
+              const style = window.getComputedStyle(image);
+              const positioned = style.position === 'fixed' || style.position === 'absolute';
+              layoutBackdrop = coversViewport(target) && (
+                /\bhero(?:-|\b)/.test(hints)
+                || (positioned && (style.objectFit === 'cover' || style.width === '100%' || style.height === '100%'
+                  || /(?:object-cover|inset-0)/.test(hints)))
+              );
+            } catch { /* semantic/geometry evidence remains available */ }
+            const backdrop = coversViewport(image) || semanticBackdrop || layoutBackdrop;
+            if (backdrop) {
+              const color = safeBackdropThemeColor();
+              if (target && color) {
+                try { target.style.setProperty('background-color', color, 'important'); } catch { /* detached */ }
               }
             }
             if (!String(image.getAttribute('alt') || '').trim() || backdrop) {
@@ -141,7 +170,7 @@ if (contextBridge && typeof contextBridge.executeInMainWorld === 'function') {
               image.style.removeProperty('visibility');
             }
           }, true);
-          window[installKey] = { version: 2 };
+          window[installKey] = { version: 3 };
         } catch { /* media compatibility must never affect page startup */ }
       }
     });
