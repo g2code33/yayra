@@ -40,7 +40,11 @@ unknown format creates an honest fallback instead of silently excluding it.
   files over the internal-viewer limit;
 - independent ascending/descending sorting by opening date, name, type, size,
   or opening frequency;
-- direct **Open**, **Desktop app**, and **Show in folder** actions;
+- full-card primary opening: clicking anywhere on an available supported file
+  card opens it directly in Yayra, while unsupported cards use their honest
+  desktop-app route;
+- direct **Open**, **Desktop app**, and **Show in folder** actions that remain
+  independently clickable above the full-card target;
 - explicit missing/moved-file state plus **Locate…** relinking;
 - removal of one row, all unavailable rows, or all history without deleting
   original files; and

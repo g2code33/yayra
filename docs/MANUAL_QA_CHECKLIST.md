@@ -190,6 +190,13 @@ this list is the reality check.
 
 ## 1f. Document download, print, and presentation actions
 
+- [ ] In the Documents hub, click the icon, filename, metadata, status, and
+  blank space of an available PPTX/PDF card. Every target must open that file
+  directly in Yayra. Tab to the full-card action and press Enter/Space to
+  confirm the same accessible behavior. Rapid double-clicking must create only
+  one open operation. **Desktop app**, **Show**, and **Remove** must keep their
+  distinct actions, and unavailable cards must offer **Locate…** rather than a
+  false open target.
 - [ ] Open representative PPTX, DOCX, PDF, and PNG files. Each integrated
   viewer must keep rendering inside Yayra and show direct **Download** and
   **Print** actions without opening its three-dot menu.

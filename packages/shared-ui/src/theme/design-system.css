@@ -9635,6 +9635,8 @@ button.fb-site-passkey-indicator {
 }
 
 .fb-document-row {
+  position: relative;
+  isolation: isolate;
   display: grid;
   grid-template-columns: 46px minmax(180px, 1fr) auto minmax(260px, auto);
   align-items: center;
@@ -9643,6 +9645,42 @@ button.fb-site-passkey-indicator {
   padding: 11px 13px;
   border-bottom: 1px solid var(--fb-border-glass, rgba(255, 255, 255, .07));
   transition: background 120ms ease;
+}
+
+/* The primary action stretches across the file card. Explicit actions stay
+   above it, so Desktop app, Show, Locate, and Remove retain their own meaning. */
+.fb-document-card-open {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  appearance: none;
+  border: 0;
+  border-radius: 0;
+  outline: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.fb-document-card-open:focus-visible {
+  outline: 2px solid var(--fb-accent-primary, #8b7cf7);
+  outline-offset: -3px;
+}
+
+.fb-document-card-open:disabled,
+.fb-document-row.is-opening .fb-document-card-open {
+  cursor: progress;
+}
+
+.fb-document-row.is-openable > .fb-document-glyph,
+.fb-document-row.is-openable > .fb-document-details,
+.fb-document-row.is-openable > .fb-document-status {
+  position: relative;
+  z-index: 2;
+  pointer-events: none;
 }
 
 .fb-document-row:last-child {
@@ -9719,14 +9757,18 @@ button.fb-site-passkey-indicator {
 }
 
 .fb-document-actions {
+  position: relative;
+  z-index: 3;
   display: flex;
   justify-content: flex-end;
   gap: 6px;
   flex-wrap: wrap;
+  pointer-events: none;
 }
 
 .fb-document-actions .fb-btn {
   min-height: 32px;
+  pointer-events: auto;
   padding: 6px 9px;
   font-size: .7rem;
 }

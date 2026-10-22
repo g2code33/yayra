@@ -242,8 +242,27 @@ test('DOCUMENT HUB UI: safe rows, filters, unavailable state and direct reopen w
     await shell.initialize();
     await shell.refreshDocumentLibrary({ render: false });
     shell.render(container);
-    assert.equal(shell.viewportElement.querySelectorAll('.fb-document-row').length, 3);
-    assert.equal(shell.viewportElement.querySelectorAll('.fb-document-row').filter((row) => row.classList.contains('is-missing')).length, 1);
+    const initialRows = shell.viewportElement.querySelectorAll('.fb-document-row');
+    assert.equal(initialRows.length, 3);
+    assert.equal(initialRows.filter((row) => row.classList.contains('is-missing')).length, 1);
+    assert.equal(shell.viewportElement.querySelectorAll('.fb-document-card-open').length, 2,
+      'every available file card has one full-card primary action');
+    const presentationRow = initialRows.find((row) => row.dataset.documentId === 'local-presentation-safe');
+    const missingRow = initialRows.find((row) => row.dataset.documentId === 'local-missing-safe');
+    const presentationCard = presentationRow.querySelector('.fb-document-card-open');
+    assert.match(presentationCard.getAttribute('aria-label'), /Open Board deck\.pptx in Yayra/);
+    assert.equal(missingRow.querySelector('.fb-document-card-open'), null,
+      'an unavailable card cannot advertise an open action that will fail');
+    presentationCard.click();
+    presentationCard.click();
+    await new Promise((resolve) => setImmediate(resolve));
+    const refreshedPresentationCard = shell.viewportElement.querySelectorAll('.fb-document-row')
+      .find((row) => row.dataset.documentId === 'local-presentation-safe')
+      ?.querySelector('.fb-document-card-open');
+    refreshedPresentationCard?.click();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls.filter(([action, id]) => action === 'reopen' && id === 'local-presentation-safe').length, 1,
+      'clicking anywhere on a supported card opens it directly in Yayra and suppresses accidental double-open across a rerender');
     assert.match(shell.viewportElement.textContent, /File moved or unavailable/);
     assert.match(shell.viewportElement.textContent, /Locate…/);
     assert.equal(JSON.stringify(shell.state.documentsItems).includes('/home/'), false, 'renderer state contains no source path');
@@ -294,6 +313,13 @@ test('DOCUMENT HUB + SLIDESHOW SOURCE CONTRACT: toolbar placement, IPC privacy, 
   assert.match(shell, /documentsDefaultSize/);
   assert.match(shell, /documentsRetentionDays/);
   assert.match(shell, /documentsShowMissing/);
+  assert.match(shell, /fb-document-card-open/);
+  assert.match(shell, /Open \$\{fileName\} \$\{destination\}/,
+    'the entire available file card exposes an accessible primary open action');
+  assert.match(css, /\.fb-document-card-open\s*\{[\s\S]*?position:\s*absolute;[\s\S]*?inset:\s*0;/,
+    'the primary button stretches across the full file card');
+  assert.match(css, /\.fb-document-actions\s*\{[\s\S]*?z-index:\s*3;/,
+    'explicit card actions remain above the full-card open target');
 
   for (const channel of [
     'yayra:doc-library-list', 'yayra:doc-library-open', 'yayra:doc-library-show',

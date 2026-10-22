@@ -19257,8 +19257,41 @@ export class BrowserShell {
     } else {
       for (const entry of entries) {
         const row = document.createElement('article');
-        row.className = `fb-document-row${entry.available === false ? ' is-missing' : ''}`;
+        const canActivate = entry.available !== false;
+        row.className = `fb-document-row${entry.available === false ? ' is-missing' : ' is-openable'}`;
         row.dataset.documentId = entry.id;
+        let cardOpen = null;
+        let opening = false;
+        const openPrimary = async () => {
+          const activatedAt = Date.now();
+          this._documentCardActivationTimes ||= new Map();
+          const lastActivationAt = this._documentCardActivationTimes.get(entry.id) || 0;
+          if (!canActivate || opening || activatedAt - lastActivationAt < 650) return false;
+          opening = true;
+          this._documentCardActivationTimes.set(entry.id, activatedAt);
+          row.classList.add('is-opening');
+          row.setAttribute('aria-busy', 'true');
+          if (cardOpen) cardOpen.disabled = true;
+          try {
+            return await this.openDocumentLibraryEntry(entry.id);
+          } finally {
+            opening = false;
+            row.classList.remove('is-opening');
+            row.removeAttribute('aria-busy');
+            if (cardOpen) cardOpen.disabled = false;
+          }
+        };
+        if (canActivate) {
+          cardOpen = document.createElement('button');
+          cardOpen.type = 'button';
+          cardOpen.className = 'fb-document-card-open';
+          const destination = entry.canOpenInYayra ? 'in Yayra' : 'with its desktop app';
+          const fileName = entry.name || 'local file';
+          cardOpen.setAttribute('aria-label', `Open ${fileName} ${destination}`);
+          cardOpen.title = `Open ${fileName} ${destination}`;
+          cardOpen.addEventListener('click', openPrimary);
+          row.appendChild(cardOpen);
+        }
         const glyph = document.createElement('span');
         glyph.className = `fb-document-glyph fb-document-glyph-${entry.category || 'other'}`;
         glyph.textContent = entry.extension ? String(entry.extension).slice(0, 5).toLocaleUpperCase() : 'FILE';
@@ -19293,7 +19326,7 @@ export class BrowserShell {
         if (entry.available === false && entry.source === 'desktop') {
           actions.appendChild(button('Locate…', 'Locate moved file', () => this.locateDocumentLibraryEntry(entry.id), 'fb-btn fb-btn-primary'));
         } else {
-          actions.appendChild(button('Open', entry.canOpenInYayra ? 'Open in Yayra' : 'Open with desktop app', () => this.openDocumentLibraryEntry(entry.id), 'fb-btn fb-btn-primary'));
+          actions.appendChild(button('Open', entry.canOpenInYayra ? 'Open in Yayra' : 'Open with desktop app', openPrimary, 'fb-btn fb-btn-primary'));
           if (entry.source === 'desktop' && entry.canOpenInYayra) {
             actions.appendChild(button('Desktop app', 'Open unchanged original with desktop app', () => this.openDocumentLibraryEntry(entry.id, { external: true })));
           }
