@@ -1105,7 +1105,17 @@ function registerIpcBridges() {
             }
           }
           if (cookies && typeof ses.clearStorageData === 'function') {
-            await ses.clearStorageData({ storages: ['cookies', 'localstorage', 'indexdb', 'serviceworkers', 'websql'] });
+            // The default Session owns Yayra's browser chrome. Its
+            // localStorage contains profiles, bookmarks, settings, sessions,
+            // and the durable tab-group catalog; those are not website data
+            // and Chrome's Clear Browsing Data does not erase browser chrome.
+            // Real websites live in separate profile/private partitions, so
+            // clear their complete site storage while clearing only cookies
+            // from the shell Session.
+            const storages = ses === session.defaultSession
+              ? ['cookies']
+              : ['cookies', 'localstorage', 'indexdb', 'serviceworkers', 'websql'];
+            await ses.clearStorageData({ storages });
           }
         } catch (err) {
           console.error('[yayra] clear-browsing-data failed for a session', err);
@@ -1439,6 +1449,7 @@ function registerIpcBridges() {
     Menu,
     clipboard,
     dialog,
+    writeFile: (filePath, data) => fs.promises.writeFile(filePath, data),
     getMainWindow: () => mainWindow,
     getWindowForWebContents: (wc) => BrowserWindow.fromWebContents(wc),
     // Chrome-style password capture/fill inside real pages (sandboxed

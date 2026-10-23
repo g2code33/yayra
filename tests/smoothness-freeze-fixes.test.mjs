@@ -18,10 +18,10 @@
  *     process is the only writer), and the renderer poll dropped from
  *     4s to 15s with a document.hidden skip - the 'storage' event
  *     listener remains the real-time sync path.
- *  4. GIANT SNAPSHOTS: page snapshots were full-resolution PNG data URLs
- *     (multi-MB strings) on every tab switch/menu open - IPC floods and
- *     renderer GC pauses. Snapshots are now width-capped JPEGs (~3% of
- *     the bytes), with PNG fallback when the image lacks resize/toJPEG.
+ *  4. OVERLAY SNAPSHOT LIFECYCLE: native pages hide immediately while one
+ *     deduplicated asynchronous capture is in flight, so menus never wait on
+ *     capture or freeze input. Captures remain lossless/native-resolution so
+ *     website text beneath Yayra overlays is clear rather than JPEG-softened.
  */
 
 import test from 'node:test';
@@ -193,7 +193,7 @@ test('downloadsStore caches reads: repeat load()/list() polls never re-read the 
   assert.equal(store2.load().items[0].id, 'a', 'persistence across instances intact');
 });
 
-// ---- 4. snapshots are width-capped JPEGs --------------------------------
+// ---- 4. snapshots are asynchronous, deduplicated, and lossless ----------
 
 function makeWebviewHarness() {
   const handlers = new Map();
@@ -222,25 +222,24 @@ function makeWebviewHarness() {
   return { handlers, views };
 }
 
-test('page snapshots are downscaled JPEGs, not full-res PNGs (multi-MB strings froze the renderer)', async () => {
+test('page snapshots stay lossless at native resolution so overlays never blur website text', async () => {
   const { handlers, views } = makeWebviewHarness();
   await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-1', url: 'https://example.com/' });
 
   const resizeCalls = [];
+  const jpegCalls = [];
   views[0].webContents.capturePage = async () => ({
     isEmpty: () => false,
     getSize: () => ({ width: 2560, height: 1440 }),
-    resize: (opts) => {
-      resizeCalls.push(opts);
-      return { toJPEG: (q) => Buffer.from(`jpeg-q${q}`), toDataURL: () => 'data:image/png;base64,FULL' };
-    },
-    toJPEG: (q) => Buffer.from(`jpeg-q${q}`),
-    toDataURL: () => 'data:image/png;base64,FULL'
+    resize: (opts) => { resizeCalls.push(opts); return null; },
+    toJPEG: (quality) => { jpegCalls.push(quality); return Buffer.from('lossy'); },
+    toDataURL: () => 'data:image/png;base64,FULL-NATIVE-RESOLUTION'
   });
 
   const result = await handlers.get('yayra:webview-capture')(null, { tabId: 'tab-1' });
-  assert.ok(String(result.snapshot).startsWith('data:image/jpeg;base64,'), 'snapshot is a JPEG data URL');
-  assert.deepEqual(resizeCalls, [{ width: 1440 }], 'a 2560px-wide capture is downscaled to 1440px');
+  assert.equal(result.snapshot, 'data:image/png;base64,FULL-NATIVE-RESOLUTION');
+  assert.deepEqual(resizeCalls, [], 'the capture is never downscaled');
+  assert.deepEqual(jpegCalls, [], 'the capture is never JPEG-compressed');
 });
 
 test('snapshot falls back to PNG when the captured image lacks resize/toJPEG', async () => {

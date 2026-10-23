@@ -433,6 +433,51 @@ test('Native engine: Google Account navigation completes Yayra OAuth and replace
   }
 });
 
+test('Native engine: the authenticated invoke result reflects and restores Google even if the one-shot event is missed', async () => {
+  const profile = { sub: 'g-return', email: 'returned@example.com', name: 'Returned User' };
+  let persisted = { signedIn: false };
+  const auth = {
+    getSession: async () => persisted,
+    onEvent: () => () => {}, // model a hidden/reloaded renderer that missed main's event
+    signIn: async () => {
+      persisted = { signedIn: true, profile, savedAt: '2026-10-23T20:00:00.000Z' };
+      return { ok: true, profile, savedAt: persisted.savedAt };
+    },
+    signOut: async () => ({ ok: true }),
+    openAccountPage: async () => ({ ok: true }),
+    openGoogleProduct: async () => ({ ok: true })
+  };
+  const { uninstall } = installFakeNativeWebview({ auth });
+  let first = null;
+  let restored = null;
+  try {
+    const container = document.createElement('div');
+    first = new BrowserShell({ container, platform: 'linux', isMobile: false });
+    await first.initialize();
+    first.navigateActiveTab('https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fwww.youtube.com%2F');
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(first.state.googleAccount.signedIn, true, 'the invoke completion updates the initiating Yayra window');
+    assert.equal(first.state.googleAccount.profile.email, profile.email);
+    assert.equal(first.state.googleAccount.savedAt, persisted.savedAt);
+    assert.match(first.rootElement.querySelector('.fb-google-account-connection').textContent, /Google is connected to Yayra/);
+    first.destroy();
+    first = null;
+
+    const restoredContainer = document.createElement('div');
+    restored = new BrowserShell({ container: restoredContainer, platform: 'linux', isMobile: false });
+    await restored.initialize();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(restored.state.googleAccount.signedIn, true, 'the persisted profile is restored on the next Yayra launch');
+    assert.equal(restored.state.googleAccount.profile.email, profile.email);
+  } finally {
+    first?.destroy();
+    restored?.destroy();
+    uninstall();
+  }
+});
+
 test('Native engine: Google product login redirect starts Yayra connection and clears the canceled embedded load', async () => {
   const listeners = new Set();
   let continuedOrigin = null;

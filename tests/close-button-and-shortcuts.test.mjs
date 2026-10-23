@@ -94,7 +94,8 @@ test('close with real websites open prompts; "keep" saves ONLY http(s) URLs', as
   assert.deepEqual(calls, [], 'window NOT closed before the user answers');
 
   shell.closeWithSessionMode('keep');
-  const saved = JSON.parse(disk.get('yayra:close-session') || 'null');
+  const closeKey = [...disk.keys()].find((key) => key.startsWith('yayra:close-session:'));
+  const saved = JSON.parse(disk.get(closeKey) || 'null');
   assert.ok(saved, 'session persisted');
   assert.deepEqual(saved.tabs.map((t) => t.url), ['https://www.youtube.com/'],
     'yayra:// internal pages never persisted as session tabs');

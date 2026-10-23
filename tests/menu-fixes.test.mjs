@@ -187,7 +187,9 @@ test('EXIT from Yayra menu quits the whole desktop app after the tab-session cho
 
     container.querySelector('.fb-close-prompt-modal').querySelector('.fb-close-just-close').click();
     assert.deepEqual(calls, ['quit-app'], 'Exit quits the entire app rather than closing only the main window');
-    assert.equal(JSON.parse(storage.getItem('yayra:close-session')).mode, 'recent', 'the chosen session mode is preserved');
+    const closeKey = Array.from({ length: storage.length }, (_, index) => storage.key(index))
+      .find((key) => key.startsWith('yayra:close-session:'));
+    assert.equal(JSON.parse(storage.getItem(closeKey)).mode, 'recent', 'the chosen profile-scoped session mode is preserved');
   } finally {
     shell.destroy();
     delete globalThis.localStorage;
@@ -476,6 +478,92 @@ test('TAB GROUP RESTORE: selecting a previous-session group opens every saved me
   } finally {
     shell.destroy();
     delete globalThis.localStorage;
+  }
+});
+
+test('TAB GROUP DURABILITY: navigation, closure, clearing site data, restart, and reopening never delete a group', async () => {
+  const storage = makeStorage();
+  const previousBridge = window.yayra;
+  let first = null;
+  let second = null;
+  let third = null;
+  try {
+    first = (await makeShell({ storage })).shell;
+    first.state.tabs[0].url = 'https://alpha.example/start';
+    first.state.tabs[0].title = 'Alpha';
+    first._textPromptDialog = async () => 'Forever';
+    await first.createTabGroup();
+    first.navigateActiveTab('https://beta.example/after-navigation');
+    first.getActiveTab().title = 'Beta after navigation';
+    first.render();
+
+    let group = first.getTabGroups().find((candidate) => candidate.name === 'Forever');
+    assert.ok(group?.catalogId, 'new normal groups receive a stable durable id');
+    assert.equal(group.tabs.length, 2);
+    const catalogId = group.catalogId;
+    const memberIds = group.tabs.map((tab) => tab.groupMemberId).sort();
+
+    for (const tab of [...first.state.tabs].filter((tab) => tab.group?.id === catalogId)) first.closeTab(tab.id);
+    group = first.getTabGroups().find((candidate) => candidate.catalogId === catalogId);
+    assert.ok(group, 'closing every grouped tab does not delete the group');
+    assert.equal(group.tabs.length, 2, 'closed members remain saved in the catalog');
+    assert.ok(group.tabs.some((tab) => tab.url === 'https://beta.example/after-navigation'), 'the member follows navigation before closure');
+
+    // Electron clears Chromium localStorage when the user chooses Cookies and
+    // site data. Groups are browser chrome rather than site data, so the live
+    // catalog must be written back immediately instead of disappearing on the
+    // next launch.
+    window.yayra = {
+      ...(previousBridge || {}),
+      system: {
+        ...(previousBridge?.system || {}),
+        clearBrowsingData: async () => {
+          while (storage.length) storage.removeItem(storage.key(0));
+          return { ok: true, clearedBytes: 0 };
+        }
+      }
+    };
+    const clearDataModal = document.createElement('div');
+    first.renderClearDataModal(clearDataModal);
+    clearDataModal.querySelector('.fb-confirm-cleardata').click();
+    await flush();
+    assert.ok(first.getTabGroups().some((candidate) => candidate.catalogId === catalogId),
+      'clearing website cookies/site data keeps the browser-owned catalog in memory');
+
+    first.destroy();
+    first = null;
+
+    second = (await makeShell({ storage })).shell;
+    group = second.getTabGroups().find((candidate) => candidate.catalogId === catalogId);
+    assert.ok(group, 'the group survives a full shell restart');
+    assert.deepEqual(group.tabs.map((tab) => tab.groupMemberId).sort(), memberIds, 'durable member identities survive updates/restarts');
+    assert.equal(second.openTabGroup(group.id), true);
+    const reopened = second.state.tabs.filter((tab) => tab.group?.id === catalogId);
+    assert.equal(reopened.length, 2, 'one action reopens every saved member');
+    assert.ok(reopened.some((tab) => tab.url === 'https://alpha.example/start'));
+    assert.ok(reopened.some((tab) => tab.url === 'https://beta.example/after-navigation'));
+
+    const removed = reopened[0];
+    const removedMemberId = removed.groupMemberId;
+    second.ungroupTab(removed.id);
+    second.closeTab(removed.id);
+    second.destroy();
+    second = null;
+
+    third = (await makeShell({ storage })).shell;
+    group = third.getTabGroups().find((candidate) => candidate.catalogId === catalogId);
+    assert.ok(group, 'removing one member does not delete the group itself');
+    assert.equal(group.tabs.length, 1);
+    assert.equal(group.tabs.some((tab) => tab.groupMemberId === removedMemberId), false, 'explicit removal is persisted');
+    third.deleteTabGroup(group.id);
+    assert.equal(third.getTabGroups().some((candidate) => candidate.catalogId === catalogId), false, 'explicit deletion removes the catalog');
+  } finally {
+    first?.destroy();
+    second?.destroy();
+    third?.destroy();
+    delete globalThis.localStorage;
+    if (previousBridge === undefined) delete window.yayra;
+    else window.yayra = previousBridge;
   }
 });
 

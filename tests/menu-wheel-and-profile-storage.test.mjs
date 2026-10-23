@@ -30,7 +30,8 @@ import {
   createBookmarksRepo,
   createEmailAddressesRepo,
   createSettingsRepo,
-  createWheelRepo
+  createWheelRepo,
+  createTabGroupsRepo
 } from '../packages/shared-ui/src/services/profileStorage.js';
 import { createOverlayBridge } from '../electron/overlayWindow.cjs';
 import { createOverlayStore, DEFAULTS } from '../electron/overlayStore.cjs';
@@ -242,6 +243,33 @@ test('wheel repo: persists only plain {id,title,url,type} and strips legacy icon
   assert.equal(await repo.getItems(), null, 'reset means "use defaults"');
 });
 
+test('tab-group repo: durable members are profile-scoped, sanitized, and never session-pruned', async () => {
+  let profileId = 'personal';
+  const storage = createProfileScopedStorage({ backing: fakeLocalStorage(), getProfileId: () => profileId });
+  const repo = createTabGroupsRepo(storage);
+  const saved = await repo.saveGroups([{
+    id: 'tg-work-1',
+    name: '  Work   forever  ',
+    color: '#3B82F6',
+    members: [
+      { id: 'tgm-a', url: 'https://example.com/path', title: 'Example' },
+      { id: 'tgm-internal', url: 'yayra://newtab', title: 'New Tab' },
+      { id: 'tgm-secret', url: 'https://user:pass@example.com/', title: 'Drop credentials' },
+      { id: 'tgm-script', url: 'javascript:alert(1)', title: 'Drop script' }
+    ]
+  }]);
+  assert.equal(saved[0].name, 'Work forever');
+  assert.equal(saved[0].color, '#3b82f6');
+  assert.deepEqual(saved[0].members.map((member) => member.id), ['tgm-a', 'tgm-internal']);
+  assert.equal((await repo.getGroups())[0].members.length, 2, 'reads never depend on the rolling session snapshot');
+
+  profileId = 'work';
+  assert.deepEqual(await repo.getGroups(), [], 'another profile starts with its own group catalog');
+  await repo.saveGroups([{ id: 'tg-work-2', name: 'Separate', color: '#10b981', members: [] }]);
+  profileId = 'personal';
+  assert.equal((await repo.getGroups())[0].id, 'tg-work-1', 'the original profile remains intact');
+});
+
 // ---------------------------------------------------------------------
 // Native bubble radial: synced custom wheel + real favicons + forwarding
 // ---------------------------------------------------------------------
@@ -400,7 +428,7 @@ test('native radial: custom wheel actions run natively for links and forward ren
 // Webview bridge: the real More-tools IPC (devtools/print/save/zoom/media)
 // ---------------------------------------------------------------------
 
-function makeWebviewHarness({ dialog } = {}) {
+function makeWebviewHarness({ dialog, writeFile } = {}) {
   const handlers = new Map();
   const ipcMain = {
     handle: (channel, fn) => handlers.set(channel, fn),
@@ -451,7 +479,8 @@ function makeWebviewHarness({ dialog } = {}) {
     shell: { openExternal: async () => {} },
     getMainWindow: () => fakeWin,
     dialog,
-    logger: { error: () => {} }
+    writeFile,
+    logger: { error: () => {}, warn: () => {} }
   });
   return { handlers, views };
 }
@@ -493,6 +522,58 @@ test('webview IPC: print, zoom (clamped), media state and mute act on the real p
   const reader = await handlers.get('yayra:webview-reader-extract')(null, { tabId: 'tab-1' });
   assert.equal(reader.ok, true);
   assert.deepEqual(reader.blocks, [{ tag: 'p', text: 'hello' }]);
+});
+
+test('webview IPC: no printer falls back to a user-selected PDF instead of a missing default queue', async () => {
+  const writes = [];
+  const dialog = {
+    showSaveDialog: async (_win, options) => ({ canceled: false, filePath: '/tmp/clear-page.pdf', options })
+  };
+  const { handlers, views } = makeWebviewHarness({
+    dialog,
+    writeFile: async (filePath, data) => writes.push([filePath, data])
+  });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-1', url: 'https://example.com/' });
+  const wc = views[0].webContents;
+  const pdfOptions = [];
+  wc.getPrintersAsync = async () => [];
+  wc.printToPDF = async (options) => {
+    pdfOptions.push(options);
+    return Buffer.from('%PDF-test');
+  };
+
+  const result = await handlers.get('yayra:webview-print')(null, { tabId: 'tab-1' });
+  assert.deepEqual(result, {
+    ok: true,
+    mode: 'pdf',
+    path: '/tmp/clear-page.pdf',
+    fallbackReason: 'no-printers'
+  });
+  assert.deepEqual(pdfOptions, [{ printBackground: true, preferCSSPageSize: true }]);
+  assert.equal(views[0].calls.some(([name]) => name === 'print'), false, 'native print is skipped when no destination exists');
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0][0], '/tmp/clear-page.pdf');
+  assert.equal(writes[0][1].toString(), '%PDF-test');
+});
+
+test('webview IPC: a stale Linux default-printer failure automatically falls back to PDF', async () => {
+  const writes = [];
+  const { handlers, views } = makeWebviewHarness({
+    dialog: { showSaveDialog: async () => ({ canceled: false, filePath: '/tmp/fallback' }) },
+    writeFile: async (filePath, data) => writes.push([filePath, data])
+  });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-1', url: 'https://example.com/' });
+  const wc = views[0].webContents;
+  wc.getPrintersAsync = async () => [{ name: 'default', displayName: 'Default' }];
+  wc.print = (_options, callback) => callback(false, "The selected printer 'default' could not be found");
+  wc.printToPDF = async () => Buffer.from('%PDF-fallback');
+
+  const result = await handlers.get('yayra:webview-print')(null, { tabId: 'tab-1' });
+  assert.equal(result.ok, true);
+  assert.equal(result.mode, 'pdf');
+  assert.equal(result.path, '/tmp/fallback.pdf', 'a missing extension is added safely');
+  assert.match(result.fallbackReason, /default.*could not be found/i);
+  assert.equal(writes[0][0], '/tmp/fallback.pdf');
 });
 
 test('webview IPC: Save page as... goes through the OS dialog, sanitizes the filename, and honours cancel', async () => {

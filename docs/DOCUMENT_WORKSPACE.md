@@ -79,8 +79,8 @@ external opening.
 - explicit missing/moved-file state plus **Locate…** relinking;
 - removal of one row, all unavailable rows, or all history without deleting
   original files; and
-- truthful browser/PWA session-only behavior where durable filesystem access
-  is unavailable.
+- browser/PWA/mobile recovery through origin-private exact-byte copies for open
+  tabs, with an explicit reselect state when storage is unavailable or evicted.
 
 **Settings > Documents** controls the default sort field/direction plus type,
 date, and size filters, history retention, missing-file visibility, presentation
@@ -112,15 +112,19 @@ of two things:
 
 The picker records a file before routing it, including supported files over the
 internal-viewer ceiling. OS **Open with Yayra** and Downloads **Open in Yayra**
-also record their source. Web/Android picker and drag-and-drop entries appear in
-a session catalog; if the browser can no longer access the bytes, the row says
-so and asks the user to choose the source again rather than pretending durable
-access exists.
+also record their source. Web/PWA/mobile picker files used by open tabs receive
+a random `docrec-*` capability and an exact-byte copy in profile-scoped,
+origin-private IndexedDB. If quota, access, or later eviction makes that copy
+unavailable, the recovered tab remains visible and asks the user to choose the
+source again rather than pretending durable access exists.
 
 `DocumentStore` still keeps active original `ArrayBuffer`/`Uint8Array` values in
-renderer memory. It stores only an optional opaque catalog id, never a path.
-Document tabs remain excluded from browser-session persistence; closing the
-final session-only tab releases its bytes and marks that session row unavailable.
+renderer memory. It stores only optional opaque catalog/recovery ids, never a
+path. Rolling recovery, explicit close-session recovery, and Ctrl+Shift+T save a
+sanitized descriptor for every non-private local-file tab. Desktop descriptors
+reopen through their trusted `local-*` catalog id; browser/PWA/mobile descriptors
+load their private byte copy. Closing the final live tab releases its in-memory
+bytes without invalidating those recovery capabilities.
 
 ## Routing and trust model
 

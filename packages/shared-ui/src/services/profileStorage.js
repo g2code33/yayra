@@ -434,7 +434,93 @@ function sanitizeSessionGroup(group) {
   if (!name) return null;
   const rawColor = String(group.color || '').trim();
   const color = /^#[0-9a-f]{6}$/i.test(rawColor) ? rawColor : null;
-  return color ? { name, color } : { name };
+  const id = /^tg-[A-Za-z0-9_-]{1,100}$/.test(String(group.id || '')) ? String(group.id) : null;
+  return { ...(id ? { id } : {}), name, ...(color ? { color } : {}) };
+}
+
+const TAB_GROUPS_KEY = 'tab-groups';
+const TAB_GROUP_ID = /^tg-[A-Za-z0-9_-]{1,100}$/;
+const TAB_GROUP_MEMBER_ID = /^tgm-[A-Za-z0-9_-]{1,120}$/;
+
+function sanitizeDurableTabUrl(value) {
+  if (typeof value !== 'string' || !value || value.length > 8192) return null;
+  if (/^https?:\/\//i.test(value)) {
+    try {
+      const parsed = new URL(value);
+      return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && !parsed.username && !parsed.password
+        ? parsed.toString()
+        : null;
+    } catch { return null; }
+  }
+  // Internal pages are safe to recreate. Runtime yayra://doc ids are not;
+  // recoverable files use a separate sanitized opaque descriptor.
+  if (/^yayra:\/\/(?!doc\/)[A-Za-z0-9._~/?#=&%+-]{1,2048}$/i.test(value)) return value;
+  return value === 'about:blank' ? value : null;
+}
+
+function sanitizeDurableTabGroup(group) {
+  if (!group || typeof group !== 'object' || !TAB_GROUP_ID.test(String(group.id || ''))) return null;
+  const name = String(group.name || '').replace(/\s+/g, ' ').trim().slice(0, 48);
+  if (!name) return null;
+  const rawColor = String(group.color || '').trim().toLowerCase();
+  const color = /^#[0-9a-f]{6}$/.test(rawColor) ? rawColor : '#8b5cf6';
+  const seenMembers = new Set();
+  const members = [];
+  for (const candidate of Array.isArray(group.members) ? group.members : []) {
+    const id = String(candidate?.id || '');
+    const document = sanitizeSessionDocument(candidate?.document);
+    const url = document
+      ? `yayra://recover-document/${encodeURIComponent(document.libraryId || document.recoveryId)}`
+      : sanitizeDurableTabUrl(candidate?.url);
+    if (!TAB_GROUP_MEMBER_ID.test(id) || seenMembers.has(id) || !url) continue;
+    seenMembers.add(id);
+    members.push({
+      id,
+      url,
+      title: document?.name || String(candidate?.title || url).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 120) || url,
+      ...(document ? { document } : {}),
+      createdAt: Number(candidate?.createdAt) || Date.now(),
+      updatedAt: Number(candidate?.updatedAt) || Number(candidate?.createdAt) || Date.now()
+    });
+  }
+  return {
+    id: String(group.id),
+    name,
+    color,
+    members,
+    createdAt: Number(group.createdAt) || Date.now(),
+    updatedAt: Number(group.updatedAt) || Number(group.createdAt) || Date.now()
+  };
+}
+
+/**
+ * Durable, profile-scoped tab-group catalog. It is intentionally separate
+ * from the rolling open-tab session: closing a tab, quitting, restoring an
+ * update, or opening every member never deletes a catalog row. Only explicit
+ * ungroup/delete actions replace the catalog without that group/member.
+ */
+export function createTabGroupsRepo(storage) {
+  const sanitize = (groups) => {
+    const result = [];
+    const ids = new Set();
+    for (const candidate of Array.isArray(groups) ? groups : []) {
+      const group = sanitizeDurableTabGroup(candidate);
+      if (!group || ids.has(group.id)) continue;
+      ids.add(group.id);
+      result.push(group);
+    }
+    return result;
+  };
+  return {
+    async getGroups() {
+      return sanitize(await storage.get(TAB_GROUPS_KEY));
+    },
+    async saveGroups(groups) {
+      const safeGroups = sanitize(groups);
+      await storage.set(TAB_GROUPS_KEY, safeGroups);
+      return safeGroups;
+    }
+  };
 }
 
 /**
@@ -444,18 +530,54 @@ function sanitizeSessionGroup(group) {
  * exits = the tabs the user did NOT manually close - exactly what the
  * next launch should offer to continue with.
  */
+const SESSION_DOCUMENT_LIBRARY_ID = /^local-[A-Za-z0-9-]{8,}$/;
+const SESSION_DOCUMENT_RECOVERY_ID = /^docrec-[A-Za-z0-9_-]{8,120}$/;
+
+function sanitizeSessionDocument(value) {
+  if (!value || typeof value !== 'object') return null;
+  const libraryId = SESSION_DOCUMENT_LIBRARY_ID.test(String(value.libraryId || '')) ? String(value.libraryId) : null;
+  const recoveryId = SESSION_DOCUMENT_RECOVERY_ID.test(String(value.recoveryId || '')) ? String(value.recoveryId) : null;
+  if (!libraryId && !recoveryId) return null;
+  return {
+    ...(libraryId ? { libraryId } : {}),
+    ...(recoveryId ? { recoveryId } : {}),
+    name: String(value.name || 'Local file').replace(/\\/g, '/').split('/').pop()
+      .replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 160) || 'Local file',
+    mime: String(value.mime || '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 200),
+    size: Math.max(0, Math.min(300 * 1024 * 1024, Number(value.size) || 0))
+  };
+}
+
 export function createSessionRepo(storage) {
   const sanitize = (tabs) => (Array.isArray(tabs) ? tabs : [])
-    .filter((t) => t && typeof t.url === 'string' && /^https?:\/\//i.test(t.url))
-    .map(({ url, title, group }) => {
+    .map(({ url, title, group, groupMemberId, document, isPrivate } = {}) => {
+      if (isPrivate) return null;
       const safeGroup = sanitizeSessionGroup(group);
+      const safeMemberId = TAB_GROUP_MEMBER_ID.test(String(groupMemberId || '')) ? String(groupMemberId) : null;
+      const safeDocument = sanitizeSessionDocument(document);
+      if (safeDocument) {
+        const id = safeDocument.libraryId || safeDocument.recoveryId;
+        return {
+          url: `yayra://recover-document/${encodeURIComponent(id)}`,
+          title: safeDocument.name,
+          document: safeDocument,
+          ...(safeGroup ? { group: safeGroup } : {}),
+          ...(safeGroup && safeMemberId ? { groupMemberId: safeMemberId } : {})
+        };
+      }
+      if (typeof url !== 'string' || !/^https?:\/\//i.test(url) || url.length > 8192) return null;
+      try {
+        const parsed = new URL(url);
+        if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) return null;
+      } catch { return null; }
       return {
         url,
-        title: String(title || url).slice(0, 120),
-        ...(safeGroup ? { group: safeGroup } : {})
+        title: String(title || url).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 120),
+        ...(safeGroup ? { group: safeGroup } : {}),
+        ...(safeGroup && safeMemberId ? { groupMemberId: safeMemberId } : {})
       };
     })
-    .slice(0, 20);
+    .filter(Boolean);
   return {
     async getLastSession() {
       const snapshot = await storage.get(LAST_SESSION_KEY);

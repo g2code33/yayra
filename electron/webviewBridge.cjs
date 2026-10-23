@@ -1304,9 +1304,13 @@ function createWebviewBridge({
   // does nothing instead of throwing.
   Menu = null,
   clipboard = null,
-  // Electron's dialog module, injected for the "Save page as..." OS save
-  // dialog. Optional: without it savePage reports { ok:false }.
+  // Electron's dialog module, injected for "Save page as..." and the
+  // printerless Print -> PDF fallback. Optional: without it those operations
+  // report { ok:false } instead of guessing a path.
   dialog = null,
+  // Injected fs writer for generated PDFs. Keeping filesystem access outside
+  // renderer IPC makes the fallback testable and prevents arbitrary writes.
+  writeFile = null,
   // Absolute path to electron/autofillPreload.cjs. When provided, every
   // page view gets sandboxed password capture/fill and email suggestion hooks
   // (context-isolated, nothing exposed to the page). Optional for test hosts.
@@ -2318,23 +2322,15 @@ function createWebviewBridge({
   }
 
   /**
-   * Encode a page snapshot CHEAPLY. toDataURL() alone produces a
-   * full-resolution PNG - a multi-megabyte base64 string per tab switch
-   * or menu open, which hammered the IPC channel and left the renderer
-   * collecting giant strings (GC pauses = micro-freezes). A snapshot is
-   * a transient still under the chrome, so a width-capped JPEG is
-   * visually identical at ~3% of the bytes. Falls back to PNG when the
-   * image object lacks resize/toJPEG (older fakes, odd platforms).
+   * Preserve the page under Yayra overlays at native resolution. The old
+   * 1440px / quality-78 JPEG path softened text and made the whole website
+   * look deliberately blurred whenever a menu or dialog opened. Electron's
+   * NativeImage data URL is lossless PNG, so the snapshot remains pixel-clear
+   * while the live sibling surface is temporarily hidden beneath HTML chrome.
+   * Capture is still asynchronous and cached per tab, preserving the existing
+   * no-freeze lifecycle without applying visual blur or lossy downscaling.
    */
   function snapshotDataUrl(image) {
-    try {
-      if (image && typeof image.getSize === 'function' && typeof image.resize === 'function' && typeof image.toJPEG === 'function') {
-        const { width } = image.getSize() || {};
-        const scaled = Number(width) > 1440 ? image.resize({ width: 1440 }) : image;
-        const buf = scaled.toJPEG(78);
-        if (buf && buf.length) return `data:image/jpeg;base64,${buf.toString('base64')}`;
-      }
-    } catch { /* fall through to PNG */ }
     return image.toDataURL();
   }
 
@@ -2713,16 +2709,84 @@ function createWebviewBridge({
     }
   });
 
-  ipcMain.handle('yayra:webview-print', (event, { tabId } = {}) => {
+  async function savePrintAsPdf(event, wc, fallbackReason = 'no-printers') {
+    if (!wc || typeof wc.printToPDF !== 'function' || !dialog || typeof dialog.showSaveDialog !== 'function'
+      || typeof writeFile !== 'function') {
+      return { ok: false, reason: fallbackReason, pdfFallbackUnavailable: true };
+    }
+    try {
+      const title = (typeof wc.getTitle === 'function' && wc.getTitle()) || 'page';
+      const safeName = String(title).replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '-').trim().slice(0, 80) || 'page';
+      const owner = (typeof getWindowForWebContents === 'function' && event?.sender
+        && getWindowForWebContents(event.sender)) || getMainWindow?.() || null;
+      const result = await dialog.showSaveDialog(owner, {
+        title: 'Save print as PDF',
+        defaultPath: `${safeName}.pdf`,
+        filters: [{ name: 'PDF document', extensions: ['pdf'] }]
+      });
+      if (result?.canceled || !result?.filePath) {
+        return { ok: false, canceled: true, mode: 'pdf', fallbackReason };
+      }
+      const filePath = /\.pdf$/i.test(result.filePath) ? result.filePath : `${result.filePath}.pdf`;
+      const pdf = await wc.printToPDF({ printBackground: true, preferCSSPageSize: true });
+      if (!pdf || !Number(pdf.length)) throw new Error('empty_pdf');
+      await writeFile(filePath, pdf);
+      return { ok: true, mode: 'pdf', path: filePath, fallbackReason };
+    } catch (err) {
+      logger.error?.('[yayra:webview] PDF print fallback failed', err);
+      return { ok: false, reason: 'pdf-fallback-failed', fallbackReason };
+    }
+  }
+
+  ipcMain.handle('yayra:webview-print', async (event, { tabId } = {}) => {
     const entry = views.get(viewKey(event, tabId));
     const wc = (entry && entry.view && entry.view.webContents) || (event && event.sender) || null;
     if (!wc || typeof wc.print !== 'function') return { ok: false, reason: 'unavailable' };
+
+    // Electron exposes the actual destination list. Do not send Linux to a
+    // synthetic/nonexistent "default" queue: when there is no printer, save
+    // a PDF directly and avoid Chromium's Failed to Print Document dialog.
+    if (typeof wc.getPrintersAsync === 'function') {
+      try {
+        const printers = await wc.getPrintersAsync();
+        if (!Array.isArray(printers) || printers.length === 0) {
+          return savePrintAsPdf(event, wc, 'no-printers');
+        }
+      } catch (err) {
+        logger.warn?.('[yayra:webview] printer discovery failed; native print will verify the destination', err);
+      }
+
+      try {
+        return await new Promise((resolve) => {
+          wc.print({}, (success, failureReason = '') => {
+            if (success) {
+              resolve({ ok: true, mode: 'printer' });
+              return;
+            }
+            // Closing the dialog is an intentional cancel, not evidence that
+            // the machine lacks a printer. All actual destination failures
+            // (including Linux's missing "default") get the PDF fallback.
+            if (/cancel/i.test(String(failureReason))) {
+              resolve({ ok: false, canceled: true, mode: 'printer' });
+              return;
+            }
+            Promise.resolve(savePrintAsPdf(event, wc, String(failureReason || 'printer-failed'))).then(resolve);
+          });
+        });
+      } catch (err) {
+        logger.error?.('[yayra:webview] native print failed; using PDF fallback', err);
+        return savePrintAsPdf(event, wc, 'printer-threw');
+      }
+    }
+
+    // Compatibility path for older Electron/test hosts that do not expose
+    // printer discovery. Preserve their existing native print behavior.
     try {
       wc.print({});
-      return { ok: true };
+      return { ok: true, mode: 'printer' };
     } catch (err) {
-      logger.error?.('[yayra:webview] print failed', err);
-      return { ok: false, reason: 'failed' };
+      logger.error?.('[yayra:webview] print failed; using PDF fallback', err);
+      return savePrintAsPdf(event, wc, 'printer-threw');
     }
   });
 

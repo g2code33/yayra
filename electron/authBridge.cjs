@@ -173,8 +173,9 @@ function createAuthBridge({
         ...(fetchImpl ? { fetchImpl } : {}),
         logger
       });
-      storeForProfile(profileId).save({ profile, tokens });
-      send('signed-in', { profile }, requestWindow, profileId);
+      const saved = storeForProfile(profileId).save({ profile, tokens });
+      const savedAt = saved?.savedAt || null;
+      send('signed-in', { profile, ...(savedAt ? { savedAt } : {}) }, requestWindow, profileId);
       // The verified loopback callback means the browser ceremony is done.
       // Bring the Yayra window that initiated it back so detached/profile
       // windows update themselves instead of sending the result elsewhere.
@@ -186,7 +187,7 @@ function createAuthBridge({
         try { win.show?.(); } catch { /* platform/window may not expose show */ }
         try { win.focus?.(); } catch { /* best effort only */ }
       }
-      return { ok: true, profile };
+      return { ok: true, profile, ...(savedAt ? { savedAt } : {}) };
     } catch (err) {
       const message = err && err.message ? err.message : String(err);
       logger?.error?.(`[yayra:auth] sign-in failed: ${message}`);
@@ -221,15 +222,16 @@ function createAuthBridge({
         obtained_at_ms: Date.now()
       };
       if (!tokenScopes(scopedTokens).has(DRIVE_READONLY_SCOPE)) throw new Error('drive_scope_not_granted');
-      storeForProfile(profileId).save({ profile, tokens: scopedTokens });
-      send('signed-in', { profile }, requestWindow, profileId);
-      send('drive-connected', { profile }, requestWindow, profileId);
+      const saved = storeForProfile(profileId).save({ profile, tokens: scopedTokens });
+      const savedAt = saved?.savedAt || null;
+      send('signed-in', { profile, ...(savedAt ? { savedAt } : {}) }, requestWindow, profileId);
+      send('drive-connected', { profile, ...(savedAt ? { savedAt } : {}) }, requestWindow, profileId);
       const matchingWindow = firstWindowForProfile(profileId);
       const win = requestWindow && !requestWindow.isDestroyed?.()
         ? requestWindow
         : (matchingWindow || (!event?.sender ? getMainWindow?.() : null));
       try { win?.show?.(); win?.focus?.(); } catch { /* best effort */ }
-      return { ok: true, profile };
+      return { ok: true, profile, ...(savedAt ? { savedAt } : {}) };
     } catch (err) {
       const message = err?.message || String(err);
       logger?.error?.(`[yayra:drive] connection failed: ${message}`);

@@ -96,20 +96,28 @@ test('hourglass while loading and internal-page icons are untouched', async () =
   assert.doesNotMatch(settingsIcon, /fb-tab-site-logo/, 'yayra:// pages keep their own icons');
 });
 
-test('continue cards keep internal pages without requesting settings.ico or downloads.ico', async () => {
+test('continue cards show local-file recovery rows without requesting fake remote icons', async () => {
   const shell = await makeShell();
   shell.state.continueTabs = [
-    { url: 'yayra://settings', title: 'Settings' },
-    { url: 'yayra://downloads', title: 'Downloads' },
+    {
+      url: 'yayra://recover-document/docrec-settings1-12345678',
+      title: 'Settings.pdf',
+      document: { recoveryId: 'docrec-settings1-12345678', name: 'Settings.pdf', mime: 'application/pdf', size: 10 }
+    },
+    {
+      url: 'yayra://recover-document/docrec-download1-12345678',
+      title: 'Downloads.png',
+      document: { recoveryId: 'docrec-download1-12345678', name: 'Downloads.png', mime: 'image/png', size: 20 }
+    },
     { url: 'https://afaregistration.com/', title: 'AFA Registration' }
   ];
   const cardHost = document.createElement('div');
   shell.appendContinueCard(cardHost, []);
   const card = cardHost.children[0];
   assert.ok(card, 'continue card is appended');
-  assert.equal((card.innerHTML.match(/class="fb-continue-item"/g) || []).length, 3, 'session restoration still includes each saved tab');
+  assert.equal((card.innerHTML.match(/class="fb-continue-item"/g) || []).length, 3, 'websites and each saved file are listed');
   assert.doesNotMatch(card.innerHTML, /settings\.ico|downloads\.ico/);
-  assert.match(card.innerHTML, /<svg/, 'internal pages use Yayra-owned icon markup');
+  assert.match(card.innerHTML, /<svg/, 'local files use Yayra-owned document icon markup');
   assert.match(card.innerHTML, /fb-tab-site-logo/);
   assert.doesNotMatch(card.innerHTML, /onerror=/, 'favicon fallback remains CSP-safe');
 });

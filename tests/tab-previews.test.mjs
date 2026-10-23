@@ -138,3 +138,16 @@ test('closeTab: a closed tab\u2019s snapshot is dropped (no dead previews, no le
   assert.equal(shell._pageSnapshots.has('tab-b'), false, 'snapshot gone with the tab');
   assert.equal(shell.state.tabs.length, 1, 'tab really closed');
 });
+
+test('lossless native snapshot cache is LRU-bounded and released with the shell', () => {
+  const { shell } = makeShell();
+  for (let index = 0; index < 8; index += 1) {
+    assert.equal(shell.storePageSnapshot(`tab-${index}`, `data:image/png;base64,FULL-RES-${index}`), true);
+  }
+  assert.equal(shell._pageSnapshots.size, 3, 'only three full-resolution captures remain resident');
+  assert.deepEqual([...shell._pageSnapshots.keys()], ['tab-5', 'tab-6', 'tab-7'], 'old captures are evicted first');
+  assert.equal(shell._pageSnapshots.get('tab-7'), 'data:image/png;base64,FULL-RES-7', 'newest capture stays lossless');
+  assert.equal(shell.storePageSnapshot('bad', 'data:image/jpeg;base64,LOSSY'), false, 'lossy/untrusted formats are rejected');
+  shell.destroy();
+  assert.equal(shell._pageSnapshots.size, 0, 'window teardown releases every capture string');
+});

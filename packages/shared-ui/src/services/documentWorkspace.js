@@ -53,9 +53,9 @@ export {
  *    existing tab system, never through the website frame.
  *  - Every engine reports capabilities explicitly; the UI never claims
  *    editing, annotation or export that the engine cannot perform.
- *  - Original bytes remain in renderer memory. Electron transfers bytes and
- *    an opaque catalog id but never a source path; web/Android uses the
- *    standard file picker.
+ *  - Original bytes remain unchanged. Electron transfers bytes plus an opaque
+ *    catalog id but never a source path; web/PWA/mobile recovery uses an
+ *    origin-private exact-byte copy keyed by an opaque id.
  *  - All engines are injected/lazy local modules, making them independently
  *    testable and keeping PDF, PPTX, DOCX and spreadsheet rendering offline.
  */
@@ -64,9 +64,10 @@ export {
 let docSeq = 0;
 
 /**
- * In-memory original-file store. Bytes never leave the selected-file path,
- * are never rewritten into another format, and disappear when the last tab
- * holding them closes.
+ * Live in-memory original-file store. Bytes are never rewritten into another
+ * format and are released when the last live tab closes. Cross-restart
+ * recovery is deliberately separate: opaque desktop catalog ids or
+ * profile-scoped origin-private byte copies, never a renderer-visible path.
  */
 export class DocumentStore {
   constructor() {

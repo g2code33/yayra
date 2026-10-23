@@ -255,6 +255,17 @@ test('DRAWER: opens on the RIGHT with sideways flyouts to its left, without dimm
   assert.match(menu, /backdrop-filter: none !important;/, 'the drawer itself never blurs the page');
 });
 
+test('OVERLAYS: full-screen Yayra chrome never applies backdrop blur to the underlying website', () => {
+  const css = readFileSync(new URL('../packages/shared-ui/src/theme/design-system.css', import.meta.url), 'utf8');
+  for (const selector of ['.fb-install-app-overlay {', '.yayra-radial-launcher-overlay {', '.fb-update-splash {']) {
+    const at = css.indexOf(selector);
+    assert.ok(at >= 0, `${selector} exists`);
+    const rule = css.slice(at, css.indexOf('}', at));
+    assert.match(rule, /backdrop-filter: none;/, `${selector} explicitly disables backdrop blur`);
+    assert.doesNotMatch(rule, /blur\(/, `${selector} leaves website pixels clear`);
+  }
+});
+
 test('DRAWER (behavior): submenus leave the scroll list and open beside the menu; click-outside closes', async () => {
   const { shell, container } = await makeShell();
   try {

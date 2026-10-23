@@ -29,7 +29,7 @@ import {
  *  - local files use real document tabs and never touch a website engine
  *  - PDF load, continuous painting, navigation, search and failure states
  *  - security: Electron transfers selected bytes, never source paths
- *  - session restore excludes ephemeral in-memory document tabs
+ *  - session recovery preserves every local-file tab through opaque refs
  */
 
 /** A deterministic fake PDF.js engine (no canvas needed). */
@@ -494,31 +494,261 @@ test('TAB INTEGRATION: the More menu closes the document tab and returns to brow
     assert.equal(shell.state.tabs.length, before, 'document tab closed');
     assert.equal(shell.state.tabs.every((t) => !t.isDocument), true);
     assert.equal(shell.documentStore.get(doc.id), null, 'closing the last tab releases the PDF bytes from memory');
-    assert.equal(shell.state.closedTabsHistory.some((tab) => tab.url === `yayra://doc/${doc.id}`), false,
-      'a byte-less PDF tab is never offered as a broken Ctrl+Shift+T restore');
+    const closed = shell.state.closedTabsHistory.find((tab) => tab.document?.name === 'close-me.pdf');
+    assert.ok(closed, 'Ctrl+Shift+T keeps an opaque recovery descriptor after releasing live bytes');
+    assert.match(closed.url, /^yayra:\/\/recover-document\/docrec-/, 'runtime document ids are never serialized');
+    await shell.restoreLastClosedTab();
+    assert.equal(shell.getActiveTab().isDocumentRecovery, true,
+      'unavailable bytes reopen as a visible recovery tab rather than silently disappearing');
   } finally {
     shell.destroy();
   }
 });
 
-test('SESSION: document tabs are NEVER written to the last-session snapshot (bytes are in-memory)', async () => {
-  const { shell } = await bootShell();
+test('SESSION: local document tabs persist an opaque byte-recovery descriptor beside websites', async () => {
+  const byteCopies = new Map();
+  const recoveryRepo = {
+    save: async ({ id, name, mime, bytes }) => {
+      byteCopies.set(id, { name, mime, data: new Uint8Array(bytes) });
+      return { id, name, mime, size: bytes.byteLength };
+    },
+    load: async (id) => byteCopies.get(id) || null
+  };
+  const { shell } = await bootShell({ documentRecoveryRepo: recoveryRepo });
   try {
     const saved = [];
     shell.sessionRepo = { saveSession: async (tabs) => { saved.push(tabs); } };
     shell._lastSessionSnapshotJson = null;
     shell._docEngineOverride = fakePdfjs();
-    shell.addDocumentTab({ name: 'secret.pdf', bytes: new Uint8Array([1]) });
+    shell.addDocumentTab({ name: 'secret.pdf', bytes: new Uint8Array([1, 2, 3]) });
     shell.state.tabs[0].url = 'https://example.com/live'; // plus one real page
     shell.queueSessionSnapshot();
     await new Promise((r) => setTimeout(r, 700));
     assert.ok(saved.length >= 1, 'a snapshot was queued');
-    for (const tabs of saved) {
-      assert.equal(tabs.some((t) => String(t.url).startsWith('yayra://doc/')), false, 'no document tabs persisted');
-      assert.ok(tabs.some((t) => t.url === 'https://example.com/live'), 'browsing tabs still persist');
+    const latest = saved.at(-1);
+    const documentEntry = latest.find((entry) => entry.document);
+    assert.ok(documentEntry, 'the open PDF is represented in the rolling session');
+    assert.match(documentEntry.url, /^yayra:\/\/recover-document\/docrec-/, 'only an opaque recovery id is serialized');
+    assert.equal(documentEntry.document.name, 'secret.pdf');
+    assert.equal('path' in documentEntry.document, false, 'no filesystem path enters renderer session storage');
+    assert.deepEqual([...byteCopies.get(documentEntry.document.recoveryId).data], [1, 2, 3],
+      'the origin-private recovery copy preserves the exact source bytes');
+    assert.ok(latest.some((entry) => entry.url === 'https://example.com/live'), 'browsing tabs still persist');
+  } finally {
+    shell.destroy();
+  }
+});
+
+test('RECOVERY: private file tabs never enter byte or session persistence', async () => {
+  let saves = 0;
+  const { shell } = await bootShell({
+    documentRecoveryRepo: { save: async () => { saves += 1; return {}; }, load: async () => null }
+  });
+  try {
+    shell.render = () => null;
+    shell.getActiveTab().isPrivate = true;
+    const doc = shell.addDocumentTab({ name: 'private.pdf', bytes: new Uint8Array([8, 8, 8]) });
+    const tab = shell.getActiveTab();
+    await Promise.resolve();
+    assert.equal(tab.isPrivate, true, 'the file inherits private browsing state');
+    assert.equal(doc.recoveryId, undefined, 'no persistent byte capability is assigned');
+    assert.equal(shell.sessionEntryForTab(tab), null, 'private file is absent from every session serializer');
+    assert.equal(saves, 0, 'private bytes are never written to IndexedDB');
+  } finally {
+    shell.destroy();
+  }
+});
+
+test('RECOVERY: every registered file extension and the unknown-file fallback reopen with exact bytes in order', async () => {
+  const stored = new Map();
+  const recoveryRepo = {
+    save: async ({ id, name, mime, bytes }) => {
+      const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      const data = view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
+      const record = { id, name, mime, size: view.byteLength, data };
+      stored.set(id, record);
+      return record;
+    },
+    load: async (id) => stored.get(id) || null
+  };
+  const { shell, container } = await bootShell({ documentRecoveryRepo: recoveryRepo });
+  const { shell: restoredShell } = await bootShell({ documentRecoveryRepo: recoveryRepo });
+  try {
+    // Avoid starting thirty viewer engines; this test exercises registration,
+    // persistence, session ordering and byte hydration rather than rendering.
+    shell.render = () => container;
+    restoredShell.render = () => container;
+    const extensions = [...new Set(Object.values(DOCUMENT_ENGINES)
+      .flatMap((engine) => engine.extensions || []))];
+    extensions.push('unknown-format');
+    const originals = [];
+    for (let index = 0; index < extensions.length; index += 1) {
+      const extension = extensions[index];
+      const bytes = new Uint8Array([index + 1, 41, 97, (index * 7) % 251]);
+      const doc = shell.addDocumentTab({ name: `recovery-${index}.${extension}`, bytes });
+      const tab = shell.getActiveTab();
+      if (index % 4 === 0) {
+        tab.group = { id: 'tg-files', name: 'Files', color: '#3b82f6' };
+        tab.groupMemberId = `tgm-file-${index}`;
+      }
+      originals.push({ name: doc.name, type: doc.type, bytes: [...bytes] });
+    }
+    await Promise.resolve();
+    const entries = shell.state.tabs.map((tab) => shell.sessionEntryForTab(tab)).filter(Boolean);
+    assert.equal(entries.length, originals.length, 'every recognized extension plus unknown fallback enters recovery');
+    assert.ok(entries.every((entry) => entry.document && /^yayra:\/\/recover-document\/docrec-/.test(entry.url)));
+    assert.equal(JSON.stringify(entries).includes('/home/'), false, 'descriptors contain no source path');
+
+    await restoredShell.restoreContinueTabs(entries);
+    const restoredTabs = restoredShell.state.tabs;
+    assert.equal(restoredTabs.length, originals.length, 'all file tabs reopen, with no five-item restore cap');
+    assert.deepEqual(restoredTabs.map((tab) => tab.title), originals.map((item) => item.name), 'tab order is unchanged');
+    for (let index = 0; index < restoredTabs.length; index += 1) {
+      const tab = restoredTabs[index];
+      const doc = restoredShell.documentStore.get(tab.docId);
+      assert.ok(doc, `${originals[index].name} has a live recovered document`);
+      assert.equal(doc.type, originals[index].type, `${originals[index].name} keeps its viewer route`);
+      assert.deepEqual([...new Uint8Array(doc.bytes)], originals[index].bytes, `${originals[index].name} keeps exact bytes`);
+      if (index % 4 === 0) {
+        assert.equal(tab.group?.id, 'tg-files', 'group metadata survives file recovery');
+        assert.equal(tab.groupMemberId, `tgm-file-${index}`);
+      }
     }
   } finally {
     shell.destroy();
+    restoredShell.destroy();
+  }
+});
+
+test('RECOVERY: a grouped file stays in the durable catalog and reopens from the group', async () => {
+  const stored = new Map();
+  const recoveryRepo = {
+    save: async ({ id, name, mime, bytes }) => {
+      const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      const record = { id, name, mime, data: view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength) };
+      stored.set(id, record);
+      return record;
+    },
+    load: async (id) => stored.get(id) || null
+  };
+  const { shell } = await bootShell({ documentRecoveryRepo: recoveryRepo });
+  try {
+    shell.render = () => null;
+    shell.addDocumentTab({ name: 'grouped.png', bytes: new Uint8Array([7, 8, 9]) });
+    const original = shell.getActiveTab();
+    original.group = { id: 'tg-file-recovery', name: 'Recovered files', color: '#3b82f6' };
+    assert.equal(shell._rememberDurableTabGroupMember(original), true);
+    await Promise.resolve();
+    const memberId = original.groupMemberId;
+    shell.closeTab(original.id);
+    const group = shell.getTabGroups().find((candidate) => candidate.catalogId === 'tg-file-recovery');
+    assert.ok(group, 'closing the live file does not delete its durable group');
+    assert.equal(group.tabs[0].document?.name, 'grouped.png', 'group member retains its opaque file descriptor');
+
+    assert.equal(shell.openTabGroup(group.id), true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const reopened = shell.state.tabs.find((tab) => tab.groupMemberId === memberId);
+    assert.equal(reopened?.isDocument, true, 'opening the group rehydrates the file tab');
+    assert.deepEqual([...new Uint8Array(shell.documentStore.get(reopened.docId).bytes)], [7, 8, 9]);
+  } finally {
+    shell.destroy();
+  }
+});
+
+test('RECOVERY: missing desktop and web files stay visible with Locate/reselect actions', async () => {
+  const previousYayra = window.yayra;
+  window.yayra = {
+    ...(previousYayra || {}),
+    system: {
+      ...(previousYayra?.system || {}),
+      documents: {
+        reopen: async (id) => id === 'local-87654321-good'
+          ? { ok: true, action: 'yayra', libraryId: id, name: 'Catalog image.png', data: new Uint8Array([5, 6, 7]) }
+          : { ok: false, reason: 'missing' },
+        locate: async () => ({ ok: false, canceled: true })
+      }
+    }
+  };
+  const { shell, container } = await bootShell({
+    documentRecoveryRepo: { load: async () => null, save: async () => null }
+  });
+  try {
+    const catalogFile = await shell.createRecoveredDocumentTab({
+      document: { libraryId: 'local-87654321-good', name: 'Catalog image.png', size: 3 }
+    });
+    assert.equal(catalogFile.isDocument, true, 'desktop opaque catalog id reopens without exposing a path');
+    assert.deepEqual([...shell.documentStore.get(catalogFile.docId).bytes], [5, 6, 7]);
+    const desktop = await shell.createRecoveredDocumentTab({
+      document: { libraryId: 'local-12345678-abcd', name: 'Moved slides.pptx', size: 900 }
+    });
+    const web = await shell.createRecoveredDocumentTab({
+      document: { recoveryId: 'docrec-abcdefgh-12345678', name: 'Evicted image.png', size: 128 }
+    });
+    assert.equal(desktop.isDocumentRecovery, true, 'missing desktop file becomes a recovery tab');
+    assert.equal(web.isDocumentRecovery, true, 'evicted web copy becomes a recovery tab');
+    shell.state.tabs = [desktop];
+    shell.state.activeTabId = desktop.id;
+    shell.render(container);
+    assert.match(container.textContent, /needs your help to reopen/i);
+    assert.ok([...container.querySelectorAll('button')].some((button) => /Locate file/.test(button.textContent)),
+      'desktop recovery offers Locate');
+    shell.state.tabs = [web];
+    shell.state.activeTabId = web.id;
+    shell.render(container);
+    assert.ok([...container.querySelectorAll('button')].some((button) => /Choose file again/.test(button.textContent)),
+      'web/PWA/mobile recovery offers reselect');
+  } finally {
+    shell.destroy();
+    window.yayra = previousYayra;
+  }
+});
+
+test('RECOVERY: close-session auto restore includes website, PDF and PNG in original order', async () => {
+  const previousLocalStorage = globalThis.localStorage;
+  const closeStorage = new Map();
+  globalThis.localStorage = {
+    get length() { return closeStorage.size; },
+    key: (index) => [...closeStorage.keys()][index] || null,
+    getItem: (key) => closeStorage.has(key) ? closeStorage.get(key) : null,
+    setItem: (key, value) => { closeStorage.set(String(key), String(value)); },
+    removeItem: (key) => { closeStorage.delete(String(key)); },
+    clear: () => closeStorage.clear()
+  };
+  const stored = new Map();
+  const recoveryRepo = {
+    save: async ({ id, name, mime, bytes }) => {
+      const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      const record = { id, name, mime, data: view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength) };
+      stored.set(id, record);
+      return record;
+    },
+    load: async (id) => stored.get(id) || null
+  };
+  localStorage.clear();
+  const first = await bootShell({ documentRecoveryRepo: recoveryRepo });
+  let second = null;
+  try {
+    first.shell.render = () => first.container;
+    first.shell.state.tabs[0].url = 'https://example.com/report';
+    first.shell.state.tabs[0].title = 'Report site';
+    first.shell.addDocumentTab({ name: 'report.pdf', bytes: new Uint8Array([1, 4, 9]) });
+    first.shell.addDocumentTab({ name: 'chart.png', bytes: new Uint8Array([137, 80, 78, 71]) });
+    await Promise.resolve();
+    first.shell.closeWithSessionMode('restore');
+    first.shell.destroy();
+
+    second = await bootShell({ documentRecoveryRepo: recoveryRepo });
+    assert.deepEqual(second.shell.state.tabs.map((tab) => tab.title), ['Report site', 'report.pdf', 'chart.png']);
+    assert.equal(second.shell.state.tabs.filter((tab) => tab.isDocument).length, 2, 'both local files automatically reopen');
+    assert.deepEqual([...new Uint8Array(second.shell.documentStore.get(second.shell.state.tabs[1].docId).bytes)], [1, 4, 9]);
+    assert.deepEqual([...new Uint8Array(second.shell.documentStore.get(second.shell.state.tabs[2].docId).bytes)], [137, 80, 78, 71]);
+    assert.equal(localStorage.getItem('yayra:close-session'), null, 'legacy unscoped key is not used');
+  } finally {
+    first.shell.destroy();
+    second?.shell.destroy();
+    localStorage.clear();
+    if (previousLocalStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = previousLocalStorage;
   }
 });
 
@@ -563,7 +793,7 @@ test('SECURITY (source pin): the Electron document IPC returns BYTES ONLY - neve
   assert.doesNotMatch(saveBlock, /convert|encode|render/i, 'saving never transforms the source bytes');
 });
 
-test('NO REGRESSION (source pin): document tabs cannot reach the web-frame path, and the session filter stays https-only', () => {
+test('NO REGRESSION (source pin): document tabs cannot reach web frames and session recovery uses sanitized descriptors', () => {
   const src = readFileSync(new URL('../packages/shared-ui/src/components/BrowserShell.js', import.meta.url), 'utf8');
   const fnStart = src.indexOf('renderViewportContent(viewport, activeTab) {');
   const fnEnd = src.indexOf('\n  /* -------------------------------------------------------------\n   * EXTERNAL WEB CONTENT FRAME HELPER', fnStart);
@@ -576,17 +806,21 @@ test('NO REGRESSION (source pin): document tabs cannot reach the web-frame path,
   assert.ok(renderDocAt > docAt, 'the document branch renders the viewer');
   assert.ok(nativeFrameAt > renderDocAt, 'web-frame creation is only the later else branch');
   assert.match(fn.slice(docAt, nativeFrameAt), /if \(url\.startsWith\('yayra:\/\/doc\/'\)\)\s*\{\s*this\.renderDocumentViewer\(viewport, activeTab\);\s*\}\s*else if/, 'document routing is exclusive and cannot fall through to a web frame');
-  // Session snapshots remain https-only (document tabs auto-excluded).
+  // Session snapshots route every candidate through the shared sanitizer;
+  // runtime doc ids and arbitrary paths are never written directly.
   const snap = src.indexOf('queueSessionSnapshot() {');
-  const snapBlock = src.slice(snap, snap + 700);
-  assert.match(snapBlock, /\^https\?:/, 'session persistence keeps filtering to real web pages');
+  const snapBlock = src.slice(snap, snap + 900);
+  assert.match(snapBlock, /sessionEntryForTab\(tab\)/, 'rolling recovery serializes websites and local files through one safe path');
+  const serializer = src.slice(src.indexOf('sessionEntryForTab(tab) {'), src.indexOf('normalizeSessionEntry(value) {'));
+  assert.match(serializer, /documentRecoveryDescriptorForTab/, 'documents use opaque recovery descriptors');
+  assert.doesNotMatch(serializer, /\.path\b|filePath/, 'session document metadata never serializes a filesystem path');
 });
 
 /* ---------------- helpers ---------------- */
 
-async function bootShell() {
+async function bootShell(options = {}) {
   const container = document.createElement('div');
-  const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+  const shell = new BrowserShell({ container, platform: 'linux', isMobile: false, ...options });
   await shell.initialize();
   shell.render(container);
   return { shell, container };

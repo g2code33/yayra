@@ -34,6 +34,15 @@ function withLocalStorage(fn) {
   return { storage, cleanup };
 }
 
+function closeSessionRecord(storage) {
+  const key = [...storage.map.keys()].find((candidate) => candidate.startsWith('yayra:close-session:'));
+  return key ? JSON.parse(storage.getItem(key)) : null;
+}
+
+function hasCloseSessionRecord(storage) {
+  return [...storage.map.keys()].some((candidate) => candidate.startsWith('yayra:close-session:'));
+}
+
 function installUpdatesBridge({ downloads = [], installs = [] } = {}) {
   let eventListener = null;
   globalThis.window.yayra = globalThis.window.yayra || {};
@@ -396,12 +405,12 @@ test('"Keep all tabs & close" -> next launch REOPENS every tab automatically', a
 
     shell.closeWithSessionMode('restore');
     assert.equal(closes.length, 1, 'window closed');
-    assert.equal(JSON.parse(storage.getItem('yayra:close-session')).mode, 'restore');
+    assert.equal(closeSessionRecord(storage).mode, 'restore');
 
     const { shell: next } = await makeShell();
     assert.deepEqual(next.state.tabs.map((t) => t.url), ['https://a.dev/', 'https://b.dev/'], 'all tabs reopened');
     assert.equal(next.state.recentTabsOffer, null, 'no offer needed - already restored');
-    assert.equal(storage.getItem('yayra:close-session'), null, 'consumed exactly once');
+    assert.equal(hasCloseSessionRecord(storage), false, 'consumed exactly once');
   } finally {
     uninstall();
     cleanup();
@@ -416,7 +425,7 @@ test('"Just close" -> next launch OFFERS the recent tabs; Reopen restores them',
     const { shell } = await makeShell();
     shell.getActiveTab().url = 'https://a.dev/';
     shell.closeWithSessionMode('recent');
-    assert.equal(JSON.parse(storage.getItem('yayra:close-session')).mode, 'recent');
+    assert.equal(closeSessionRecord(storage).mode, 'recent');
 
     const { shell: next, container: nextContainer } = await makeShell();
     assert.equal(next.state.tabs[0].url, 'yayra://newtab', 'starts on a fresh tab');
@@ -441,7 +450,7 @@ test('"Close all tabs & close" -> next launch starts completely fresh', async ()
     const { shell } = await makeShell();
     shell.getActiveTab().url = 'https://a.dev/';
     shell.closeWithSessionMode('fresh');
-    assert.deepEqual(JSON.parse(storage.getItem('yayra:close-session')).tabs, [], 'nothing saved');
+    assert.deepEqual(closeSessionRecord(storage).tabs, [], 'nothing saved');
 
     const { shell: next } = await makeShell();
     assert.equal(next.state.tabs.length, 1);
@@ -464,7 +473,7 @@ test('private tabs are NEVER written into the close session', async () => {
     shell.getActiveTab().url = 'https://secret.dev/';
 
     shell.closeWithSessionMode('restore');
-    const saved = JSON.parse(storage.getItem('yayra:close-session'));
+    const saved = closeSessionRecord(storage);
     assert.deepEqual(saved.tabs.map((t) => t.url), ['https://public.dev/'], 'incognito never persisted');
   } finally {
     uninstall();

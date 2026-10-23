@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { reloadActionForInput, createWebviewBridge } from '../electron/webviewBridge.cjs';
-import { createShortcutsRepo, createSessionRepo } from '../packages/shared-ui/src/services/profileStorage.js';
+import { createShortcutsRepo, createSessionRepo, createTabGroupsRepo } from '../packages/shared-ui/src/services/profileStorage.js';
 
 const require = createRequire(import.meta.url);
 const { createCapsLockChords } = require('../electron/globalHotkeys.cjs');
@@ -142,17 +142,79 @@ test('shortcuts repo: add/edit/remove with https-only validation and the 12-tile
   assert.equal((await repo.getShortcuts()).length, 11);
 });
 
-test('session repo: snapshot keeps only real non-private websites - what the user did NOT close by hand', async () => {
+test('session repo: snapshot keeps safe websites and opaque local-file recovery descriptors', async () => {
   const repo = createSessionRepo(memoryStorage());
   assert.deepEqual((await repo.getLastSession()).tabs, [], 'fresh profile has no previous session');
   await repo.saveSession([
     { url: 'https://docs.rs/x', title: 'docs', group: { name: 'Research', color: '#3b82f6' } },
+    {
+      url: 'yayra://doc/runtime-id',
+      title: 'Quarterly deck',
+      document: {
+        recoveryId: 'docrec-abcdefgh-12345678',
+        name: '/home/user/secret/Quarterly deck.pptx',
+        mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        size: 4096,
+        path: '/home/user/secret/Quarterly deck.pptx'
+      },
+      group: { id: 'tg-research', name: 'Research', color: '#3b82f6' },
+      groupMemberId: 'tgm-deck'
+    },
     { url: 'yayra://newtab', title: 'New Tab' },
-    { url: 'not a url', title: 'junk' }
+    { url: 'not a url', title: 'junk' },
+    { url: 'https://user:password@example.com/', title: 'credential URL' },
+    { url: 'https://private.example/', title: 'private', isPrivate: true },
+    { document: { recoveryId: 'docrec-private1-12345678', name: 'private.pdf' }, isPrivate: true },
+    { document: { recoveryId: '../../etc/passwd', name: 'bad' } }
   ]);
   const { tabs, savedAt } = await repo.getLastSession();
-  assert.deepEqual(tabs, [{ url: 'https://docs.rs/x', title: 'docs', group: { name: 'Research', color: '#3b82f6' } }], 'restored sessions retain safe tab-group metadata');
+  assert.equal(tabs.length, 2, 'only the website and valid opaque file capability survive');
+  assert.deepEqual(tabs[0], { url: 'https://docs.rs/x', title: 'docs', group: { name: 'Research', color: '#3b82f6' } });
+  assert.deepEqual(tabs[1], {
+    url: 'yayra://recover-document/docrec-abcdefgh-12345678',
+    title: 'Quarterly deck.pptx',
+    document: {
+      recoveryId: 'docrec-abcdefgh-12345678',
+      name: 'Quarterly deck.pptx',
+      mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      size: 4096
+    },
+    group: { id: 'tg-research', name: 'Research', color: '#3b82f6' },
+    groupMemberId: 'tgm-deck'
+  }, 'file order/group metadata survives, while arbitrary source paths are stripped');
+  assert.equal(JSON.stringify(tabs).includes('/home/user/secret'), false, 'session metadata never contains a filesystem path');
   assert.ok(savedAt > 0);
+});
+
+test('durable tab-group catalog retains a sanitized local-file capability', async () => {
+  const repo = createTabGroupsRepo(memoryStorage());
+  await repo.saveGroups([{
+    id: 'tg-files',
+    name: 'Files',
+    color: '#8b5cf6',
+    members: [{
+      id: 'tgm-report',
+      url: 'yayra://doc/runtime-only',
+      title: 'unsafe title',
+      document: {
+        recoveryId: 'docrec-report12-12345678',
+        name: 'C:\\Users\\alice\\report.pdf',
+        mime: 'application/pdf',
+        size: 42,
+        path: 'C:\\Users\\alice\\report.pdf'
+      }
+    }]
+  }]);
+  const groups = await repo.getGroups();
+  assert.equal(groups.length, 1);
+  assert.deepEqual(groups[0].members[0].document, {
+    recoveryId: 'docrec-report12-12345678',
+    name: 'report.pdf',
+    mime: 'application/pdf',
+    size: 42
+  });
+  assert.equal(groups[0].members[0].url, 'yayra://recover-document/docrec-report12-12345678');
+  assert.equal(JSON.stringify(groups).includes('Users'), false, 'durable group metadata cannot leak a source path');
 });
 
 // ---------- CapsLock chords (pure state machine) -------------------------

@@ -44,12 +44,24 @@ import {
   DEFAULT_BOOKMARK_GROUP_ID,
   createWheelRepo,
   createShortcutsRepo,
-  createSessionRepo
+  createSessionRepo,
+  createTabGroupsRepo
 } from '../services/profileStorage.js';
 import { YayraAiService, AI_DEFAULTS, describeAiReason } from '../services/aiService.js';
+import {
+  createDocumentRecoveryRepo,
+  isDocumentRecoveryId,
+  newDocumentRecoveryId
+} from '../services/documentRecovery.js';
 import { ExtensionManager, BUILT_IN_EXTENSIONS } from '../../../browser-contract/src/extensions/ExtensionManager.js';
 
 const MAX_DOCUMENT_SIZE_MB = Math.floor(MAX_DOCUMENT_BYTES / (1024 * 1024));
+// Native captures are lossless/full-resolution so overlay text remains clear.
+// Bound their renderer cache: data URLs can otherwise retain tens of MiB per
+// tab indefinitely after a tab-switcher/overlay capture.
+const MAX_PAGE_SNAPSHOT_ENTRIES = 3;
+const MAX_PAGE_SNAPSHOT_CHARS = 48 * 1024 * 1024;
+const DOCUMENT_LIBRARY_ID = /^local-[A-Za-z0-9-]{8,}$/;
 const isPowerPointDocument = (kind) => kind === 'pptx' || kind === 'ppt';
 const isWordDocument = (kind) => kind === 'docx' || kind === 'doc';
 const isSpreadsheetDocument = (kind) => kind === 'xlsx' || kind === 'xls';
@@ -245,12 +257,27 @@ export class BrowserShell {
       this.wheelRepo = options.wheelRepo || createWheelRepo(scoped);
       this.shortcutsRepo = options.shortcutsRepo || createShortcutsRepo(scoped);
       this.sessionRepo = options.sessionRepo || createSessionRepo(scoped);
+      this.tabGroupsRepo = options.tabGroupsRepo || createTabGroupsRepo(scoped);
     } else {
       this.profileStorage = null;
       this.wheelRepo = options.wheelRepo || null;
       this.shortcutsRepo = options.shortcutsRepo || null;
       this.sessionRepo = options.sessionRepo || null;
+      this.tabGroupsRepo = options.tabGroupsRepo || null;
     }
+    // The durable catalog is loaded before render-time snapshots may write it.
+    // This guard is reset during an in-window profile change, preventing one
+    // profile's groups from ever being persisted into another profile.
+    this._tabGroupsLoaded = !this.tabGroupsRepo;
+    this._lastTabGroupsCatalogJson = null;
+
+    // Desktop files recover through opaque ids owned by electron/documentLibrary.
+    // Web/PWA/mobile picker files have no durable filesystem handle, so keep
+    // their exact bytes in profile-scoped IndexedDB for open-tab recovery.
+    this.documentRecoveryRepo = options.documentRecoveryRepo || createDocumentRecoveryRepo({
+      getProfileId: () => this.currentProfileId()
+    });
+    this._documentRecoveryWrites = new Map();
 
     if (!this.emailAddressesRepo && this.storageAdapter
       && typeof this.storageAdapter.get === 'function' && typeof this.storageAdapter.set === 'function') {
@@ -342,9 +369,13 @@ export class BrowserShell {
       bookmarksActiveGroupId: DEFAULT_BOOKMARK_GROUP_ID,
       // Profile-scoped email addresses saved from submitted web forms.
       rememberedEmails: [],
-      // Full previous-session snapshot, kept separately from the compact
-      // five-item Continue prompt so a group click can reopen every member
-      // recorded in that session.
+      // Durable profile-scoped tab groups. Unlike the rolling previous-session
+      // snapshot below, this catalog is never pruned when tabs close or an
+      // update/restart completes; only explicit remove/ungroup/delete actions
+      // alter membership.
+      tabGroupCatalog: [],
+      // Full previous-session snapshot, retained only for legacy migration and
+      // the compact Continue card. Durable groups no longer depend on it.
       tabGroupRestoreTabs: [],
       // Chrome-style new tab: the user's own pinned shortcut tiles and
       // the previous session's not-manually-closed tabs ("Continue with
@@ -972,7 +1003,12 @@ export class BrowserShell {
       .filter((tab) => tab && !tab.isPrivate && /^https?:\/\//i.test(String(tab.url || '')))
       .map((tab) => {
         const group = this.sanitizeTabGroup(tab.group);
-        return { url: tab.url, title: tab.title || tab.url, ...(group ? { group } : {}) };
+        return {
+          url: tab.url,
+          title: tab.title || tab.url,
+          ...(group ? { group } : {}),
+          ...(group && tab.groupMemberId ? { groupMemberId: tab.groupMemberId } : {})
+        };
       });
     try { await this.sessionRepo.saveSession(tabs); } catch { /* OAuth can proceed without tab recovery */ }
   }
@@ -985,14 +1021,39 @@ export class BrowserShell {
     // snapshot first so the account/product tab remains recoverable after the
     // callback reload rather than leaving an older snapshot on disk.
     await this._persistTabsBeforeGoogleRedirect();
-    const result = await this.authBridge.signIn(this.currentProfileId());
+    const profileId = this.currentProfileId();
+    const result = await this.authBridge.signIn(profileId);
     if (!result?.ok && result?.error !== 'sign_in_already_in_progress') {
       this.state.googleAccount = { status: 'error', signedIn: false, profile: null, error: result?.error || 'sign_in_failed', savedAt: null };
       this.render();
+    } else if (result?.ok && result.profile && profileId === this.currentProfileId()) {
+      // IPC events are the live multi-window path, but the invoke response is
+      // an equally authenticated completion signal. Applying it closes a race
+      // where the initiating renderer was hidden/reloaded while Chrome
+      // returned the callback and therefore missed the one-shot event.
+      const alreadyApplied = this.state.googleAccount?.signedIn
+        && this.state.googleAccount?.profile?.sub === result.profile.sub
+        && this.state.googleAccount?.profile?.email === result.profile.email;
+      this.state.googleAccount = {
+        status: 'signed-in',
+        signedIn: true,
+        profile: result.profile,
+        error: null,
+        savedAt: result.savedAt || this.state.googleAccount?.savedAt || new Date().toISOString()
+      };
+      for (const record of this._googleAccountConnections.values()) {
+        record.status = 'connected';
+        record.error = null;
+        record.autoStart = false;
+      }
+      this.handleAccountSignal(result.profile.email, { source: 'yayra-account' });
+      if (!alreadyApplied) {
+        this.showTransientNotice(`Google connected to Yayra${result.profile.email ? ` as ${result.profile.email}` : ''}.`);
+      }
+      this.render();
     }
-    // On success the 'signed-in' event from handleGoogleAuthEvent() already
-    // updates state + re-renders; web/PWA returns { pending:true } while its
-    // full-page provider redirect is underway.
+    // Web/PWA returns { pending:true } while its full-page provider redirect
+    // is underway; its callback adapter applies the same persisted session.
     return result;
   }
 
@@ -1042,7 +1103,13 @@ export class BrowserShell {
         }
         break;
       case 'signed-in':
-        this.state.googleAccount = { status: 'signed-in', signedIn: true, profile: evt.profile, error: null, savedAt: new Date().toISOString() };
+        this.state.googleAccount = {
+          status: 'signed-in',
+          signedIn: true,
+          profile: evt.profile,
+          error: null,
+          savedAt: evt.savedAt || new Date().toISOString()
+        };
         for (const record of this._googleAccountConnections.values()) {
           record.status = 'connected';
           record.error = null;
@@ -1342,10 +1409,14 @@ export class BrowserShell {
   }
 
   async initialize() {
+    // The local document store must exist before close/crash recovery: saved
+    // PDF, PPTX, image, Office, text, and other supported file tabs are
+    // rehydrated into it from an opaque desktop-library id or IndexedDB bytes.
+    this.documentStore = new DocumentStore();
     // Honour last session's close choice (keep all tabs -> reopen them;
     // just close -> offer them) and any "install update when opened
     // again" scheduled last run. Both are consumed exactly once.
-    this.restoreCloseSession();
+    await this.restoreCloseSession();
     // ChatGPT-style AI chats: restore every saved conversation so any of
     // them can be continued later (the active thread starts fresh).
     this._loadAiChats();
@@ -1353,8 +1424,6 @@ export class BrowserShell {
     // app..." can trigger the REAL install flow (see installPageAsApp).
     this._capturePwaInstallPrompt();
     this._armConnectivityAwareness();
-    // Local document workspace (Phase 1: PDF) - in-memory, local-first.
-    this.documentStore = new DocumentStore();
     // Keep one PDF.js controller per document tab. The shell rebuilds its DOM
     // on tab switches/resizes; the controller is reattached instead of
     // reparsing the same bytes or leaving a spinner on a stale DOM node.
@@ -1506,16 +1575,36 @@ export class BrowserShell {
       }
     }
 
+    // Durable tab groups are a profile catalog, not an open-tab snapshot.
+    // Load them before the previous session so legacy grouped session rows can
+    // be migrated into (rather than temporarily masquerading as) the catalog.
+    if (this.tabGroupsRepo?.getGroups) {
+      try {
+        this.state.tabGroupCatalog = await this.tabGroupsRepo.getGroups();
+      } catch (err) {
+        console.warn('Failed to load durable tab groups in BrowserShell:', err);
+        this.state.tabGroupCatalog = [];
+      } finally {
+        this._tabGroupsLoaded = true;
+        this._lastTabGroupsCatalogJson = JSON.stringify(this.state.tabGroupCatalog || []);
+      }
+    }
+
     // "Continue with these tabs": what the PREVIOUS run left open (tabs
     // the user closed by hand were already dropped from the snapshot).
     // Read BEFORE this run's own snapshot starts overwriting it.
     if (this.sessionRepo && typeof this.sessionRepo.getLastSession === 'function') {
       try {
         const prev = await this.sessionRepo.getLastSession();
-        const openNow = new Set(this.state.tabs.map((t) => t.url));
-        const previousTabs = (prev.tabs || []).filter((t) => !t?.isPrivate && /^https?:\/\//i.test(t?.url || ''));
+        const openNow = new Set(this.state.tabs
+          .map((tab) => this.sessionEntryForTab(tab))
+          .filter(Boolean)
+          .map((entry) => this.sessionEntryKey(entry)));
+        const previousTabs = (prev.tabs || [])
+          .map((entry) => this.normalizeSessionEntry(entry))
+          .filter(Boolean);
         this.state.tabGroupRestoreTabs = previousTabs;
-        this.state.continueTabs = previousTabs.filter((t) => !openNow.has(t.url)).slice(0, 5);
+        this.state.continueTabs = previousTabs.filter((entry) => !openNow.has(this.sessionEntryKey(entry)));
         // Identifies THIS snapshot so "No thanks" dismisses exactly it
         // (a future session's tabs will prompt again).
         this.state.continueSavedAt = prev.savedAt || null;
@@ -1523,6 +1612,11 @@ export class BrowserShell {
         console.warn('Failed to load the previous session in BrowserShell:', err);
       }
     }
+    // One-time compatibility migration: groups created by older releases
+    // lived only in the previous-session rows. Adopt them without deleting
+    // the rows, then merge any grouped tabs supplied by this launch.
+    this.adoptLegacyTabGroups(this.state.tabGroupRestoreTabs || []);
+    this.queueDurableTabGroupsSnapshot();
 
     // Radial action wheel: load this profile's saved customization (the
     // old build wrote customizations to localStorage but never read them
@@ -1790,6 +1884,10 @@ export class BrowserShell {
     // Truth-check it on EVERY render - the page stays live, always.
     try { this.healStuckPageSurface(); } catch { /* best-effort heal */ }
 
+    // Durable tab groups track navigation/title changes but never infer a
+    // deletion from a closed/missing tab. Explicit ungroup/delete paths are
+    // the only code that removes catalog rows.
+    this.queueDurableTabGroupsSnapshot();
     // Keep the "last session" snapshot rolling: every render follows a
     // state change, and the JSON-compare inside makes no-op calls free.
     this.queueSessionSnapshot();
@@ -3591,6 +3689,8 @@ export class BrowserShell {
     // away from its site.
     if (url.startsWith('yayra://doc/')) {
       this.renderDocumentViewer(viewport, activeTab);
+    } else if (url.startsWith('yayra://recover-document/')) {
+      this.renderDocumentRecoveryPage(viewport, activeTab);
     } else if (!url || url === 'yayra://newtab' || url === 'about:blank') {
       this.renderNewTabPage(viewport, activeTab);
     } else if (url === 'yayra://settings') {
@@ -4399,6 +4499,25 @@ export class BrowserShell {
     this.capacitorTabWeb?.tabWebRemove({ id: tabId }).catch(() => {});
   }
 
+  /** Keep only a tiny LRU of trusted native-page captures. Captures stay
+   * lossless and full-resolution; bounding count/encoded size prevents a
+   * long tab session from pinning hundreds of MiB of base64 strings. */
+  storePageSnapshot(tabId, snapshot) {
+    if (!tabId || typeof snapshot !== 'string' || !snapshot.startsWith('data:image/png;base64,')) return false;
+    // Move replacements to the Map tail (most recently captured).
+    this._pageSnapshots.delete(tabId);
+    this._pageSnapshots.set(tabId, snapshot);
+    const totalChars = () => [...this._pageSnapshots.values()]
+      .reduce((total, value) => total + (typeof value === 'string' ? value.length : 0), 0);
+    while (this._pageSnapshots.size > MAX_PAGE_SNAPSHOT_ENTRIES
+      || (this._pageSnapshots.size > 1 && totalChars() > MAX_PAGE_SNAPSHOT_CHARS)) {
+      const oldest = this._pageSnapshots.keys().next().value;
+      if (!oldest || oldest === tabId) break;
+      this._pageSnapshots.delete(oldest);
+    }
+    return true;
+  }
+
   /**
    * Shows only the active tab's native view (when it should be visible -
    * i.e. the active tab is actually rendering external web content, not an
@@ -4442,7 +4561,7 @@ export class BrowserShell {
         if (capturePromise) {
           capturePromise.then((res) => {
             if (res && res.snapshot) {
-              this._pageSnapshots.set(tabId, res.snapshot);
+              this.storePageSnapshot(tabId, res.snapshot);
               this.applyPageSnapshot(tabId);
               // The tab switcher may already be on screen showing a stale
               // or placeholder preview for this tab - paint the fresh one.
@@ -4458,7 +4577,7 @@ export class BrowserShell {
       if (wantsCapture && result && typeof result.then === 'function') {
         result.then((res) => {
           if (res && res.snapshot) {
-            this._pageSnapshots.set(tabId, res.snapshot);
+            this.storePageSnapshot(tabId, res.snapshot);
             this.applyPageSnapshot(tabId);
             this.refreshTabSwitcherPreviews();
           }
@@ -4924,6 +5043,10 @@ export class BrowserShell {
           }
         }
         tab.url = evt.url || tab.url;
+        if (tab.group && !tab.isPrivate) {
+          this._rememberDurableTabGroupMember(tab);
+          this.persistDurableTabGroups();
+        }
         if (!this.isGoogleOwnedUrl(tab.url)) this._inAppOnlyGoogleTabs.delete(tabId);
         tab.isSecure = (tab.url || '').startsWith('https://');
         tab.canGoBack = Boolean(evt.canGoBack);
@@ -4960,6 +5083,10 @@ export class BrowserShell {
       }
       case 'title-updated':
         tab.title = evt.title || tab.title;
+        if (tab.group && !tab.isPrivate) {
+          this._rememberDurableTabGroupMember(tab);
+          this.persistDurableTabGroups();
+        }
         // Surgical in-place label update - a full render here made every
         // page load (and every SPA title tick) flash the whole chrome.
         this.refreshTabTitleUi(tabId);
@@ -10460,7 +10587,16 @@ export class BrowserShell {
           this.showTransientNotice('Printing was canceled because the document tab changed.');
           return;
         }
-        if (typeof window !== 'undefined' && typeof window.print === 'function') window.print();
+        if (this.nativeWebview && typeof this.nativeWebview.print === 'function') {
+          const result = await this.nativeWebview.print(tab.id);
+          if (result?.ok && result.mode === 'pdf') {
+            this.showTransientNotice(`No usable printer was available. Saved a PDF to ${result.path}.`);
+          } else if (!result?.ok && !result?.canceled) {
+            this.showTransientNotice('Yayra couldn’t print this document or save the PDF fallback.');
+          }
+        } else if (typeof window !== 'undefined' && typeof window.print === 'function') {
+          window.print();
+        }
       } catch {
         this.showTransientNotice('Yayra couldn’t open the print dialog for this document.');
       } finally {
@@ -10471,8 +10607,15 @@ export class BrowserShell {
     }
     if (this.nativeWebview && typeof this.nativeWebview.print === 'function' && tab) {
       try {
-        const res = this.nativeWebview.print(tab.id);
-        if (res && typeof res.catch === 'function') res.catch(() => {});
+        const res = await this.nativeWebview.print(tab.id);
+        if (res?.ok && res.mode === 'pdf') {
+          this.showTransientNotice(`No usable printer was available. Saved a PDF to ${res.path}.`);
+          return;
+        }
+        if (res?.ok || res?.canceled) return;
+        this.showTransientNotice(res?.pdfFallbackUnavailable
+          ? 'No printer is available and PDF saving is unavailable in this build.'
+          : 'Yayra could not print this page or save the PDF fallback.');
         return;
       } catch { /* fall through */ }
     }
@@ -11773,47 +11916,276 @@ export class BrowserShell {
     const candidateColor = String(group.color || '').trim().toLowerCase();
     const color = BrowserShell.TAB_GROUP_COLORS.find((entry) => entry.toLowerCase() === candidateColor)
       || BrowserShell.TAB_GROUP_COLORS[0];
-    return { name, color };
+    const id = /^tg-[A-Za-z0-9_-]{1,100}$/.test(String(group.id || '')) ? String(group.id) : null;
+    return { ...(id ? { id } : {}), name, color };
   }
 
   tabGroupIdentity(group, isPrivate = false) {
     const safeGroup = this.sanitizeTabGroup(group);
     if (!safeGroup) return null;
+    // Durable ids survive rename, colour changes, navigation and restarts.
+    // Private groups are intentionally ephemeral and stay name/colour keyed.
+    if (!isPrivate && safeGroup.id) return `catalog::${safeGroup.id}`;
     const privacyScope = isPrivate ? 'private::' : '';
     return `${privacyScope}${safeGroup.name.toLocaleLowerCase()}::${safeGroup.color.toLowerCase()}`;
   }
 
+  _newTabGroupRecordId(prefix = 'tg') {
+    return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  _durableTabGroupUrl(value) {
+    const url = String(value || '');
+    if (!url || url.length > 8192 || /^yayra:\/\/doc\//i.test(url)) return null;
+    if (url === 'about:blank' || /^yayra:\/\/(?!doc\/)[A-Za-z0-9._~/?#=&%+-]+$/i.test(url)) return url;
+    try {
+      const parsed = new URL(url);
+      return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && !parsed.username && !parsed.password
+        ? parsed.toString()
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  _catalogGroupByIdentity(groupOrId) {
+    const groups = this.state.tabGroupCatalog || [];
+    const rawId = typeof groupOrId === 'string'
+      ? String(groupOrId).replace(/^catalog::/, '')
+      : this.sanitizeTabGroup(groupOrId)?.id;
+    if (rawId) {
+      const byId = groups.find((candidate) => candidate.id === rawId);
+      if (byId) return byId;
+    }
+    const safe = typeof groupOrId === 'object' ? this.sanitizeTabGroup(groupOrId) : null;
+    return safe
+      ? groups.find((candidate) => candidate.name.toLocaleLowerCase() === safe.name.toLocaleLowerCase()
+        && String(candidate.color).toLowerCase() === safe.color.toLowerCase()) || null
+      : null;
+  }
+
+  _ensureDurableTabGroup(group, { create = true } = {}) {
+    const safe = this.sanitizeTabGroup(group);
+    if (!safe) return null;
+    let record = this._catalogGroupByIdentity(safe);
+    if (!record && !create) return null;
+    if (!record) {
+      const now = Date.now();
+      record = {
+        id: safe.id || this._newTabGroupRecordId('tg'),
+        name: safe.name,
+        color: safe.color,
+        members: [],
+        createdAt: now,
+        updatedAt: now
+      };
+      this.state.tabGroupCatalog.push(record);
+    } else if (record.name !== safe.name || record.color !== safe.color) {
+      record.name = safe.name;
+      record.color = safe.color;
+      record.updatedAt = Date.now();
+    }
+    return record;
+  }
+
+  _rememberDurableTabGroupMember(tab, { allowUrlReuse = true } = {}) {
+    if (!tab || tab.isPrivate) return false;
+    const safeGroup = this.sanitizeTabGroup(tab.group);
+    if (!safeGroup) return false;
+    const record = this._ensureDurableTabGroup(safeGroup);
+    if (!record) return false;
+    const group = { id: record.id, name: record.name, color: record.color };
+    let changed = !safeGroup.id || safeGroup.id !== record.id;
+    tab.group = group;
+
+    const document = /^yayra:\/\/(?:doc|recover-document)\//i.test(String(tab.url || ''))
+      ? this.documentRecoveryDescriptorForTab(tab)
+      : null;
+    const url = document ? this.documentRecoveryUrl(document) : this._durableTabGroupUrl(tab.url);
+    if (!url) return changed;
+    const claimed = new Set((this.state.tabs || [])
+      .filter((candidate) => candidate !== tab && this.tabGroupIdentity(candidate.group, candidate.isPrivate) === `catalog::${record.id}`)
+      .map((candidate) => candidate.groupMemberId)
+      .filter(Boolean));
+    let member = tab.groupMemberId
+      ? record.members.find((candidate) => candidate.id === tab.groupMemberId)
+      : null;
+    if (!member && allowUrlReuse) {
+      member = record.members.find((candidate) => candidate.url === url && !claimed.has(candidate.id)) || null;
+    }
+    const now = Date.now();
+    if (!member) {
+      const requestedMemberId = /^tgm-[A-Za-z0-9_-]{1,120}$/.test(String(tab.groupMemberId || ''))
+        && !claimed.has(tab.groupMemberId)
+        ? tab.groupMemberId
+        : this._newTabGroupRecordId('tgm');
+      member = {
+        id: requestedMemberId,
+        url,
+        title: document?.name || String(tab.title || url).slice(0, 120),
+        ...(document ? { document } : {}),
+        createdAt: now,
+        updatedAt: now
+      };
+      record.members.push(member);
+      changed = true;
+    }
+    if (tab.groupMemberId !== member.id) {
+      tab.groupMemberId = member.id;
+      changed = true;
+    }
+    const title = document?.name || String(tab.title || url).slice(0, 120);
+    const documentChanged = JSON.stringify(member.document || null) !== JSON.stringify(document || null);
+    if (member.url !== url || member.title !== title || documentChanged) {
+      member.url = url;
+      member.title = title;
+      if (document) member.document = document;
+      else delete member.document;
+      member.updatedAt = now;
+      changed = true;
+    }
+    if (changed) record.updatedAt = now;
+    return changed;
+  }
+
+  _forgetDurableTabGroupMember(tab, groupId = null) {
+    if (!tab || tab.isPrivate) return false;
+    const record = this._catalogGroupByIdentity(groupId || tab.group);
+    if (!record) return false;
+    const before = record.members.length;
+    const memberId = String(tab.groupMemberId || '');
+    const url = this._durableTabGroupUrl(tab.url);
+    record.members = record.members.filter((member) => memberId ? member.id !== memberId : member.url !== url);
+    if (record.members.length !== before) {
+      record.updatedAt = Date.now();
+      return true;
+    }
+    return false;
+  }
+
+  persistDurableTabGroups() {
+    if (!this._tabGroupsLoaded || !this.tabGroupsRepo?.saveGroups) return;
+    const snapshot = JSON.parse(JSON.stringify(this.state.tabGroupCatalog || []));
+    const json = JSON.stringify(snapshot);
+    if (json === this._lastTabGroupsCatalogJson) return;
+    this._lastTabGroupsCatalogJson = json;
+    Promise.resolve(this.tabGroupsRepo.saveGroups(snapshot)).catch(() => {
+      // Retry on the next render/action if quota or an adapter failed.
+      if (this._lastTabGroupsCatalogJson === json) this._lastTabGroupsCatalogJson = null;
+    });
+  }
+
+  queueDurableTabGroupsSnapshot() {
+    if (!this._tabGroupsLoaded) return;
+    let changed = false;
+    for (const tab of this.state.tabs || []) {
+      if (tab?.group && !tab.isPrivate) changed = this._rememberDurableTabGroupMember(tab) || changed;
+    }
+    if (changed || JSON.stringify(this.state.tabGroupCatalog || []) !== this._lastTabGroupsCatalogJson) {
+      this.persistDurableTabGroups();
+    }
+  }
+
+  adoptLegacyTabGroups(entries) {
+    if (!this._tabGroupsLoaded) return;
+    let changed = false;
+    for (const entry of Array.isArray(entries) ? entries : []) {
+      if (!entry?.group || entry.isPrivate) continue;
+      const record = this._ensureDurableTabGroup(entry.group);
+      const url = this._durableTabGroupUrl(entry.url);
+      if (!record || !url) continue;
+      let member = entry.groupMemberId
+        ? record.members.find((candidate) => candidate.id === entry.groupMemberId)
+        : null;
+      if (!member) member = record.members.find((candidate) => candidate.url === url) || null;
+      if (!member) {
+        const now = Date.now();
+        member = {
+          id: this._newTabGroupRecordId('tgm'),
+          url,
+          title: entry.document?.name || String(entry.title || url).slice(0, 120),
+          ...(entry.document ? { document: entry.document } : {}),
+          createdAt: now,
+          updatedAt: now
+        };
+        record.members.push(member);
+        record.updatedAt = now;
+        changed = true;
+      } else if (entry.document && JSON.stringify(member.document || null) !== JSON.stringify(entry.document)) {
+        member.document = entry.document;
+        member.title = entry.document.name;
+        member.updatedAt = Date.now();
+        record.updatedAt = member.updatedAt;
+        changed = true;
+      }
+      entry.group = { id: record.id, name: record.name, color: record.color };
+      entry.groupMemberId = member.id;
+    }
+    if (changed) this.persistDurableTabGroups();
+  }
+
   getTabGroups() {
     const groups = new Map();
-    const addMember = (tab, fromRestore = false) => {
+    const ensureRecord = (group, isPrivate) => {
+      const id = this.tabGroupIdentity(group, isPrivate);
+      if (!id) return null;
+      if (!groups.has(id)) groups.set(id, {
+        id,
+        catalogId: !isPrivate ? this.sanitizeTabGroup(group)?.id || null : null,
+        name: group.name,
+        color: group.color,
+        isPrivate,
+        tabs: [],
+        _keys: new Map()
+      });
+      return groups.get(id);
+    };
+    const addMember = (tab, source = 'live') => {
       const group = this.sanitizeTabGroup(tab?.group);
       if (!group) return;
-      // Private groups are ephemeral and never merge with the normal
-      // profile's groups, even when their names and colours are identical.
-      const isPrivate = fromRestore ? false : Boolean(tab.isPrivate);
-      const id = this.tabGroupIdentity(group, isPrivate);
-      if (!groups.has(id)) groups.set(id, { id, name: group.name, color: group.color, isPrivate, tabs: [], _keys: new Set() });
-      const record = groups.get(id);
-      const url = String(tab.url || '');
-      // A recovered session row and its already-open counterpart represent
-      // one member. Live duplicate tabs still remain distinct by tab id.
-      if (fromRestore && record.tabs.some((member) => member.url === url)) return;
-      const key = tab.id ? `tab:${tab.id}` : `restore:${url}`;
-      if (record._keys.has(key)) return;
-      record._keys.add(key);
+      const isPrivate = source === 'live' ? Boolean(tab.isPrivate) : false;
+      const record = ensureRecord(group, isPrivate);
+      if (!record) return;
+      const memberId = String(tab.groupMemberId || '');
+      const key = memberId ? `member:${memberId}` : (source === 'live' && tab.id ? `tab:${tab.id}` : `${source}:${tab.url}`);
+      const existingIndex = record._keys.get(key);
+      if (existingIndex !== undefined) {
+        // A live tab is the authoritative representation of its durable row.
+        if (source === 'live') record.tabs[existingIndex] = tab;
+        return;
+      }
+      if (source !== 'live' && record.tabs.some((member) => member.url === tab.url && (member.id || member.groupMemberId))) return;
+      record._keys.set(key, record.tabs.length);
       record.tabs.push(tab);
     };
-    for (const tab of this.state.tabs || []) addMember(tab);
-    for (const tab of this.state.tabGroupRestoreTabs || []) addMember(tab, true);
+
+    for (const catalog of this.state.tabGroupCatalog || []) {
+      const group = this.sanitizeTabGroup(catalog);
+      if (!group) continue;
+      ensureRecord(group, false);
+      for (const member of catalog.members || []) {
+        addMember({
+          url: member.url,
+          title: member.title,
+          ...(member.document ? { document: member.document, documentRecovery: member.document } : {}),
+          group,
+          groupMemberId: member.id,
+          _durableGroupMember: true
+        }, 'durable');
+      }
+    }
+    for (const tab of this.state.tabs || []) addMember(tab, 'live');
+    for (const tab of this.state.tabGroupRestoreTabs || []) addMember(tab, 'restore');
     return Array.from(groups.values(), ({ _keys, ...group }) => group);
   }
 
   openTabGroup(groupId) {
     const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
     if (!group || !group.tabs.length) return false;
-    const groupData = { name: group.name, color: group.color };
+    const groupData = { ...(group.catalogId ? { id: group.catalogId } : {}), name: group.name, color: group.color };
     const openedMembers = [];
     const restoredEntries = [];
+    let newlyOpened = 0;
 
     for (const member of group.tabs) {
       const liveTab = member.id
@@ -11824,13 +12196,17 @@ export class BrowserShell {
         continue;
       }
 
-      const saved = (this.state.tabGroupRestoreTabs || []).find((entry) =>
-        entry.url === member.url && this.tabGroupIdentity(entry.group, false) === group.id);
-      if (!saved || !/^https?:\/\//i.test(String(saved.url || ''))) continue;
+      const saved = member._durableGroupMember
+        ? member
+        : (this.state.tabGroupRestoreTabs || []).find((entry) =>
+          (entry.groupMemberId && entry.groupMemberId === member.groupMemberId)
+          || (entry.url === member.url && this.tabGroupIdentity(entry.group, false) === group.id));
+      if (!saved || !this._durableTabGroupUrl(saved.url)) continue;
 
       const alreadyGrouped = this.state.tabs.find((tab) =>
-        !tab.isPrivate && tab.url === saved.url
-        && this.tabGroupIdentity(tab.group, false) === group.id);
+        !tab.isPrivate
+        && ((saved.groupMemberId && tab.groupMemberId === saved.groupMemberId)
+          || (tab.url === saved.url && this.tabGroupIdentity(tab.group, false) === group.id)));
       if (alreadyGrouped) {
         openedMembers.push(alreadyGrouped);
         restoredEntries.push(saved);
@@ -11843,31 +12219,53 @@ export class BrowserShell {
         !tab.isPrivate && tab.url === saved.url && !this.sanitizeTabGroup(tab.group));
       if (ungrouped) {
         ungrouped.group = groupData;
+        ungrouped.groupMemberId = saved.groupMemberId || null;
+        this._rememberDurableTabGroupMember(ungrouped);
         openedMembers.push(ungrouped);
         restoredEntries.push(saved);
         continue;
       }
 
       const restored = this.createNewTab(false, { group: groupData, render: false });
-      this.navigateActiveTab(saved.url);
-      if (saved.title) restored.title = String(saved.title).slice(0, 120);
+      restored.groupMemberId = saved.groupMemberId || null;
+      const document = this.sanitizeDocumentRecoveryDescriptor(saved.document || saved.documentRecovery);
+      if (document) {
+        restored.url = this.documentRecoveryUrl(document);
+        restored.title = document.name;
+        restored.isSecure = true;
+        restored.isLoading = false;
+        restored.isDocumentRecovery = true;
+        restored.documentRecovery = document;
+        restored.documentRecoveryError = null;
+        this.state.urlInputValue = this.getDisplayUrl(restored.url);
+      } else {
+        this.navigateActiveTab(saved.url);
+        if (saved.title) restored.title = String(saved.title).slice(0, 120);
+      }
+      this._rememberDurableTabGroupMember(restored);
       openedMembers.push(restored);
       restoredEntries.push(saved);
+      newlyOpened += 1;
+      if (document) void this.retryDocumentRecovery(restored.id);
     }
 
     if (!openedMembers.length) return false;
     if (restoredEntries.length) {
+      const restoredMemberIds = new Set(restoredEntries.map((entry) => entry.groupMemberId).filter(Boolean));
       const restoredUrls = new Set(restoredEntries.map((entry) => entry.url));
       this.state.tabGroupRestoreTabs = (this.state.tabGroupRestoreTabs || []).filter((entry) =>
-        !(this.tabGroupIdentity(entry.group, false) === group.id && restoredUrls.has(entry.url)));
+        !(this.tabGroupIdentity(entry.group, false) === group.id
+          && (restoredMemberIds.has(entry.groupMemberId) || restoredUrls.has(entry.url))));
       this.state.continueTabs = (this.state.continueTabs || []).filter((entry) =>
-        !(this.tabGroupIdentity(entry.group, false) === group.id && restoredUrls.has(entry.url)));
+        !(this.tabGroupIdentity(entry.group, false) === group.id
+          && (restoredMemberIds.has(entry.groupMemberId) || restoredUrls.has(entry.url))));
     }
 
     const target = openedMembers[0];
+    this.persistDurableTabGroups();
     this.selectTab(target.id);
-    if (restoredEntries.length) {
-      this.showTransientNotice(`Opened ${restoredEntries.length} saved tab${restoredEntries.length === 1 ? '' : 's'} from “${group.name}”.`);
+    if (newlyOpened > 0) {
+      this.showTransientNotice(`Opened ${newlyOpened} saved tab${newlyOpened === 1 ? '' : 's'} from “${group.name}”.`);
     }
     return true;
   }
@@ -11888,40 +12286,59 @@ export class BrowserShell {
       this.showTransientNotice('Group name was empty - the group was not renamed.');
       return false;
     }
+    const catalog = this._catalogGroupByIdentity(group.catalogId || groupId);
+    if (catalog) {
+      catalog.name = name;
+      catalog.updatedAt = Date.now();
+    }
+    const renamed = { ...(group.catalogId ? { id: group.catalogId } : {}), name, color: group.color };
     for (const tab of this.state.tabs) {
-      if (this.tabGroupIdentity(tab.group, tab.isPrivate) === groupId) {
-        tab.group = { name, color: group.color };
-      }
+      if (this.tabGroupIdentity(tab.group, tab.isPrivate) === groupId) tab.group = renamed;
     }
     for (const tab of this.state.tabGroupRestoreTabs || []) {
-      if (this.tabGroupIdentity(tab.group, false) === groupId) tab.group = { name, color: group.color };
+      if (this.tabGroupIdentity(tab.group, false) === groupId) tab.group = renamed;
     }
     for (const tab of this.state.continueTabs || []) {
-      if (this.tabGroupIdentity(tab.group, false) === groupId) tab.group = { name, color: group.color };
+      if (this.tabGroupIdentity(tab.group, false) === groupId) tab.group = renamed;
     }
+    this.persistDurableTabGroups();
     this.render();
     this.showTransientNotice(`Tab group renamed to “${name}”.`);
     return true;
   }
 
-  ungroupTabGroup(groupId) {
+  ungroupTabGroup(groupId, { deleted = false } = {}) {
     const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
     if (!group) return 0;
     let changed = 0;
     for (const tab of this.state.tabs) {
       if (this.tabGroupIdentity(tab.group, tab.isPrivate) === groupId) {
         tab.group = null;
+        tab.groupMemberId = null;
         changed += 1;
       }
     }
     this.state.tabGroupRestoreTabs = (this.state.tabGroupRestoreTabs || []).filter((tab) =>
       this.tabGroupIdentity(tab.group, false) !== groupId);
     for (const tab of this.state.continueTabs || []) {
-      if (this.tabGroupIdentity(tab.group, false) === groupId) tab.group = null;
+      if (this.tabGroupIdentity(tab.group, false) === groupId) {
+        tab.group = null;
+        tab.groupMemberId = null;
+      }
+    }
+    if (group.catalogId) {
+      this.state.tabGroupCatalog = (this.state.tabGroupCatalog || []).filter((candidate) => candidate.id !== group.catalogId);
+      this.persistDurableTabGroups();
     }
     this.render();
-    this.showTransientNotice(`“${group.name}” ungrouped - its open tabs stay open.`);
+    this.showTransientNotice(deleted
+      ? `“${group.name}” deleted - its open tabs stay open.`
+      : `“${group.name}” ungrouped - its open tabs stay open.`);
     return changed;
+  }
+
+  deleteTabGroup(groupId) {
+    return this.ungroupTabGroup(groupId, { deleted: true });
   }
 
   ungroupTab(tabId) {
@@ -11929,14 +12346,23 @@ export class BrowserShell {
     if (!tab?.group) return false;
     const groupId = this.tabGroupIdentity(tab.group, tab.isPrivate);
     const name = this.sanitizeTabGroup(tab.group)?.name || 'Tab group';
+    const memberId = tab.groupMemberId;
+    this._forgetDurableTabGroupMember(tab, groupId);
     tab.group = null;
+    tab.groupMemberId = null;
     // A previous-session copy of this same member should not make it appear
     // grouped again after this tab was explicitly ungrouped.
     this.state.tabGroupRestoreTabs = (this.state.tabGroupRestoreTabs || []).filter((entry) =>
-      !(this.tabGroupIdentity(entry.group, false) === groupId && entry.url === tab.url));
+      !(this.tabGroupIdentity(entry.group, false) === groupId
+        && (memberId ? entry.groupMemberId === memberId : entry.url === tab.url)));
     for (const entry of this.state.continueTabs || []) {
-      if (this.tabGroupIdentity(entry.group, false) === groupId && entry.url === tab.url) entry.group = null;
+      if (this.tabGroupIdentity(entry.group, false) === groupId
+        && (memberId ? entry.groupMemberId === memberId : entry.url === tab.url)) {
+        entry.group = null;
+        entry.groupMemberId = null;
+      }
     }
+    this.persistDurableTabGroups();
     this.render();
     this.showTransientNotice(`This tab was removed from “${name}”.`);
     return true;
@@ -11983,10 +12409,11 @@ export class BrowserShell {
       const title = document.createElement('strong');
       title.textContent = group.name;
       const details = document.createElement('small');
-      details.textContent = `${group.tabs.length} tab${group.tabs.length === 1 ? '' : 's'} · ${group.tabs.map((tab) => this.getTabTitle(tab)).join(', ')}`;
+      const memberTitles = group.tabs.map((tab) => this.getTabTitle(tab)).join(', ');
+      details.textContent = `${group.tabs.length} tab${group.tabs.length === 1 ? '' : 's'}${memberTitles ? ` · ${memberTitles}` : ' · Saved until you delete it'}`;
       const open = document.createElement('span');
       open.className = 'fb-tab-group-picker-open';
-      open.textContent = group.tabs.length > 1 ? 'Open all' : 'Open';
+      open.textContent = group.tabs.length > 1 ? 'Open all' : (group.tabs.length === 1 ? 'Open' : 'Empty');
       copy.appendChild(title);
       copy.appendChild(details);
       item.appendChild(swatch);
@@ -12024,7 +12451,8 @@ export class BrowserShell {
       const title = document.createElement('strong');
       title.textContent = group.name;
       const details = document.createElement('small');
-      details.textContent = `${group.tabs.length} tab${group.tabs.length === 1 ? '' : 's'}: ${group.tabs.map((tab) => this.getTabTitle(tab)).join(', ')}`;
+      const memberTitles = group.tabs.map((tab) => this.getTabTitle(tab)).join(', ');
+      details.textContent = `${group.tabs.length} tab${group.tabs.length === 1 ? '' : 's'}${memberTitles ? `: ${memberTitles}` : ' · group retained until deletion'}`;
       copy.appendChild(title);
       copy.appendChild(details);
       header.appendChild(swatch);
@@ -12042,6 +12470,7 @@ export class BrowserShell {
       makeAction('fb-tab-group-open-btn', 'Open group', () => this.openTabGroup(group.id));
       makeAction('fb-tab-group-rename-btn', 'Rename', () => this.renameTabGroup(group.id));
       makeAction('fb-tab-group-ungroup-btn', 'Ungroup', () => this.ungroupTabGroup(group.id));
+      makeAction('fb-tab-group-delete-btn', 'Delete group', () => this.deleteTabGroup(group.id));
       card.appendChild(header);
       card.appendChild(actions);
       container.appendChild(card);
@@ -12156,9 +12585,12 @@ export class BrowserShell {
   }
 
   _nextTabGroupColor() {
-    const used = new Set(this.state.tabs.map((t) => t.group && t.group.color).filter(Boolean));
-    const free = BrowserShell.TAB_GROUP_COLORS.find((c) => !used.has(c));
-    return free || BrowserShell.TAB_GROUP_COLORS[this.state.tabs.length % BrowserShell.TAB_GROUP_COLORS.length];
+    const used = new Set([
+      ...(this.state.tabs || []).map((tab) => tab.group?.color),
+      ...(this.state.tabGroupCatalog || []).map((group) => group.color)
+    ].filter(Boolean));
+    const free = BrowserShell.TAB_GROUP_COLORS.find((color) => !used.has(color));
+    return free || BrowserShell.TAB_GROUP_COLORS[(this.state.tabGroupCatalog?.length || this.state.tabs.length) % BrowserShell.TAB_GROUP_COLORS.length];
   }
 
   /** Create a named group from the active tab and a fresh tab in one render. */
@@ -12181,11 +12613,20 @@ export class BrowserShell {
     const existing = this.getTabGroups().find((candidate) =>
       candidate.isPrivate === Boolean(tab.isPrivate)
       && candidate.name.toLocaleLowerCase() === groupName.toLocaleLowerCase());
-    const group = existing
-      ? { name: existing.name, color: existing.color }
+    let group = existing
+      ? { ...(existing.catalogId ? { id: existing.catalogId } : {}), name: existing.name, color: existing.color }
       : { name: groupName, color: this._nextTabGroupColor() };
+    if (!tab.isPrivate) {
+      if (tab.group) this._forgetDurableTabGroupMember(tab);
+      const catalog = this._ensureDurableTabGroup(group);
+      group = { id: catalog.id, name: catalog.name, color: catalog.color };
+    }
     tab.group = group;
-    this.createNewTab(Boolean(tab.isPrivate), { group, render: false });
+    tab.groupMemberId = null;
+    this._rememberDurableTabGroupMember(tab, { allowUrlReuse: false });
+    const freshTab = this.createNewTab(Boolean(tab.isPrivate), { group, render: false });
+    this._rememberDurableTabGroupMember(freshTab, { allowUrlReuse: false });
+    this.persistDurableTabGroups();
     this.render();
     this.showTransientNotice(`Group “${group.name}” created with the current tab and a new tab.`);
     return true;
@@ -12210,10 +12651,20 @@ export class BrowserShell {
     const existing = this.getTabGroups().find((candidate) =>
       candidate.isPrivate === Boolean(tab.isPrivate)
       && candidate.name.toLocaleLowerCase() === groupName.toLocaleLowerCase());
-    const group = existing
-      ? { name: existing.name, color: existing.color }
+    let group = existing
+      ? { ...(existing.catalogId ? { id: existing.catalogId } : {}), name: existing.name, color: existing.color }
       : { name: groupName, color: this._nextTabGroupColor() };
+    const oldIdentity = this.tabGroupIdentity(tab.group, tab.isPrivate);
+    const staysInSameGroup = Boolean(oldIdentity && oldIdentity === existing?.id);
+    if (!tab.isPrivate) {
+      if (tab.group && !staysInSameGroup) this._forgetDurableTabGroupMember(tab);
+      const catalog = this._ensureDurableTabGroup(group);
+      group = { id: catalog.id, name: catalog.name, color: catalog.color };
+    }
     tab.group = group;
+    if (!staysInSameGroup) tab.groupMemberId = null;
+    this._rememberDurableTabGroupMember(tab, { allowUrlReuse: staysInSameGroup });
+    this.persistDurableTabGroups();
     this.render();
     this.showTransientNotice(`“${this.getTabTitle(tab)}” added to group “${group.name}”.`);
     return true;
@@ -12225,7 +12676,11 @@ export class BrowserShell {
     const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
     if (!tab || !group || Boolean(tab.isPrivate) !== Boolean(group.isPrivate)) return false;
     if (this.tabGroupIdentity(tab.group, tab.isPrivate) === group.id) return true;
-    tab.group = { name: group.name, color: group.color };
+    if (!tab.isPrivate && tab.group) this._forgetDurableTabGroupMember(tab);
+    tab.group = { ...(group.catalogId ? { id: group.catalogId } : {}), name: group.name, color: group.color };
+    tab.groupMemberId = null;
+    this._rememberDurableTabGroupMember(tab, { allowUrlReuse: false });
+    this.persistDurableTabGroups();
     this.render();
     this.showTransientNotice(`“${this.getTabTitle(tab)}” added to group “${group.name}”.`);
     return true;
@@ -12255,24 +12710,26 @@ export class BrowserShell {
 
   /** Remove every tab from its group (Chrome's "Ungroup"). */
   ungroupAllTabs() {
-    let count = 0;
-    const openMembers = new Set();
+    const durableMemberIds = new Set((this.state.tabGroupCatalog || [])
+      .flatMap((group) => (group.members || []).map((member) => member.id)));
+    const privateMembers = (this.state.tabs || []).filter((tab) => tab.isPrivate && tab.group).length;
+    const count = durableMemberIds.size + privateMembers;
     for (const tab of this.state.tabs) {
       if (tab.group) {
-        const id = this.tabGroupIdentity(tab.group, tab.isPrivate);
-        openMembers.add(`${id}::${tab.url}`);
         tab.group = null;
-        count += 1;
+        tab.groupMemberId = null;
       }
     }
     for (const tab of this.state.tabGroupRestoreTabs || []) {
-      if (tab.group) {
-        const key = `${this.tabGroupIdentity(tab.group, false)}::${tab.url}`;
-        if (!openMembers.has(key)) count += 1;
-        tab.group = null;
-      }
+      tab.group = null;
+      tab.groupMemberId = null;
     }
-    for (const tab of this.state.continueTabs || []) tab.group = null;
+    for (const tab of this.state.continueTabs || []) {
+      tab.group = null;
+      tab.groupMemberId = null;
+    }
+    this.state.tabGroupCatalog = [];
+    this.persistDurableTabGroups();
     this.render();
     this.showTransientNotice(count > 0
       ? `${count} tab${count === 1 ? '' : 's'} removed from their group${count === 1 ? '' : 's'}.`
@@ -12939,11 +13396,8 @@ export class BrowserShell {
     // the "recover recent tabs never comes" bug.
     if (this.options?.isMiniShell) return;
     const tabs = (this.state.tabs || [])
-      .filter((t) => t && !t.isPrivate && /^https?:\/\//i.test(String(t.url || '')))
-      .map((t) => {
-        const group = this.sanitizeTabGroup(t.group);
-        return { url: t.url, title: t.title || t.url, ...(group ? { group } : {}) };
-      });
+      .map((tab) => this.sessionEntryForTab(tab))
+      .filter(Boolean);
     // Launch-wipe protection: a fresh run opens on a lone newtab, and
     // 600ms later used to OVERWRITE the previous session's snapshot
     // with [] - if the user quit again without browsing (or the app
@@ -13044,8 +13498,11 @@ export class BrowserShell {
       if (this.shortcutsRepo?.getShortcuts) {
         try { fresh.shortcuts = await this.shortcutsRepo.getShortcuts(); } catch { /* keep current */ }
       }
+      if (this.tabGroupsRepo?.getGroups) {
+        try { fresh.tabGroups = await this.tabGroupsRepo.getGroups(); } catch { /* keep current */ }
+      }
 
-      const snapshot = JSON.stringify([fresh.history, fresh.bookmarks, fresh.bookmarkGroups, fresh.bookmarkDefaultGroupId, fresh.downloads, fresh.settings, fresh.shortcuts]);
+      const snapshot = JSON.stringify([fresh.history, fresh.bookmarks, fresh.bookmarkGroups, fresh.bookmarkDefaultGroupId, fresh.downloads, fresh.settings, fresh.shortcuts, fresh.tabGroups]);
       if (snapshot === this._bgRefreshSnapshot) return false;
       const isFirstPass = this._bgRefreshSnapshot === undefined;
       this._bgRefreshSnapshot = snapshot;
@@ -13058,6 +13515,10 @@ export class BrowserShell {
       if (fresh.downloadRoot !== undefined) this.state.downloadRoot = fresh.downloadRoot;
       if (fresh.settings) this.state.settings = { ...this.state.settings, ...fresh.settings };
       if (fresh.shortcuts) this.state.userShortcuts = fresh.shortcuts;
+      if (fresh.tabGroups) {
+        this.state.tabGroupCatalog = fresh.tabGroups;
+        this._lastTabGroupsCatalogJson = JSON.stringify(fresh.tabGroups);
+      }
 
       // The very first pass just seeds the snapshot - initialize()
       // already rendered this exact data.
@@ -13803,6 +14264,14 @@ export class BrowserShell {
     this.state.activeTabId = this.state.tabs[0].id;
     this.state.urlInputValue = '';
     this.state.isBookmarked = false;
+    // profileService already points at the destination profile. Block the
+    // render-time catalog writer until that profile's own groups are loaded,
+    // otherwise the previous profile's groups could leak into the new scope.
+    this._tabGroupsLoaded = !this.tabGroupsRepo;
+    this._lastTabGroupsCatalogJson = null;
+    this.state.tabGroupCatalog = [];
+    this.state.tabGroupRestoreTabs = [];
+    this.state.continueTabs = [];
     this.render();
     if (profile) {
       this.showTransientNotice(`Browsing as ${profile.name}${profile.email ? ` (${profile.email})` : ''} - separate from other profiles.`);
@@ -13877,18 +14346,30 @@ export class BrowserShell {
     if (this.shortcutsRepo?.getShortcuts) {
       try { this.state.userShortcuts = await this.shortcutsRepo.getShortcuts(); } catch { /* keep current */ }
     }
+    if (this.tabGroupsRepo?.getGroups) {
+      try { this.state.tabGroupCatalog = await this.tabGroupsRepo.getGroups(); } catch { this.state.tabGroupCatalog = []; }
+      this._tabGroupsLoaded = true;
+      this._lastTabGroupsCatalogJson = JSON.stringify(this.state.tabGroupCatalog || []);
+    }
     if (this.sessionRepo?.getLastSession) {
       try {
         // Profile switch: the previous-session offer belongs to the NEW
         // profile; the rolling snapshot restarts from its tabs too.
         const prev = await this.sessionRepo.getLastSession();
-        const openNow = new Set(this.state.tabs.map((t) => t.url));
-        const previousTabs = (prev.tabs || []).filter((t) => !t?.isPrivate && /^https?:\/\//i.test(t?.url || ''));
+        const openNow = new Set(this.state.tabs
+          .map((tab) => this.sessionEntryForTab(tab))
+          .filter(Boolean)
+          .map((entry) => this.sessionEntryKey(entry)));
+        const previousTabs = (prev.tabs || [])
+          .map((entry) => this.normalizeSessionEntry(entry))
+          .filter(Boolean);
         this.state.tabGroupRestoreTabs = previousTabs;
-        this.state.continueTabs = previousTabs.filter((t) => !openNow.has(t.url)).slice(0, 5);
+        this.state.continueTabs = previousTabs.filter((entry) => !openNow.has(this.sessionEntryKey(entry)));
         this._lastSessionSnapshotJson = null;
       } catch { /* keep current */ }
     }
+    this.adoptLegacyTabGroups(this.state.tabGroupRestoreTabs || []);
+    this.queueDurableTabGroupsSnapshot();
     this.render();
   }
 
@@ -13929,12 +14410,401 @@ export class BrowserShell {
     this.showTransientNotice('To exit Yayra, close this browser tab or app window.');
   }
 
+  sanitizeDocumentRecoveryDescriptor(value) {
+    if (!value || typeof value !== 'object') return null;
+    const libraryId = DOCUMENT_LIBRARY_ID.test(String(value.libraryId || '')) ? String(value.libraryId) : null;
+    const recoveryId = isDocumentRecoveryId(value.recoveryId) ? String(value.recoveryId) : null;
+    if (!libraryId && !recoveryId) return null;
+    const name = String(value.name || 'Local file')
+      .replace(/\\/g, '/')
+      .split('/')
+      .pop()
+      .replace(/[\u0000-\u001f\u007f]/g, '')
+      .trim()
+      .slice(0, 160) || 'Local file';
+    const mime = String(value.mime || '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 200);
+    const size = Math.max(0, Math.min(MAX_DOCUMENT_BYTES, Number(value.size) || 0));
+    return {
+      ...(libraryId ? { libraryId } : {}),
+      ...(recoveryId ? { recoveryId } : {}),
+      name,
+      mime,
+      size
+    };
+  }
+
+  documentRecoveryDescriptorForTab(tab) {
+    if (!tab) return null;
+    const doc = tab.docId ? this.documentStore?.get(tab.docId) : null;
+    const existing = this.sanitizeDocumentRecoveryDescriptor(tab.documentRecovery);
+    const descriptor = this.sanitizeDocumentRecoveryDescriptor({
+      libraryId: doc?.libraryId || existing?.libraryId,
+      recoveryId: doc?.recoveryId || existing?.recoveryId,
+      name: doc?.name || existing?.name || tab.title,
+      mime: doc?.mime || existing?.mime,
+      size: doc?.size || existing?.size
+    });
+    if (descriptor) tab.documentRecovery = descriptor;
+    return descriptor;
+  }
+
+  documentRecoveryUrl(descriptor) {
+    const safe = this.sanitizeDocumentRecoveryDescriptor(descriptor);
+    const id = safe?.libraryId || safe?.recoveryId;
+    return id ? `yayra://recover-document/${encodeURIComponent(id)}` : null;
+  }
+
+  sessionEntryKey(value) {
+    const document = this.sanitizeDocumentRecoveryDescriptor(value?.document || value?.documentRecovery);
+    if (document) return `document:${document.libraryId || document.recoveryId}`;
+    return `url:${String(value?.url || '')}`;
+  }
+
+  sessionEntryForTab(tab) {
+    if (!tab || tab.isPrivate) return null;
+    const group = this.sanitizeTabGroup(tab.group);
+    const isDocumentUrl = /^yayra:\/\/(?:doc|recover-document)\//i.test(String(tab.url || ''));
+    const document = isDocumentUrl ? this.documentRecoveryDescriptorForTab(tab) : null;
+    if (document) {
+      return {
+        url: this.documentRecoveryUrl(document),
+        title: document.name,
+        document,
+        ...(group ? { group } : {}),
+        ...(group && tab.groupMemberId ? { groupMemberId: tab.groupMemberId } : {})
+      };
+    }
+    if (!/^https?:\/\//i.test(String(tab.url || ''))) return null;
+    return {
+      url: tab.url,
+      title: tab.title || tab.url,
+      ...(group ? { group } : {}),
+      ...(group && tab.groupMemberId ? { groupMemberId: tab.groupMemberId } : {})
+    };
+  }
+
+  normalizeSessionEntry(value) {
+    if (!value || typeof value !== 'object' || value.isPrivate) return null;
+    const group = this.sanitizeTabGroup(value.group);
+    const groupMemberId = /^tgm-[A-Za-z0-9_-]{1,120}$/.test(String(value.groupMemberId || ''))
+      ? String(value.groupMemberId)
+      : null;
+    const document = this.sanitizeDocumentRecoveryDescriptor(value.document || value.documentRecovery);
+    if (document) {
+      return {
+        url: this.documentRecoveryUrl(document),
+        title: document.name,
+        document,
+        ...(group ? { group } : {}),
+        ...(group && groupMemberId ? { groupMemberId } : {})
+      };
+    }
+    const url = String(value.url || '');
+    if (!/^https?:\/\//i.test(url) || url.length > 8192) return null;
+    try {
+      const parsed = new URL(url);
+      if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) return null;
+    } catch { return null; }
+    return {
+      url,
+      title: String(value.title || url).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 120) || url,
+      ...(group ? { group } : {}),
+      ...(group && groupMemberId ? { groupMemberId } : {})
+    };
+  }
+
+  isRecoverableSessionEntry(value) {
+    return Boolean(this.normalizeSessionEntry(value));
+  }
+
+  async createRecoveredDocumentTab(entry, { tabId = null } = {}) {
+    const normalized = this.normalizeSessionEntry(entry);
+    const descriptor = normalized?.document;
+    if (!descriptor) return null;
+    let source = null;
+    let failureReason = 'recovery-unavailable';
+    if (descriptor.libraryId && typeof this.systemBridge?.documents?.reopen === 'function') {
+      try {
+        const result = await this.systemBridge.documents.reopen(descriptor.libraryId);
+        if (result?.ok && result.action === 'yayra' && result.data) {
+          source = {
+            name: result.name || descriptor.name,
+            bytes: result.data,
+            mime: descriptor.mime,
+            libraryId: result.libraryId || descriptor.libraryId
+          };
+        } else {
+          failureReason = result?.reason || 'unavailable';
+        }
+      } catch {
+        failureReason = 'read-failed';
+      }
+    } else if (descriptor.recoveryId && typeof this.documentRecoveryRepo?.load === 'function') {
+      try {
+        const result = await this.documentRecoveryRepo.load(descriptor.recoveryId);
+        if (result?.data) {
+          source = {
+            name: result.name || descriptor.name,
+            bytes: result.data,
+            mime: result.mime || descriptor.mime,
+            recoveryId: descriptor.recoveryId
+          };
+        }
+      } catch {
+        failureReason = 'read-failed';
+      }
+    }
+
+    const id = tabId || `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    if (!source) {
+      return {
+        id,
+        title: descriptor.name,
+        url: this.documentRecoveryUrl(descriptor),
+        isSecure: true,
+        canGoBack: false,
+        canGoForward: false,
+        isLoading: false,
+        isPrivate: false,
+        favicon: null,
+        isDocumentRecovery: true,
+        documentRecovery: descriptor,
+        documentRecoveryError: failureReason,
+        ...(normalized.group ? { group: normalized.group } : {}),
+        ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {})
+      };
+    }
+
+    let doc;
+    try {
+      doc = this.documentStore.add({
+        name: source.name,
+        bytes: source.bytes,
+        mime: source.mime || '',
+        libraryId: source.libraryId || null
+      });
+    } catch {
+      return {
+        id,
+        title: descriptor.name,
+        url: this.documentRecoveryUrl(descriptor),
+        isSecure: true,
+        canGoBack: false,
+        canGoForward: false,
+        isLoading: false,
+        isPrivate: false,
+        favicon: null,
+        isDocumentRecovery: true,
+        documentRecovery: descriptor,
+        documentRecoveryError: 'invalid-document',
+        ...(normalized.group ? { group: normalized.group } : {}),
+        ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {})
+      };
+    }
+    if (source.recoveryId) doc.recoveryId = source.recoveryId;
+    const recoveredDescriptor = this.sanitizeDocumentRecoveryDescriptor({
+      libraryId: doc.libraryId,
+      recoveryId: doc.recoveryId,
+      name: doc.name,
+      mime: doc.mime,
+      size: doc.size
+    });
+    if (!doc.libraryId) this.rememberSessionDocument(doc);
+    const docState = createDocumentViewerState(doc.type);
+    if (isPowerPointDocument(doc.type)) {
+      docState.notesColor = normalizePptxNotesColor(this.state.settings.pptxNotesColor);
+    }
+    docState.status = 'loading';
+    return {
+      id,
+      title: doc.name,
+      url: `yayra://doc/${doc.id}`,
+      isSecure: true,
+      canGoBack: false,
+      canGoForward: false,
+      isLoading: false,
+      isPrivate: false,
+      favicon: null,
+      isDocument: true,
+      docId: doc.id,
+      docState,
+      documentRecovery: recoveredDescriptor,
+      ...(normalized.group ? { group: normalized.group } : {}),
+      ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {})
+    };
+  }
+
+  async retryDocumentRecovery(tabId, { locate = false } = {}) {
+    const index = this.state.tabs.findIndex((tab) => tab.id === tabId);
+    const tab = this.state.tabs[index];
+    if (index < 0 || !tab?.isDocumentRecovery) return false;
+    const descriptor = this.sanitizeDocumentRecoveryDescriptor(tab.documentRecovery);
+    if (!descriptor) return false;
+    if (locate && descriptor.libraryId && typeof this.systemBridge?.documents?.locate === 'function') {
+      const located = await this.systemBridge.documents.locate(descriptor.libraryId);
+      if (!located?.ok) {
+        if (!located?.canceled) this.showTransientNotice('That file could not be reconnected.');
+        return false;
+      }
+    }
+    tab.documentRecoveryError = null;
+    this.render();
+    const recovered = await this.createRecoveredDocumentTab({
+      document: descriptor,
+      group: tab.group,
+      groupMemberId: tab.groupMemberId
+    }, { tabId });
+    if (!recovered || recovered.isDocumentRecovery) {
+      if (recovered) this.state.tabs[index] = recovered;
+      this.render();
+      this.showTransientNotice(descriptor.libraryId
+        ? 'The file is still unavailable. Locate it or restore its original location.'
+        : 'The saved file bytes are unavailable. Choose the original file again.');
+      return false;
+    }
+    this.state.tabs[index] = recovered;
+    this.state.activeTabId = tabId;
+    this.state.urlInputValue = this.getDisplayUrl(recovered.url);
+    this.render();
+    this.showTransientNotice(`Recovered “${descriptor.name}”.`);
+    return true;
+  }
+
+  async replaceDocumentRecoveryWithFile(tabId, file) {
+    const index = this.state.tabs.findIndex((tab) => tab.id === tabId);
+    const tab = this.state.tabs[index];
+    if (index < 0 || !tab?.isDocumentRecovery || !file) return false;
+    if (Number.isFinite(file.size) && file.size > MAX_DOCUMENT_BYTES) {
+      this.showTransientNotice(`Documents larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`);
+      return false;
+    }
+    let bytes;
+    try {
+      if (typeof file.arrayBuffer === 'function') bytes = await file.arrayBuffer();
+      else bytes = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error || new Error('read-failed'));
+        reader.readAsArrayBuffer(file);
+      });
+    } catch {
+      this.showTransientNotice('Couldn’t read the selected file.');
+      return false;
+    }
+    let doc;
+    try {
+      doc = this.documentStore.add({ name: file.name, bytes, mime: file.type || '' });
+    } catch (error) {
+      this.showTransientNotice(error?.message === 'document-too-large'
+        ? `Documents larger than ${MAX_DOCUMENT_SIZE_MB} MB can’t be opened in Yayra.`
+        : 'That file appears to be empty.');
+      return false;
+    }
+    const oldDescriptor = this.sanitizeDocumentRecoveryDescriptor(tab.documentRecovery);
+    doc.recoveryId = oldDescriptor?.recoveryId || newDocumentRecoveryId();
+    this.rememberSessionDocument(doc);
+    const docState = createDocumentViewerState(doc.type);
+    if (isPowerPointDocument(doc.type)) {
+      docState.notesColor = normalizePptxNotesColor(this.state.settings.pptxNotesColor);
+    }
+    docState.status = 'loading';
+    const replacement = {
+      ...tab,
+      title: doc.name,
+      url: `yayra://doc/${doc.id}`,
+      isDocument: true,
+      isDocumentRecovery: false,
+      docId: doc.id,
+      docState,
+      documentRecovery: this.sanitizeDocumentRecoveryDescriptor({
+        recoveryId: doc.recoveryId,
+        name: doc.name,
+        mime: doc.mime,
+        size: doc.size
+      })
+    };
+    delete replacement.documentRecoveryError;
+    this.state.tabs[index] = replacement;
+    this.state.activeTabId = tabId;
+    this.state.urlInputValue = this.getDisplayUrl(replacement.url);
+    let persisted = null;
+    try {
+      persisted = await this.documentRecoveryRepo?.save?.({
+        id: doc.recoveryId,
+        name: doc.name,
+        mime: doc.mime,
+        bytes: doc.bytes
+      });
+    } catch { /* handled by honest notice below */ }
+    this.render();
+    this.showTransientNotice(persisted
+      ? `Reconnected “${doc.name}”.`
+      : 'The file reopened, but device storage could not protect it for the next restart.');
+    return true;
+  }
+
+  reselectDocumentRecovery(tabId) {
+    if (typeof document === 'undefined') return false;
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.removeAttribute?.('accept');
+    input.setAttribute('aria-label', 'Choose the original file again');
+    input.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;';
+    let settled = false;
+    input.addEventListener('change', () => {
+      settled = true;
+      const file = input.files?.[0];
+      input.remove();
+      if (file) void this.replaceDocumentRecoveryWithFile(tabId, file);
+    }, { once: true });
+    // Most engines do not emit change when the picker is cancelled. Clean up
+    // the temporary off-screen input when focus returns to Yayra.
+    if (typeof window !== 'undefined') {
+      window.addEventListener?.('focus', () => {
+        setTimeout(() => { if (!settled) input.remove(); }, 0);
+      }, { once: true });
+    }
+    document.body.appendChild(input);
+    input.click();
+    return true;
+  }
+
+  createRecoveredWebsiteTab(entry, id) {
+    const normalized = this.normalizeSessionEntry(entry);
+    if (!normalized || normalized.document) return null;
+    return {
+      id,
+      title: normalized.title || 'New Tab',
+      url: normalized.url,
+      isSecure: String(normalized.url).startsWith('https://'),
+      canGoBack: false,
+      canGoForward: false,
+      isLoading: false,
+      isPrivate: false,
+      favicon: null,
+      ...(normalized.group ? { group: normalized.group } : {}),
+      ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {})
+    };
+  }
+
+  async createTabsFromSessionEntries(entries, idPrefix = `tab-${Date.now()}`) {
+    const restored = [];
+    for (let index = 0; index < entries.length; index += 1) {
+      const normalized = this.normalizeSessionEntry(entries[index]);
+      if (!normalized) continue;
+      const id = `${idPrefix}-${index}`;
+      const tab = normalized.document
+        ? await this.createRecoveredDocumentTab(normalized, { tabId: id })
+        : this.createRecoveredWebsiteTab(normalized, id);
+      if (tab) restored.push(tab);
+    }
+    return restored;
+  }
+
   requestAppClose({ exitWholeApp = false } = {}) {
-    // Only REAL web pages warrant the session prompt. Internal pages
-    // (Settings, History, ...) used to count as "real tabs", so closing
-    // an app that showed only Settings interrogated the user about
-    // nothing - and could even save yayra:// URLs as the session.
-    const realTabs = this.state.tabs.filter((t) => !t.isPrivate && /^https?:\/\//i.test(t.url || ''));
+    // Only recoverable web pages and local files warrant the session prompt.
+    // Internal pages (Settings, History, ...) are never serialized.
+    const realTabs = this.state.tabs.map((tab) => this.sessionEntryForTab(tab)).filter(Boolean);
     const controls = this.windowControls;
     const canQuitWholeApp = exitWholeApp && controls && typeof controls.quit === 'function';
     if (!realTabs.length || typeof document === 'undefined') {
@@ -13950,94 +14820,117 @@ export class BrowserShell {
     this.render();
   }
 
+  closeSessionStorageKey() {
+    return `yayra:close-session:${encodeURIComponent(this.currentProfileId())}`;
+  }
+
   closeWithSessionMode(mode) {
     const exitWholeApp = Boolean(this.state.closePromptExitsApp);
     this.state.closePrompt = false;
     this.state.closePromptExitsApp = false;
     const tabs = mode === 'fresh'
       ? []
-      : this.state.tabs
-        .filter((t) => !t.isPrivate && /^https?:\/\//i.test(t.url || ''))
-        .map((t) => {
-          const group = this.sanitizeTabGroup(t.group);
-          return { url: t.url, title: t.title || '', ...(group ? { group } : {}) };
-        });
+      : this.state.tabs.map((tab) => this.sessionEntryForTab(tab)).filter(Boolean);
     if (typeof localStorage !== 'undefined') {
       try {
-        localStorage.setItem('yayra:close-session', JSON.stringify({ mode, tabs, savedAt: new Date().toISOString() }));
+        localStorage.setItem(this.closeSessionStorageKey(), JSON.stringify({
+          mode,
+          tabs,
+          profileId: this.currentProfileId(),
+          savedAt: new Date().toISOString()
+        }));
       } catch { /* storage unavailable - closing still works */ }
     }
-    try {
-      if (exitWholeApp && typeof this.windowControls?.quit === 'function') this.windowControls.quit();
-      else this.windowControls?.close();
-    } catch { /* already closing */ }
+    const finishClose = () => {
+      try {
+        if (exitWholeApp && typeof this.windowControls?.quit === 'function') this.windowControls.quit();
+        else this.windowControls?.close();
+      } catch { /* already closing */ }
+    };
+    const pendingWrites = [...(this._documentRecoveryWrites?.values?.() || [])];
+    if (pendingWrites.length) {
+      // Give origin-private writes a chance to commit before Electron tears
+      // down the renderer. The choice record is already saved, so even a
+      // quota failure comes back as a visible recovery tab.
+      let closeWaitTimer = null;
+      Promise.race([
+        Promise.allSettled(pendingWrites),
+        new Promise((resolve) => { closeWaitTimer = setTimeout(resolve, 2500); })
+      ]).finally(() => {
+        if (closeWaitTimer) clearTimeout(closeWaitTimer);
+        finishClose();
+      });
+    } else {
+      finishClose();
+    }
     // Web/PWA builds have no native window to close - at least dismiss
     // the prompt so the choice is still honoured on the next visit.
     this.render();
   }
 
   /** Consume the previous session's close choice (once, at launch). */
-  restoreCloseSession() {
+  async restoreCloseSession() {
     if (typeof localStorage === 'undefined') return;
+    const scopedKey = this.closeSessionStorageKey();
+    let storageKey = scopedKey;
+    let raw = null;
+    try {
+      raw = localStorage.getItem(scopedKey);
+      // One-time migration for sessions saved before profile-scoped keys.
+      if (raw === null) {
+        storageKey = 'yayra:close-session';
+        raw = localStorage.getItem(storageKey);
+      }
+    } catch { raw = null; }
     let saved = null;
-    try { saved = JSON.parse(localStorage.getItem('yayra:close-session') || 'null'); } catch { saved = null; }
+    try { saved = JSON.parse(raw || 'null'); } catch { saved = null; }
     if (!saved) return;
-    try { localStorage.removeItem('yayra:close-session'); } catch { /* ignore */ }
-    const tabs = Array.isArray(saved.tabs) ? saved.tabs.filter((t) => t && t.url) : [];
+    if (saved.profileId && String(saved.profileId) !== this.currentProfileId()) return;
+    try { localStorage.removeItem(storageKey); } catch { /* ignore */ }
+    const tabs = Array.isArray(saved.tabs)
+      ? saved.tabs.map((entry) => this.normalizeSessionEntry(entry)).filter(Boolean)
+      : [];
     if (!tabs.length) return;
     // A deep link (explicit initialUrl) always wins the first tab - the
     // saved session is downgraded to an offer instead of a takeover.
     if (saved.mode === 'restore' && this.options?.initialUrl) saved.mode = 'recent';
     if (saved.mode === 'restore') {
-      // Reopen every tab automatically, exactly as they were.
-      this.state.tabs = tabs.map((t, i) => {
-        const group = this.sanitizeTabGroup(t.group);
-        return {
-          id: `tab-${Date.now()}-${i}`,
-          title: t.title || 'New Tab',
-          url: t.url,
-          isSecure: String(t.url).startsWith('https://'),
-          canGoBack: false,
-          canGoForward: false,
-          isLoading: false,
-          isPrivate: false,
-          favicon: null,
-          ...(group ? { group } : {})
-        };
-      });
-      this.state.activeTabId = this.state.tabs[0].id;
-      this.state.urlInputValue = this.getDisplayUrl(this.state.tabs[0].url);
+      // Reopen every website and local file in its original order. Missing
+      // files remain as explicit recovery tabs rather than disappearing.
+      const restored = await this.createTabsFromSessionEntries(tabs);
+      if (!restored.length) return;
+      this.state.tabs = restored;
+      this.state.activeTabId = restored[0].id;
+      this.state.urlInputValue = this.getDisplayUrl(restored[0].url);
     } else if (saved.mode === 'recent') {
-      // Plain close: offer the recent tabs instead of forcing them open.
+      // Plain close: offer websites and files instead of forcing them open.
       this.state.recentTabsOffer = tabs;
     }
   }
 
   acceptRecentTabsOffer() {
-    const tabs = this.state.recentTabsOffer || [];
+    const tabs = (this.state.recentTabsOffer || [])
+      .map((entry) => this.normalizeSessionEntry(entry))
+      .filter(Boolean);
     this.state.recentTabsOffer = null;
-    if (!tabs.length) { this.render(); return; }
-    const restored = tabs.map((t, i) => {
-      const group = this.sanitizeTabGroup(t.group);
-      return {
-        id: `tab-${Date.now()}-${i}`,
-        title: t.title || 'New Tab',
-        url: t.url,
-        isSecure: String(t.url).startsWith('https://'),
-        canGoBack: false,
-        canGoForward: false,
-        isLoading: false,
-        isPrivate: false,
-        favicon: null,
-        ...(group ? { group } : {})
-      };
-    });
-    // Replace a lone pristine new-tab; otherwise append after current tabs.
-    const onlyPristine = this.state.tabs.length === 1 && this.state.tabs[0].url === 'yayra://newtab';
-    this.state.tabs = onlyPristine ? restored : [...this.state.tabs, ...restored];
-    this.state.activeTabId = restored[0].id;
-    this.state.urlInputValue = this.getDisplayUrl(restored[0].url);
-    this.render();
+    const applyRestored = (restored) => {
+      if (!restored.length) { this.render(); return restored; }
+      // Replace a lone pristine new-tab; otherwise append after current tabs.
+      const onlyPristine = this.state.tabs.length === 1 && this.state.tabs[0].url === 'yayra://newtab';
+      this.state.tabs = onlyPristine ? restored : [...this.state.tabs, ...restored];
+      this.state.activeTabId = restored[0].id;
+      this.state.urlInputValue = this.getDisplayUrl(restored[0].url);
+      this.render();
+      return restored;
+    };
+    if (!tabs.length) return Promise.resolve(applyRestored([]));
+    if (!tabs.some((entry) => entry.document)) {
+      const prefix = `tab-${Date.now()}-recent`;
+      return Promise.resolve(applyRestored(tabs
+        .map((entry, index) => this.createRecoveredWebsiteTab(entry, `${prefix}-${index}`))
+        .filter(Boolean)));
+    }
+    return this.createTabsFromSessionEntries(tabs, `tab-${Date.now()}-recent`).then(applyRestored);
   }
 
   dismissRecentTabsOffer() {
@@ -14055,18 +14948,21 @@ export class BrowserShell {
     });
     root.appendChild(scrim);
 
-    const realCount = this.state.tabs.filter((t) => !t.isPrivate && t.url && t.url !== 'yayra://newtab').length;
+    const recoverableEntries = this.state.tabs.map((tab) => this.sessionEntryForTab(tab)).filter(Boolean);
+    const realCount = recoverableEntries.length;
+    const fileCount = recoverableEntries.filter((entry) => entry.document).length;
+    const itemWord = fileCount ? 'item' : 'tab';
     const modal = document.createElement('div');
     modal.className = 'fb-close-prompt-modal';
     modal.setAttribute('role', 'dialog');
     modal.setAttribute('aria-label', 'Close Yayra');
     modal.innerHTML = `
       <strong class="fb-close-prompt-title">Close Yayra?</strong>
-      <p class="fb-close-prompt-text">You have ${realCount} open tab${realCount === 1 ? '' : 's'}. What should happen to ${realCount === 1 ? 'it' : 'them'}?</p>
+      <p class="fb-close-prompt-text">You have ${realCount} open ${itemWord}${realCount === 1 ? '' : 's'}${fileCount ? ` (${fileCount} local file${fileCount === 1 ? '' : 's'})` : ''}. What should happen to ${realCount === 1 ? 'it' : 'them'}?</p>
       <div class="fb-close-prompt-actions">
-        <button class="fb-btn fb-btn-primary fb-close-keep-tabs">Keep all tabs &amp; close <small>reopens them automatically next time</small></button>
-        <button class="fb-btn fb-btn-secondary fb-close-just-close">Just close <small>offers your recent tabs next time</small></button>
-        <button class="fb-btn fb-btn-secondary fb-close-all-tabs">Close all tabs &amp; close <small>starts fresh next time</small></button>
+        <button class="fb-btn fb-btn-primary fb-close-keep-tabs">Keep all tabs &amp; files <small>reopens them automatically next time</small></button>
+        <button class="fb-btn fb-btn-secondary fb-close-just-close">Just close <small>offers your recent tabs and files next time</small></button>
+        <button class="fb-btn fb-btn-secondary fb-close-all-tabs">Close all &amp; start fresh <small>does not reopen this session next time</small></button>
         <button class="fb-btn fb-btn-secondary fb-close-cancel">Cancel</button>
       </div>
     `;
@@ -14086,14 +14982,15 @@ export class BrowserShell {
     const card = document.createElement('div');
     card.className = 'fb-recent-tabs-offer';
     card.setAttribute('role', 'dialog');
-    card.setAttribute('aria-label', 'Reopen recent tabs');
+    const fileCount = tabs.filter((entry) => this.normalizeSessionEntry(entry)?.document).length;
+    card.setAttribute('aria-label', 'Reopen recent tabs and files');
     card.innerHTML = `
       <span class="fb-recent-tabs-icon">${Icons.history}</span>
-      <span class="fb-recent-tabs-text"><strong>Pick up where you left off?</strong><small>${tabs.length} recent tab${tabs.length === 1 ? '' : 's'} from your last session</small></span>
+      <span class="fb-recent-tabs-text"><strong>Pick up where you left off?</strong><small>${tabs.length} recent item${tabs.length === 1 ? '' : 's'}${fileCount ? `, including ${fileCount} local file${fileCount === 1 ? '' : 's'}` : ''}</small></span>
       <button class="fb-btn fb-btn-primary fb-recent-tabs-reopen">Reopen</button>
       <button class="fb-btn fb-btn-secondary fb-recent-tabs-dismiss">Dismiss</button>
     `;
-    card.querySelector('.fb-recent-tabs-reopen')?.addEventListener('click', () => this.acceptRecentTabsOffer());
+    card.querySelector('.fb-recent-tabs-reopen')?.addEventListener('click', () => { void this.acceptRecentTabsOffer(); });
     card.querySelector('.fb-recent-tabs-dismiss')?.addEventListener('click', () => this.dismissRecentTabsOffer());
     root.appendChild(card);
   }
@@ -16572,7 +17469,15 @@ export class BrowserShell {
           const res = await this.systemBridge.clearBrowsingData({ cache: wantCache, cookies: wantCookies });
           if (res && res.ok) {
             if (wantCache) done.push(res.clearedBytes > 0 ? `cache (${(res.clearedBytes / (1024 * 1024)).toFixed(1)} MB freed)` : 'cache');
-            if (wantCookies) done.push('cookies & site data');
+            if (wantCookies) {
+              done.push('cookies & site data');
+              // Tab groups are browser chrome, not site data. Current desktop
+              // builds preserve the shell store in main; this write-back also
+              // protects this catalog if an adapter (or an older desktop
+              // bridge during an update) clears shell localStorage anyway.
+              this._lastTabGroupsCatalogJson = null;
+              this.persistDurableTabGroups();
+            }
           }
         } catch { /* reported below by omission */ }
       } else if (wantCache && typeof caches !== 'undefined' && caches?.keys) {
@@ -17248,7 +18153,7 @@ export class BrowserShell {
       && this.nativeWebview && typeof this.nativeWebview.capture === 'function') {
       try {
         this.nativeWebview.capture(prevId).then((res) => {
-          if (res && res.snapshot) this._pageSnapshots.set(prevId, res.snapshot);
+          if (res && res.snapshot) this.storePageSnapshot(prevId, res.snapshot);
         }).catch(() => { /* preview stays as-is */ });
       } catch { /* preview stays as-is */ }
     }
@@ -17275,6 +18180,10 @@ export class BrowserShell {
     this._pageSnapshots.delete(tabId); // closed tab, dead preview
 
     const [closedTab] = this.state.tabs.splice(tabIndex, 1);
+    // Capture the opaque recovery capability while the in-memory document is
+    // still present. Its bytes can then be released without breaking
+    // Ctrl+Shift+T or a later session snapshot.
+    const closedDocumentRecovery = this.documentRecoveryDescriptorForTab(closedTab);
     if (closedTab?.docId) {
       const session = this._documentViewerSessions?.get(tabId);
       if (session) {
@@ -17290,17 +18199,24 @@ export class BrowserShell {
       }
     }
 
-    // A closed PDF is intentionally not kept in the in-memory restore list:
-    // closing it releases its bytes, so advertising it to Ctrl+Shift+T would
-    // create a dead document tab. If a document tab navigated to a website,
-    // that website remains restorable without the document metadata.
-    const isDocumentUrl = String(closedTab?.url || '').startsWith('yayra://doc/');
-    if (closedTab && !closedTab.isPrivate && closedTab.url !== 'yayra://newtab' && !isDocumentUrl) {
-      const restorableTab = { ...closedTab };
-      if (restorableTab.docId) {
+    if (closedTab && !closedTab.isPrivate && closedTab.url !== 'yayra://newtab') {
+      let restorableTab = { ...closedTab };
+      if (closedDocumentRecovery && /^yayra:\/\/(?:doc|recover-document)\//i.test(String(closedTab.url || ''))) {
+        restorableTab = {
+          title: closedDocumentRecovery.name,
+          url: this.documentRecoveryUrl(closedDocumentRecovery),
+          document: closedDocumentRecovery,
+          documentRecovery: closedDocumentRecovery,
+          ...(closedTab.group ? { group: closedTab.group } : {}),
+          ...(closedTab.groupMemberId ? { groupMemberId: closedTab.groupMemberId } : {})
+        };
+      } else if (restorableTab.docId) {
+        // The document tab navigated to a website; restore that website, not
+        // stale viewer state from the old local file.
         delete restorableTab.isDocument;
         delete restorableTab.docId;
         delete restorableTab.docState;
+        delete restorableTab.documentRecovery;
       }
       this.state.closedTabsHistory.unshift(restorableTab);
       if (this.state.closedTabsHistory.length > 25) {
@@ -17329,8 +18245,9 @@ export class BrowserShell {
     if (!tab) return;
     const newId = `tab-${Date.now()}`;
     const index = this.state.tabs.findIndex((t) => t.id === tabId);
-    const duplicate = { ...tab, id: newId, isLoading: false };
+    const duplicate = { ...tab, id: newId, isLoading: false, groupMemberId: null };
     this.state.tabs.splice(index + 1, 0, duplicate);
+    if (duplicate.group) this._rememberDurableTabGroupMember(duplicate, { allowUrlReuse: false });
     this.selectTab(newId);
   }
 
@@ -17618,19 +18535,26 @@ export class BrowserShell {
     positionMenu();
   }
 
-  restoreLastClosedTab() {
+  async restoreLastClosedTab() {
     if (this.state.closedTabsHistory.length === 0) return;
 
     const lastClosed = this.state.closedTabsHistory.shift();
     const newId = `tab-${Date.now()}`;
-    const restoredTab = {
-      ...lastClosed,
-      id: newId,
-      canGoBack: false,
-      canGoForward: false,
-      isLoading: false
-    };
-
+    const descriptor = this.sanitizeDocumentRecoveryDescriptor(lastClosed?.document || lastClosed?.documentRecovery);
+    const restoredTab = descriptor
+      ? await this.createRecoveredDocumentTab({
+        document: descriptor,
+        group: lastClosed.group,
+        groupMemberId: lastClosed.groupMemberId
+      }, { tabId: newId })
+      : {
+        ...lastClosed,
+        id: newId,
+        canGoBack: false,
+        canGoForward: false,
+        isLoading: false
+      };
+    if (!restoredTab) return;
     this.state.tabs.push(restoredTab);
     this.selectTab(newId);
   }
@@ -17879,6 +18803,10 @@ export class BrowserShell {
     const activeTab = this.getActiveTab();
     if (!activeTab) return;
     this._systemBrowserHandoffs.delete(activeTab.id);
+    if (activeTab.isDocumentRecovery || String(activeTab.url || '').startsWith('yayra://recover-document/')) {
+      void this.retryDocumentRecovery(activeTab.id);
+      return;
+    }
     // FREEZE FIX: refresh must ALWAYS hand back the live page surface -
     // in the field a stuck obscured flag made refresh look dead.
     try { this.healStuckPageSurface(); } catch { /* best-effort heal */ }
@@ -17984,33 +18912,68 @@ export class BrowserShell {
     return true;
   }
 
-  /** "Restore all" on the continue-with-these-tabs prompt: open every entry. */
+  /** "Restore all" on the continue prompt: reopen websites and local files
+   * in their original order. Missing file bytes become visible recovery tabs. */
   restoreContinueTabs(entries) {
-    const list = Array.isArray(entries) ? entries : [];
+    const list = (Array.isArray(entries) ? entries : [])
+      .map((entry) => this.normalizeSessionEntry(entry))
+      .filter(Boolean);
     // The offer is being consumed: clear it and mark it answered so it
     // neither re-prompts this session nor blocks the rolling snapshot.
     this.state.continueTabs = [];
     this.state.settings.continueDismissedAt = this.state.continueSavedAt || 'no-snapshot-id';
     this._sessionHadRealTabs = true;
     this.persistSettings?.();
-    let opened = 0;
-    for (const entry of list) {
-      if (!/^https?:\/\//i.test(entry?.url || '')) continue;
-      if (opened === 0) {
-        // The newtab the prompt lives on becomes the first restored tab.
-        this.navigateActiveTab(entry.url);
-      } else {
-        this.createNewTab();
-        this.navigateActiveTab(entry.url);
+
+    const applyRestored = (restored) => {
+      if (!restored.length) { this.render(); return restored; }
+      const onlyPristine = this.state.tabs.length === 1
+        && this.state.tabs[0].url === 'yayra://newtab'
+        && !this.state.tabs[0].isPrivate;
+      this.state.tabs = onlyPristine ? restored : [...this.state.tabs, ...restored];
+      this.state.activeTabId = restored[0].id;
+      this.state.urlInputValue = this.getDisplayUrl(restored[0].url);
+      for (const tab of restored) {
+        if (tab.group) this._rememberDurableTabGroupMember(tab);
       }
-      const restoredTab = this.getActiveTab();
-      if (restoredTab) restoredTab.group = this.sanitizeTabGroup(entry.group);
-      opened += 1;
-    }
-    if (opened > 0) {
       this.render();
-      this.showTransientNotice(`Restored ${opened} tab${opened === 1 ? '' : 's'}.`);
+      this.showTransientNotice(`Restored ${restored.length} tab${restored.length === 1 ? '' : 's'}.`);
+      return restored;
+    };
+
+    // Preserve the existing immediate website-only contract (keyboard and
+    // tests observe the active tab synchronously). Local files necessarily
+    // wait for disk/IndexedDB, then use the same ordered application path.
+    if (!list.some((entry) => entry.document)) {
+      const prefix = `tab-${Date.now()}-continue`;
+      return Promise.resolve(applyRestored(list
+        .map((entry, index) => this.createRecoveredWebsiteTab(entry, `${prefix}-${index}`))
+        .filter(Boolean)));
     }
+    return this.createTabsFromSessionEntries(list, `tab-${Date.now()}-continue`)
+      .then(applyRestored);
+  }
+
+  async restoreSingleContinueEntry(entry) {
+    const normalized = this.normalizeSessionEntry(entry);
+    if (!normalized) return false;
+    const restored = normalized.document
+      ? await this.createRecoveredDocumentTab(normalized)
+      : this.createRecoveredWebsiteTab(normalized, `tab-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`);
+    if (!restored) return false;
+    const onlyPristine = this.state.tabs.length === 1
+      && this.state.tabs[0].url === 'yayra://newtab'
+      && !this.state.tabs[0].isPrivate;
+    this.state.tabs = onlyPristine ? [restored] : [...this.state.tabs, restored];
+    this.state.activeTabId = restored.id;
+    this.state.urlInputValue = this.getDisplayUrl(restored.url);
+    if (restored.group) this._rememberDurableTabGroupMember(restored);
+    const key = this.sessionEntryKey(normalized);
+    this.state.continueTabs = (this.state.continueTabs || [])
+      .filter((candidate) => this.sessionEntryKey(candidate) !== key);
+    this._sessionHadRealTabs = true;
+    this.render();
+    return true;
   }
 
   /** "No thanks" on the prompt: remember the snapshot so it never re-asks. */
@@ -18034,23 +18997,29 @@ export class BrowserShell {
    * the only thing that closes the prompt.
    */
   renderRestoreBar(root) {
-    const tabs = (this.state.continueTabs || []).filter((t) => /^https?:\/\//i.test(t?.url || ''));
+    const tabs = (this.state.continueTabs || [])
+      .map((entry) => this.normalizeSessionEntry(entry))
+      .filter(Boolean);
     if (!tabs.length || this._restoreToastClosed) return;
     const continueSnapshotId = this.state.continueSavedAt || 'no-snapshot-id';
     if (this.state.settings.continueDismissedAt === continueSnapshotId) return;
+    const fileCount = tabs.filter((entry) => entry.document).length;
+    const itemLabel = tabs.length === 1
+      ? (fileCount ? 'one local file' : 'one tab')
+      : `${tabs.length} tabs${fileCount ? `, including ${fileCount} local file${fileCount === 1 ? '' : 's'}` : ''}`;
     const bar = document.createElement('div');
     bar.className = 'fb-restore-bar';
     bar.setAttribute('role', 'alertdialog');
-    bar.setAttribute('aria-label', 'Restore pages?');
+    bar.setAttribute('aria-label', 'Restore tabs and files?');
     bar.innerHTML = `
-      <span class="fb-restore-bar-head">Restore pages?</span>
-      <span class="fb-restore-bar-body">Yayra closed before you finished - ${tabs.length === 1 ? 'one tab' : `${tabs.length} tabs`} from your last session can come back.</span>
+      <span class="fb-restore-bar-head">Restore tabs and files?</span>
+      <span class="fb-restore-bar-body">Yayra closed before you finished - ${itemLabel} from your last session can come back.</span>
       <span class="fb-restore-bar-spacer"></span>
       <button class="fb-restore-toast-btn fb-restore-bar-btn">Restore</button>
       <button class="fb-restore-toast-close fb-restore-bar-close" aria-label="Dismiss" title="Dismiss">${Icons.close}</button>
     `;
     bar.querySelector('.fb-restore-bar-btn')?.addEventListener('click', () => {
-      this.restoreContinueTabs(tabs.map((t) => ({ url: t.url, title: t.title || t.url, group: t.group })));
+      void this.restoreContinueTabs(tabs);
     });
     bar.querySelector('.fb-restore-bar-close')?.addEventListener('click', () => {
       this._restoreToastClosed = true;
@@ -18071,20 +19040,36 @@ export class BrowserShell {
    */
   appendContinueCard(newTabPage, frequentSites = []) {
     const continueEntries = [];
-    const seenContinue = new Set(this.state.tabs.map((t) => t.url));
-    for (const t of (this.state.continueTabs || [])) {
-      const url = String(t?.url || '');
-      if (!url || seenContinue.has(url)) continue;
-      seenContinue.add(url);
-      continueEntries.push({ url, favicon: t.favicon || null, title: t.title || url, reason: 'From last session', group: t.group });
+    const seenContinue = new Set(this.state.tabs
+      .map((tab) => this.sessionEntryForTab(tab))
+      .filter(Boolean)
+      .map((entry) => this.sessionEntryKey(entry)));
+    const recoveryEntries = (this.state.continueTabs || [])
+      .map((entry) => this.normalizeSessionEntry(entry))
+      .filter(Boolean);
+    for (const entry of recoveryEntries) {
+      const key = this.sessionEntryKey(entry);
+      if (seenContinue.has(key)) continue;
+      seenContinue.add(key);
+      continueEntries.push({
+        ...entry,
+        favicon: entry.favicon || null,
+        title: entry.document?.name || entry.title || entry.url,
+        reason: 'From last session'
+      });
+      // Keep the card compact. "Restore all" below still restores every
+      // recovery entry, not merely these five preview rows.
       if (continueEntries.length >= 5) break;
     }
     for (const site of frequentSites) {
       const url = String(site?.url || '');
       if (continueEntries.length >= 5) break;
-      if (!/^https?:\/\//i.test(url) || seenContinue.has(url)) continue;
-      seenContinue.add(url);
-      continueEntries.push({ url, favicon: site.favicon || null, title: site.title || url, reason: 'You visit often' });
+      if (!/^https?:\/\//i.test(url)) continue;
+      const entry = this.normalizeSessionEntry({ url, title: site.title || url });
+      const key = this.sessionEntryKey(entry);
+      if (!entry || seenContinue.has(key)) continue;
+      seenContinue.add(key);
+      continueEntries.push({ ...entry, favicon: site.favicon || null, reason: 'You visit often' });
     }
     const continueSnapshotId = this.state.continueSavedAt || 'no-snapshot-id';
     const continueDismissed = this.state.settings.continueDismissedAt === continueSnapshotId;
@@ -18092,22 +19077,23 @@ export class BrowserShell {
     const continueCard = document.createElement('div');
     continueCard.className = 'fb-continue-card';
     continueCard.innerHTML = `
-      <div class="fb-continue-card-head">Continue with these tabs?</div>
-      ${continueEntries.map((entry) => {
-        let host = entry.url;
-        try {
-          const parsed = new URL(entry.url);
-          host = parsed.protocol === 'yayra:' ? 'Yayra' : parsed.hostname;
-        } catch { /* keep the visible label for a non-URL tab */ }
-        const icon = this.getTabFavicon({ url: entry.url, favicon: entry.favicon, isLoading: false });
-        const safeUrl = String(entry.url).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
-        const safeTitle = String(entry.title || entry.url).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+      <div class="fb-continue-card-head">Continue with these tabs and files?</div>
+      ${continueEntries.map((entry, index) => {
+        let host = 'Local file';
+        if (!entry.document) {
+          host = entry.url;
+          try { host = new URL(entry.url).hostname; } catch { /* keep visible label */ }
+        }
+        const icon = entry.document
+          ? Icons.document
+          : this.getTabFavicon({ url: entry.url, favicon: entry.favicon, isLoading: false });
+        const safeTitle = escapeHtml(entry.title || entry.url);
         return `
-        <button class="fb-continue-item" data-url="${safeUrl}">
+        <button class="fb-continue-item" data-entry-index="${index}">
           <span class="fb-continue-favicon fb-continue-favicon-wrap">${icon}</span>
           <span class="fb-continue-text">
             <span class="fb-continue-title">${safeTitle}</span>
-            <span class="fb-continue-meta">${host} &bull; ${entry.reason}</span>
+            <span class="fb-continue-meta">${escapeHtml(host)} &bull; ${entry.reason}</span>
           </span>
         </button>`;
       }).join('')}
@@ -18118,17 +19104,14 @@ export class BrowserShell {
     `;
     continueCard.querySelectorAll('.fb-continue-item').forEach((item) => {
       item.addEventListener('click', () => {
-        const entry = continueEntries.find((candidate) => candidate.url === item.dataset.url);
-        this.navigateActiveTab(item.dataset.url);
-        const active = this.getActiveTab();
-        if (active && entry?.group) {
-          active.group = this.sanitizeTabGroup(entry.group);
-          this.render();
-        }
+        const entry = continueEntries[Number(item.dataset.entryIndex)];
+        if (entry) void this.restoreSingleContinueEntry(entry);
       });
     });
     continueCard.querySelector('.fb-continue-restore-btn')?.addEventListener('click', () => {
-      this.restoreContinueTabs(continueEntries);
+      // Recovery rows take precedence and include entries beyond the five-row
+      // preview. If this is only a frequent-sites suggestion, restore those.
+      void this.restoreContinueTabs(recoveryEntries.length ? recoveryEntries : continueEntries);
     });
     continueCard.querySelector('.fb-continue-dismiss-btn')?.addEventListener('click', () => {
       this.dismissContinueTabs();
@@ -19693,6 +20676,7 @@ export class BrowserShell {
   /** Registers a local file and opens a fresh tab. Recognized types use a
    * bundled viewer; unknown formats use the honest original-file fallback. */
   addDocumentTab({ name, bytes, mime = '', libraryId = null }) {
+    const privateDocument = Boolean(this.getActiveTab()?.isPrivate);
     let doc;
     try {
       doc = this.documentStore.add({ name, bytes, mime, libraryId });
@@ -19702,14 +20686,25 @@ export class BrowserShell {
         : 'That file appears to be empty.');
       return null;
     }
-    if (!doc.libraryId) this.rememberSessionDocument(doc);
-    this.createNewTab();
+    // Desktop files already have an opaque catalog capability. Picker files
+    // need a stable, non-path recovery id whose exact bytes are copied to
+    // origin-private IndexedDB before the next app launch.
+    if (!privateDocument && !doc.libraryId) doc.recoveryId = newDocumentRecoveryId();
+    if (!privateDocument && !doc.libraryId) this.rememberSessionDocument(doc);
+    this.createNewTab(privateDocument);
     const tab = this.getActiveTab();
     if (!tab) return null;
     tab.url = `yayra://doc/${doc.id}`;
     tab.title = doc.name;
     tab.isDocument = true;
     tab.docId = doc.id;
+    tab.documentRecovery = this.sanitizeDocumentRecoveryDescriptor({
+      libraryId: doc.libraryId,
+      recoveryId: doc.recoveryId,
+      name: doc.name,
+      mime: doc.mime,
+      size: doc.size
+    });
     tab.docState = createDocumentViewerState(doc.type);
     if (isPowerPointDocument(doc.type)) {
       tab.docState.notesColor = normalizePptxNotesColor(
@@ -19717,6 +20712,33 @@ export class BrowserShell {
       );
     }
     tab.docState.status = 'loading';
+    if (doc.recoveryId && typeof this.documentRecoveryRepo?.save === 'function') {
+      tab.documentRecoverySaving = true;
+      const write = Promise.resolve(this.documentRecoveryRepo.save({
+        id: doc.recoveryId,
+        name: doc.name,
+        mime: doc.mime,
+        bytes: doc.bytes
+      })).then((saved) => {
+        tab.documentRecoverySaving = false;
+        tab.documentRecoveryAvailable = Boolean(saved);
+        if (!saved) {
+          this.showTransientNotice('This file is open, but device storage could not protect it for restart recovery.');
+        }
+        this.queueSessionSnapshot();
+      }).catch(() => {
+        tab.documentRecoverySaving = false;
+        tab.documentRecoveryAvailable = false;
+        this.showTransientNotice('This file is open, but device storage could not protect it for restart recovery.');
+        this.queueSessionSnapshot();
+      });
+      this._documentRecoveryWrites.set(doc.recoveryId, write);
+      write.finally(() => {
+        if (this._documentRecoveryWrites.get(doc.recoveryId) === write) {
+          this._documentRecoveryWrites.delete(doc.recoveryId);
+        }
+      });
+    }
     this.render();
     return doc;
   }
@@ -19762,6 +20784,67 @@ export class BrowserShell {
       });
     }
     return this._pdfjsLibPromise;
+  }
+
+  /** Visible recovery surface for a file that moved, was deleted, or whose
+   * origin-private byte copy was evicted. Never silently drop a file tab. */
+  renderDocumentRecoveryPage(viewport, tab) {
+    const descriptor = this.sanitizeDocumentRecoveryDescriptor(tab.documentRecovery);
+    const page = document.createElement('section');
+    page.className = 'fb-document-recovery-page';
+    page.setAttribute('role', 'alert');
+
+    const card = document.createElement('div');
+    card.className = 'fb-document-recovery-card';
+    const icon = document.createElement('div');
+    icon.className = 'fb-document-recovery-icon';
+    icon.setAttribute('aria-hidden', 'true');
+    icon.innerHTML = Icons.document;
+    const title = document.createElement('h1');
+    title.textContent = descriptor?.name || tab.title || 'Local file';
+    const heading = document.createElement('h2');
+    heading.textContent = 'This file needs your help to reopen';
+    const message = document.createElement('p');
+    message.textContent = descriptor?.libraryId
+      ? 'Yayra kept this tab, but the original file cannot be read from its saved location. It may have moved, been renamed, or become unavailable.'
+      : 'Yayra kept this tab, but its private recovery copy is no longer available. Device storage may have been cleared or could not save the file.';
+    const detail = document.createElement('p');
+    detail.className = 'fb-document-recovery-detail';
+    detail.textContent = descriptor?.size
+      ? `${this.formatDocumentBytes(descriptor.size)} • ${descriptor.mime || 'Local document'}`
+      : (descriptor?.mime || 'Local document');
+
+    const actions = document.createElement('div');
+    actions.className = 'fb-document-recovery-actions';
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'fb-btn fb-btn-primary';
+    retry.textContent = 'Try again';
+    retry.addEventListener('click', () => { void this.retryDocumentRecovery(tab.id); });
+    actions.appendChild(retry);
+
+    const reconnect = document.createElement('button');
+    reconnect.type = 'button';
+    reconnect.className = 'fb-btn fb-btn-secondary';
+    if (descriptor?.libraryId && typeof this.systemBridge?.documents?.locate === 'function') {
+      reconnect.textContent = 'Locate file…';
+      reconnect.addEventListener('click', () => { void this.retryDocumentRecovery(tab.id, { locate: true }); });
+    } else {
+      reconnect.textContent = 'Choose file again…';
+      reconnect.addEventListener('click', () => this.reselectDocumentRecovery(tab.id));
+    }
+    actions.appendChild(reconnect);
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'fb-btn fb-btn-outline';
+    remove.textContent = 'Remove tab';
+    remove.addEventListener('click', () => this.closeTab(tab.id));
+    actions.appendChild(remove);
+
+    for (const child of [icon, title, heading, message, detail, actions]) card.appendChild(child);
+    page.appendChild(card);
+    viewport.appendChild(page);
   }
 
   /** The integrated document tab: toolbar (pages, zoom, search, close) +
@@ -21155,7 +22238,8 @@ export class BrowserShell {
     // A document tab carries its glyph only while it is actually displaying
     // the local document route; navigating away keeps the PDF available for
     // Back, but the current web page should use its own site icon.
-    if (tab.isDocument && String(tab.url || '').startsWith('yayra://doc/')) return Icons.document;
+    if ((tab.isDocument && String(tab.url || '').startsWith('yayra://doc/'))
+      || String(tab.url || '').startsWith('yayra://recover-document/')) return Icons.document;
     // "Time sign" while the page is loading: the tab's icon slot becomes
     // an animated hourglass the moment loading starts, and flips back to
     // the real favicon when the page is fully loaded. Updated in place by
@@ -21634,9 +22718,12 @@ export class BrowserShell {
     }
     this._documentViewerSessions?.clear?.();
     this._activeDocViewer = null;
-    // PDF bytes are intentionally session-memory only; release them with the
-    // shell so an unmounted/closed window cannot retain an open document.
+    // Live document bytes are released with the shell; durable recovery uses
+    // only the separate opaque catalog/IndexedDB capabilities.
     for (const doc of this.documentStore?.list?.() || []) this.documentStore.remove(doc.id);
+    // Full-resolution native captures are large base64 strings. Drop the
+    // bounded cache eagerly when this window is dismantled.
+    this._pageSnapshots?.clear?.();
     // Android overlay-permission grant watcher (poll + listeners).
     if (this._stopOverlayGrantWatch) {
       try { this._stopOverlayGrantWatch(); } catch { /* already stopped */ }
