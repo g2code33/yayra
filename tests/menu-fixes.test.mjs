@@ -91,6 +91,7 @@ test('INSTALL AS APP (Android): a REAL native home-screen shortcut is requested 
   try {
     shell.state.tabs[0].url = 'https://news.example.com/';
     shell.state.tabs[0].title = 'Example News';
+    shell.state.tabs[0].favicon = 'data:image/png;base64,AAAA';
     shell.render(container);
     // The editable-name dialog (pre-filled with the site title) is part of
     // the flow - simulate the user accepting the suggested name.
@@ -99,6 +100,8 @@ test('INSTALL AS APP (Android): a REAL native home-screen shortcut is requested 
     assert.equal(installCalls.length, 1, 'the native install method was called');
     assert.equal(installCalls[0].url, 'https://news.example.com/');
     assert.equal(installCalls[0].title, 'Example News');
+    assert.equal(installCalls[0].iconDataUrl, 'data:image/png;base64,AAAA', 'the live site logo reaches Android');
+    assert.equal(installCalls[0].iconUrl, null);
   } finally {
     shell.destroy();
     delete window.Capacitor;
@@ -110,7 +113,14 @@ test('CAST, SAVE, AND SHARE → INSTALL PAGE AS APP: the submenu click installs 
   const installCalls = [];
   window.yayra = {
     system: {
-      installPageAsAppPreview: async () => ({ ok: true, name: 'Redis', startUrl: 'https://redis.io/?source=app', pwa: true }),
+      installPageAsAppPreview: async () => ({
+        ok: true,
+        name: 'Redis',
+        startUrl: 'https://redis.io/?source=app',
+        pwa: true,
+        iconAvailable: true,
+        iconDataUrl: 'data:image/png;base64,UkVESVM='
+      }),
       installPageAsApp: async (opts) => {
         installCalls.push(opts);
         return { ok: true, name: opts.title, inLauncher: true, pwa: true };
@@ -121,6 +131,7 @@ test('CAST, SAVE, AND SHARE → INSTALL PAGE AS APP: the submenu click installs 
   try {
     shell.state.tabs[0].url = 'https://redis.io/docs/latest/';
     shell.state.tabs[0].title = 'Redis documentation';
+    shell.state.tabs[0].favicon = 'https://redis.io/favicon.ico';
     let confirmation = null;
     shell._installPageAsAppDialog = async (opts) => { confirmation = opts; return 'Redis Docs'; };
     shell.showTransientNotice = () => {};
@@ -138,11 +149,12 @@ test('CAST, SAVE, AND SHARE → INSTALL PAGE AS APP: the submenu click installs 
 
     assert.equal(confirmation.url, 'https://redis.io/docs/latest/', 'confirmation describes the active site');
     assert.equal(confirmation.title, 'Redis', 'site manifest name is suggested');
-    assert.ok(confirmation.iconHtml.includes('redis.io'), 'the site favicon is previewed');
+    assert.ok(confirmation.iconHtml.includes('data:image/png;base64,UkVESVM='), 'the resolved site logo is previewed');
     assert.equal(installCalls.length, 1, 'the submenu click reaches the native installer');
     assert.equal(installCalls[0].url, 'https://redis.io/?source=app', 'the site app start URL is installed');
     assert.equal(installCalls[0].title, 'Redis Docs', 'the edited site name reaches the installer');
     assert.equal(installCalls[0].nameOverride, 'Redis Docs');
+    assert.equal(installCalls[0].favicon, 'https://redis.io/favicon.ico', 'the live site favicon reaches the installer');
   } finally {
     shell.destroy();
     if (previousBridge === undefined) delete window.yayra;
@@ -203,13 +215,20 @@ test('EXIT on web/PWA tells the user to close the browser tab instead of silentl
   }
 });
 
-test('INSTALL AS APP (web): triggers the browser\'s real PWA install flow when available; internal pages are refused honestly', async () => {
-  const { shell, container } = await makeShell();
+test('INSTALL AS APP (web): never installs Yayra in place of the active site', async () => {
+  const { shell } = await makeShell();
+  const oldOpen = window.open;
+  const opened = [];
+  const notices = [];
+  window.open = (...args) => { opened.push(args); return {}; };
   try {
     // Internal page: honest refusal, no prompt.
+    shell.showTransientNotice = (message) => notices.push(String(message));
     shell.state.tabs[0].url = 'yayra://newtab';
     await shell.installPageAsApp();
-    // Web + browser install prompt available: the REAL install flow runs.
+
+    // beforeinstallprompt belongs to Yayra's own origin. It must NOT be used
+    // for a command whose requested identity is example.com.
     let prompted = 0;
     shell._pwaInstallPrompt = {
       prompt: async () => { prompted += 1; },
@@ -217,9 +236,12 @@ test('INSTALL AS APP (web): triggers the browser\'s real PWA install flow when a
     };
     shell.state.tabs[0].url = 'https://example.com/';
     await shell.installPageAsApp();
-    assert.equal(prompted, 1, 'the browser install prompt was triggered');
-    assert.equal(shell._pwaInstallPrompt, null, 'the one-shot prompt is consumed');
+    assert.equal(prompted, 0, 'Yayra installation prompt is never substituted for the site');
+    assert.ok(shell._pwaInstallPrompt, 'Yayra own prompt remains available for an explicit Yayra install elsewhere');
+    assert.equal(opened[0][0], 'https://example.com/', 'site opens top-level for its own browser install flow');
+    assert.match(notices.at(-1), /site.*own logo/i);
   } finally {
+    window.open = oldOpen;
     shell.destroy();
     delete globalThis.localStorage;
   }
@@ -589,11 +611,20 @@ test('KOTTON (Kotlin pin): the Android plugin really implements installSiteAsApp
   assert.ok(src.includes('requestPinShortcut'), 'real pinned-shortcut API on Android 8+');
   assert.ok(src.includes('com.yayra.app:/browse?url='), 'shortcut deep-links back into Yayra on the site');
   assert.ok(src.includes('INSTALL_SHORTCUT'), 'legacy broadcast fallback declared');
-  // SITE LOGO: the shortcut uses the site's own favicon bitmap when it can
-  // be fetched (off the main thread), falling back to the Yayra logo.
-  assert.ok(src.includes('fetchFaviconBitmap'), 'site favicon fetched');
-  assert.ok(src.includes('Icon.createWithBitmap'), 'site bitmap used for the pinned shortcut');
-  assert.ok(src.includes('Intent.EXTRA_SHORTCUT_ICON,'), 'legacy broadcast carries the site bitmap too');
+  // SITE LOGO: live/manifest/HTML favicon candidates are resolved off the
+  // main thread. An iconless site gets a generated identity—never Yayra.
+  assert.ok(src.includes('fetchFaviconBitmap'), 'site favicon pipeline runs');
+  assert.ok(src.includes('providedIconDataUrl'), 'the live tab favicon remains an early fallback after manifest art');
+  assert.ok(src.includes('org.json.JSONObject'), 'Web App Manifest icons are discovered');
+  assert.ok(src.indexOf('org.json.JSONObject') < src.indexOf('providedBitmap?.let'), 'manifest launcher icons are tried before the live favicon fallback');
+  assert.ok(src.includes('apple-touch-icon.png'), 'conventional high-resolution site icon is tried');
+  assert.ok(src.includes('Icon.createWithBitmap(siteBitmap)'), 'site bitmap used for the pinned shortcut');
+  assert.ok(src.includes('Intent.EXTRA_SHORTCUT_ICON, siteBitmap'), 'legacy broadcast carries the site bitmap too');
+  assert.ok(src.includes('generateSiteIdentityBitmap'), 'iconless sites receive an origin-derived neutral identity');
+  assert.ok(src.includes('embeddedPngFromIco'), 'modern ICO favicon payloads are decoded on Android');
+  assert.ok(src.includes('decodeSiteBitmap'), 'untrusted favicon dimensions are bounded before launcher use');
+  assert.ok(!src.includes('site-icon-unavailable'), 'normal iconless installs no longer fail closed');
+  assert.ok(!src.includes('getIdentifier("yayra_bubble_logo"'), 'Yayra logo can never brand an installed site');
   assert.ok(src.includes('Looper.getMainLooper()'), 'network off the main thread, pin on it');
   const ensure = readFileSync(new URL('../scripts/ensure-capacitor-platform.mjs', import.meta.url), 'utf8');
   assert.ok(ensure.includes('com.android.launcher.permission.INSTALL_SHORTCUT'), 'manifest permission injected for legacy devices');

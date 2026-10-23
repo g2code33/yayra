@@ -5,7 +5,12 @@ import android.app.Activity
 import android.content.Intent
 import android.content.pm.ShortcutInfo
 import android.content.pm.ShortcutManager
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
 import android.graphics.drawable.Icon
 import android.net.Uri
 import android.os.Build
@@ -518,6 +523,8 @@ class YayraOverlayPlugin : Plugin() {
             return
         }
         val title = (call.getString("title") ?: url).trim().ifEmpty { url }
+        val providedIconDataUrl = call.getString("iconDataUrl")
+        val providedIconUrl = call.getString("iconUrl")
         // RFC 3986, not application/x-www-form-urlencoded: URLEncoder
         // encodes a space as '+', which the JS side's decodeURIComponent
         // leaves as a literal '+', mangling the deep-linked site URL.
@@ -527,56 +534,57 @@ class YayraOverlayPlugin : Plugin() {
             setPackage(context.packageName)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        // SITE LOGO ON THE HOME SCREEN: fetch the site's own favicon OFF the
-        // main thread (NetworkOnMainThreadException otherwise), then pin the
-        // shortcut on the main thread with the site's bitmap when it
-        // decoded, falling back to the Yayra bubble logo. Best effort only.
+        // SITE LOGO ON THE HOME SCREEN: prefer manifest/page-declared art,
+        // then the live tab favicon and conventional locations off the
+        // main thread. Truly iconless sites receive a deterministic
+        // origin-derived identicon—never Yayra's application resource.
         Thread {
-            val siteBitmap = try { fetchFaviconBitmap(url) } catch (err: Exception) { null }
+            val downloadedBitmap = try {
+                fetchFaviconBitmap(url, providedIconDataUrl, providedIconUrl)
+            } catch (err: Exception) {
+                null
+            }
+            val generatedIcon = downloadedBitmap == null
+            val siteBitmap = downloadedBitmap ?: generateSiteIdentityBitmap(url)
             android.os.Handler(android.os.Looper.getMainLooper()).post {
                 try {
+                    if (siteBitmap == null) {
+                        call.resolve(JSObject().put("ok", false).put("reason", "site-identity-unavailable"))
+                        return@post
+                    }
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                         val shortcutManager = context.getSystemService(ShortcutManager::class.java)
                         if (shortcutManager != null && shortcutManager.isRequestPinShortcutSupported) {
-                            val icon = if (siteBitmap != null) {
-                                Icon.createWithBitmap(siteBitmap)
-                            } else {
-                                val logoResId = context.resources.getIdentifier("yayra_bubble_logo", "drawable", context.packageName)
-                                if (logoResId != 0) {
-                                    Icon.createWithResource(context, logoResId)
-                                } else {
-                                    Icon.createWithResource(context, android.R.drawable.ic_menu_view)
-                                }
-                            }
-                            val shortcut = ShortcutInfo.Builder(context, "yayra-site-${url.hashCode()}")
+                            val shortcutId = "yayra-site-${url.hashCode()}"
+                            val shortcut = ShortcutInfo.Builder(context, shortcutId)
                                 .setShortLabel(title.take(10))
                                 .setLongLabel(title.take(40))
-                                .setIcon(icon)
+                                .setIcon(Icon.createWithBitmap(siteBitmap))
                                 .setIntent(launchIntent)
                                 .build()
+                            // Re-running Install repairs an older pinned shortcut
+                            // that carried Yayra's logo instead of duplicating it.
+                            val alreadyPinned = shortcutManager.pinnedShortcuts.any { it.id == shortcutId }
+                            if (alreadyPinned) {
+                                shortcutManager.updateShortcuts(listOf(shortcut))
+                                call.resolve(JSObject().put("ok", true).put("method", "updated-shortcut").put("generatedIcon", generatedIcon))
+                                return@post
+                            }
                             shortcutManager.requestPinShortcut(shortcut, null)
-                            call.resolve(JSObject().put("ok", true).put("method", "pinned-shortcut"))
+                            call.resolve(JSObject().put("ok", true).put("method", "pinned-shortcut").put("generatedIcon", generatedIcon))
                             return@post
                         }
                     }
                     // Legacy path (pre-Android-8 or launchers without pin support):
-                    // the INSTALL_SHORTCUT broadcast (permission is declared in the
-                    // manifest, injected by scripts/ensure-capacitor-platform.mjs).
-                    val logoResId = context.resources.getIdentifier("yayra_bubble_logo", "drawable", context.packageName)
+                    // the INSTALL_SHORTCUT broadcast carries the same verified
+                    // site bitmap and never an application-resource fallback.
                     val broadcast = Intent("com.android.launcher.action.INSTALL_SHORTCUT").apply {
                         putExtra(Intent.EXTRA_SHORTCUT_NAME, title)
                         putExtra(Intent.EXTRA_SHORTCUT_INTENT, launchIntent)
-                        if (siteBitmap != null) {
-                            putExtra(Intent.EXTRA_SHORTCUT_ICON, siteBitmap)
-                        } else if (logoResId != 0) {
-                            putExtra(
-                                Intent.EXTRA_SHORTCUT_ICON_RESOURCE,
-                                Intent.ShortcutIconResource.fromContext(context, logoResId)
-                            )
-                        }
+                        putExtra(Intent.EXTRA_SHORTCUT_ICON, siteBitmap)
                     }
                     context.sendBroadcast(broadcast)
-                    call.resolve(JSObject().put("ok", true).put("method", "legacy-broadcast"))
+                    call.resolve(JSObject().put("ok", true).put("method", "legacy-broadcast").put("generatedIcon", generatedIcon))
                 } catch (err: Exception) {
                     call.reject("install-failed: ${err.message}")
                 }
@@ -619,27 +627,273 @@ class YayraOverlayPlugin : Plugin() {
         }
     }
 
-    /**
-     * Best-effort fetch + decode of the site's own favicon (PNG data served
-     * at /favicon.ico decodes cleanly; true ICO containers may not - the
-     * caller falls back to the Yayra logo). Time-boxed to 4s.
-     */
-    private fun fetchFaviconBitmap(siteUrl: String?): android.graphics.Bitmap? {
-        if (siteUrl == null) return null
+    private fun htmlAttribute(tag: String, name: String): String {
+        val escaped = Regex.escape(name)
+        val match = Regex(
+            """\b$escaped\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'<>]+))""",
+            RegexOption.IGNORE_CASE
+        ).find(tag) ?: return ""
+        return match.groupValues.drop(1).firstOrNull { it.isNotEmpty() } ?: ""
+    }
+
+    private fun absoluteHttpUrl(base: String, candidate: String?): String? {
+        if (candidate.isNullOrBlank()) return null
         return try {
-            val host = java.net.URI(siteUrl).host ?: return null
-            val conn = java.net.URL("https://$host/favicon.ico").openConnection() as java.net.HttpURLConnection
-            conn.connectTimeout = 4000
-            conn.readTimeout = 4000
+            val resolved = java.net.URI(base).resolve(candidate.trim())
+            if (resolved.scheme == "http" || resolved.scheme == "https") resolved.toString() else null
+        } catch (err: Exception) {
+            null
+        }
+    }
+
+    private fun fetchIconBytes(target: String, maxBytes: Int): ByteArray? {
+        var conn: java.net.HttpURLConnection? = null
+        return try {
+            val parsed = java.net.URL(target)
+            if (parsed.protocol != "http" && parsed.protocol != "https") return null
+            conn = parsed.openConnection() as java.net.HttpURLConnection
+            conn.connectTimeout = 5000
+            conn.readTimeout = 5000
             conn.instanceFollowRedirects = true
-            if (conn.responseCode !in 200..299) {
-                conn.disconnect()
-                return null
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36")
+            conn.setRequestProperty("Accept", "image/*,application/manifest+json,text/html;q=0.8,*/*;q=0.5")
+            if (conn.responseCode !in 200..299) return null
+            if (conn.contentLength > maxBytes) return null
+            val output = java.io.ByteArrayOutputStream()
+            conn.inputStream.use { input ->
+                val buffer = ByteArray(16 * 1024)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    output.write(buffer, 0, read)
+                    if (output.size() > maxBytes) return null
+                }
             }
-            val bytes = conn.inputStream.use { it.readBytes() }
-            conn.disconnect()
-            if (bytes.isEmpty() || bytes.size > 512_000) return null
-            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            output.toByteArray().takeIf { it.isNotEmpty() }
+        } catch (err: Exception) {
+            null
+        } finally {
+            try { conn?.disconnect() } catch (_err: Exception) { }
+        }
+    }
+
+    private fun littleEndianInt(bytes: ByteArray, offset: Int): Int {
+        if (offset < 0 || offset + 4 > bytes.size) return -1
+        return (bytes[offset].toInt() and 0xff) or
+            ((bytes[offset + 1].toInt() and 0xff) shl 8) or
+            ((bytes[offset + 2].toInt() and 0xff) shl 16) or
+            ((bytes[offset + 3].toInt() and 0xff) shl 24)
+    }
+
+    /** Modern ICO files usually embed their best entry as a normal PNG. */
+    private fun embeddedPngFromIco(bytes: ByteArray): ByteArray? {
+        if (bytes.size < 22 || bytes[0].toInt() != 0 || bytes[1].toInt() != 0 ||
+            (bytes[2].toInt() and 0xff) != 1 || bytes[3].toInt() != 0
+        ) return null
+        val count = (bytes[4].toInt() and 0xff) or ((bytes[5].toInt() and 0xff) shl 8)
+        if (count <= 0 || count > 128 || 6 + (count * 16) > bytes.size) return null
+        var best: ByteArray? = null
+        var bestArea = -1
+        val signature = byteArrayOf(0x89.toByte(), 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)
+        for (index in 0 until count) {
+            val entry = 6 + (index * 16)
+            val width = (bytes[entry].toInt() and 0xff).let { if (it == 0) 256 else it }
+            val height = (bytes[entry + 1].toInt() and 0xff).let { if (it == 0) 256 else it }
+            val length = littleEndianInt(bytes, entry + 8)
+            val offset = littleEndianInt(bytes, entry + 12)
+            if (length <= signature.size || offset < 0 || offset.toLong() + length.toLong() > bytes.size.toLong()) continue
+            var png = true
+            for (byteIndex in signature.indices) {
+                if (bytes[offset + byteIndex] != signature[byteIndex]) { png = false; break }
+            }
+            if (!png || width * height <= bestArea) continue
+            best = bytes.copyOfRange(offset, offset + length)
+            bestArea = width * height
+        }
+        return best
+    }
+
+    /** Decode untrusted favicon bytes at a launcher-safe memory/dimension cap. */
+    private fun decodeSiteBitmap(input: ByteArray): Bitmap? {
+        if (input.isEmpty() || input.size > 2_000_000) return null
+        val bytes = embeddedPngFromIco(input) ?: input
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        val width = bounds.outWidth
+        val height = bounds.outHeight
+        if (width <= 0 || height <= 0 || width > 32_768 || height > 32_768) return null
+        var sample = 1
+        while (maxOf(width, height) / sample > 1024) sample *= 2
+        val decoded = BitmapFactory.decodeByteArray(
+            bytes,
+            0,
+            bytes.size,
+            BitmapFactory.Options().apply { inSampleSize = sample }
+        ) ?: return null
+        val maxDimension = maxOf(decoded.width, decoded.height)
+        if (maxDimension <= 512) return decoded
+        val scale = 512.0 / maxDimension.toDouble()
+        val scaled = Bitmap.createScaledBitmap(
+            decoded,
+            (decoded.width * scale).toInt().coerceAtLeast(1),
+            (decoded.height * scale).toInt().coerceAtLeast(1),
+            true
+        )
+        if (scaled !== decoded) decoded.recycle()
+        return scaled
+    }
+
+    /** Stable, neutral fallback for a site that publishes no decodable art. */
+    private fun generateSiteIdentityBitmap(siteUrl: String): Bitmap? {
+        return try {
+            val parsed = java.net.URI(siteUrl)
+            val scheme = parsed.scheme?.lowercase(Locale.US) ?: return null
+            val authority = parsed.rawAuthority?.lowercase(Locale.US) ?: return null
+            if (scheme != "http" && scheme != "https") return null
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+                .digest("$scheme://$authority".toByteArray(Charsets.UTF_8))
+            val hue = ((((digest[0].toInt() and 0xff) shl 8) or (digest[1].toInt() and 0xff)) % 360).toFloat()
+            val background = Color.HSVToColor(floatArrayOf(hue, 0.62f, 0.58f))
+            val foreground = Color.HSVToColor(floatArrayOf((hue + 165f) % 360f, 0.38f, 0.98f))
+            val accent = Color.HSVToColor(floatArrayOf((hue + 38f) % 360f, 0.72f, 0.92f))
+            val size = 256
+            val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bitmap)
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+            paint.color = background
+            canvas.drawRoundRect(RectF(0f, 0f, size.toFloat(), size.toFloat()), 46f, 46f, paint)
+
+            val margin = 48f
+            val gap = 5f
+            val cell = (size - (margin * 2f) - (gap * 4f)) / 5f
+            for (row in 0 until 5) {
+                for (sourceColumn in 0 until 3) {
+                    val digestIndex = 5 + (row * 3) + sourceColumn
+                    val value = digest[digestIndex].toInt() and 0xff
+                    if ((value and 1) == 0) continue
+                    val columns = if (sourceColumn == 2) intArrayOf(2) else intArrayOf(sourceColumn, 4 - sourceColumn)
+                    paint.color = if ((value and 2) == 2) accent else foreground
+                    for (column in columns) {
+                        val left = margin + (column * (cell + gap))
+                        val top = margin + (row * (cell + gap))
+                        canvas.drawRoundRect(RectF(left, top, left + cell, top + cell), 4f, 4f, paint)
+                    }
+                }
+            }
+            bitmap
+        } catch (err: Exception) {
+            null
+        }
+    }
+
+    private fun decodeProvidedIcon(dataUrl: String?): Bitmap? {
+        if (dataUrl.isNullOrBlank() || dataUrl.length > 4_000_000) return null
+        return try {
+            if (!dataUrl.startsWith("data:image/", ignoreCase = true)) return null
+            val comma = dataUrl.indexOf(',')
+            if (comma < 0 || !dataUrl.substring(0, comma).contains(";base64", ignoreCase = true)) return null
+            val bytes = android.util.Base64.decode(dataUrl.substring(comma + 1), android.util.Base64.DEFAULT)
+            decodeSiteBitmap(bytes)
+        } catch (err: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Resolve the site's own launcher bitmap from the live tab, Web App
+     * Manifest, HTML icon links, conventional favicon names, or a final
+     * favicon mirror. Returning null asks the caller for an origin-derived
+     * neutral identicon; it never selects Yayra's bundled application logo.
+     */
+    private fun fetchFaviconBitmap(
+        siteUrl: String?,
+        providedIconDataUrl: String?,
+        providedIconUrl: String?
+    ): android.graphics.Bitmap? {
+        if (siteUrl == null) return null
+        val providedBitmap = decodeProvidedIcon(providedIconDataUrl)
+
+        return try {
+            val siteUri = java.net.URI(siteUrl)
+            val host = siteUri.host ?: return null
+            val authority = siteUri.rawAuthority ?: host
+            val candidates = mutableListOf<String>()
+            fun add(candidate: String?) {
+                val resolved = absoluteHttpUrl(siteUrl, candidate) ?: return
+                if (!candidates.contains(resolved)) candidates.add(resolved)
+            }
+
+            val pageBytes = fetchIconBytes(siteUrl, 768_000)
+            val html = pageBytes?.toString(Charsets.UTF_8) ?: ""
+            val linkTags = Regex("""<link\b[^>]*>""", RegexOption.IGNORE_CASE)
+                .findAll(html.take(768_000)).map { it.value }.toList()
+
+            // Manifest icons are the site's explicit installed-app identity.
+            val manifestHref = linkTags.firstNotNullOfOrNull { tag ->
+                val rel = htmlAttribute(tag, "rel").lowercase().split(Regex("""\s+"""))
+                if (rel.contains("manifest")) htmlAttribute(tag, "href").ifBlank { null } else null
+            }
+            val manifestUrl = absoluteHttpUrl(siteUrl, manifestHref)
+            if (manifestUrl != null) {
+                val manifestText = fetchIconBytes(manifestUrl, 512_000)?.toString(Charsets.UTF_8)
+                if (!manifestText.isNullOrBlank()) {
+                    try {
+                        val icons = org.json.JSONObject(manifestText).optJSONArray("icons")
+                        val ranked = mutableListOf<Pair<Int, String>>()
+                        if (icons != null) {
+                            for (index in 0 until icons.length()) {
+                                val icon = icons.optJSONObject(index) ?: continue
+                                val src = icon.optString("src")
+                                val purpose = icon.optString("purpose", "any").lowercase()
+                                if (src.isBlank() || (purpose.contains("monochrome") && !purpose.contains("any") && !purpose.contains("maskable"))) continue
+                                val absolute = absoluteHttpUrl(manifestUrl, src) ?: continue
+                                val size = Regex("""(\d+)\s*x\s*(\d+)""").findAll(icon.optString("sizes"))
+                                    .map { match -> match.groupValues[1].toIntOrNull()?.times(match.groupValues[2].toIntOrNull() ?: 0) ?: 0 }
+                                    .maxOrNull() ?: 0
+                                ranked.add(Pair(size, absolute))
+                            }
+                        }
+                        ranked.sortedByDescending { it.first }.take(12).forEach { add(it.second) }
+                    } catch (_err: Exception) { /* malformed manifest: continue */ }
+                }
+            }
+
+            // Non-PWA pages still own their declared favicon/touch icon.
+            val htmlIcons = mutableListOf<Pair<Int, String>>()
+            linkTags.forEach { tag ->
+                val rel = htmlAttribute(tag, "rel").lowercase().split(Regex("""\s+"""))
+                if (!rel.contains("icon") && !rel.contains("apple-touch-icon")) return@forEach
+                val href = absoluteHttpUrl(siteUrl, htmlAttribute(tag, "href")) ?: return@forEach
+                val sizes = htmlAttribute(tag, "sizes")
+                val score = Regex("""(\d+)\s*x\s*(\d+)""").find(sizes)?.groupValues?.get(1)?.toIntOrNull()
+                    ?: if (rel.contains("apple-touch-icon")) 180 else 32
+                htmlIcons.add(Pair(score, href))
+            }
+            htmlIcons.sortedByDescending { it.first }.take(8).forEach { add(it.second) }
+
+            // Manifest launcher art and declared touch/favicons outrank the
+            // live Chromium favicon supplied by the tab, matching PWA rules.
+            for (candidate in candidates) {
+                val bytes = fetchIconBytes(candidate, 2_000_000) ?: continue
+                val bitmap = decodeSiteBitmap(bytes)
+                if (bitmap != null) return bitmap
+            }
+            providedBitmap?.let { return it }
+            val declaredCount = candidates.size
+            add(providedIconUrl)
+            add("${siteUri.scheme}://$authority/favicon.ico")
+            add("${siteUri.scheme}://$authority/favicon.png")
+            add("${siteUri.scheme}://$authority/apple-touch-icon.png")
+            val origin = "${siteUri.scheme}://$authority"
+            val encodedOrigin = java.net.URLEncoder.encode(origin, "UTF-8")
+            add("https://www.google.com/s2/favicons?domain_url=$encodedOrigin&sz=256")
+
+            for (index in declaredCount until candidates.size) {
+                val bytes = fetchIconBytes(candidates[index], 2_000_000) ?: continue
+                val bitmap = decodeSiteBitmap(bytes)
+                if (bitmap != null) return bitmap
+            }
+            null
         } catch (err: Exception) {
             null
         }

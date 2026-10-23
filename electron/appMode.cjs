@@ -73,6 +73,8 @@ function slugify(name) {
  *   { kind:'shortcut', path, options }                 (Windows .lnk via shell.writeShortcutLink)
  * Linux gets BOTH a desktop icon and an applications-menu entry - that
  * applications entry is what makes it feel "installed" like a PWA.
+ * Linux/Windows require an explicit verified site icon: omitting it would make
+ * the OS inherit Yayra's executable/hicolor logo and misbrand the shortcut.
  */
 function buildInstallPlan({ platform, execPath, url, title, desktopDir, applicationsDir = null, startMenuDir = null, iconPath = null }) {
   if (!url || !/^https?:\/\//i.test(String(url))) return { ok: false, reason: 'invalid-url' };
@@ -85,6 +87,7 @@ function buildInstallPlan({ platform, execPath, url, title, desktopDir, applicat
   const join = (dir, file) => `${String(dir).replace(/[\\/]+$/, '')}${platform === 'win32' ? '\\' : '/'}${file}`;
 
   if (platform === 'linux') {
+    if (!iconPath) return { ok: false, reason: 'site-icon-unavailable' };
     const contents = '[Desktop Entry]\n'
       + 'Type=Application\n'
       + `Name=${name}\n`
@@ -108,6 +111,7 @@ function buildInstallPlan({ platform, execPath, url, title, desktopDir, applicat
   }
 
   if (platform === 'win32') {
+    if (!iconPath) return { ok: false, reason: 'site-icon-unavailable' };
     const options = {
       target: execPath,
       args: `--app="${normalized}"`,

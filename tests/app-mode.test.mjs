@@ -42,7 +42,7 @@ test('buildInstallPlan linux: desktop + applications-menu .desktop entries launc
     title: 'YouTube Music',
     desktopDir: '/home/me/Desktop',
     applicationsDir: '/home/me/.local/share/applications',
-    iconPath: '/opt/Yayra/icon.png'
+    iconPath: '/home/me/.config/yayra/pwa-icons/site.png'
   });
   assert.equal(plan.ok, true);
   assert.equal(plan.name, 'YouTube Music');
@@ -57,12 +57,12 @@ test('buildInstallPlan linux: desktop + applications-menu .desktop entries launc
     assert.match(artifact.contents, /^\[Desktop Entry\]\n/);
     assert.ok(artifact.contents.includes('Exec="/opt/Yayra/yayra" --app="https://music.youtube.com/"'));
     assert.ok(artifact.contents.includes('Name=YouTube Music'));
-    assert.ok(artifact.contents.includes('Icon=/opt/Yayra/icon.png'));
+    assert.ok(artifact.contents.includes('Icon=/home/me/.config/yayra/pwa-icons/site.png'));
     assert.ok(artifact.contents.includes('Terminal=false'));
   }
 });
 
-test('buildInstallPlan linux without applicationsDir: desktop entry only, not in launcher', () => {
+test('buildInstallPlan linux fails closed instead of inheriting the Yayra icon', () => {
   const plan = buildInstallPlan({
     platform: 'linux',
     execPath: '/opt/Yayra/yayra',
@@ -70,10 +70,7 @@ test('buildInstallPlan linux without applicationsDir: desktop entry only, not in
     title: 'Example',
     desktopDir: '/home/me/Desktop'
   });
-  assert.equal(plan.ok, true);
-  assert.equal(plan.inLauncher, false);
-  assert.equal(plan.artifacts.length, 1);
-  assert.ok(!plan.artifacts[0].contents.includes('Icon='));
+  assert.deepEqual(plan, { ok: false, reason: 'site-icon-unavailable' });
 });
 
 test('buildInstallPlan win32: desktop + Start Menu shortcuts with --app args', () => {
@@ -84,7 +81,7 @@ test('buildInstallPlan win32: desktop + Start Menu shortcuts with --app args', (
     title: 'Example App',
     desktopDir: 'C:\\Users\\me\\Desktop',
     startMenuDir: 'C:\\Users\\me\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs',
-    iconPath: 'C:\\Yayra\\yayra.ico'
+    iconPath: 'C:\\Users\\me\\AppData\\Roaming\\yayra\\pwa-icons\\site.ico'
   });
   assert.equal(plan.ok, true);
   assert.equal(plan.inLauncher, true);
@@ -96,7 +93,7 @@ test('buildInstallPlan win32: desktop + Start Menu shortcuts with --app args', (
   for (const artifact of plan.artifacts) {
     assert.equal(artifact.options.target, 'C:\\Yayra\\yayra.exe');
     assert.equal(artifact.options.args, '--app="https://example.com/app"');
-    assert.equal(artifact.options.icon, 'C:\\Yayra\\yayra.ico');
+    assert.equal(artifact.options.icon, 'C:\\Users\\me\\AppData\\Roaming\\yayra\\pwa-icons\\site.ico');
   }
 });
 
@@ -140,32 +137,42 @@ test('install handler (source pin): AppImage shortcuts target the .AppImage FILE
   assert.ok(!block.includes('iconCandidate'), 'no unshipped PNG icon candidate');
 });
 
-test('install handler (source pin): the TRUE PWA flow - the SITE OWN name/icon/start url, icon fallbacks per platform', () => {
+test('install handler (source pin): the TRUE site-app flow requires the SITE OWN name/icon/start url', () => {
   const src = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
   const start = src.indexOf("ipcMain.handle('yayra:install-page-as-app'");
   const block = src.slice(start, start + 4000);
   assert.ok(start > -1, 'handler exists');
   assert.match(block, /async \(_event/, 'the handler is async (manifest fetches)');
-  assert.match(block, /resolvePwaInstallIdentity\(url, title\)/, 'the site own PWA identity is resolved');
-  assert.match(block, /iconPath = identity\.iconFile \|\| \(process\.platform === 'linux' \? 'yayra' : null\)/,
-    'the SITE OWN icon file is used, with the honest per-platform fallback');
+  assert.match(block, /resolvePwaInstallIdentity\(url, title, favicon\)/, 'the site identity includes the live page favicon');
+  assert.match(block, /if \(!identity\.iconFile\) return \{ ok: false, reason: 'site-icon-unavailable' \};/,
+    'a missing site logo aborts instead of inheriting Yayra branding');
+  assert.match(block, /const iconPath = identity\.iconFile;/, 'the SITE OWN icon file is the only icon');
+  assert.doesNotMatch(block, /\? 'yayra'|yayra_bubble_logo/, 'no Yayra fallback remains');
   assert.match(block, /url: identity\.startUrl/, 'the manifest start url is installed');
   assert.match(block, /title: installName/, 'the site own (or user-edited) name is installed');
   assert.match(block, /pwa: identity\.pwa/, 'the renderer learns whether it was a true PWA install');
 });
 
-test('buildInstallPlan linux: a bare hicolor icon NAME is written verbatim (Icon=yayra)', () => {
-  const plan = buildInstallPlan({
+test('buildInstallPlan linux requires an explicit verified site icon', () => {
+  const rejected = buildInstallPlan({
+    platform: 'linux',
+    execPath: '/home/me/Applications/yayra.AppImage',
+    url: 'https://music.youtube.com/',
+    title: 'YouTube Music',
+    desktopDir: '/home/me/Desktop'
+  });
+  assert.deepEqual(rejected, { ok: false, reason: 'site-icon-unavailable' });
+
+  const accepted = buildInstallPlan({
     platform: 'linux',
     execPath: '/home/me/Applications/yayra.AppImage',
     url: 'https://music.youtube.com/',
     title: 'YouTube Music',
     desktopDir: '/home/me/Desktop',
-    iconPath: 'yayra'
+    iconPath: '/home/me/.config/yayra/pwa-icons/site.png'
   });
-  assert.equal(plan.ok, true);
-  assert.ok(plan.artifacts[0].contents.includes('Icon=yayra\n'));
-  assert.ok(plan.artifacts[0].contents.includes('Exec="/home/me/Applications/yayra.AppImage" --app="https://music.youtube.com/"'));
+  assert.equal(accepted.ok, true);
+  assert.match(accepted.artifacts[0].contents, /Icon=\/home\/me\/\.config\/yayra\/pwa-icons\/site\.png/);
 });
 
 
@@ -189,7 +196,8 @@ test('buildInstallPlan linux: StartupWMClass matches the class the real window w
     url,
     title: 'YouTube Music',
     desktopDir: '/home/me/Desktop',
-    applicationsDir: '/home/me/.local/share/applications'
+    applicationsDir: '/home/me/.local/share/applications',
+    iconPath: '/home/me/.config/yayra/pwa-icons/site.png'
   });
   const expected = `StartupWMClass=${appWindowClass(url)}`;
   for (const artifact of plan.artifacts) {

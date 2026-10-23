@@ -10,7 +10,7 @@ const { registerDesktopUpdateHandlers } = require('./desktopUpdater.cjs');
 const { createWebviewBridge, buildContextMenuTemplate, buildBrowserUserAgent } = require('./webviewBridge.cjs');
 const { parseAppModeUrl, buildInstallPlan, appWindowClass } = require('./appMode.cjs');
 const { parsePdfFileArg } = require('./pdfLaunch.cjs');
-const { extractManifestLink, extractIconLink, parseManifest, pickInstallIdentity, isPngBuffer, isIcoBuffer, pngToIco } = require('./pwaManifest.cjs');
+const { extractManifestLink, parseManifest, pickInstallIdentity, siteIconCandidates, isPngBuffer, isIcoBuffer, extractPngFromIco, generateSiteIdentityPng, pngToIco } = require('./pwaManifest.cjs');
 const { startGlobalHotkeys } = require('./globalHotkeys.cjs');
 const { createAuthBridge } = require('./authBridge.cjs');
 const { createAuthStore } = require('./authStore.cjs');
@@ -351,12 +351,14 @@ function createAppModeWindow(url) {
   }
   let hostname = 'app';
   try { hostname = new URL(url).hostname; } catch { /* keep default */ }
+  const siteIconFile = cachedSiteIconFile(normalized);
   const win = new BrowserWindow({
     width: 1100,
     height: 760,
     autoHideMenuBar: true,
     backgroundColor: '#101218',
     title: hostname,
+    ...(siteIconFile ? { icon: siteIconFile } : {}),
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -381,6 +383,18 @@ function createAppModeWindow(url) {
     try { win.setTitle(pageTitle || hostname); } catch { /* closing */ }
   });
   win.loadURL(url);
+  // Older shortcuts created before site-icon enforcement may not have a
+  // cached bitmap yet. Repair the running taskbar/dock identity in place; new
+  // installs already have siteIconFile before this window can be launched.
+  if (!siteIconFile) {
+    resolvePwaInstallIdentity(normalized, hostname).then((identity) => {
+      try {
+        if (identity.iconFile && !win.isDestroyed() && typeof win.setIcon === 'function') {
+          win.setIcon(identity.iconFile);
+        }
+      } catch { /* window closed or platform has no mutable icon */ }
+    }).catch(() => {});
+  }
   appModeWindows.set(normalized, win);
   win.on('closed', () => { appModeWindows.delete(normalized); });
   return win;
@@ -429,29 +443,137 @@ function flushPendingPdfFiles() {
   }
 }
 
+/** Stable cache key shared by installation and the later app-mode window. */
+function siteIconCacheSlug(url) {
+  return crypto.createHash('sha1').update(String(url || '')).digest('hex').slice(0, 16);
+}
+
+function cachedSiteIconFile(url, platform = process.platform) {
+  try {
+    const dir = path.join(app.getPath('userData'), 'pwa-icons');
+    const slug = siteIconCacheSlug(new URL(String(url)).toString());
+    // A downloaded site logo always supersedes an older generated identity.
+    const candidates = platform === 'win32'
+      ? [
+          path.join(dir, `${slug}.ico`),
+          path.join(dir, `${slug}.png`),
+          path.join(dir, `${slug}-generated.ico`),
+          path.join(dir, `${slug}-generated.png`)
+        ]
+      : [path.join(dir, `${slug}.png`), path.join(dir, `${slug}-generated.png`)];
+    return candidates.find((candidate) => fs.existsSync(candidate)) || null;
+  } catch {
+    return null;
+  }
+}
+
+function isGeneratedSiteIconFile(iconFile) {
+  return /-generated\.(?:png|ico)$/i.test(String(iconFile || ''));
+}
+
+/** Decode PNG/JPEG/WebP/ICO (where Chromium supports it) to launcher PNG. */
+function normalizeSiteIconToPng(bytes) {
+  const decodableBytes = extractPngFromIco(bytes) || bytes;
+  try {
+    let image = nativeImage.createFromBuffer(decodableBytes);
+    if (!image || image.isEmpty()) return isPngBuffer(decodableBytes) ? decodableBytes : null;
+    const size = image.getSize();
+    const width = Number(size.width) || 0;
+    const height = Number(size.height) || 0;
+    const maxDimension = Math.max(width, height);
+    if (width <= 0 || height <= 0) return null;
+    // Preserve the site's authored aspect ratio. Upscale tiny favicons enough
+    // for launcher rendering, and cap huge/untrusted artwork at 512 px.
+    const target = maxDimension < 128 ? 256 : (maxDimension > 512 ? 512 : maxDimension);
+    if (target !== maxDimension) {
+      image = width >= height
+        ? image.resize({ width: target, quality: 'best' })
+        : image.resize({ height: target, quality: 'best' });
+    }
+    const png = image.toPNG();
+    return isPngBuffer(png) ? png : null;
+  } catch {
+    return isPngBuffer(decodableBytes) ? decodableBytes : null;
+  }
+}
+
+function persistSiteIcon(startUrl, bytes, { generated = false } = {}) {
+  try {
+    const png = normalizeSiteIconToPng(bytes);
+    const originalIco = isIcoBuffer(bytes) ? bytes : null;
+    if (!png && !(process.platform === 'win32' && originalIco)) return null;
+    const dir = path.join(app.getPath('userData'), 'pwa-icons');
+    fs.mkdirSync(dir, { recursive: true });
+    const slug = siteIconCacheSlug(new URL(String(startUrl)).toString());
+    const suffix = generated ? '-generated' : '';
+    let pngPath = null;
+    if (png) {
+      pngPath = path.join(dir, `${slug}${suffix}.png`);
+      fs.writeFileSync(pngPath, png);
+    }
+    let iconFile = pngPath;
+    if (process.platform === 'win32') {
+      const icoPath = path.join(dir, `${slug}${suffix}.ico`);
+      fs.writeFileSync(icoPath, png ? pngToIco(png) : originalIco);
+      iconFile = icoPath;
+    }
+    return {
+      iconFile,
+      generated,
+      iconDataUrl: png
+        ? `data:image/png;base64,${png.toString('base64')}`
+        : `data:image/x-icon;base64,${originalIco.toString('base64')}`
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
- * TRUE PWA INSTALL - the site's own identity for "Install page as app":
- * reads the site's Web App Manifest (its OWN name, OWN icon, OWN
- * start_url) and downloads its own icon into userData/pwa-icons, so the
- * desktop entry is a PWA OF THAT SITE - exactly like Chrome's install -
- * not a shortcut stamped with Yayra's branding. Windows .lnk icons need
- * .ico, so a PNG icon is wrapped via pngToIco(); Linux .desktop entries
- * take the absolute PNG path. Non-PWA sites fall back honestly (page
- * title, the site's favicon.ico on Windows, the Yayra hicolor name on
- * Linux). Everything is strictly time-boxed and never throws - a slow
- * or missing manifest can only degrade the branding, never the install.
+ * TRUE PWA INSTALL - resolve and persist the site's own identity. Manifest and
+ * HTML icons win, followed by conventional same-origin favicon locations and
+ * favicon mirrors. Every raster format Chromium can decode is normalized to a
+ * launcher-safe PNG (plus ICO on Windows). There is deliberately NO Yayra-logo
+ * fallback: if real site artwork cannot be obtained, an origin-derived neutral
+ * identicon is generated so the site still installs with its own identity.
  */
-async function resolvePwaInstallIdentity(url, pageTitle) {
-  const fallback = { name: pageTitle || '', startUrl: url, iconFile: null, pwa: false };
+async function resolvePwaInstallIdentity(url, pageTitle, preferredIcon = null) {
+  const fallback = { name: pageTitle || '', startUrl: url, iconFile: null, iconDataUrl: null, generatedIcon: false, pwa: false };
   try {
     if (!url || !/^https?:\/\//i.test(String(url))) return fallback;
     const ua = buildBrowserUserAgent({ platform: process.platform, chromeVersion: process.versions.chrome });
-    const fetchBoxed = async (target, ms) => {
+    const fetchBytesBoxed = async (target, ms, maxBytes) => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), ms);
       try {
-        const res = await net.fetch(target, { signal: controller.signal, headers: { 'User-Agent': ua, Accept: '*/*' }, redirect: 'follow' });
-        return res && res.ok ? res : null;
+        const res = await net.fetch(target, {
+          signal: controller.signal,
+          headers: { 'User-Agent': ua, Accept: 'image/*,application/manifest+json,text/html;q=0.8,*/*;q=0.5' },
+          redirect: 'follow'
+        });
+        if (!res || !res.ok) return null;
+        const declaredLength = Number(res.headers?.get?.('content-length'));
+        if (Number.isFinite(declaredLength) && declaredLength > maxBytes) return null;
+        if (!res.body || typeof res.body.getReader !== 'function') {
+          const bytes = Buffer.from(await res.arrayBuffer());
+          return bytes.length > 0 && bytes.length <= maxBytes ? bytes : null;
+        }
+        const reader = res.body.getReader();
+        const chunks = [];
+        let total = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = Buffer.from(value);
+          total += chunk.length;
+          if (total > maxBytes) {
+            controller.abort();
+            try { await reader.cancel(); } catch { /* already aborted */ }
+            return null;
+          }
+          chunks.push(chunk);
+        }
+        return total > 0 ? Buffer.concat(chunks, total) : null;
       } catch {
         return null;
       } finally {
@@ -459,59 +581,81 @@ async function resolvePwaInstallIdentity(url, pageTitle) {
       }
     };
 
-    // 1. The page's HTML -> its manifest link -> the manifest itself.
+    // 1. The page's HTML -> its manifest link -> manifest-owned identity.
     let manifest = null;
     let manifestUrl = null;
     let html = '';
-    const pageRes = await fetchBoxed(url, 6000);
-    if (pageRes) {
-      html = await pageRes.text().catch(() => '');
+    const pageBytes = await fetchBytesBoxed(url, 6000, 768 * 1024);
+    if (pageBytes) {
+      html = pageBytes.toString('utf8');
       manifestUrl = extractManifestLink(html, url);
       if (manifestUrl) {
-        const manifestRes = await fetchBoxed(manifestUrl, 6000);
-        if (manifestRes) manifest = parseManifest(await manifestRes.text().catch(() => ''));
+        const manifestBytes = await fetchBytesBoxed(manifestUrl, 6000, 512 * 1024);
+        if (manifestBytes) manifest = parseManifest(manifestBytes.toString('utf8'));
       }
     }
     const identity = pickInstallIdentity({ manifest, manifestUrl, pageUrl: url, pageTitle });
 
-    // 2. The site's OWN icon: the manifest icon, else the page's own
-    // <link rel="icon"> / apple-touch-icon, else favicon.ico.
-    let iconUrl = identity.iconSrc;
-    if (!iconUrl && html) iconUrl = extractIconLink(html, url);
-    if (!iconUrl) {
-      try { iconUrl = new URL('/favicon.ico', url).toString(); } catch { iconUrl = null; }
-    }
-    let iconFile = null;
-    if (iconUrl) {
-      const iconRes = await fetchBoxed(iconUrl, 6000);
-      if (iconRes) {
-        const bytes = Buffer.from(await iconRes.arrayBuffer().catch(() => new ArrayBuffer(0)));
-        if (bytes.length > 0 && bytes.length <= 3 * 1024 * 1024) {
-          const dir = path.join(app.getPath('userData'), 'pwa-icons');
-          fs.mkdirSync(dir, { recursive: true });
-          const slug = crypto.createHash('sha1').update(identity.startUrl).digest('hex').slice(0, 16);
-          if (isPngBuffer(bytes)) {
-            const pngPath = path.join(dir, `${slug}.png`);
-            fs.writeFileSync(pngPath, bytes);
-            if (process.platform === 'win32') {
-              const icoPath = path.join(dir, `${slug}.ico`);
-              fs.writeFileSync(icoPath, pngToIco(bytes));
-              iconFile = icoPath;
-            } else {
-              iconFile = pngPath; // Linux .desktop: absolute PNG path
-            }
-          } else if (isIcoBuffer(bytes) && process.platform === 'win32') {
-            const icoPath = path.join(dir, `${slug}.ico`);
-            fs.writeFileSync(icoPath, bytes);
-            iconFile = icoPath;
-          } // Linux can't use .ico in Icon= - the hicolor fallback stays
-        }
+    // 2. Try every site-logo source in priority order. Do not stop at an ICO,
+    // JPEG, or WebP response merely because Linux launchers need PNG: Electron
+    // can decode and normalize those formats first.
+    let persisted = null;
+    const iconUrls = siteIconCandidates({ manifest, manifestUrl, html, pageUrl: url, preferredIcon }).slice(0, 32);
+    // Fetch a bounded batch in parallel but evaluate it in declared priority
+    // order. Normal iconless sites wait one network window—not 6 seconds per
+    // candidate—while hostile manifests cannot allocate 32 large responses at
+    // once.
+    for (let offset = 0; offset < iconUrls.length && !persisted; offset += 8) {
+      const batch = await Promise.all(
+        iconUrls.slice(offset, offset + 8)
+          .map((iconUrl) => fetchBytesBoxed(iconUrl, 6000, 3 * 1024 * 1024))
+      );
+      for (const bytes of batch) {
+        if (!bytes) continue;
+        persisted = persistSiteIcon(identity.startUrl, bytes);
+        if (persisted) break;
       }
     }
-    return { name: identity.name, startUrl: identity.startUrl, iconFile, pwa: identity.pwa };
+
+    // Reuse a previously verified site icon when the network is temporarily
+    // unavailable. It is keyed by the exact normalized start URL, never by the
+    // Yayra executable or application icon. If the site truly has no usable
+    // artwork, persist a deterministic origin-derived identicon instead.
+    let iconFile = persisted?.iconFile || cachedSiteIconFile(identity.startUrl);
+    let iconDataUrl = persisted?.iconDataUrl || null;
+    let generatedIcon = persisted?.generated === true || isGeneratedSiteIconFile(iconFile);
+    if (!iconFile) {
+      const generated = persistSiteIcon(identity.startUrl, generateSiteIdentityPng(identity.startUrl), { generated: true });
+      iconFile = generated?.iconFile || null;
+      iconDataUrl = generated?.iconDataUrl || null;
+      generatedIcon = Boolean(iconFile);
+    }
+    if (!iconDataUrl && iconFile) {
+      try {
+        const previewFile = /\.ico$/i.test(iconFile) ? iconFile.replace(/\.ico$/i, '.png') : iconFile;
+        const bytes = fs.readFileSync(previewFile);
+        if (isPngBuffer(bytes)) iconDataUrl = `data:image/png;base64,${bytes.toString('base64')}`;
+      } catch { /* installer can still use the cached file */ }
+    }
+    if (iconFile && !fs.existsSync(iconFile)) iconFile = null;
+    return {
+      name: identity.name,
+      startUrl: identity.startUrl,
+      iconFile,
+      iconDataUrl,
+      generatedIcon: Boolean(iconFile && generatedIcon),
+      pwa: Boolean(identity.pwa && iconFile)
+    };
   } catch (err) {
-    console.warn('[yayra] pwa identity lookup fell back to plain install', err && err.message);
-    return fallback;
+    console.warn('[yayra] site identity lookup failed', err && err.message);
+    let iconFile = cachedSiteIconFile(url);
+    let iconDataUrl = null;
+    if (!iconFile) {
+      const generated = persistSiteIcon(url, generateSiteIdentityPng(url), { generated: true });
+      iconFile = generated?.iconFile || null;
+      iconDataUrl = generated?.iconDataUrl || null;
+    }
+    return { ...fallback, iconFile, iconDataUrl, generatedIcon: isGeneratedSiteIconFile(iconFile) };
   }
 }
 
@@ -938,16 +1082,24 @@ function registerIpcBridges() {
   // see createAppModeWindow() + electron/appMode.cjs.
   // Preview of the site's own PWA identity (name/start url/pwa flag) for
   // the renderer's editable install dialog - nothing is written.
-  ipcMain.handle('yayra:install-page-as-app-preview', async (_event, { url, title } = {}) => {
+  ipcMain.handle('yayra:install-page-as-app-preview', async (_event, { url, title, favicon } = {}) => {
     try {
-      const identity = await resolvePwaInstallIdentity(url, title);
-      return { ok: true, name: identity.name, startUrl: identity.startUrl, pwa: identity.pwa };
+      const identity = await resolvePwaInstallIdentity(url, title, favicon);
+      return {
+        ok: true,
+        name: identity.name,
+        startUrl: identity.startUrl,
+        pwa: identity.pwa,
+        iconAvailable: Boolean(identity.iconFile),
+        iconDataUrl: identity.iconDataUrl || null,
+        generatedIcon: Boolean(identity.generatedIcon)
+      };
     } catch {
       return { ok: false };
     }
   });
 
-  ipcMain.handle('yayra:install-page-as-app', async (_event, { url, title, nameOverride } = {}) => {
+  ipcMain.handle('yayra:install-page-as-app', async (_event, { url, title, nameOverride, favicon } = {}) => {
     try {
       // SHORTCUT TARGET FIX: inside a running AppImage, process.execPath
       // is the TEMPORARY squashfs mount (/tmp/.mount_yayraXXX/yayra)
@@ -958,20 +1110,18 @@ function registerIpcBridges() {
       if (typeof process.env.APPIMAGE === 'string' && process.env.APPIMAGE.trim() !== '' && fs.existsSync(process.env.APPIMAGE)) {
         execPath = process.env.APPIMAGE;
       }
-      // TRUE PWA INSTALL: the desktop entry carries the SITE'S OWN name,
-      // OWN icon and OWN start url from its Web App Manifest (see
-      // resolvePwaInstallIdentity + electron/pwaManifest.cjs). When the
-      // site has no icon to give, Windows .lnk icons inherit the exe's
-      // own embedded icon and Linux .desktop entries fall back to the
-      // hicolor name 'yayra' (installed by the .deb, registered by
-      // AppImage desktop integration).
-      const identity = await resolvePwaInstallIdentity(url, title);
+      // TRUE SITE APP: the launcher and running app window must carry the
+      // SITE'S OWN name, icon, and start URL. A missing favicon receives a
+      // deterministic site-specific identicon; it never inherits the Yayra
+      // executable/hicolor icon or another product's identity.
+      const identity = await resolvePwaInstallIdentity(url, title, favicon);
+      if (!identity.iconFile) return { ok: false, reason: 'site-icon-unavailable' };
       // The user may EDIT the install name in the renderer dialog - an
       // explicit non-empty override always wins over the manifest name.
       const installName = (typeof nameOverride === 'string' && nameOverride.trim() !== '')
         ? nameOverride.trim().slice(0, 60)
         : identity.name;
-      const iconPath = identity.iconFile || (process.platform === 'linux' ? 'yayra' : null);
+      const iconPath = identity.iconFile;
       const plan = buildInstallPlan({
         platform: process.platform,
         execPath,
@@ -1019,7 +1169,15 @@ function registerIpcBridges() {
           } catch { /* best effort */ }
         }
       }
-      return { ok: true, name: plan.name, path: primaryPath, inLauncher: plan.inLauncher, pwa: identity.pwa, edited: installName !== identity.name };
+      return {
+        ok: true,
+        name: plan.name,
+        path: primaryPath,
+        inLauncher: plan.inLauncher,
+        pwa: identity.pwa,
+        generatedIcon: Boolean(identity.generatedIcon),
+        edited: installName !== identity.name
+      };
     } catch (err) {
       console.error('[yayra] install page as app failed', err);
       return { ok: false, reason: 'failed' };

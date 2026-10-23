@@ -7,12 +7,15 @@ const require = createRequire(import.meta.url);
 const {
   isPngBuffer,
   isIcoBuffer,
+  extractPngFromIco,
+  generateSiteIdentityPng,
   extractManifestLink,
   extractIconLink,
   parseManifest,
   pickManifestIcon,
   resolveStartUrl,
   pickInstallIdentity,
+  siteIconCandidates,
   pngToIco
 } = require('../electron/pwaManifest.cjs');
 
@@ -76,9 +79,15 @@ test('pickManifestIcon: chooses the LARGEST usable raster icon and resolves it a
   assert.equal(pickManifestIcon({ icons: [{ src: 'm.png', sizes: '192x192', purpose: 'monochrome' }] }, MANIFEST_URL), null);
   // maskable icons ARE launcher icons
   assert.ok(pickManifestIcon({ icons: [{ src: 'm.png', sizes: '192x192', purpose: 'maskable' }] }, MANIFEST_URL));
-  // sizes: "any" counts as scalable
+  // sizes: "any" and multi-size declarations are ranked correctly.
   const any = pickManifestIcon({ icons: [{ src: 'any.png', sizes: 'any', type: 'image/png' }] }, MANIFEST_URL);
   assert.equal(any.src, 'https://app.example.com/any.png');
+  const multi = pickManifestIcon({ icons: [
+    { src: 'multi.ico', sizes: '16x16 32x32 256x256', type: 'image/x-icon' },
+    { src: 'small.png', sizes: '48x48', type: 'image/png' }
+  ] }, MANIFEST_URL);
+  assert.equal(multi.src, 'https://app.example.com/multi.ico');
+  assert.equal(multi.width, 256);
   assert.equal(pickManifestIcon({ icons: [] }, MANIFEST_URL), null);
   assert.equal(pickManifestIcon({}, MANIFEST_URL), null);
 });
@@ -123,6 +132,31 @@ test('pickInstallIdentity: the SITE\u2019S OWN name/icon; honest fallbacks for n
   assert.equal(bare.name, 'app.example.com', 'hostname is the last resort');
 });
 
+test('siteIconCandidates: exhausts site-owned logos and mirrors without ever adding Yayra branding', () => {
+  const candidates = siteIconCandidates({
+    manifest: { icons: [
+      { src: '/icon-192.png', sizes: '192x192', type: 'image/png' },
+      { src: '/icon-512.png', sizes: '512x512', type: 'image/png' }
+    ] },
+    manifestUrl: MANIFEST_URL,
+    html: '<link rel="icon" href="/favicon.png"><link rel="apple-touch-icon" href="/touch.png" sizes="180x180">',
+    pageUrl: PAGE,
+    preferredIcon: 'https://app.example.com/live-favicon.png'
+  });
+  assert.equal(candidates[0], 'https://app.example.com/icon-512.png', 'largest manifest launcher icon wins');
+  assert.equal(candidates[1], 'https://app.example.com/icon-192.png', 'a second manifest icon survives if the largest URL is broken');
+  assert.equal(candidates[2], 'https://app.example.com/touch.png', 'best HTML-declared site icon follows');
+  assert.equal(candidates[3], 'https://app.example.com/favicon.png', 'additional declared favicons remain available');
+  assert.equal(candidates[4], 'https://app.example.com/live-favicon.png', 'Chromium-reported live favicon remains an early fallback');
+  assert.ok(candidates.includes('https://app.example.com/favicon.ico'));
+  assert.ok(candidates.includes('https://app.example.com/favicon.png'));
+  assert.ok(candidates.includes('https://app.example.com/apple-touch-icon.png'));
+  assert.ok(candidates.some((url) => url.startsWith('https://icons.duckduckgo.com/ip3/app.example.com.ico')));
+  assert.ok(candidates.some((url) => url.startsWith('https://www.google.com/s2/favicons?')));
+  assert.equal(candidates.some((url) => /yayra/i.test(url)), false, 'the browser logo is never an icon candidate');
+  assert.equal(new Set(candidates).size, candidates.length, 'candidate retries are deduplicated');
+});
+
 test('pngToIco: a valid ICO container around the PNG (Windows .lnk icons need .ico)', () => {
   // Minimal structural PNG: signature + IHDR with 512x512.
   const png = Buffer.alloc(40);
@@ -142,6 +176,7 @@ test('pngToIco: a valid ICO container around the PNG (Windows .lnk icons need .i
   assert.equal(ico.readUInt32LE(14), png.length, 'payload size');
   assert.equal(ico.readUInt32LE(18), 22, 'payload offset');
   assert.ok(ico.slice(22).equals(png), 'PNG payload intact');
+  assert.deepEqual(extractPngFromIco(ico), png, 'PNG-backed ICO can be normalized on Linux and Android-class launchers');
   // Small icon: dimensions encoded directly.
   png.writeUInt32BE(48, 16);
   png.writeUInt32BE(48, 20);
@@ -165,21 +200,37 @@ test('magic-byte guards: Content-Type is never trusted', () => {
   assert.equal(isIcoBuffer(Buffer.alloc(4)), false);
 });
 
-test('WIRING (source pin): main.cjs runs the full identity pipeline and never blocks the install', () => {
+test('iconless sites receive a deterministic origin-specific neutral PNG identity', () => {
+  const first = generateSiteIdentityPng('https://iconless.example/docs/page');
+  const sameOrigin = generateSiteIdentityPng('https://iconless.example/another/path?x=1');
+  const otherSite = generateSiteIdentityPng('https://different.example/');
+  assert.ok(isPngBuffer(first), 'fallback is a real PNG launcher asset');
+  assert.equal(first.readUInt32BE(16), 256);
+  assert.equal(first.readUInt32BE(20), 256);
+  assert.deepEqual(first, sameOrigin, 'one origin keeps one stable identity across routes');
+  assert.notDeepEqual(first, otherSite, 'different sites do not share a generic browser logo');
+  assert.equal(generateSiteIdentityPng('yayra://newtab'), null, 'internal/browser URLs never get an install identity');
+});
+
+test('WIRING (source pin): main.cjs resolves a site icon or generates a site-specific identity', () => {
   const src = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
   assert.match(src, /require\('\.\/pwaManifest\.cjs'\)/, 'the pure module is loaded');
   const fn = src.indexOf('async function resolvePwaInstallIdentity');
+  const helpers = src.indexOf('function siteIconCacheSlug');
   assert.ok(fn > -1, 'identity resolver exists');
-  const block = src.slice(fn, src.indexOf('\n}', fn));
+  assert.ok(helpers > -1 && helpers < fn, 'site-icon cache/normalization helpers exist');
+  const block = src.slice(helpers, src.indexOf('\n\napp.whenReady()', fn));
   assert.match(block, /extractManifestLink/, 'page HTML is scanned for the manifest');
   assert.match(block, /parseManifest/, 'the manifest is parsed');
   assert.match(block, /pickInstallIdentity/, 'the identity (name/icon/start url) is picked');
-  assert.match(block, /pwa-icons/, 'the site\\u2019s own icon is stored under userData/pwa-icons');
-  assert.match(block, /pngToIco/, 'PNG icons are wrapped into .ico for Windows .lnk');
-  assert.match(block, /favicon\.ico/, 'non-PWA sites get their favicon.ico on Windows');
+  assert.match(block, /siteIconCandidates/, 'manifest, HTML, conventional, and mirrored site icons are tried');
+  assert.match(block, /persistSiteIcon/, 'the verified site icon is stored for launcher and window use');
+  assert.match(block, /normalizeSiteIconToPng/, 'JPEG/WebP/ICO sources are normalized for Linux launchers');
+  assert.match(block, /generateSiteIdentityPng/, 'an iconless site receives a deterministic neutral identity');
+  assert.match(block, /generated:\s*true/, 'generated identities are tracked separately from downloaded logos');
   assert.match(block, /AbortController/, 'every fetch is time-boxed - a slow site never blocks the install');
   assert.match(block, /catch \(err\)/, 'any failure is caught');
-  assert.match(block, /return fallback/, 'the pipeline degrades to a plain install, never fails');
+  assert.match(block, /return fallback/, 'invalid input returns an iconless identity that the handler refuses safely');
   // The handler wires it all into the install plan.
   const h = src.indexOf("ipcMain.handle('yayra:install-page-as-app'");
   const hblock = src.slice(h, h + 2000);
@@ -187,13 +238,16 @@ test('WIRING (source pin): main.cjs runs the full identity pipeline and never bl
   assert.match(hblock, /await resolvePwaInstallIdentity/, 'identity resolved before planning');
   assert.match(hblock, /url: identity\.startUrl/, 'the PWA start url is what gets installed');
   assert.match(hblock, /title: (identity\.name|installName)/, "the PWA's own (or user-edited) name is the launcher name");
-  assert.match(hblock, /iconPath = identity\.iconFile/, "the PWA's own icon is the launcher icon");
+  assert.match(hblock, /if \(!identity\.iconFile\) return \{ ok: false, reason: 'site-icon-unavailable' \};/, 'an exceptional identity-generation failure still cannot inherit Yayra branding');
+  assert.match(hblock, /iconPath = identity\.iconFile/, "the PWA's own icon is the only launcher icon");
+  assert.doesNotMatch(hblock, /Icon=yayra|\? 'yayra'|yayra_bubble_logo/, 'no Yayra icon fallback can enter the site-app plan');
 });
 
-test('WIRING (source pin): the renderer announces a true PWA install as such', () => {
+test('WIRING (source pin): successful installs distinguish real logos from generated site identities', () => {
   const src = readFileSync(new URL('../packages/shared-ui/src/components/BrowserShell.js', import.meta.url), 'utf8');
-  assert.match(src, /res\.pwa/, 'the pwa flag is consumed');
-  assert.match(src, /its own icon is on your desktop/, 'the success message says it is the site\\u2019s own app');
+  assert.match(src, /site-specific generated icon/, 'iconless sites are described honestly');
+  assert.match(src, /the site\\'s own logo/, 'real site logos are still identified as such');
+  assert.doesNotMatch(src, /(?:Added|Installed)[^\n]+Yayra(?:'s)? logo/, 'success never implies a Yayra-logo fallback');
 });
 
 
@@ -249,13 +303,91 @@ test('INSTALL FLOW (desktop): the name is EDITABLE - previewed from the site own
     assert.equal(lastInstall.url, 'https://example.com/?src=pwa', 'the manifest start url is installed');
     assert.equal(lastInstall.title, 'My Example', 'the EDITED name is used');
     assert.equal(lastInstall.nameOverride, 'My Example', 'the edit is passed as an explicit override');
-    assert.ok(notices.some((n) => /its own icon/.test(n)), 'announced as the site own app');
+    assert.ok(notices.some((n) => /site's own logo/.test(n)), 'announced with the site-owned logo');
 
     lastInstall = null;
     shell._installPageAsAppDialog = async () => null;
     await shell.installPageAsApp();
     assert.equal(lastInstall, null, 'cancel writes nothing');
     assert.ok(notices.some((n) => /cancelled/i.test(n)), 'cancellation is confirmed to the user');
+  } finally {
+    shell.destroy();
+    delete globalThis.window.yayra;
+  }
+});
+
+test('INSTALL FLOW: an exceptional site-identity creation failure aborts instead of using Yayra branding', async () => {
+  const { setupDomShim } = await import('./dom-shim.mjs');
+  setupDomShim();
+  const { BrowserShell } = await import('../packages/shared-ui/src/components/BrowserShell.js');
+  let installs = 0;
+  globalThis.window.yayra = {
+    system: {
+      installPageAsAppPreview: async () => ({
+        ok: true,
+        name: 'No Logo Site',
+        startUrl: 'https://no-logo.example/',
+        pwa: false,
+        iconAvailable: false,
+        iconDataUrl: null
+      }),
+      installPageAsApp: async () => { installs += 1; return { ok: true }; }
+    }
+  };
+  const shell = new BrowserShell({ container: document.createElement('div'), platform: 'linux', isMobile: false });
+  await shell.initialize();
+  const notices = [];
+  shell.showTransientNotice = (message) => notices.push(String(message));
+  shell.state.tabs[0].url = 'https://no-logo.example/';
+  shell.state.tabs[0].title = 'No Logo Site';
+  shell._installPageAsAppDialog = async () => { throw new Error('dialog must not open without any safe site identity'); };
+  try {
+    await shell.installPageAsApp();
+    assert.equal(installs, 0, 'no launcher is written');
+    assert.match(notices.at(-1), /safe identity/i);
+    assert.match(notices.at(-1), /will not substitute its own logo/i);
+  } finally {
+    shell.destroy();
+    delete globalThis.window.yayra;
+  }
+});
+
+test('INSTALL FLOW: iconless sites preview and install with a generated site-specific identity', async () => {
+  const { setupDomShim } = await import('./dom-shim.mjs');
+  setupDomShim();
+  const { BrowserShell } = await import('../packages/shared-ui/src/components/BrowserShell.js');
+  let installed = null;
+  globalThis.window.yayra = {
+    system: {
+      installPageAsAppPreview: async () => ({
+        ok: true,
+        name: 'Iconless Example',
+        startUrl: 'https://iconless.example/',
+        pwa: false,
+        iconAvailable: true,
+        generatedIcon: true,
+        iconDataUrl: 'data:image/png;base64,AA=='
+      }),
+      installPageAsApp: async (options) => {
+        installed = options;
+        return { ok: true, name: options.title, inLauncher: true, generatedIcon: true };
+      }
+    }
+  };
+  const shell = new BrowserShell({ container: document.createElement('div'), platform: 'linux', isMobile: false });
+  await shell.initialize();
+  const notices = [];
+  let dialogOptions = null;
+  shell.showTransientNotice = (message) => notices.push(String(message));
+  shell.state.tabs[0].url = 'https://iconless.example/path';
+  shell.state.tabs[0].title = 'Iconless Example';
+  shell._installPageAsAppDialog = async (options) => { dialogOptions = options; return options.title; };
+  try {
+    await shell.installPageAsApp();
+    assert.ok(installed, 'the launcher install proceeds instead of failing closed');
+    assert.match(dialogOptions.iconHtml, /data:image\/png;base64,AA==/, 'the generated identity is shown in confirmation');
+    assert.ok(notices.some((notice) => /site-specific generated icon/i.test(notice)), 'success identifies the neutral fallback honestly');
+    assert.equal(notices.some((notice) => /Yayra logo.*installed|installed.*Yayra logo/i.test(notice)), false);
   } finally {
     shell.destroy();
     delete globalThis.window.yayra;
@@ -301,8 +433,11 @@ test('WIRING (source pin): preview IPC + preload bridge + nameOverride honored i
   assert.match(mainSrc, /yayra:install-page-as-app-preview/, 'preview IPC registered');
   assert.match(mainSrc, /nameOverride\.trim\(\) !== ''/, 'nameOverride validated');
   assert.match(mainSrc, /title: installName/, 'the override (or manifest) name reaches the plan');
-  assert.match(mainSrc, /extractIconLink\(html, url\)/, 'non-PWA sites get their own <link rel=icon> logo');
+  assert.match(mainSrc, /siteIconCandidates\(\{ manifest, manifestUrl, html, pageUrl: url, preferredIcon \}\)/, 'the live favicon plus all site-owned/fallback candidates are tried');
+  assert.match(mainSrc, /iconAvailable: Boolean\(identity\.iconFile\)/, 'preview reports whether a real site logo exists');
+  assert.match(mainSrc, /iconDataUrl: identity\.iconDataUrl \|\| null/, 'resolved logo reaches the confirmation dialog');
   const preloadSrc = readFileSync(new URL('../electron/preload.cjs', import.meta.url), 'utf8');
   assert.match(preloadSrc, /installPageAsAppPreview/, 'the renderer can call the preview');
-  assert.match(preloadSrc, /installPageAsApp:\s*\(\{\s*url,\s*title,\s*nameOverride\s*\}\s*=\s*\{\}\)\s*=> ipcRenderer\.invoke\('yayra:install-page-as-app',\s*\{\s*url,\s*title,\s*nameOverride\s*\}\)/s, 'the editable name override reaches the desktop installer');
+  assert.match(preloadSrc, /installPageAsApp:\s*\(\{\s*url,\s*title,\s*nameOverride,\s*favicon\s*\}\s*=\s*\{\}\)\s*=> ipcRenderer\.invoke\('yayra:install-page-as-app',\s*\{\s*url,\s*title,\s*nameOverride,\s*favicon\s*\}\)/s, 'the editable name and live site favicon reach the desktop installer');
+  assert.match(preloadSrc, /installPageAsAppPreview:\s*\(\{\s*url,\s*title,\s*favicon\s*\}/, 'preview receives the same live site favicon');
 });

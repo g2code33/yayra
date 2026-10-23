@@ -242,8 +242,8 @@ const api = {
     createShortcut: ({ url, title } = {}) => ipcRenderer.invoke('yayra:create-shortcut', { url, title }),
     // Chrome-style "Install page as app...": real launcher entries that
     // reopen the site in its own minimal app window (yayra --app=<url>).
-    installPageAsApp: ({ url, title, nameOverride } = {}) => ipcRenderer.invoke('yayra:install-page-as-app', { url, title, nameOverride }),
-    installPageAsAppPreview: ({ url, title } = {}) => ipcRenderer.invoke('yayra:install-page-as-app-preview', { url, title }),
+    installPageAsApp: ({ url, title, nameOverride, favicon } = {}) => ipcRenderer.invoke('yayra:install-page-as-app', { url, title, nameOverride, favicon }),
+    installPageAsAppPreview: ({ url, title, favicon } = {}) => ipcRenderer.invoke('yayra:install-page-as-app-preview', { url, title, favicon }),
     // Local document workspace. Paths stay in the trusted main process: this
     // surface exposes opaque catalog ids, safe display metadata and (only
     // when opening a supported format) the explicitly requested file bytes.

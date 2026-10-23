@@ -969,6 +969,33 @@ html {
   justify-content: center;
 }
 
+/* Deterministic hostname identity used only when a site logo cannot load.
+   It is deliberately neutral and site-colored—not a Yayra brand asset. */
+.fb-site-generated-identity {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  color: #fff;
+  background: hsl(var(--fb-site-identity-hue, 210) 58% 38%);
+  border-radius: 24%;
+  font-size: 0.66em;
+  font-weight: 760;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.fb-tab-logo-stack .fb-site-generated-identity {
+  font-size: 10px;
+}
+
+.fb-install-app-icon .fb-site-generated-identity {
+  font-size: 22px;
+}
+
 .fb-tab-site-logo {
   position: relative;
   z-index: 1;

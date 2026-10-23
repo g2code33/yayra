@@ -10876,9 +10876,9 @@ export class BrowserShell {
    * platform - Android gets a pinned home-screen shortcut that opens Yayra
    * straight on the site (YayraOverlayPlugin.installSiteAsApp); the desktop
    * app writes a real launcher entry (desktop icon + apps/Start menu) that
-   * reopens the site in its own minimal app window; web/PWA can only
-   * install Yayra itself, so it triggers the browser's own install flow
-   * when available and is honest otherwise.
+   * reopens the site in its own minimal app window. A web/PWA origin cannot
+   * install another origin, so that path opens the site directly for the
+   * browser's own correctly branded install flow—never a Yayra substitute.
    */
   async installPageAsApp() {
     const tab = this.getActiveTab();
@@ -10906,9 +10906,20 @@ export class BrowserShell {
         shortcutName = editedName;
       } catch { /* prompt unavailable (tests/embedders) - keep the site title */ }
       try {
-        const res = await overlay.installSiteAsApp({ url: tab.url, title: shortcutName });
+        const reportedIcon = typeof tab.favicon === 'string' ? tab.favicon : '';
+        const res = await overlay.installSiteAsApp({
+          url: tab.url,
+          title: shortcutName,
+          iconDataUrl: /^data:image\//i.test(reportedIcon) ? reportedIcon : null,
+          iconUrl: /^https?:\/\//i.test(reportedIcon) ? reportedIcon : null
+        });
         if (res && res.ok) {
-          this.showTransientNotice(`Added \u201C${shortcutName}\u201D to your home screen - tap it to open Yayra straight on the site.`);
+          const identityKind = res.generatedIcon ? 'a site-specific generated icon' : 'the site\u2019s own logo';
+          this.showTransientNotice(`Added \u201C${shortcutName}\u201D to your home screen with ${identityKind}.`);
+          return;
+        }
+        if (res && (res.reason === 'site-icon-unavailable' || res.reason === 'site-identity-unavailable')) {
+          this.showTransientNotice('Couldn\u2019t create a safe identity for this site. Yayra will not substitute its own logo.');
           return;
         }
         this.showTransientNotice(`Couldn\u2019t add the site to your home screen${res && res.reason ? ` (${res.reason})` : ''}.`);
@@ -10922,58 +10933,79 @@ export class BrowserShell {
       try {
         let installName = String(tab.title || tab.url).slice(0, 60);
         let startUrl = tab.url;
+        let previewGeneratedIcon = false;
+        const reportedFavicon = typeof tab.favicon === 'string' && /^https?:\/\//i.test(tab.favicon) ? tab.favicon : null;
+        let previewIconHtml = this.getTabFavicon(tab, { showLoading: false });
         if (typeof this.systemBridge.installPageAsAppPreview === 'function') {
           try {
-            const preview = await this.systemBridge.installPageAsAppPreview({ url: tab.url, title: tab.title || tab.url });
+            const preview = await this.systemBridge.installPageAsAppPreview({
+              url: tab.url,
+              title: tab.title || tab.url,
+              favicon: reportedFavicon
+            });
             if (preview && preview.ok) {
               if (preview.name) installName = String(preview.name).slice(0, 60);
               if (preview.startUrl) startUrl = preview.startUrl;
+              previewGeneratedIcon = preview.generatedIcon === true;
+              if (typeof preview.iconDataUrl === 'string' && /^data:image\/(?:png|x-icon);base64,[a-z0-9+/=]+$/i.test(preview.iconDataUrl)) {
+                previewIconHtml = `<img class="fb-tab-site-logo" src="${preview.iconDataUrl}" alt="" />`;
+              }
+              if (preview.iconAvailable === false) {
+                this.showTransientNotice('Couldn\'t create a safe identity for this site. Yayra will not substitute its own logo.');
+                return;
+              }
             }
-          } catch { /* preview is best-effort - plain install still works */ }
+          } catch { /* preview is best-effort - the installer rechecks */ }
         }
         let finalName = installName;
         try {
           const editedName = await this._installPageAsAppDialog({
             title: installName,
             url: tab.url,
-            // Show the site's identity even when the live page is currently
-            // navigating; loading chrome is not a usable launcher icon.
-            iconHtml: this.getTabFavicon(tab, { showLoading: false })
+            iconHtml: previewIconHtml
           });
           if (editedName === null) { this.showTransientNotice('Install cancelled.'); return; }
           finalName = editedName;
         } catch { /* prompt unavailable (tests/embedders) - keep the site name */ }
-        const res = await this.systemBridge.installPageAsApp({ url: startUrl, title: finalName, nameOverride: finalName });
+        const res = await this.systemBridge.installPageAsApp({
+          url: startUrl,
+          title: finalName,
+          nameOverride: finalName,
+          favicon: reportedFavicon
+        });
         if (res && res.ok) {
-          this.showTransientNotice(res.pwa
-            ? `Installed "${res.name}" as an app - its own icon is on your desktop${res.inLauncher ? ' and in your apps menu' : ''}, and it opens in its own window.`
-            : `Installed "${res.name}" - it's on your desktop${res.inLauncher ? ' and in your apps menu' : ''}, and opens in its own window.`);
+          const usedGeneratedIcon = typeof res.generatedIcon === 'boolean'
+            ? res.generatedIcon
+            : previewGeneratedIcon;
+          const identityKind = usedGeneratedIcon ? 'a site-specific generated icon' : 'the site\'s own logo';
+          this.showTransientNotice(`Installed "${res.name}" as an app - ${identityKind} is on your desktop${res.inLauncher ? ' and in your apps menu' : ''}, and it opens in its own window.`);
           return;
         }
         if (res && res.reason === 'unsupported-platform') {
           this.showTransientNotice('Installing pages as apps is not supported on macOS yet - use "Create desktop shortcut..." instead.');
           return;
         }
+        if (res && (res.reason === 'site-icon-unavailable' || res.reason === 'site-identity-unavailable')) {
+          this.showTransientNotice('Couldn\'t create a safe identity for this site. Yayra will never replace it with the Yayra logo.');
+          return;
+        }
         this.showTransientNotice(`Couldn't install the app${res && res.reason ? ` (${res.reason})` : ''}.`);
         return;
       } catch { /* fall through to the web path */ }
     }
-    // 3. Web/PWA: a web page may only install ITSELF. Trigger the browser's
-    // real install flow for Yayra when it's available; be honest otherwise.
-    if (this._pwaInstallPrompt && typeof this._pwaInstallPrompt.prompt === 'function') {
-      try {
-        await this._pwaInstallPrompt.prompt();
-        const choice = await this._pwaInstallPrompt.userChoice;
-        this._pwaInstallPrompt = null; // one-shot per the platform contract
-        if (choice && choice.outcome === 'accepted') {
-          this.showTransientNotice('Installing Yayra as an app - it gets its own window and taskbar entry.');
-          return;
-        }
-        this.showTransientNotice('Install cancelled.');
-        return;
-      } catch { /* fall through to honesty */ }
-    }
-    this.showTransientNotice('A web page can\u2019t install another site as an app - use the Yayra desktop or Android app for that. To install Yayra itself, use your browser\u2019s install / add-to-home-screen option.');
+    // 3. Web/PWA: beforeinstallprompt belongs to Yayra's own origin. Using it
+    // here would install a Yayra-logo app for somebody else's site—the exact
+    // identity bug this command must never create. Open the site top-level so
+    // the browser can read THAT origin's manifest, then let its own Install /
+    // Add to Home Screen action create the correctly branded app.
+    let openedSite = false;
+    try {
+      const opened = window.open?.(tab.url, '_blank', 'noopener,noreferrer');
+      openedSite = opened !== null && opened !== false;
+    } catch { /* popup policy can block it */ }
+    this.showTransientNotice(openedSite
+      ? 'Opened the site directly. Use your browser\'s Install app / Add to Home Screen action there so the app uses the site\'s own logo.'
+      : 'To install this site with its own logo, open it directly in your browser and use Install app / Add to Home Screen. Yayra will not install itself in its place.');
   }
 
   /** Pin the active website in Yayra's profile-scoped New Tab shortcuts. */
@@ -20877,6 +20909,25 @@ export class BrowserShell {
     return true;
   }
 
+  _siteIdentityFallbackHtml(url) {
+    let host = '';
+    let identity = '';
+    try {
+      const parsed = new URL(String(url || ''));
+      host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+      identity = parsed.origin.toLowerCase();
+    } catch { host = ''; identity = ''; }
+    if (!host || !identity) return Icons.globe;
+    let hash = 2166136261;
+    for (let index = 0; index < identity.length; index += 1) {
+      hash ^= identity.charCodeAt(index);
+      hash = Math.imul(hash, 16777619) >>> 0;
+    }
+    const hue = hash % 360;
+    const initial = (host.match(/[a-z0-9]/i)?.[0] || '•').toUpperCase();
+    return `<span class="fb-site-generated-identity" style="--fb-site-identity-hue:${hue}" aria-hidden="true">${initial}</span>`;
+  }
+
   getTabFavicon(tab, { showLoading = true } = {}) {
     if (!tab) return Icons.globe;
     // A document tab carries its glyph only while it is actually displaying
@@ -20914,7 +20965,7 @@ export class BrowserShell {
       const src = reported || (host ? `https://icons.duckduckgo.com/ip3/${host}.ico` : '');
       if (src) {
         const safeSrc = src.replace(/"/g, '&quot;');
-        return `<span class="fb-tab-logo-stack"><span class="fb-tab-logo-fallback">${Icons.globe}</span>`
+        return `<span class="fb-tab-logo-stack"><span class="fb-tab-logo-fallback">${this._siteIdentityFallbackHtml(url)}</span>`
           + `<img class="fb-tab-site-logo" src="${safeSrc}" alt="" loading="lazy" /></span>`;
       }
     }
