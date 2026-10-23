@@ -76,8 +76,21 @@ export function normalizeGoogleProductOrigin(value) {
   return `${parsed.origin}/`;
 }
 export const PROFILE_KEY = 'yayra:google-account';
+export const DEFAULT_AUTH_PROFILE_ID = 'default';
 export const PENDING_MAX_AGE_MS = 10 * 60 * 1000;
+const MAX_AUTH_PROFILE_ID_LENGTH = 160;
 const MAX_CALLBACK_QUERY_LENGTH = 8192;
+
+export function normalizeAuthProfileId(value) {
+  const id = typeof value === 'string' ? value.trim() : '';
+  if (!id || id.length > MAX_AUTH_PROFILE_ID_LENGTH || !/^[A-Za-z0-9_-]+$/.test(id)) return DEFAULT_AUTH_PROFILE_ID;
+  return id;
+}
+
+export function authStorageKey(baseKey, profileId = DEFAULT_AUTH_PROFILE_ID) {
+  const id = normalizeAuthProfileId(profileId);
+  return id === DEFAULT_AUTH_PROFILE_ID ? baseKey : `${baseKey}:profile:${id}`;
+}
 const MAX_EXCHANGE_RESPONSE_BYTES = 64 * 1024;
 
 function base64urlFromBytes(bytes) {
@@ -173,10 +186,11 @@ export async function downloadDelegatedDriveFile({
   fileId,
   exchangeUrl,
   sessionStorage,
+  profileId = DEFAULT_AUTH_PROFILE_ID,
   fetchImpl = globalThis.fetch,
   maxBytes = 300 * 1024 * 1024
 }) {
-  const session = loadDriveSession(sessionStorage);
+  const session = loadDriveSession(sessionStorage, () => Date.now(), profileId);
   if (!session) throw new Error('drive_reconnect_required');
   const response = await fetchImpl(driveDownloadUrlForExchange(exchangeUrl, fileId), {
     method: 'GET',
@@ -185,7 +199,7 @@ export async function downloadDelegatedDriveFile({
   if (!response.ok) {
     const text = await readBoundedExchangeResponse(response);
     const code = safeExchangeErrorCode(text);
-    if (response.status === 401) sessionStorage.removeItem(DRIVE_SESSION_KEY);
+    if (response.status === 401) sessionStorage.removeItem(authStorageKey(DRIVE_SESSION_KEY, profileId));
     throw new Error(`drive_download_failed:${response.status}:${code}`);
   }
   const declared = Number(response.headers?.get?.('content-length'));
@@ -221,14 +235,14 @@ export async function downloadDelegatedDriveFile({
 export async function revokeDelegatedDriveSession({
   exchangeUrl,
   sessionStorage,
+  profileId = DEFAULT_AUTH_PROFILE_ID,
   fetchImpl = globalThis.fetch,
   timeoutMs = 5000
 }) {
-  const session = loadDriveSession(sessionStorage);
+  const session = loadDriveSession(sessionStorage, () => Date.now(), profileId);
   // Local logout is authoritative and immediate even when the Worker or
-  // Google is unavailable. The opaque capability cannot be recovered from
-  // browser storage after this point.
-  sessionStorage?.removeItem?.(DRIVE_SESSION_KEY);
+  // Google is unavailable. Only this profile's opaque capability is removed.
+  sessionStorage?.removeItem?.(authStorageKey(DRIVE_SESSION_KEY, profileId));
   if (!session) return { ok: true, revoked: false };
 
   const controller = typeof AbortController === 'function' ? new AbortController() : null;
@@ -324,25 +338,26 @@ export function sanitizeDriveSession(value) {
   return { id, expiresAt, scope: 'drive.readonly' };
 }
 
-export function saveDriveSession(sessionStorage, value) {
+export function saveDriveSession(sessionStorage, value, profileId = DEFAULT_AUTH_PROFILE_ID) {
   const session = sanitizeDriveSession(value);
   if (!session) throw new Error('invalid_drive_session');
-  sessionStorage.setItem(DRIVE_SESSION_KEY, JSON.stringify(session));
+  sessionStorage.setItem(authStorageKey(DRIVE_SESSION_KEY, profileId), JSON.stringify(session));
   return session;
 }
 
-export function loadDriveSession(sessionStorage, now = () => Date.now()) {
-  const raw = sessionStorage?.getItem?.(DRIVE_SESSION_KEY);
+export function loadDriveSession(sessionStorage, now = () => Date.now(), profileId = DEFAULT_AUTH_PROFILE_ID) {
+  const key = authStorageKey(DRIVE_SESSION_KEY, profileId);
+  const raw = sessionStorage?.getItem?.(key);
   if (!raw || raw.length > 4096) return null;
   try {
     const session = sanitizeDriveSession(JSON.parse(raw));
     if (!session || Date.parse(session.expiresAt) <= Number(now())) {
-      sessionStorage?.removeItem?.(DRIVE_SESSION_KEY);
+      sessionStorage?.removeItem?.(key);
       return null;
     }
     return session;
   } catch {
-    sessionStorage?.removeItem?.(DRIVE_SESSION_KEY);
+    sessionStorage?.removeItem?.(key);
     return null;
   }
 }
@@ -391,6 +406,7 @@ export async function beginSignIn({
   origin,
   returnTo = '/',
   capability = 'profile',
+  profileId = DEFAULT_AUTH_PROFILE_ID,
   sessionStorage,
   cryptoImpl = globalThis.crypto,
   navigate
@@ -405,6 +421,7 @@ export async function beginSignIn({
     codeVerifier,
     state,
     capability,
+    profileId: normalizeAuthProfileId(profileId),
     returnTo: safeReturnToPath(returnTo, safeOrigin),
     startedAt: new Date().toISOString()
   }));
@@ -470,6 +487,7 @@ export async function completeSignIn({
     || typeof pending.codeVerifier !== 'string'
     || !/^[A-Za-z0-9._~-]{43,128}$/.test(pending.codeVerifier)
     || (pending.capability !== undefined && !['profile', 'drive-readonly'].includes(pending.capability))
+    || (pending.profileId !== undefined && normalizeAuthProfileId(pending.profileId) !== pending.profileId)
     || typeof pending.startedAt !== 'string') {
     throw new Error('corrupt_pending_sign_in');
   }
@@ -515,20 +533,21 @@ export async function completeSignIn({
   if (capability === 'drive-readonly' && !driveSession) throw new Error('exchange_malformed_drive_session');
   return {
     profile,
+    ...(pending.profileId !== undefined ? { profileId: normalizeAuthProfileId(pending.profileId) } : {}),
     ...(driveSession ? { driveSession } : {}),
     returnTo: safeReturnToPath(pending.returnTo, safeOrigin)
   };
 }
 
 /** Profile-only persistence (see the security trade-off note at the top). */
-export function saveProfile(localStorage, profile) {
+export function saveProfile(localStorage, profile, profileId = DEFAULT_AUTH_PROFILE_ID) {
   const cleanProfile = sanitizeGoogleProfile(profile);
   if (!cleanProfile) throw new Error('invalid_profile');
-  localStorage.setItem(PROFILE_KEY, JSON.stringify({ profile: cleanProfile, savedAt: new Date().toISOString() }));
+  localStorage.setItem(authStorageKey(PROFILE_KEY, profileId), JSON.stringify({ profile: cleanProfile, savedAt: new Date().toISOString() }));
 }
 
-export function loadProfile(localStorage) {
-  const raw = localStorage.getItem(PROFILE_KEY);
+export function loadProfile(localStorage, profileId = DEFAULT_AUTH_PROFILE_ID) {
+  const raw = localStorage.getItem(authStorageKey(PROFILE_KEY, profileId));
   if (!raw || raw.length > 16 * 1024) return null;
   try {
     const parsed = JSON.parse(raw);
@@ -543,8 +562,8 @@ export function loadProfile(localStorage) {
   }
 }
 
-export function clearProfile(localStorage) {
-  localStorage.removeItem(PROFILE_KEY);
+export function clearProfile(localStorage, profileId = DEFAULT_AUTH_PROFILE_ID) {
+  localStorage.removeItem(authStorageKey(PROFILE_KEY, profileId));
 }
 
 /**
@@ -575,29 +594,32 @@ export function createWebAuthBridge({
   }
 
   return {
-    async signIn() {
+    async signIn(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
       if (!clientId) return { ok: false, error: 'not_configured' };
-      emit({ type: 'signing-in' });
+      emit({ type: 'signing-in', profileId });
       try {
-        await beginSignIn({ clientId, origin, returnTo: getPath(), sessionStorage, cryptoImpl, navigate });
+        await beginSignIn({ clientId, origin, returnTo: getPath(), profileId, sessionStorage, cryptoImpl, navigate });
         // The page is now navigating away to Google; by the time the user
         // is back, a fresh page load picks the session up from storage.
         return { ok: true, pending: true };
       } catch (err) {
         const message = err && err.message ? err.message : String(err);
-        emit({ type: 'error', message });
+        emit({ type: 'error', profileId, message });
         return { ok: false, error: message };
       }
     },
-    async connectDrive() {
+    async connectDrive(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
       if (!clientId) return { ok: false, error: 'not_configured' };
-      emit({ type: 'drive-connecting' });
+      emit({ type: 'drive-connecting', profileId });
       try {
         await beginSignIn({
           clientId,
           origin,
           returnTo: getPath(),
           capability: 'drive-readonly',
+          profileId,
           sessionStorage,
           cryptoImpl,
           navigate
@@ -605,30 +627,34 @@ export function createWebAuthBridge({
         return { ok: true, pending: true };
       } catch (err) {
         const message = err && err.message ? err.message : String(err);
-        emit({ type: 'drive-error', message });
+        emit({ type: 'drive-error', profileId, message });
         return { ok: false, error: message };
       }
     },
-    async downloadDriveFile(fileId) {
+    async downloadDriveFile(fileId, claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
       try {
-        const result = await downloadDelegatedDriveFile({ fileId, exchangeUrl, sessionStorage: localStorage, fetchImpl });
+        const result = await downloadDelegatedDriveFile({ fileId, exchangeUrl, sessionStorage: localStorage, profileId, fetchImpl });
         return { ok: true, ...result };
       } catch (err) {
         return { ok: false, error: err?.message || String(err) };
       }
     },
-    async getDriveSession() {
-      const session = loadDriveSession(localStorage);
+    async getDriveSession(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
+      const session = loadDriveSession(localStorage, () => Date.now(), profileId);
       return session ? { connected: true, expiresAt: session.expiresAt } : { connected: false };
     },
-    async signOut() {
-      clearProfile(localStorage);
-      emit({ type: 'signed-out' });
-      await revokeDelegatedDriveSession({ exchangeUrl, sessionStorage: localStorage, fetchImpl });
+    async signOut(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
+      clearProfile(localStorage, profileId);
+      emit({ type: 'signed-out', profileId });
+      await revokeDelegatedDriveSession({ exchangeUrl, sessionStorage: localStorage, profileId, fetchImpl });
       return { ok: true };
     },
-    async getSession() {
-      const saved = loadProfile(localStorage);
+    async getSession(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
+      const saved = loadProfile(localStorage, profileId);
       if (!saved) return { signedIn: false };
       return { signedIn: true, profile: saved.profile, savedAt: saved.savedAt };
     },

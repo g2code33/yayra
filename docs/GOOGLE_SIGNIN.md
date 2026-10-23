@@ -142,6 +142,13 @@ Desktop uses the native-app loopback pattern:
 9. Token material is encrypted at rest with Electron `safeStorage`
    (Keychain/libsecret/DPAPI). If OS-backed encryption is unavailable, tokens
    are not written in plaintext.
+10. App identity and Drive credentials are scoped to the browsing profile
+    bound to the initiating `BrowserWindow`. The main process pins that
+    binding before navigation, routes events only to windows for the same
+    profile, and stores non-default sessions in separate hashed filenames.
+    The default profile keeps using the legacy `google-session.json`, so an
+    existing encrypted session survives upgrade without token migration or a
+    forced sign-in.
 
 There is no desktop `yayra://oauth-callback` handler and no bearer token in a
 URL. Loopback is the registered return channel for the Desktop OAuth client.
@@ -152,7 +159,8 @@ Relevant files:
   exchange, and profile validation.
 - `electron/authBridge.cjs` — system-browser launch, renderer-safe identity
   IPC, encrypted scoped Drive refresh/download, and credential revocation.
-- `electron/authStore.cjs` — OS-keychain-backed encrypted token persistence.
+- `electron/authStore.cjs` — per-profile, OS-keychain-backed encrypted token
+  persistence with legacy-default migration.
 - `electron/googleAuthConfig.cjs` — desktop client configuration.
 - `tests/google-oauth.test.mjs`, `tests/google-auth-bridge.test.mjs`, and
   `tests/google-auth-store.test.mjs` — automated coverage.
@@ -210,8 +218,10 @@ Web/PWA app identity uses a full-page redirect rather than a popup:
    plus only an opaque origin-bound session ID.
 7. The display profile and opaque Drive capability survive app/browser
    restarts in `localStorage`; no Google access or refresh token reaches
-   browser JavaScript. Logout removes the local capability and calls the
-   Worker's revocation endpoint.
+   browser JavaScript. Keys are namespaced by browsing profile, and the
+   profile id is carried inside the validated one-use redirect transaction.
+   Logout removes only that profile's local capability and calls the Worker's
+   revocation endpoint.
 
 A Worker-side `/auth/google` kickoff is intentionally unnecessary: PKCE and
 state are generated in the initiating tab, where `sessionStorage` preserves

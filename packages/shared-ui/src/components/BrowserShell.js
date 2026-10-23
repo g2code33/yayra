@@ -215,7 +215,10 @@ export class BrowserShell {
     if (options.windowProfileId && this.profileService) {
       try {
         const exists = (this.profileService.list() || []).some((p) => p.id === options.windowProfileId);
-        if (exists) this.profileService.switchTo(options.windowProfileId);
+        if (exists) {
+          if (typeof this.profileService.bindToWindow === 'function') this.profileService.bindToWindow(options.windowProfileId);
+          else this.profileService.switchTo(options.windowProfileId);
+        }
       } catch { /* unknown profile id - stay on the stored current one */ }
     }
 
@@ -636,8 +639,12 @@ export class BrowserShell {
     this._unsubscribeAuthBridge = null;
     if (this.authBridge) {
       this._unsubscribeAuthBridge = this.authBridge.onEvent((evt) => this.handleGoogleAuthEvent(evt));
-      this.authBridge.getSession()
+      const accountProfileId = this.currentProfileId();
+      this.authBridge.getSession(accountProfileId)
         .then((session) => {
+          // A delayed response may never hydrate a window that has since used
+          // the no-window in-place fallback to another browsing profile.
+          if (accountProfileId !== this.currentProfileId()) return;
           if (session?.signedIn) {
             this.state.googleAccount = { status: 'signed-in', signedIn: true, profile: session.profile, error: null, savedAt: session.savedAt || null };
             for (const record of this._googleAccountConnections.values()) {
@@ -703,6 +710,15 @@ export class BrowserShell {
   get authBridge() {
     if (typeof window === 'undefined') return null;
     return (window.yayra && window.yayra.auth) || (window.ibrowse && window.ibrowse.auth) || null;
+  }
+
+  currentProfileId() {
+    try {
+      const id = this.profileService?.current?.()?.id;
+      return typeof id === 'string' && id ? id : 'default';
+    } catch {
+      return 'default';
+    }
   }
 
   // window.yayra.downloads (exposed by electron/preload.cjs, backed by
@@ -969,7 +985,7 @@ export class BrowserShell {
     // snapshot first so the account/product tab remains recoverable after the
     // callback reload rather than leaving an older snapshot on disk.
     await this._persistTabsBeforeGoogleRedirect();
-    const result = await this.authBridge.signIn();
+    const result = await this.authBridge.signIn(this.currentProfileId());
     if (!result?.ok && result?.error !== 'sign_in_already_in_progress') {
       this.state.googleAccount = { status: 'error', signedIn: false, profile: null, error: result?.error || 'sign_in_failed', savedAt: null };
       this.render();
@@ -993,7 +1009,7 @@ export class BrowserShell {
   async signOutOfGoogle() {
     if (!this.authBridge) return;
     this.state.isAccountMenuOpen = false;
-    await this.authBridge.signOut();
+    await this.authBridge.signOut(this.currentProfileId());
   }
 
   // Opens Google's own "Manage your Account" page in the user's system
@@ -1012,6 +1028,11 @@ export class BrowserShell {
 
   handleGoogleAuthEvent(evt) {
     if (!evt) return;
+    // Electron broadcasts only to windows pinned to the same profile, while
+    // web/PWA adapters share one JS bridge across same-origin windows. Keep a
+    // renderer-side boundary too: an event tagged for another profile can
+    // never replace or clear this window's account state.
+    if (evt.profileId && evt.profileId !== this.currentProfileId()) return;
     switch (evt.type) {
       case 'signing-in':
         this.state.googleAccount = { ...this.state.googleAccount, status: 'signing-in', error: null };
@@ -10521,15 +10542,16 @@ export class BrowserShell {
     if (!this._driveFallbackInflight) this._driveFallbackInflight = new Map();
     if (this._driveFallbackInflight.has(tabId)) return this._driveFallbackInflight.get(tabId);
     const attempt = (async () => {
-      let result = await this.authBridge.downloadDriveFile(fileId);
+      const profileId = this.currentProfileId();
+      let result = await this.authBridge.downloadDriveFile(fileId, profileId);
       if (!result?.ok && /drive_reconnect_required|drive_session_required/i.test(String(result?.error || ''))
         && typeof this.authBridge.connectDrive === 'function') {
-        const connected = await this.authBridge.connectDrive();
+        const connected = await this.authBridge.connectDrive(profileId);
         // Web/PWA returns pending because its full-page OAuth redirect now
         // owns control. Native mobile returns only after the verified deep
         // link, so it can retry immediately without exposing Google tokens.
         if (!connected?.ok || connected.pending) return connected || { ok: false, error: 'drive_reconnect_required' };
-        result = await this.authBridge.downloadDriveFile(fileId);
+        result = await this.authBridge.downloadDriveFile(fileId, profileId);
       }
       if (!result?.ok || (!result.blob && !result.data)) return result || { ok: false, error: 'drive_download_failed' };
       let bytes;
@@ -13786,9 +13808,34 @@ export class BrowserShell {
       this.showTransientNotice(`Browsing as ${profile.name}${profile.email ? ` (${profile.email})` : ''} - separate from other profiles.`);
     }
     // All persistence is profile-scoped (see profileStorage.js): after a
-    // switch, load the NEW profile's settings, history, bookmarks and
-    // wheel so nothing from the previous profile leaks across.
+    // switch, load the NEW profile's settings, history, bookmarks, account
+    // and wheel so nothing from the previous profile leaks across.
     this.reloadProfileScopedState().catch(() => {});
+    this.reloadGoogleAccountForCurrentProfile().catch(() => {});
+  }
+
+  async reloadGoogleAccountForCurrentProfile() {
+    const profileId = this.currentProfileId();
+    this.state.googleAccount = { status: 'idle', signedIn: false, profile: null, error: null, savedAt: null };
+    if (!this.authBridge?.getSession) {
+      this.render();
+      return;
+    }
+    try {
+      const session = await this.authBridge.getSession(profileId);
+      if (profileId !== this.currentProfileId()) return;
+      if (session?.signedIn) {
+        this.state.googleAccount = {
+          status: 'signed-in',
+          signedIn: true,
+          profile: session.profile,
+          error: null,
+          savedAt: session.savedAt || null
+        };
+      }
+    } finally {
+      if (profileId === this.currentProfileId()) this.render();
+    }
   }
 
   /** Load the current profile's persisted state into this.state. */

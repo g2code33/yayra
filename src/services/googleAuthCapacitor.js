@@ -58,10 +58,12 @@ import {
   buildAuthorizationUrl,
   clearProfile,
   downloadDelegatedDriveFile,
+  DEFAULT_AUTH_PROFILE_ID,
   DRIVE_SCOPES,
   generatePkcePair,
   generateState,
   loadProfile,
+  normalizeAuthProfileId,
   normalizeGoogleProductOrigin,
   readBoundedExchangeResponse,
   revokeDelegatedDriveSession,
@@ -262,71 +264,76 @@ export function createCapacitorAuthBridge({
   }
 
   return {
-    async signIn() {
+    async signIn(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
       if (signingIn) return { ok: false, error: 'sign_in_already_in_progress' };
       if (!clientId) return { ok: false, error: 'not_configured' };
       signingIn = true;
-      emit({ type: 'signing-in' });
+      emit({ type: 'signing-in', profileId });
       try {
         const { profile } = await signInWithGoogleCapacitor({
           clientId, platform, exchangeUrl, redirectUri,
           openBrowser, closeBrowser, onUrlOpen, onBrowserFinished,
           fetchImpl, cryptoImpl, timeoutMs
         });
-        saveProfile(localStorage, profile);
-        emit({ type: 'signed-in', profile });
+        saveProfile(localStorage, profile, profileId);
+        emit({ type: 'signed-in', profileId, profile });
         return { ok: true, profile };
       } catch (err) {
         const message = err && err.message ? err.message : String(err);
-        emit({ type: 'error', message });
+        emit({ type: 'error', profileId, message });
         return { ok: false, error: message };
       } finally {
         signingIn = false;
       }
     },
-    async connectDrive() {
+    async connectDrive(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
       if (!clientId) return { ok: false, error: 'not_configured' };
       if (signingIn) return { ok: false, error: 'sign_in_already_in_progress' };
       signingIn = true;
-      emit({ type: 'drive-connecting' });
+      emit({ type: 'drive-connecting', profileId });
       try {
         const { profile, driveSession } = await signInWithGoogleCapacitor({
           clientId, platform, exchangeUrl, redirectUri, capability: 'drive-readonly',
           openBrowser, closeBrowser, onUrlOpen, onBrowserFinished,
           fetchImpl, cryptoImpl, timeoutMs
         });
-        saveProfile(localStorage, profile);
-        saveDriveSession(localStorage, driveSession);
+        saveProfile(localStorage, profile, profileId);
+        saveDriveSession(localStorage, driveSession, profileId);
         // Drive consent also verifies the Yayra identity. Emit the ordinary
         // account event first so the avatar/account state updates immediately
         // when the deep link returns, matching desktop and web callbacks.
-        emit({ type: 'signed-in', profile });
-        emit({ type: 'drive-connected', profile, expiresAt: driveSession.expiresAt });
+        emit({ type: 'signed-in', profileId, profile });
+        emit({ type: 'drive-connected', profileId, profile, expiresAt: driveSession.expiresAt });
         return { ok: true, profile, expiresAt: driveSession.expiresAt };
       } catch (err) {
         const message = err && err.message ? err.message : String(err);
-        emit({ type: 'drive-error', message });
+        emit({ type: 'drive-error', profileId, message });
         return { ok: false, error: message };
       } finally {
         signingIn = false;
       }
     },
-    async downloadDriveFile(fileId) {
+    async downloadDriveFile(fileId, claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
       try {
-        const result = await downloadDelegatedDriveFile({ fileId, exchangeUrl, sessionStorage: localStorage, fetchImpl });
+        const result = await downloadDelegatedDriveFile({ fileId, exchangeUrl, sessionStorage: localStorage, profileId, fetchImpl });
         return { ok: true, ...result };
       } catch (err) {
         return { ok: false, error: err?.message || String(err) };
       }
     },
-    async signOut() {
-      clearProfile(localStorage);
-      emit({ type: 'signed-out' });
-      await revokeDelegatedDriveSession({ exchangeUrl, sessionStorage: localStorage, fetchImpl });
+    async signOut(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
+      clearProfile(localStorage, profileId);
+      emit({ type: 'signed-out', profileId });
+      await revokeDelegatedDriveSession({ exchangeUrl, sessionStorage: localStorage, profileId, fetchImpl });
       return { ok: true };
     },
-    async getSession() {
-      const saved = loadProfile(localStorage);
+    async getSession(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
+      const saved = loadProfile(localStorage, profileId);
       if (!saved) return { signedIn: false };
       return { signedIn: true, profile: saved.profile, savedAt: saved.savedAt };
     },

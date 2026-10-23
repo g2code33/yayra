@@ -7,6 +7,7 @@ import {
   DRIVE_SESSION_KEY,
   PENDING_KEY,
   PROFILE_KEY,
+  authStorageKey,
   beginSignIn,
   buildAuthorizationUrl,
   clearProfile,
@@ -443,6 +444,27 @@ test('profile persistence round trip stores only profile + savedAt, and clears c
   assert.equal(loadProfile(local), null);
 });
 
+test('web profile and delegated Drive persistence are isolated per browsing profile', () => {
+  const local = fakeStorage();
+  const personalDrive = { id: 'P'.repeat(43), expiresAt: '2099-01-01T00:00:00.000Z', scope: 'drive.readonly' };
+  const workDrive = { id: 'W'.repeat(43), expiresAt: '2099-01-01T00:00:00.000Z', scope: 'drive.readonly' };
+  saveProfile(local, { sub: 'personal', email: 'personal@example.com' }, 'default');
+  saveProfile(local, { sub: 'work', email: 'work@example.com' }, 'profile-work');
+  saveDriveSession(local, personalDrive, 'default');
+  saveDriveSession(local, workDrive, 'profile-work');
+
+  assert.equal(loadProfile(local, 'default').profile.email, 'personal@example.com');
+  assert.equal(loadProfile(local, 'profile-work').profile.email, 'work@example.com');
+  assert.equal(loadDriveSession(local, () => Date.now(), 'default').id, personalDrive.id);
+  assert.equal(loadDriveSession(local, () => Date.now(), 'profile-work').id, workDrive.id);
+  assert.equal(local.getItem(PROFILE_KEY) !== null, true, 'legacy/default key remains compatible');
+  assert.equal(local.getItem(authStorageKey(PROFILE_KEY, 'profile-work')) !== null, true);
+
+  clearProfile(local, 'profile-work');
+  assert.equal(loadProfile(local, 'profile-work'), null);
+  assert.equal(loadProfile(local, 'default').profile.email, 'personal@example.com');
+});
+
 test('loadProfile tolerates corrupt or incomplete stored JSON', () => {
   assert.equal(loadProfile(fakeStorage({ [PROFILE_KEY]: 'not json' })), null);
   assert.equal(loadProfile(fakeStorage({ [PROFILE_KEY]: JSON.stringify({ profile: {} }) })), null);
@@ -478,6 +500,24 @@ test('web auth bridge satisfies the BrowserShell contract: signIn emits signing-
   assert.deepEqual(events.map((e) => e.type), ['signing-in']);
   assert.equal(navigations.length, 1);
   assert.equal(JSON.parse(session.getItem(PENDING_KEY)).returnTo, '/current-page');
+});
+
+test('web auth bridge carries the selected profile through redirect state and scopes sign-out', async () => {
+  const { bridge, local, session } = makeBridge();
+  saveProfile(local, { sub: 'personal', email: 'personal@example.com' }, 'default');
+  saveProfile(local, { sub: 'work', email: 'work@example.com' }, 'profile-work');
+  const events = [];
+  bridge.onEvent((event) => events.push(event));
+
+  assert.deepEqual(await bridge.signIn('profile-work'), { ok: true, pending: true });
+  assert.equal(JSON.parse(session.getItem(PENDING_KEY)).profileId, 'profile-work');
+  assert.equal(events[0].profileId, 'profile-work');
+
+  await bridge.signOut('profile-work');
+  assert.equal((await bridge.getSession('default')).profile.email, 'personal@example.com');
+  assert.deepEqual(await bridge.getSession('profile-work'), { signedIn: false });
+  assert.equal(events.at(-1).type, 'signed-out');
+  assert.equal(events.at(-1).profileId, 'profile-work');
 });
 
 test('web auth bridge reports not_configured without a client id instead of failing deep in the flow', async () => {

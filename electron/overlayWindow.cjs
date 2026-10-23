@@ -72,7 +72,7 @@ function createOverlayBridge({
   // disabled and bubble clicks fall back to restoring the main window.
   mainPreloadPath = null,
   // URL the mini window loads (the dist shell in compact mini mode).
-  miniUrl = 'yayra://app/index.html?shell=mini',
+  miniUrl = 'yayra://app/index.html?shell=mini&profile=default',
   // Electron Menu class for the bubble's right-click menu.
   Menu = null,
   // Recreates the main browser window after it was closed - this is what

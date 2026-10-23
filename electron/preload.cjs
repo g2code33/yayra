@@ -122,11 +122,15 @@ const api = {
   // main-process store. Scoped Drive API access stays behind IPC, so neither
   // Google bearer tokens nor refresh tokens enter renderer JavaScript.
   auth: {
-    signIn: () => ipcRenderer.invoke('yayra:auth-sign-in'),
-    connectDrive: () => ipcRenderer.invoke('yayra:auth-connect-drive'),
-    downloadDriveFile: (fileId) => ipcRenderer.invoke('yayra:auth-download-drive-file', { fileId }),
-    signOut: () => ipcRenderer.invoke('yayra:auth-sign-out'),
-    getSession: () => ipcRenderer.invoke('yayra:auth-get-session'),
+    // Every app-account operation carries this shell window's browsing
+    // profile. The main process pre-pins native shell windows (or resolves an
+    // auxiliary shell from its trusted boot URL), so renderer code cannot
+    // read or clear another open profile's encrypted credentials.
+    signIn: (profileId = 'default') => ipcRenderer.invoke('yayra:auth-sign-in', { profileId }),
+    connectDrive: (profileId = 'default') => ipcRenderer.invoke('yayra:auth-connect-drive', { profileId }),
+    downloadDriveFile: (fileId, profileId = 'default') => ipcRenderer.invoke('yayra:auth-download-drive-file', { fileId, profileId }),
+    signOut: (profileId = 'default') => ipcRenderer.invoke('yayra:auth-sign-out', { profileId }),
+    getSession: (profileId = 'default') => ipcRenderer.invoke('yayra:auth-get-session', { profileId }),
     openAccountPage: () => ipcRenderer.invoke('yayra:auth-open-account-page'),
     // Credential-free product origins only; main validates exact HTTPS Google
     // ownership before invoking the OS browser.

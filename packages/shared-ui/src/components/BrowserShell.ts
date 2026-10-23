@@ -32,6 +32,8 @@ export interface BrowserShellOptions {
   isMobile?: boolean;
   initialUrl?: string;
   initialPrivate?: boolean;
+  /** Immutable browsing-profile binding supplied by a profile window URL. */
+  windowProfileId?: string | null;
   tabs?: BrowserTabState[];
   activeTabId?: string;
   navigationController?: any;

@@ -12,7 +12,7 @@ const { parseAppModeUrl, buildInstallPlan, appWindowClass } = require('./appMode
 const { parsePdfFileArg } = require('./pdfLaunch.cjs');
 const { extractManifestLink, parseManifest, pickInstallIdentity, siteIconCandidates, isPngBuffer, isIcoBuffer, extractPngFromIco, generateSiteIdentityPng, pngToIco } = require('./pwaManifest.cjs');
 const { startGlobalHotkeys } = require('./globalHotkeys.cjs');
-const { createAuthBridge } = require('./authBridge.cjs');
+const { createAuthBridge, normalizeAuthProfileId } = require('./authBridge.cjs');
 const { createAuthStore } = require('./authStore.cjs');
 const { signInWithGoogle } = require('./googleAuth.cjs');
 const { resolveGoogleClientId, resolveGoogleClientSecret } = require('./googleAuthConfig.cjs');
@@ -51,8 +51,50 @@ let downloadsBridge = null;
 // ever receives opaque ids plus display metadata or bytes for one chosen id.
 let documentLibrary = null;
 // Extra per-profile shell windows (Chrome-style: one window per profile,
-// the previous window stays). Tracked for cleanup only.
+// the previous window stays). The WeakMap is the authoritative main-process
+// account boundary for every shell webContents. Main/profile windows are
+// pinned before their first navigation. Any auxiliary shell is derived from
+// its main-process-loaded boot URL (never from an arbitrary IPC claim).
 const profileWindows = new Set();
+const webContentsProfileIds = new WeakMap();
+
+function bindWebContentsProfile(contents, claimedProfileId) {
+  if (!contents) return 'default';
+  const existing = webContentsProfileIds.get(contents);
+  if (existing) return existing;
+  const profileId = normalizeAuthProfileId(claimedProfileId);
+  webContentsProfileIds.set(contents, profileId);
+  return profileId;
+}
+
+function resolveWebContentsProfile(contents) {
+  const existing = contents && webContentsProfileIds.get(contents);
+  if (existing) return existing;
+  // Auxiliary shells (currently yayra mini) are not constructed here. Bind
+  // them from the trusted app URL that the main process loaded; absence of a
+  // profile boot parameter means the default profile. The renderer's claimed
+  // IPC profile is intentionally not consulted.
+  let bootProfileId = 'default';
+  try {
+    const currentUrl = new URL(contents?.getURL?.() || '');
+    if (currentUrl.protocol === `${CUSTOM_SCHEME}:` && currentUrl.hostname === 'app') {
+      bootProfileId = currentUrl.searchParams.get('profile') || 'default';
+    }
+  } catch { /* retain default */ }
+  return bindWebContentsProfile(contents, bootProfileId);
+}
+
+function windowsForProfile(profileId) {
+  const expected = normalizeAuthProfileId(profileId);
+  return BrowserWindow.getAllWindows().filter((win) => {
+    try {
+      return !win.isDestroyed() && webContentsProfileIds.get(win.webContents) === expected;
+    } catch {
+      return false;
+    }
+  });
+}
+
 let overlayBridge = null;
 let webviewBridge = null;
 let globalHotkeys = null;
@@ -1413,17 +1455,30 @@ function registerIpcBridges() {
   // browser is the RFC 8252 external user-agent; a one-shot 127.0.0.1 loopback
   // callback returns only the code/state to this main process. See
   // electron/googleAuth.cjs + electron/authBridge.cjs for the full rationale.
-  const authStore = createAuthStore({
-    fs,
-    safeStorageImpl: safeStorage,
-    userDataDir: app.getPath('userData')
-  });
+  const authStores = new Map();
+  const getAuthStore = (claimedProfileId) => {
+    const profileId = normalizeAuthProfileId(claimedProfileId);
+    if (!authStores.has(profileId)) {
+      authStores.set(profileId, createAuthStore({
+        fs,
+        safeStorageImpl: safeStorage,
+        userDataDir: app.getPath('userData'),
+        profileId
+      }));
+    }
+    return authStores.get(profileId);
+  };
   createAuthBridge({
     ipcMain,
     shell,
     getMainWindow: () => mainWindow,
     getWindowForWebContents: (wc) => BrowserWindow.fromWebContents(wc),
-    authStore,
+    getProfileIdForWebContents: (wc) => resolveWebContentsProfile(wc),
+    getWindowsForProfile: (profileId) => windowsForProfile(profileId),
+    // Default keeps the legacy google-session.json path; all other profiles
+    // resolve to independently encrypted hashed files in authStore.cjs.
+    authStore: getAuthStore('default'),
+    getAuthStore,
     clientId: resolveGoogleClientId(),
     clientSecret: resolveGoogleClientSecret(),
     // Use Electron's own net.fetch (Chromium's network stack) instead of
@@ -1494,7 +1549,7 @@ function registerIpcBridges() {
   // the right identity, and its web-content partition joins download
   // tracking the moment the window exists.
   ipcMain.handle('yayra:open-profile-window', async (_event, { profileId, url, isPrivate = false } = {}) => {
-    const id = String(profileId || 'default');
+    const id = normalizeAuthProfileId(profileId);
     const initialUrl = normalizeHttpUrl(url);
     try {
       if (id !== 'default') {
@@ -1632,6 +1687,7 @@ function installShellFreezeRecovery(win, label = 'shell') {
  * profile's own session partition (see electron/webviewBridge.cjs).
  */
 async function createProfileWindow(profileId, initialUrl = null, { isPrivate = false } = {}) {
+  const boundProfileId = normalizeAuthProfileId(profileId);
   const win = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -1647,6 +1703,9 @@ async function createProfileWindow(profileId, initialUrl = null, { isPrivate = f
       backgroundThrottling: false
     }
   });
+  // Pin before navigation/preload: every later auth IPC from this native
+  // window is resolved to this profile even if renderer input is forged.
+  bindWebContentsProfile(win.webContents, boundProfileId);
   profileWindows.add(win);
   const clearShellRecovery = installShellFreezeRecovery(win, 'profile shell');
   win.webContents.on('context-menu', (_event, params) => {
@@ -1660,7 +1719,7 @@ async function createProfileWindow(profileId, initialUrl = null, { isPrivate = f
     if (webviewBridge) webviewBridge.destroyForWebContents(winContents);
     profileWindows.delete(win);
   });
-  const boot = new URLSearchParams({ profile: String(profileId || 'default') });
+  const boot = new URLSearchParams({ profile: boundProfileId });
   const bootUrl = normalizeHttpUrl(initialUrl);
   if (bootUrl) boot.set('page', bootUrl);
   if (isPrivate) boot.set('private', '1');
@@ -1709,6 +1768,10 @@ function createWindow() {
     }
   });
 
+  // The primary shell is the legacy/default profile. Other profiles are
+  // always opened through createProfileWindow(), where they are pre-pinned
+  // independently. Do this before preload/navigation so IPC cannot race it.
+  bindWebContentsProfile(mainWindow.webContents, 'default');
   const win = mainWindow;
 
   // PDFs queued before the window existed (OS "Open With" at cold start)
@@ -1752,10 +1815,14 @@ function createWindow() {
   winContents.on('did-fail-load', (_event, code, description, url) => {
     lastLoadError = { code, description, url };
     console.error(`[yayra] renderer load failed; retrying file fallback code=${code} url=${url}`);
-    if (!winContents.isDestroyed()) win.loadFile(path.join(DIST_DIR, 'index.html'));
+    if (!winContents.isDestroyed()) {
+      win.loadFile(path.join(DIST_DIR, 'index.html'), { query: { profile: 'default' } });
+    }
   });
   const isBadLoad = process.env.YAYRA_FORCE_BAD_LOAD === '1' || process.env.IBROWSE_FORCE_BAD_LOAD === '1';
-  const loadTarget = isBadLoad ? `${CUSTOM_SCHEME}://app/does-not-exist.html` : `${CUSTOM_SCHEME}://app/index.html`;
+  const loadTarget = isBadLoad
+    ? `${CUSTOM_SCHEME}://app/does-not-exist.html?profile=default`
+    : `${CUSTOM_SCHEME}://app/index.html?profile=default`;
   win.loadURL(loadTarget);
   if (process.env.YAYRA_SMOKE === '1' || process.env.IBROWSE_SMOKE === '1') {
     winContents.once('did-finish-load', async () => {

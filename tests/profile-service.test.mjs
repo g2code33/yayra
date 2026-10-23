@@ -103,6 +103,24 @@ test('Profiles: state persists across instances via storage', () => {
   assert.equal(svc2.current().email, 'grace@example.com');
 });
 
+test('Profiles: binding a second window does not rewrite the shared persisted current profile', () => {
+  const storage = new MemoryStorage();
+  const seed = new ProfileService({ storage });
+  const work = seed.createProfile({ name: 'Work' });
+  assert.equal(seed.current().id, DEFAULT_PROFILE_ID);
+
+  const workWindow = new ProfileService({ storage });
+  assert.equal(workWindow.bindToWindow(work.id).id, work.id);
+  assert.equal(workWindow.current().id, work.id, 'this window is bound to Work');
+
+  // Persist unrelated profile metadata from the bound window. currentId must
+  // remain the original/default identity rather than leaking Work globally.
+  workWindow.renameProfile(work.id, 'Work account');
+  const restartedMain = new ProfileService({ storage });
+  assert.equal(restartedMain.current().id, DEFAULT_PROFILE_ID);
+  assert.equal(restartedMain.list().find((profile) => profile.id === work.id).name, 'Work account');
+});
+
 test('Profiles: the last profile can never be deleted; deleting current falls back', () => {
   const svc = new ProfileService({ storage: new MemoryStorage() });
   assert.equal(svc.deleteProfile(DEFAULT_PROFILE_ID), false, 'last profile is undeletable');

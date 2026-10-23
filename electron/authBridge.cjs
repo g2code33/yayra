@@ -26,6 +26,8 @@ const DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
 const DRIVE_MAX_FILE_BYTES = 300 * 1024 * 1024;
 const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 const GOOGLE_REVOKE_ENDPOINT = 'https://oauth2.googleapis.com/revoke';
+const DEFAULT_PROFILE_ID = 'default';
+const MAX_PROFILE_ID_LENGTH = 160;
 const DRIVE_EXPORTS = Object.freeze({
   'application/vnd.google-apps.document': {
     mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', extension: '.docx'
@@ -69,45 +71,97 @@ function tokenScopes(tokens) {
   return new Set(String(tokens?.scope || '').split(/\s+/).filter(Boolean));
 }
 
+function normalizeAuthProfileId(value) {
+  const id = typeof value === 'string' ? value.trim() : '';
+  if (!id || id.length > MAX_PROFILE_ID_LENGTH || !/^[A-Za-z0-9_-]+$/.test(id)) return DEFAULT_PROFILE_ID;
+  return id;
+}
+
 function createAuthBridge({
   ipcMain,
   shell,
   getMainWindow,
   getWindowForWebContents,
+  getProfileIdForWebContents,
+  getWindowsForProfile,
   authStore,
+  getAuthStore,
   clientId,
   clientSecret,
   fetchImpl,
   signInImpl,
   logger = console
 }) {
-  let signingIn = false;
+  const signingInProfiles = new Set();
 
   function resolveRequestWindow(event) {
     try {
       const win = event?.sender && getWindowForWebContents?.(event.sender);
       if (win && !win.isDestroyed?.()) return win;
-    } catch { /* detached/closing renderer: fall back to the main window */ }
+      // An IPC event with a sender must never fall through to an unrelated
+      // main window when that sender is already detached/closing.
+      if (event?.sender) return null;
+    } catch { return null; }
     return getMainWindow?.() || null;
   }
 
-  function send(type, payload = {}, preferredWindow = null) {
-    const windows = [];
-    if (preferredWindow && !preferredWindow.isDestroyed?.()) windows.push(preferredWindow);
-    const mainWindow = getMainWindow?.();
-    if (mainWindow && !mainWindow.isDestroyed?.() && !windows.includes(mainWindow)) windows.push(mainWindow);
-    for (const win of windows) {
-      win.webContents?.send?.(AUTH_EVENT_CHANNEL, { type, ...payload });
+  function resolveProfileId(event, payload = {}) {
+    const claimed = normalizeAuthProfileId(payload?.profileId);
+    try {
+      if (event?.sender && typeof getProfileIdForWebContents === 'function') {
+        return normalizeAuthProfileId(getProfileIdForWebContents(event.sender, claimed));
+      }
+    } catch {
+      // A resolver failure cannot grant access to a different profile.
+      return DEFAULT_PROFILE_ID;
+    }
+    return claimed;
+  }
+
+  function storeForProfile(profileId) {
+    const store = typeof getAuthStore === 'function' ? getAuthStore(profileId) : authStore;
+    if (!store || typeof store.load !== 'function' || typeof store.save !== 'function' || typeof store.clear !== 'function') {
+      throw new Error('auth_store_unavailable');
+    }
+    return store;
+  }
+
+  function firstWindowForProfile(profileId) {
+    if (typeof getWindowsForProfile !== 'function') return null;
+    try {
+      return (getWindowsForProfile(normalizeAuthProfileId(profileId)) || [])
+        .find((candidate) => candidate && !candidate.isDestroyed?.()) || null;
+    } catch {
+      return null;
     }
   }
 
-  async function handleSignIn(event) {
-    if (signingIn) return { ok: false, error: 'sign_in_already_in_progress' };
+  function send(type, payload = {}, preferredWindow = null, profileId = DEFAULT_PROFILE_ID) {
+    const normalizedProfileId = normalizeAuthProfileId(profileId);
+    const windows = [];
+    if (preferredWindow && !preferredWindow.isDestroyed?.()) windows.push(preferredWindow);
+    if (typeof getWindowsForProfile === 'function') {
+      try {
+        for (const win of getWindowsForProfile(normalizedProfileId) || []) {
+          if (win && !win.isDestroyed?.() && !windows.includes(win)) windows.push(win);
+        }
+      } catch { /* the initiating window still receives the event */ }
+    }
+    // Deliberately no unconditional main-window fan-out. That old behavior
+    // replaced one open profile window's account when another signed in.
+    for (const win of windows) {
+      win.webContents?.send?.(AUTH_EVENT_CHANNEL, { type, ...payload, profileId: normalizedProfileId });
+    }
+  }
+
+  async function handleSignIn(event, payload = {}) {
+    const profileId = resolveProfileId(event, payload);
+    if (signingInProfiles.has(profileId)) return { ok: false, error: 'sign_in_already_in_progress' };
     if (!clientId || !clientSecret) return { ok: false, error: 'not_configured' };
 
-    signingIn = true;
+    signingInProfiles.add(profileId);
     const requestWindow = resolveRequestWindow(event);
-    send('signing-in', {}, requestWindow);
+    send('signing-in', {}, requestWindow, profileId);
     try {
       const { profile, tokens } = await signInImpl({
         clientId,
@@ -119,14 +173,15 @@ function createAuthBridge({
         ...(fetchImpl ? { fetchImpl } : {}),
         logger
       });
-      authStore.save({ profile, tokens });
-      send('signed-in', { profile }, requestWindow);
+      storeForProfile(profileId).save({ profile, tokens });
+      send('signed-in', { profile }, requestWindow, profileId);
       // The verified loopback callback means the browser ceremony is done.
       // Bring the Yayra window that initiated it back so detached/profile
       // windows update themselves instead of sending the result elsewhere.
+      const matchingWindow = firstWindowForProfile(profileId);
       const win = requestWindow && !requestWindow.isDestroyed?.()
         ? requestWindow
-        : getMainWindow?.();
+        : (matchingWindow || (!event?.sender ? getMainWindow?.() : null));
       if (win && !win.isDestroyed?.()) {
         try { win.show?.(); } catch { /* platform/window may not expose show */ }
         try { win.focus?.(); } catch { /* best effort only */ }
@@ -135,19 +190,20 @@ function createAuthBridge({
     } catch (err) {
       const message = err && err.message ? err.message : String(err);
       logger?.error?.(`[yayra:auth] sign-in failed: ${message}`);
-      send('error', { message }, requestWindow);
+      send('error', { message }, requestWindow, profileId);
       return { ok: false, error: message };
     } finally {
-      signingIn = false;
+      signingInProfiles.delete(profileId);
     }
   }
 
-  async function handleConnectDrive(event) {
-    if (signingIn) return { ok: false, error: 'sign_in_already_in_progress' };
+  async function handleConnectDrive(event, payload = {}) {
+    const profileId = resolveProfileId(event, payload);
+    if (signingInProfiles.has(profileId)) return { ok: false, error: 'sign_in_already_in_progress' };
     if (!clientId || !clientSecret || typeof fetchImpl !== 'function') return { ok: false, error: 'not_configured' };
-    signingIn = true;
+    signingInProfiles.add(profileId);
     const requestWindow = resolveRequestWindow(event);
-    send('drive-connecting', {}, requestWindow);
+    send('drive-connecting', {}, requestWindow, profileId);
     try {
       const { profile, tokens } = await signInImpl({
         clientId,
@@ -165,24 +221,28 @@ function createAuthBridge({
         obtained_at_ms: Date.now()
       };
       if (!tokenScopes(scopedTokens).has(DRIVE_READONLY_SCOPE)) throw new Error('drive_scope_not_granted');
-      authStore.save({ profile, tokens: scopedTokens });
-      send('signed-in', { profile }, requestWindow);
-      send('drive-connected', { profile }, requestWindow);
-      const win = requestWindow && !requestWindow.isDestroyed?.() ? requestWindow : getMainWindow?.();
+      storeForProfile(profileId).save({ profile, tokens: scopedTokens });
+      send('signed-in', { profile }, requestWindow, profileId);
+      send('drive-connected', { profile }, requestWindow, profileId);
+      const matchingWindow = firstWindowForProfile(profileId);
+      const win = requestWindow && !requestWindow.isDestroyed?.()
+        ? requestWindow
+        : (matchingWindow || (!event?.sender ? getMainWindow?.() : null));
       try { win?.show?.(); win?.focus?.(); } catch { /* best effort */ }
       return { ok: true, profile };
     } catch (err) {
       const message = err?.message || String(err);
       logger?.error?.(`[yayra:drive] connection failed: ${message}`);
-      send('drive-error', { message }, requestWindow);
+      send('drive-error', { message }, requestWindow, profileId);
       return { ok: false, error: message };
     } finally {
-      signingIn = false;
+      signingInProfiles.delete(profileId);
     }
   }
 
-  async function usableDriveSession() {
-    const session = authStore.load();
+  async function usableDriveSession(profileId) {
+    const store = storeForProfile(profileId);
+    const session = store.load();
     if (!session?.profile || !session.tokens || !tokenScopes(session.tokens).has(DRIVE_READONLY_SCOPE)) {
       throw new Error('drive_reconnect_required');
     }
@@ -218,17 +278,18 @@ function createAuthBridge({
       scope: refreshed.scope || tokens.scope,
       obtained_at_ms: Date.now()
     };
-    authStore.save({ profile: session.profile, tokens: nextTokens });
+    store.save({ profile: session.profile, tokens: nextTokens });
     return { ...session, tokens: nextTokens };
   }
 
-  async function handleDownloadDriveFile(_event, { fileId } = {}) {
+  async function handleDownloadDriveFile(event, { fileId, profileId: claimedProfileId } = {}) {
+    const profileId = resolveProfileId(event, { profileId: claimedProfileId });
     if (typeof fetchImpl !== 'function') return { ok: false, error: 'not_configured' };
     if (typeof fileId !== 'string' || !/^[A-Za-z0-9_-]{10,200}$/.test(fileId)) {
       return { ok: false, error: 'invalid_drive_file_id' };
     }
     try {
-      const session = await usableDriveSession();
+      const session = await usableDriveSession(profileId);
       const authorization = { Authorization: `Bearer ${session.tokens.access_token}` };
       const metadataUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=id,name,mimeType,size,capabilities%28canDownload%29&supportsAllDrives=true`;
       const metadataResponse = await fetchImpl(metadataUrl, { headers: { ...authorization, Accept: 'application/json' } });
@@ -267,10 +328,12 @@ function createAuthBridge({
     }
   }
 
-  async function handleSignOut(event) {
-    const session = authStore.load();
-    authStore.clear();
-    send('signed-out', {}, resolveRequestWindow(event));
+  async function handleSignOut(event, payload = {}) {
+    const profileId = resolveProfileId(event, payload);
+    const store = storeForProfile(profileId);
+    const session = store.load();
+    store.clear();
+    send('signed-out', {}, resolveRequestWindow(event), profileId);
 
     // Local sign-out is authoritative and immediate. Revoke the strongest
     // surviving Google credential best-effort without ever exposing it over
@@ -302,8 +365,9 @@ function createAuthBridge({
     return { ok: true };
   }
 
-  async function handleGetSession() {
-    const session = authStore.load();
+  async function handleGetSession(event, payload = {}) {
+    const profileId = resolveProfileId(event, payload);
+    const session = storeForProfile(profileId).load();
     if (!session || !session.profile) return { signedIn: false };
     return { signedIn: true, profile: session.profile, savedAt: session.savedAt };
   }
@@ -356,4 +420,9 @@ function createAuthBridge({
   };
 }
 
-module.exports = { createAuthBridge, AUTH_EVENT_CHANNEL, normalizeGoogleProductOrigin };
+module.exports = {
+  createAuthBridge,
+  AUTH_EVENT_CHANNEL,
+  normalizeGoogleProductOrigin,
+  normalizeAuthProfileId
+};

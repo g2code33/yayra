@@ -259,7 +259,7 @@ function makeMiniHarness({ getMainWindow = () => null, createMainWindow = null }
     path,
     preloadPath: '/fake/overlayPreload.cjs',
     mainPreloadPath: '/fake/preload.cjs',
-    miniUrl: 'yayra://app/index.html?shell=mini',
+    miniUrl: 'yayra://app/index.html?shell=mini&profile=default',
     overlayStore,
     getMainWindow,
     createMainWindow
@@ -277,6 +277,7 @@ test('overlayWindow: single bubble click opens the floating mini browser window 
   const mini = bridge.getMiniWindow();
   assert.ok(mini, 'mini window is tracked');
   assert.match(mini.loadedUrl, /shell=mini/, 'loads the compact mini shell');
+  assert.match(mini.loadedUrl, /profile=default/, 'mini is pinned to the default account profile');
   assert.equal(mini.opts.frame, false, 'frameless floating panel');
   assert.equal(mini.opts.webPreferences.preload, '/fake/preload.cjs', 'full window.yayra API preload (native tabs work inside the mini)');
   assert.equal(mini.alwaysOnTop.level, 'screen-saver', 'floats above other apps like the bubble');

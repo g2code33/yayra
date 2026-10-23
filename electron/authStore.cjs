@@ -1,31 +1,45 @@
 'use strict';
 
 /**
- * Persists the signed-in Google session for Yayra's Electron desktop build.
+ * Persists Yayra's app-level Google session for one browsing profile.
  *
  * Security design:
- *   - Only the non-sensitive profile (sub/email/name/picture) is ever sent
- *     to the renderer over IPC (see electron/main.cjs + preload.cjs). The
- *     renderer never sees access/refresh tokens.
- *   - The raw token response (which may include a long-lived refresh_token)
- *     is encrypted at rest with Electron's `safeStorage`, which is backed by
- *     the OS keychain (Keychain on macOS, libsecret on Linux, DPAPI on
- *     Windows) - never written to disk in plaintext.
- *   - Everything lives under Electron's per-user `userData` directory, so a
- *     signed-in session is local to one machine/profile, matching how the
- *     rest of Yayra's local-first storage works.
+ *   - Only the non-sensitive Google profile (sub/email/name/picture) crosses
+ *     IPC. Access and refresh tokens remain in the Electron main process.
+ *   - Token JSON is encrypted with Electron safeStorage (the OS keychain)
+ *     before disk persistence. Raw credentials are never written.
+ *   - Every Yayra browsing profile gets a different file. The default
+ *     profile deliberately retains the legacy `google-session.json` path,
+ *     which migrates existing users without copying or re-encrypting tokens.
+ *     Non-default filenames are a SHA-256 digest of the validated profile id,
+ *     so a renderer-controlled value can never become a path traversal.
  *
- * Fully dependency-injected (fsImpl, safeStorageImpl, userDataDir) so this
- * is unit-testable with a real temp directory and a fake safeStorage, with
- * no real Electron runtime required.
+ * Fully dependency-injected for tests; no Electron runtime is required.
  */
 
 const path = require('node:path');
+const { createHash } = require('node:crypto');
 
 const FILE_NAME = 'google-session.json';
+const DEFAULT_PROFILE_ID = 'default';
+const MAX_PROFILE_ID_LENGTH = 160;
 
-function createAuthStore({ fs, safeStorageImpl, userDataDir }) {
-  const filePath = path.join(userDataDir, FILE_NAME);
+function normalizeAuthProfileId(value) {
+  const id = typeof value === 'string' ? value.trim() : '';
+  if (!id || id.length > MAX_PROFILE_ID_LENGTH || !/^[A-Za-z0-9_-]+$/.test(id)) return DEFAULT_PROFILE_ID;
+  return id;
+}
+
+function fileNameForProfile(profileId = DEFAULT_PROFILE_ID) {
+  const id = normalizeAuthProfileId(profileId);
+  if (id === DEFAULT_PROFILE_ID) return FILE_NAME;
+  const digest = createHash('sha256').update(id, 'utf8').digest('hex');
+  return `google-session-${digest}.json`;
+}
+
+function createAuthStore({ fs, safeStorageImpl, userDataDir, profileId = DEFAULT_PROFILE_ID }) {
+  const normalizedProfileId = normalizeAuthProfileId(profileId);
+  const filePath = path.join(userDataDir, fileNameForProfile(normalizedProfileId));
 
   function isEncryptionAvailable() {
     try {
@@ -36,14 +50,19 @@ function createAuthStore({ fs, safeStorageImpl, userDataDir }) {
   }
 
   function save({ profile, tokens }) {
-    const payload = { profile, savedAt: new Date().toISOString() };
+    const payload = {
+      version: 2,
+      profileId: normalizedProfileId,
+      profile,
+      savedAt: new Date().toISOString()
+    };
     if (isEncryptionAvailable() && tokens) {
       const encrypted = safeStorageImpl.encryptString(JSON.stringify(tokens));
       payload.tokensEncrypted = encrypted.toString('base64');
     } else if (tokens) {
       // No OS keychain available (e.g. some headless Linux CI environments).
       // Do not persist raw tokens unencrypted; the user will simply need to
-      // sign in again next launch. The profile alone is harmless to keep.
+      // sign in again next launch. The display profile alone is harmless.
       payload.tokensEncrypted = null;
       payload.encryptionUnavailable = true;
     }
@@ -60,6 +79,10 @@ function createAuthStore({ fs, safeStorageImpl, userDataDir }) {
     } catch {
       return null;
     }
+    // Legacy default sessions had no version/profileId fields. They remain
+    // valid only for the default store because only that store uses the old
+    // filename. A scoped file whose embedded id does not match is ignored.
+    if (payload?.profileId && normalizeAuthProfileId(payload.profileId) !== normalizedProfileId) return null;
     let tokens = null;
     if (payload.tokensEncrypted && isEncryptionAvailable()) {
       try {
@@ -76,11 +99,23 @@ function createAuthStore({ fs, safeStorageImpl, userDataDir }) {
     try {
       if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
     } catch {
-      // ignore - nothing to clear
+      // Local sign-out remains authoritative even if cleanup raced shutdown.
     }
   }
 
-  return { save, load, clear };
+  return {
+    save,
+    load,
+    clear,
+    profileId: normalizedProfileId,
+    filePath
+  };
 }
 
-module.exports = { createAuthStore, FILE_NAME };
+module.exports = {
+  createAuthStore,
+  fileNameForProfile,
+  normalizeAuthProfileId,
+  FILE_NAME,
+  DEFAULT_PROFILE_ID
+};

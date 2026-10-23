@@ -41,6 +41,11 @@ export class ProfileService {
     this.storage = storage;
     this.now = now;
     this.state = this.load();
+    // A native/web profile window can be pinned to a profile without
+    // rewriting the shared persisted `currentId`. Otherwise booting Work in
+    // a second window silently changes which identity the already-open
+    // Personal window (or the next main window) considers current.
+    this.windowProfileId = null;
   }
 
   load() {
@@ -88,7 +93,21 @@ export class ProfileService {
   }
 
   current() {
-    return this.state.profiles.find((p) => p.id === this.state.currentId) || this.state.profiles[0];
+    const currentId = this.windowProfileId || this.state.currentId;
+    return this.state.profiles.find((p) => p.id === currentId) || this.state.profiles[0];
+  }
+
+  /**
+   * Bind only this service/window instance. Unlike switchTo(), this never
+   * changes shared storage's global currentId, so two live windows retain
+   * independent identities even though their profile metadata is shared.
+   */
+  bindToWindow(profileId) {
+    const profile = this.state.profiles.find((p) => p.id === profileId);
+    if (!profile) return null;
+    this.windowProfileId = profile.id;
+    profile.lastUsedAt = this.now();
+    return profile;
   }
 
   getProfileForEmail(email) {
@@ -115,6 +134,7 @@ export class ProfileService {
   switchTo(profileId) {
     const profile = this.state.profiles.find((p) => p.id === profileId);
     if (!profile) return null;
+    this.windowProfileId = null;
     this.state.currentId = profile.id;
     profile.lastUsedAt = this.now();
     this.persist();
@@ -136,6 +156,7 @@ export class ProfileService {
     const idx = this.state.profiles.findIndex((p) => p.id === profileId);
     if (idx === -1) return false;
     this.state.profiles.splice(idx, 1);
+    if (this.windowProfileId === profileId) this.windowProfileId = null;
     if (this.state.currentId === profileId) {
       this.state.currentId = this.state.profiles[0].id;
       this.state.profiles[0].lastUsedAt = this.now();

@@ -30,7 +30,7 @@ async function run() {
     return fail('Google sign-in is not configured for this deployment.');
   }
   try {
-    const { profile, driveSession, returnTo } = await completeSignIn({
+    const { profile, profileId = 'default', driveSession, returnTo } = await completeSignIn({
       search: window.location.search,
       origin: window.location.origin,
       pathname: window.location.pathname,
@@ -38,11 +38,11 @@ async function run() {
       sessionStorage: window.sessionStorage,
       fetchImpl: window.fetch.bind(window)
     });
-    saveProfile(window.localStorage, profile);
+    saveProfile(window.localStorage, profile, profileId);
     // The value is an opaque, origin-bound, Drive-readonly capability — not a
     // Google token. Persist it so the reflected Yayra connection survives a
     // browser/PWA restart; the Worker keeps encrypted Google credentials.
-    if (driveSession) saveDriveSession(window.localStorage, driveSession);
+    if (driveSession) saveDriveSession(window.localStorage, driveSession, profileId);
     if (statusEl) statusEl.textContent = driveSession
       ? `Google Drive connected for ${profile.email} — returning to Yayra…`
       : `Signed in as ${profile.email} — returning to Yayra…`;

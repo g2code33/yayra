@@ -75,11 +75,176 @@ test('authBridge: sign-in returns to the detached/profile window that initiated 
 
   const result = await ipcMain.invoke('yayra:auth-sign-in', { sender });
   assert.equal(result.ok, true);
-  assert.deepEqual(mainWindow.sent.map((entry) => entry.payload.type), ['signing-in', 'signed-in'],
-    'the shared main account state stays synchronized too');
+  assert.deepEqual(mainWindow.sent, [],
+    'a profile-window sign-in must never replace the unrelated main-window account');
   assert.deepEqual(requestWindow.sent.map((entry) => entry.payload.type), ['signing-in', 'signed-in']);
+  assert.ok(requestWindow.sent.every((entry) => entry.payload.profileId === 'default'), 'events identify their profile');
   assert.equal(requestWindow.shown, 1);
   assert.equal(requestWindow.focused, 1);
+});
+
+test('authBridge: two open profile windows retain independent accounts and sign-out cannot cross the sender binding', async () => {
+  const ipcMain = fakeIpcMain();
+  const personalWindow = fakeWindow();
+  const workWindow = fakeWindow();
+  const personalSender = { id: 101 };
+  const workSender = { id: 202 };
+  const senderWindows = new Map([
+    [personalSender, personalWindow],
+    [workSender, workWindow]
+  ]);
+  const senderProfiles = new Map([
+    [personalSender, 'default'],
+    [workSender, 'profile-work']
+  ]);
+  const stores = new Map([
+    ['default', fakeAuthStore()],
+    ['profile-work', fakeAuthStore()]
+  ]);
+  const windowsByProfile = new Map([
+    ['default', [personalWindow]],
+    ['profile-work', [workWindow]]
+  ]);
+  const responses = [
+    { profile: { sub: 'personal', email: 'personal@example.com' }, tokens: { access_token: 'personal-private' } },
+    { profile: { sub: 'work', email: 'work@example.com' }, tokens: { access_token: 'work-private' } }
+  ];
+
+  createAuthBridge({
+    ipcMain,
+    shell: { openExternal: async () => {} },
+    getMainWindow: () => personalWindow,
+    getWindowForWebContents: (sender) => senderWindows.get(sender) || null,
+    // This models electron/main.cjs: the native BrowserWindow binding wins
+    // over any profileId forged in the renderer payload.
+    getProfileIdForWebContents: (sender) => senderProfiles.get(sender),
+    getWindowsForProfile: (profileId) => windowsByProfile.get(profileId) || [],
+    authStore: stores.get('default'),
+    getAuthStore: (profileId) => stores.get(profileId),
+    clientId: 'client-123',
+    clientSecret: 'secret-123',
+    signInImpl: async () => responses.shift()
+  });
+
+  await ipcMain.invoke('yayra:auth-sign-in', { sender: personalSender }, { profileId: 'default' });
+  await ipcMain.invoke('yayra:auth-sign-in', { sender: workSender }, { profileId: 'profile-work' });
+
+  assert.equal((await ipcMain.invoke('yayra:auth-get-session', { sender: personalSender }, { profileId: 'default' })).profile.email, 'personal@example.com');
+  assert.equal((await ipcMain.invoke('yayra:auth-get-session', { sender: workSender }, { profileId: 'profile-work' })).profile.email, 'work@example.com');
+  assert.deepEqual(personalWindow.sent.map((entry) => entry.payload.profileId), ['default', 'default']);
+  assert.deepEqual(workWindow.sent.map((entry) => entry.payload.profileId), ['profile-work', 'profile-work']);
+
+  // Work lies and asks to sign out `default`; the trusted sender binding
+  // still scopes the operation to profile-work.
+  await ipcMain.invoke('yayra:auth-sign-out', { sender: workSender }, { profileId: 'default' });
+  assert.deepEqual(await ipcMain.invoke('yayra:auth-get-session', { sender: workSender }, { profileId: 'profile-work' }), { signedIn: false });
+  assert.equal((await ipcMain.invoke('yayra:auth-get-session', { sender: personalSender }, { profileId: 'default' })).profile.email, 'personal@example.com');
+  assert.equal(personalWindow.sent.some((entry) => entry.payload.type === 'signed-out'), false,
+    'personal window is never cleared by work sign-out');
+  assert.equal(workWindow.sent.at(-1).payload.type, 'signed-out');
+  assert.equal(workWindow.sent.at(-1).payload.profileId, 'profile-work');
+
+  const leaked = [...personalWindow.sent, ...workWindow.sent]
+    .some((entry) => JSON.stringify(entry.payload).includes('-private'));
+  assert.equal(leaked, false, 'no profile token crosses IPC');
+});
+
+test('authBridge: Drive consent and API download stay inside the initiating profile', async () => {
+  const ipcMain = fakeIpcMain();
+  const personalWindow = fakeWindow();
+  const workWindow = fakeWindow();
+  const personalSender = { id: 301 };
+  const workSender = { id: 302 };
+  const personalStore = fakeAuthStore();
+  const workStore = fakeAuthStore();
+  personalStore.save({
+    profile: { sub: 'personal', email: 'personal@example.com' },
+    tokens: { access_token: 'personal-access' }
+  });
+  const seenAuthorizations = [];
+  const fetchImpl = async (url, options = {}) => {
+    if (String(url).includes('?fields=')) {
+      seenAuthorizations.push(options.headers.Authorization);
+      return new Response(JSON.stringify({
+        id: 'file-1234567890', name: 'Work plan.pdf', mimeType: 'application/pdf', size: '3', capabilities: { canDownload: true }
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (String(url).includes('alt=media')) {
+      seenAuthorizations.push(options.headers.Authorization);
+      return new Response(new Uint8Array([1, 2, 3]), {
+        status: 200,
+        headers: { 'content-type': 'application/pdf', 'content-length': '3' }
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  createAuthBridge({
+    ipcMain,
+    shell: { openExternal: async () => {} },
+    getMainWindow: () => personalWindow,
+    getWindowForWebContents: (sender) => sender === workSender ? workWindow : personalWindow,
+    getProfileIdForWebContents: (sender) => sender === workSender ? 'profile-work' : 'default',
+    getWindowsForProfile: (profileId) => profileId === 'profile-work' ? [workWindow] : [personalWindow],
+    authStore: personalStore,
+    getAuthStore: (profileId) => profileId === 'profile-work' ? workStore : personalStore,
+    clientId: 'c',
+    clientSecret: 's',
+    fetchImpl,
+    signInImpl: async () => ({
+      profile: { sub: 'work', email: 'work@example.com' },
+      tokens: {
+        access_token: 'work-access',
+        refresh_token: 'work-refresh',
+        scope: 'openid email profile https://www.googleapis.com/auth/drive.readonly',
+        expires_in: 3600
+      }
+    })
+  });
+
+  // Even with a forged default claim, the sender is pinned to Work.
+  const connected = await ipcMain.invoke('yayra:auth-connect-drive', { sender: workSender }, { profileId: 'default' });
+  assert.equal(connected.ok, true);
+  assert.equal(workStore.load().profile.email, 'work@example.com');
+  assert.equal(personalStore.load().profile.email, 'personal@example.com');
+  assert.equal(personalWindow.sent.length, 0);
+  assert.deepEqual(workWindow.sent.map((entry) => entry.payload.type), [
+    'drive-connecting', 'signed-in', 'drive-connected'
+  ]);
+
+  const downloaded = await ipcMain.invoke('yayra:auth-download-drive-file', { sender: workSender }, {
+    profileId: 'default', fileId: 'file-1234567890'
+  });
+  assert.equal(downloaded.ok, true);
+  assert.equal(downloaded.filename, 'Work plan.pdf');
+  assert.deepEqual([...downloaded.data], [1, 2, 3]);
+  assert.deepEqual(seenAuthorizations, ['Bearer work-access', 'Bearer work-access']);
+});
+
+test('authBridge: different profiles may complete OAuth concurrently while duplicate work in one profile is rejected', async () => {
+  const ipcMain = fakeIpcMain();
+  const stores = new Map([['default', fakeAuthStore()], ['profile-work', fakeAuthStore()]]);
+  const resolvers = [];
+  createAuthBridge({
+    ipcMain,
+    shell: { openExternal: async () => {} },
+    getMainWindow: () => fakeWindow(),
+    authStore: stores.get('default'),
+    getAuthStore: (profileId) => stores.get(profileId),
+    clientId: 'c',
+    clientSecret: 's',
+    signInImpl: async () => new Promise((resolve) => resolvers.push(resolve))
+  });
+
+  const personal = ipcMain.invoke('yayra:auth-sign-in', null, { profileId: 'default' });
+  const duplicate = await ipcMain.invoke('yayra:auth-sign-in', null, { profileId: 'default' });
+  const work = ipcMain.invoke('yayra:auth-sign-in', null, { profileId: 'profile-work' });
+  assert.deepEqual(duplicate, { ok: false, error: 'sign_in_already_in_progress' });
+  assert.equal(resolvers.length, 2, 'separate profiles are not blocked by each other');
+  resolvers[0]({ profile: { sub: 'p' }, tokens: {} });
+  resolvers[1]({ profile: { sub: 'w' }, tokens: {} });
+  assert.equal((await personal).ok, true);
+  assert.equal((await work).ok, true);
 });
 
 test('authBridge: sign-in failure emits an error event and does not persist a session', async () => {

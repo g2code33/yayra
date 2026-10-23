@@ -453,6 +453,93 @@ test('Shell: windowProfileId boot option binds the new window to its profile', (
   assert.equal(svc2.current().id, DEFAULT_PROFILE_ID);
 });
 
+test('Shell: two live profile windows keep different Google accounts and ignore each other’s auth lifecycle', async () => {
+  const storage = new MemoryStorage();
+  const seed = new ProfileService({ storage });
+  seed.evaluateSignIn('personal@example.com');
+  const work = seed.createProfile({ name: 'Work', email: 'work@example.com' });
+  const listeners = new Set();
+  const calls = [];
+  const accounts = new Map([
+    ['default', { sub: 'personal', name: 'Personal', email: 'personal@example.com' }],
+    [work.id, { sub: 'work', name: 'Work', email: 'work@example.com' }]
+  ]);
+  const emit = (event) => {
+    for (const listener of [...listeners]) listener(event);
+  };
+  const auth = {
+    onEvent(listener) { listeners.add(listener); return () => listeners.delete(listener); },
+    async getSession(profileId) {
+      calls.push(['getSession', profileId]);
+      const profile = accounts.get(profileId);
+      return profile
+        ? { signedIn: true, profile, savedAt: '2026-01-01T00:00:00.000Z' }
+        : { signedIn: false };
+    },
+    async signIn(profileId) {
+      calls.push(['signIn', profileId]);
+      const profile = { sub: 'work-new', name: 'New Work', email: 'new-work@example.com' };
+      accounts.set(profileId, profile);
+      emit({ type: 'signed-in', profileId, profile });
+      return { ok: true, profile };
+    },
+    async signOut(profileId) {
+      calls.push(['signOut', profileId]);
+      accounts.delete(profileId);
+      emit({ type: 'signed-out', profileId });
+      return { ok: true };
+    },
+    async downloadDriveFile(_fileId, profileId) {
+      calls.push(['downloadDriveFile', profileId]);
+      return { ok: false, error: 'drive_reconnect_required' };
+    },
+    async connectDrive(profileId) {
+      calls.push(['connectDrive', profileId]);
+      return { ok: true, pending: true };
+    }
+  };
+  globalThis.window.yayra = { auth };
+  try {
+    const personalWindow = makeShell({ storage, options: { windowProfileId: 'default' } }).shell;
+    const workWindow = makeShell({ storage, options: { windowProfileId: work.id } }).shell;
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.equal(personalWindow.state.googleAccount.profile.email, 'personal@example.com');
+    assert.equal(workWindow.state.googleAccount.profile.email, 'work@example.com');
+    assert.deepEqual(calls.filter(([name]) => name === 'getSession'), [
+      ['getSession', 'default'],
+      ['getSession', work.id]
+    ]);
+
+    // Account chooser completion in Work is tagged and ignored by Personal.
+    await workWindow.switchGoogleAccount();
+    assert.equal(workWindow.state.googleAccount.profile.email, 'new-work@example.com');
+    assert.equal(personalWindow.state.googleAccount.profile.email, 'personal@example.com');
+    assert.deepEqual(calls.find(([name]) => name === 'signIn'), ['signIn', work.id]);
+
+    // Drive fallback must use Work's delegated session, never Personal's.
+    await workWindow._downloadDriveFileThroughApi(
+      workWindow.state.activeTabId,
+      'https://drive.google.com/file/d/abcdefghij12345/view'
+    );
+    assert.ok(calls.some(([name, id]) => name === 'downloadDriveFile' && id === work.id));
+    assert.ok(calls.some(([name, id]) => name === 'connectDrive' && id === work.id));
+
+    await workWindow.signOutOfGoogle();
+    assert.equal(workWindow.state.googleAccount.signedIn, false);
+    assert.equal(personalWindow.state.googleAccount.profile.email, 'personal@example.com',
+      'Work sign-out cannot clear Personal');
+    assert.deepEqual(calls.find(([name]) => name === 'signOut'), ['signOut', work.id]);
+
+    // Even an accidental/broadcast foreign event is defense-in-depth filtered.
+    emit({ type: 'signed-out', profileId: work.id });
+    assert.equal(personalWindow.state.googleAccount.signedIn, true);
+  } finally {
+    delete globalThis.window.yayra;
+  }
+});
+
 /* ------------------------- downloadsBridge.attachSession ------------------------- */
 
 test('downloadsBridge: profile-window sessions join download tracking exactly once', () => {
