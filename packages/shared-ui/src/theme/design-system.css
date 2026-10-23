@@ -5083,6 +5083,11 @@ button.fb-site-passkey-indicator {
   gap: 1px;
   animation: fb-fade-in 0.1s ease;
   font-size: 0.85rem;
+  /* Body-mounted Electron chrome must remain a renderer hit target even if a
+     frameless-window/theme rule marks surrounding top chrome as draggable. */
+  -webkit-app-region: no-drag;
+  pointer-events: auto;
+  touch-action: manipulation;
 }
 
 .fb-tab-context-menu-item {
@@ -5093,6 +5098,9 @@ button.fb-site-passkey-indicator {
   padding: 8px 10px;
   border-radius: 6px;
   cursor: pointer;
+  -webkit-app-region: no-drag;
+  pointer-events: auto;
+  touch-action: manipulation;
 }
 
 .fb-tab-context-menu-item:hover:not(:disabled) {

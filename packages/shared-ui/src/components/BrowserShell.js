@@ -2257,7 +2257,16 @@ export class BrowserShell {
 
   recoverTopChromeInput(reason = 'recovery', { closeTransientMenus = false } = {}) {
     const cancelled = this.cancelActivePointerGestures(reason);
-    const healed = this.healTopChromeInputBlockers({ closeTransientMenus });
+    // Moving focus from a native WebContentsView back to Yayra's renderer is
+    // part of selecting an HTML tab-menu item on desktop. Treating that
+    // expected focus handoff as an outside dismissal removes the button
+    // between pointer-down and click, so every visible option appears dead.
+    // A valid, fresh menu pair survives focus return; orphaned, hidden or
+    // expired blockers are still retired by healTopChromeInputBlockers().
+    const focusReturn = reason === 'focus' || reason === 'window-focus';
+    const healed = this.healTopChromeInputBlockers({
+      closeTransientMenus: Boolean(closeTransientMenus) && !focusReturn
+    });
     try {
       for (const el of this.rootElement?.querySelectorAll?.('.fb-tab-pointer-dragging') || []) {
         el.classList?.remove?.('fb-tab-pointer-dragging');
@@ -17330,6 +17339,12 @@ export class BrowserShell {
     const menu = document.createElement('div');
     menu.className = 'fb-tab-context-menu';
     menu.setAttribute('role', 'menu');
+    // This popup is body-mounted, outside the strip's explicit no-drag
+    // subtree. Pin its hit-testing contract inline as well as in CSS so a
+    // frameless-window/theme rule can never turn visible menu rows into an
+    // Electron drag region that receives hover but swallows left clicks.
+    menu.style?.setProperty?.('-webkit-app-region', 'no-drag');
+    menu.style?.setProperty?.('pointer-events', 'auto');
     if (!tab || !tab.id) return;
 
     // Clicking/tapping OR right-clicking anywhere outside the menu must
@@ -17347,8 +17362,13 @@ export class BrowserShell {
       menu.remove();
       try { window.removeEventListener?.('blur', dismiss, true); } catch { /* shim */ }
       // Truth-check all remaining overlays before restoring the native page;
-      // another real modal may still legitimately own it.
-      this.healStuckPageSurface();
+      // another real modal may still legitimately own it. Restoration is
+      // recovery work, never a precondition for invoking the selected menu
+      // command: a bridge disappearing during shutdown must not make every
+      // otherwise-local tab action look inert.
+      try { this.healStuckPageSurface(); } catch (error) {
+        try { this.logger?.(`[tab-menu] page restore failed: ${error?.message || error}`); } catch { /* logging is non-critical */ }
+      }
     };
     scrim._yayraDismiss = dismiss;
     menu._yayraDismiss = dismiss;
@@ -17416,6 +17436,65 @@ export class BrowserShell {
       menu.style.top = `${top}px`;
     };
 
+    // Electron/Linux can occasionally deliver pointer-up while dropping the
+    // compatibility click as focus moves from the native site view to this
+    // renderer. Activate on primary pointer-up, retain click for keyboard and
+    // assistive technology, and suppress only the synthetic click belonging
+    // to the pointer-up we already handled. Commands are exactly-once even if
+    // both events arrive.
+    const bindReliablePress = (button, handler) => {
+      let suppressNextClick = false;
+      let suppressionTimer = null;
+      let pressedPointer = null;
+      const pointerToken = (event) => event?.pointerId ?? 'primary';
+      const isPrimaryActivation = (event) => {
+        if (event?.isPrimary === false) return false;
+        const pointerButton = event?.button == null ? 0 : Number(event.button);
+        return pointerButton === 0 || pointerButton === -1;
+      };
+      button.addEventListener('pointerdown', (event) => {
+        if (isPrimaryActivation(event)) pressedPointer = pointerToken(event);
+      });
+      button.addEventListener('pointercancel', () => { pressedPointer = null; });
+      button.addEventListener('pointerup', (event) => {
+        if (!isPrimaryActivation(event) || pressedPointer !== pointerToken(event)) return;
+        pressedPointer = null;
+        suppressNextClick = true;
+        if (suppressionTimer) clearTimeout(suppressionTimer);
+        suppressionTimer = setTimeout(() => { suppressNextClick = false; }, 0);
+        suppressionTimer?.unref?.();
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+        handler(event);
+      });
+      button.addEventListener('click', (event) => {
+        if (suppressNextClick) {
+          suppressNextClick = false;
+          if (suppressionTimer) clearTimeout(suppressionTimer);
+          suppressionTimer = null;
+          event?.preventDefault?.();
+          event?.stopPropagation?.();
+          return;
+        }
+        handler(event);
+      });
+    };
+    let actionCommitted = false;
+    const runMenuAction = (action, event) => {
+      if (actionCommitted) return;
+      actionCommitted = true;
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      dismiss();
+      try {
+        action?.();
+      } finally {
+        // Some actions already render. The final render is intentional and
+        // keeps background-tab actions and bridge-only reloads consistent.
+        this.render();
+      }
+    };
+
     // Use textContent for labels: group names are user-entered and must
     // never be interpreted as markup in a tab context menu.
     items.forEach((item, index) => {
@@ -17449,14 +17528,12 @@ export class BrowserShell {
           childButton.className = 'fb-tab-context-menu-item fb-tab-context-submenu-item';
           childButton.setAttribute('role', 'menuitem');
           childButton.textContent = child.label;
-          childButton.addEventListener('click', () => {
-            dismiss();
-            child.action?.();
-            this.render();
-          });
+          bindReliablePress(childButton, (event) => runMenuAction(child.action, event));
           submenu.appendChild(childButton);
         }
-        toggle.addEventListener('click', () => {
+        bindReliablePress(toggle, (event) => {
+          event?.preventDefault?.();
+          event?.stopPropagation?.();
           const expanded = toggle.getAttribute('aria-expanded') === 'true';
           toggle.setAttribute('aria-expanded', String(!expanded));
           submenu.style.display = expanded ? 'none' : 'flex';
@@ -17475,11 +17552,7 @@ export class BrowserShell {
       button.setAttribute('data-idx', String(index));
       button.disabled = Boolean(item.disabled);
       button.textContent = item.label;
-      button.addEventListener('click', () => {
-        dismiss();
-        item.action?.();
-        this.render();
-      });
+      bindReliablePress(button, (event) => runMenuAction(item.action, event));
       menu.appendChild(button);
     });
 

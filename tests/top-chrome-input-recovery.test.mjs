@@ -189,6 +189,79 @@ test('orphan tab-menu scrims auto-retire and a re-render closes a valid transien
   }
 });
 
+test('fresh tab menu survives native focus handoff and primary pointer-up commits its command exactly once', async () => {
+  const h = await makeShell();
+  try {
+    const target = h.shell.getActiveTab();
+    target.url = 'https://focus-handoff.example/';
+    h.shell.render(h.container);
+    h.shell.renderTabContextMenu(80, 80, target);
+
+    const menu = document.body.querySelector('.fb-tab-context-menu');
+    const newTab = [...menu.querySelectorAll('.fb-tab-context-menu-item')]
+      .find((button) => button.textContent === 'New Tab');
+    assert.ok(newTab, 'action row is present before the native-to-shell focus handoff');
+
+    h.shell.recoverTopChromeInput('window-focus', { closeTransientMenus: true });
+    assert.equal(document.body.querySelector('.fb-tab-context-menu'), menu,
+      'normal focus return keeps a fresh valid menu available for the pending click');
+
+    const before = h.shell.state.tabs.length;
+    const primaryPointer = (type) => ({
+      type,
+      target: newTab,
+      pointerType: 'mouse',
+      isPrimary: true,
+      pointerId: 77,
+      button: 0,
+      preventDefault() {},
+      stopPropagation() {}
+    });
+    newTab.dispatchEvent(primaryPointer('pointerdown'));
+    newTab.dispatchEvent(primaryPointer('pointerup'));
+    assert.equal(h.shell.state.tabs.length, before + 1,
+      'pointer-up works even when Chromium drops the compatibility click during focus transfer');
+    assert.equal(document.body.querySelector('.fb-tab-context-menu'), null, 'committed action closes the menu');
+
+    // Chromium normally follows pointer-up with click. The detached row must
+    // not run a destructive tab command twice if that compatibility event
+    // still arrives after the pointer-up path handled it.
+    newTab.click();
+    assert.equal(h.shell.state.tabs.length, before + 1, 'pointer-up plus click is exactly one command');
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('tab menu commands are not blocked when native page restoration throws synchronously', async () => {
+  const h = await makeShell();
+  try {
+    const target = h.shell.getActiveTab();
+    target.url = 'https://restore-error.example/';
+    h.shell.render(h.container);
+    const bridge = {
+      setVisible(_tabId, visible) {
+        if (visible) throw new Error('native view was destroyed');
+        return Promise.resolve({ ok: true });
+      },
+      setBounds() { return Promise.resolve({ ok: true }); },
+      destroy() { return Promise.resolve({ ok: true }); }
+    };
+    globalThis.window.yayra = { webview: bridge };
+    h.shell._nativeWebviewTabIds.add(target.id);
+    h.shell.renderTabContextMenu(80, 80, target);
+
+    const before = h.shell.state.tabs.length;
+    const newTab = [...document.body.querySelectorAll('.fb-tab-context-menu-item')]
+      .find((button) => button.textContent === 'New Tab');
+    newTab.click();
+    assert.equal(h.shell.state.tabs.length, before + 1,
+      'the local command runs even if restoring the old native surface fails');
+  } finally {
+    h.cleanup();
+  }
+});
+
 test('native page bounds can never cover the custom tab/caption row', () => {
   assert.equal(MIN_NATIVE_PAGE_Y, 36);
   assert.deepEqual(
@@ -267,5 +340,7 @@ test('source contract: native focus recovery crosses preload IPC and no top chil
   assert.match(main, /window-focus[\s\S]{0,3000}CHROME_INPUT_RECOVERY_CHANNEL|CHROME_INPUT_RECOVERY_CHANNEL[\s\S]{0,5000}window-focus/);
   assert.match(main, /cancelForWebContents/);
   assert.match(css, /\.fb-chrome-tabstrip \*[\s\S]{0,220}-webkit-app-region:\s*no-drag/);
+  assert.match(css, /\.fb-tab-context-menu\s*\{[\s\S]{0,700}-webkit-app-region:\s*no-drag[\s\S]{0,100}pointer-events:\s*auto/,
+    'body-mounted tab menu is always an interactive renderer region');
   assert.match(css, /\.fb-dropdown-scrim\[data-tab-ctx="true"\][\s\S]{0,180}top:\s*36px/);
 });
