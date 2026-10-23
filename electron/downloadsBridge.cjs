@@ -58,6 +58,8 @@ function createDownloadsBridge({
   sessions = [],
   downloadsStore,
   getMainWindow,
+  onDownloadStarted = null,
+  onDownloadCompleted = null,
   idFactory = () => `dl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
   logger = console
 }) {
@@ -72,7 +74,7 @@ function createDownloadsBridge({
   // decorations. Entries are dropped the moment a download settles.
   const activeItems = new Map();
 
-  function attachItem(item) {
+  function attachItem(item, sourceWebContents = null) {
     const id = idFactory();
     let dir;
     try {
@@ -96,6 +98,7 @@ function createDownloadsBridge({
       filename,
       path: savePath,
       url: typeof item.getURL === 'function' ? item.getURL() : '',
+      mimeType: typeof item.getMimeType === 'function' ? item.getMimeType() : '',
       sizeBytes: typeof item.getTotalBytes === 'function' ? item.getTotalBytes() : 0,
       size: formatBytes(typeof item.getTotalBytes === 'function' ? item.getTotalBytes() : 0),
       state: 'Downloading',
@@ -105,6 +108,17 @@ function createDownloadsBridge({
     downloadsStore.addOrUpdateItem(record);
     activeItems.set(id, item);
     send('started', record);
+    try {
+      onDownloadStarted?.({
+        webContents: sourceWebContents,
+        id,
+        url: record.url,
+        filename: record.filename,
+        mimeType: record.mimeType
+      });
+    } catch (err) {
+      logger?.warn?.(`[yayra:downloads] download handoff notification failed: ${err?.message || err}`);
+    }
 
     // 'updated' fires for every received chunk - persisting EVERY event
     // meant a synchronous disk write on the main thread many times per
@@ -146,14 +160,23 @@ function createDownloadsBridge({
       downloadsStore.addOrUpdateItem(updated);
       activeItems.delete(id);
       send('done', updated);
+      if (finalState === 'Completed') {
+        try {
+          Promise.resolve(onDownloadCompleted?.(updated)).catch((err) => {
+            logger?.warn?.(`[yayra:downloads] completion integration failed: ${err?.message || err}`);
+          });
+        } catch (err) {
+          logger?.warn?.(`[yayra:downloads] completion integration failed: ${err?.message || err}`);
+        }
+      }
     });
 
     return record;
   }
 
-  function handleWillDownload(_event, item) {
+  function handleWillDownload(_event, item, sourceWebContents) {
     try {
-      attachItem(item);
+      attachItem(item, sourceWebContents);
     } catch (err) {
       logger?.error?.(`[yayra:downloads] will-download handling failed: ${err?.message || err}`);
     }

@@ -202,17 +202,47 @@ function renderTable(doc, shape) {
   return wrap;
 }
 
-function renderImage(doc, shape, showImages) {
-  if (!showImages || !shape.imageUrl || shape.w <= 0 || shape.h <= 0) return null;
+function imageSources(shape) {
+  const candidates = Array.isArray(shape.imageUrls) ? shape.imageUrls : [];
+  return [...new Set([shape.imageUrl, ...candidates].filter((value) => typeof value === 'string' && value))];
+}
+
+function unavailableImage(doc, shape, thumbnail) {
+  const fallback = doc.createElement('div');
+  fallback.className = 'fb-pptx-shape fb-pptx-image-unavailable';
+  fallback.setAttribute('role', 'img');
+  fallback.setAttribute('aria-label', 'Presentation image unavailable');
+  fallback.style.cssText = `${shapeBase(shape)};display:flex;align-items:center;justify-content:center;box-sizing:border-box;padding:8px;overflow:hidden;border:1px solid rgba(100,116,139,.35);background:linear-gradient(135deg,#f8fafc,#e2e8f0);color:#475569;font:600 ${thumbnail ? 8 : 12}px ${FONT_STACK};text-align:center;`;
+  fallback.textContent = thumbnail ? 'Image' : 'Image unavailable';
+  return fallback;
+}
+
+function installImageFallback(img, sources, onExhausted) {
+  let index = 0;
+  img.addEventListener('error', () => {
+    index += 1;
+    if (index < sources.length) {
+      img.src = sources[index];
+      img.setAttribute?.('src', sources[index]);
+      return;
+    }
+    onExhausted?.();
+  });
+}
+
+function renderImage(doc, shape, showImages, thumbnail) {
+  const sources = imageSources(shape);
+  if (!showImages || !sources.length || shape.w <= 0 || shape.h <= 0) return null;
   const radius = geometryRadius(shape.geom);
   if (!shape.crop) {
     const img = doc.createElement('img');
     img.className = 'fb-pptx-shape fb-pptx-image';
-    img.src = shape.imageUrl;
+    img.src = sources[0];
     img.alt = '';
     img.draggable = false;
     img.loading = 'lazy';
     img.style.cssText = `${shapeBase(shape)};object-fit:fill;${radius ? `border-radius:${radius};` : ''}user-select:none;`;
+    installImageFallback(img, sources, () => img.replaceWith?.(unavailableImage(doc, shape, thumbnail)));
     return img;
   }
   const crop = shape.crop;
@@ -222,10 +252,11 @@ function renderImage(doc, shape, showImages) {
   clip.className = 'fb-pptx-shape fb-pptx-image-crop';
   clip.style.cssText = `${shapeBase(shape)};overflow:hidden;${radius ? `border-radius:${radius};` : ''}`;
   const img = doc.createElement('img');
-  img.src = shape.imageUrl;
+  img.src = sources[0];
   img.alt = '';
   img.draggable = false;
   img.style.cssText = `position:absolute;max-width:none;left:${-(crop.l * shape.w) / keptWidth}px;top:${-(crop.t * shape.h) / keptHeight}px;width:${shape.w / keptWidth}px;height:${shape.h / keptHeight}px;object-fit:fill;user-select:none;`;
+  installImageFallback(img, sources, () => clip.replaceWith?.(unavailableImage(doc, shape, thumbnail)));
   clip.appendChild(img);
   return clip;
 }
@@ -304,7 +335,7 @@ function renderVideo(doc, shape, showImages, thumbnail) {
 
 function renderShape(doc, shape, helpers, showImages, thumbnail) {
   if (shape.type === 'video') return renderVideo(doc, shape, showImages, thumbnail);
-  if (shape.type === 'image') return renderImage(doc, shape, showImages);
+  if (shape.type === 'image') return renderImage(doc, shape, showImages, thumbnail);
   if (shape.type === 'table') return renderTable(doc, shape);
   if (shape.type === 'line') {
     const line = doc.createElement('div');
@@ -390,6 +421,17 @@ export function renderPptxSlide(container, {
     thumbnail ? 'pointer-events:none;user-select:none' : ''
   ].filter(Boolean).join(';');
   for (const shape of slide.shapes || []) append(canvas, renderShape(doc, shape, helpers, showImages, thumbnail));
+  const diagnostics = Array.isArray(slide.diagnostics) ? slide.diagnostics.filter((item) => item?.message) : [];
+  if (diagnostics.length) {
+    const warning = doc.createElement('div');
+    warning.className = 'fb-pptx-fidelity-warning';
+    warning.setAttribute('role', 'status');
+    warning.setAttribute('aria-label', diagnostics.map((item) => item.message).join(' '));
+    warning.title = diagnostics.map((item) => item.message).join('\n');
+    warning.textContent = thumbnail ? '⚠' : `⚠ Rendering issue${diagnostics.length > 1 ? `s (${diagnostics.length})` : ''}`;
+    warning.style.cssText = `position:absolute;right:8px;bottom:8px;z-index:999;max-width:45%;padding:${thumbnail ? '1px 3px' : '4px 7px'};border:1px solid #d97706;border-radius:5px;background:#fffbeb;color:#92400e;font:700 ${thumbnail ? 8 : 11}px ${FONT_STACK};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:0 1px 3px rgba(15,23,42,.18);`;
+    canvas.appendChild(warning);
+  }
   frame.appendChild(canvas);
   container.appendChild(frame);
   return { frame, canvas };

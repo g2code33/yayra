@@ -292,6 +292,143 @@ test('auth exchange serves Android/iOS clients WITHOUT a secret and accepts only
   }
 });
 
+test('Drive delegation keeps Google tokens encrypted in Worker KV and streams a scoped file back to the same Yayra origin', async () => {
+  const originalFetch = globalThis.fetch;
+  const records = new Map();
+  const kv = {
+    async get(key) { return records.get(key) || null; },
+    async put(key, value) { records.set(key, value); },
+    async delete(key) { records.delete(key); }
+  };
+  const env = {
+    ...AUTH_ENV,
+    GOOGLE_DRIVE_SESSIONS: kv,
+    GOOGLE_DRIVE_SESSION_SECRET: 'test-only-drive-session-secret-32-bytes-minimum'
+  };
+  const upstream = [];
+  globalThis.fetch = async (target, options = {}) => {
+    const url = String(target);
+    upstream.push({ url, options });
+    if (url.includes('oauth2.googleapis.com/token')) {
+      return new Response(JSON.stringify({
+        access_token: 'ya29.drive-private',
+        refresh_token: '1//drive-refresh-private',
+        expires_in: 3600,
+        scope: `openid email profile https://www.googleapis.com/auth/drive.readonly`
+      }), { status: 200 });
+    }
+    if (url === 'https://oauth2.googleapis.com/revoke') {
+      assert.equal(options.method, 'POST');
+      assert.equal(new URLSearchParams(options.body).get('token'), '1//drive-refresh-private');
+      return new Response('', { status: 200 });
+    }
+    if (url.includes('/oauth2/v3/userinfo')) {
+      return new Response(JSON.stringify({ sub: 'drive-user', name: 'Drive User', email: 'drive@example.com' }), { status: 200 });
+    }
+    if (url.includes('fields=id')) {
+      return new Response(JSON.stringify({
+        id: 'file-1234567890',
+        name: 'Research Methodology.pptx',
+        mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        size: '4',
+        capabilities: { canDownload: true }
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    if (url.includes('alt=media')) {
+      return new Response(new Uint8Array([0x50, 0x4b, 0x03, 0x04]), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+          'Content-Length': '4'
+        }
+      });
+    }
+    throw new Error(`unexpected upstream: ${url}`);
+  };
+  try {
+    const exchange = await worker.fetch(exchangeRequest({
+      code: 'drive-code',
+      codeVerifier: VALID_CODE_VERIFIER,
+      redirectUri: 'https://yayra.pages.dev/auth/callback',
+      platform: 'web',
+      capability: 'drive-readonly'
+    }, 'POST', { Origin: 'https://yayra.pages.dev' }), env);
+    assert.equal(exchange.status, 200);
+    const exchanged = await exchange.json();
+    assert.equal(exchanged.profile.email, 'drive@example.com');
+    assert.match(exchanged.driveSession.id, /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(exchanged.driveSession.scope, 'drive.readonly');
+    assert.equal(JSON.stringify(exchanged).includes('ya29.drive-private'), false);
+    assert.equal(records.size, 1);
+    const sealed = [...records.values()][0];
+    assert.match(sealed, /^v1\./);
+    assert.equal(sealed.includes('drive-refresh-private'), false, 'KV holds only AES-GCM ciphertext');
+
+    const downloadUrl = 'https://yayra-updates-api.g2code335.workers.dev/api/drive/download?fileId=file-1234567890';
+    const download = await worker.fetch(new Request(downloadUrl, {
+      headers: {
+        Origin: 'https://yayra.pages.dev',
+        Authorization: `YayraDrive ${exchanged.driveSession.id}`,
+        'cf-connecting-ip': '203.0.113.240'
+      }
+    }), env);
+    assert.equal(download.status, 200);
+    assert.equal(download.headers.get('access-control-allow-origin'), 'https://yayra.pages.dev');
+    assert.equal(download.headers.get('x-yayra-drive-fallback'), 'delegated');
+    assert.match(download.headers.get('content-disposition'), /Research%20Methodology\.pptx/);
+    assert.deepEqual([...new Uint8Array(await download.arrayBuffer())], [0x50, 0x4b, 0x03, 0x04]);
+    const mediaCalls = upstream.filter((call) => call.url.includes('/drive/v3/files/'));
+    assert.equal(mediaCalls.length, 2);
+    assert.equal(mediaCalls.every((call) => call.options.headers.Authorization === 'Bearer ya29.drive-private'), true);
+
+    const wrongOrigin = await worker.fetch(new Request(downloadUrl, {
+      headers: {
+        Origin: 'https://attacker.example',
+        Authorization: `YayraDrive ${exchanged.driveSession.id}`,
+        'cf-connecting-ip': '203.0.113.241'
+      }
+    }), env);
+    assert.equal(wrongOrigin.status, 403, 'an opaque session cannot be replayed from another origin');
+
+    const revokeUrl = 'https://yayra-updates-api.g2code335.workers.dev/api/drive/session/revoke';
+    const crossOriginRevoke = await worker.fetch(new Request(revokeUrl, {
+      method: 'POST',
+      headers: {
+        Origin: 'https://attacker.example',
+        Authorization: `YayraDrive ${exchanged.driveSession.id}`,
+        'cf-connecting-ip': '203.0.113.242'
+      }
+    }), env);
+    assert.equal(crossOriginRevoke.status, 403);
+    assert.equal(records.size, 1, 'a foreign origin cannot revoke another Yayra origin\'s capability');
+
+    const revoke = await worker.fetch(new Request(revokeUrl, {
+      method: 'POST',
+      headers: {
+        Origin: 'https://yayra.pages.dev',
+        Authorization: `YayraDrive ${exchanged.driveSession.id}`,
+        'cf-connecting-ip': '203.0.113.243'
+      }
+    }), env);
+    assert.equal(revoke.status, 200);
+    assert.deepEqual(await revoke.json(), { ok: true, providerRevoked: true });
+    assert.equal(records.size, 0, 'logout deletes encrypted Worker credentials before provider revocation');
+    assert.equal(upstream.some((call) => call.url === 'https://oauth2.googleapis.com/revoke'), true);
+
+    const afterRevoke = await worker.fetch(new Request(downloadUrl, {
+      headers: {
+        Origin: 'https://yayra.pages.dev',
+        Authorization: `YayraDrive ${exchanged.driveSession.id}`,
+        'cf-connecting-ip': '203.0.113.244'
+      }
+    }), env);
+    assert.equal(afterRevoke.status, 401);
+    assert.deepEqual(await afterRevoke.json(), { error: 'drive_reconnect_required' });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('auth exchange passes Google OAuth error codes through without echoing request contents', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({ error: 'invalid_grant', error_description: 'Code was already redeemed.' }), { status: 400 });

@@ -122,6 +122,9 @@ async function staticSmokeFallback() {
       || !existsSync(path.join(documentRoot, 'pptxRenderer.mjs'))
       || !existsSync(path.join(documentRoot, 'docxPreview.mjs'))
       || !existsSync(path.join(documentRoot, 'xlsx.mjs'))
+      || !existsSync(path.join(documentRoot, 'legacyOffice.mjs'))
+      || !existsSync(path.join(documentRoot, 'LEGACY-OFFICE-NOTICES.md'))
+      || !existsSync(path.join(root, 'dist/packages/shared-ui/src/services/legacyOfficeWorker.js'))
       || !existsSync(path.join(documentRoot, 'manifest.json'))) {
     console.error('desktop smoke fallback failed: one or more offline document engines are missing');
     process.exit(1);

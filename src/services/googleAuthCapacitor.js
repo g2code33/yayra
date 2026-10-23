@@ -24,8 +24,9 @@
  *      `platform: 'android' | 'ios'`; the worker exchanges them against
  *      the matching "Android"/"iOS" Google client (these client types
  *      have NO secret - they're verified by package name + SHA-1 /
- *      bundle ID instead), fetches userinfo, and returns ONLY the
- *      profile.
+ *      bundle ID instead), fetches userinfo, and returns the verified
+ *      profile. A separate Drive-readonly flow additionally returns only an
+ *      opaque Worker capability; raw Google tokens remain server-side.
  *
  * WHY THE PLUGIN CHOICE (researched 2026-10): the once-popular
  * @byteowls/capacitor-oauth2 is unmaintained (last publish 2023,
@@ -39,10 +40,10 @@
  * WHY THE EXCHANGE GOES THROUGH THE WORKER even though mobile clients are
  * public (a direct on-device exchange, the classic AppAuth pattern, would
  * also work): routing it server-side means RAW TOKENS NEVER EXIST IN THE
- * APP'S JS CONTEXT AT ALL - the same "profile only" guarantee the Electron
+ * APP'S JS CONTEXT AT ALL - the same token-isolation guarantee the Electron
  * bridge enforces across IPC and the web flow enforces in the browser. In
  * a Capacitor app, UI and flow logic share one WebView context, so the
- * only way to keep tokens away from UI-reachable code is to never let
+ * only way to keep Google tokens away from UI-reachable code is to never let
  * them arrive. Trade-off (documented in docs/GOOGLE_SIGNIN.md): mobile
  * sign-in needs the worker reachable - which the app already requires for
  * update checks.
@@ -56,13 +57,18 @@
 import {
   buildAuthorizationUrl,
   clearProfile,
+  downloadDelegatedDriveFile,
+  DRIVE_SCOPES,
   generatePkcePair,
   generateState,
   loadProfile,
   normalizeGoogleProductOrigin,
   readBoundedExchangeResponse,
+  revokeDelegatedDriveSession,
   safeExchangeErrorCode,
+  sanitizeDriveSession,
   sanitizeGoogleProfile,
+  saveDriveSession,
   saveProfile,
   validatedExchangeUrl
 } from './googleAuthWeb.js';
@@ -111,6 +117,7 @@ export async function signInWithGoogleCapacitor({
   platform,
   exchangeUrl,
   redirectUri = DEFAULT_MOBILE_REDIRECT_URI,
+  capability = 'profile',
   openBrowser,
   closeBrowser,
   onUrlOpen,
@@ -124,6 +131,7 @@ export async function signInWithGoogleCapacitor({
   if (!clientId) throw new Error('not_configured');
   if (!exchangeUrl) throw new Error('not_configured');
   if (platform !== 'android' && platform !== 'ios') throw new Error('invalid_platform');
+  if (!['profile', 'drive-readonly'].includes(capability)) throw new Error('invalid_capability');
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 10 * 60 * 1000) throw new Error('invalid_timeout');
   const safeExchangeUrl = validatedExchangeUrl(exchangeUrl);
   // The Worker and generated Android/iOS manifests are bound to this one
@@ -132,7 +140,13 @@ export async function signInWithGoogleCapacitor({
 
   const { codeVerifier, codeChallenge } = await generatePkcePair(cryptoImpl);
   const state = generateState(cryptoImpl);
-  const authUrl = buildAuthorizationUrl({ clientId, redirectUri, state, codeChallenge });
+  const authUrl = buildAuthorizationUrl({
+    clientId,
+    redirectUri,
+    state,
+    codeChallenge,
+    ...(capability === 'drive-readonly' ? { scopes: DRIVE_SCOPES } : {})
+  });
 
   // Subscribe BEFORE opening the browser - on a slow device the redirect
   // can land before Browser.open()'s promise even settles.
@@ -202,7 +216,7 @@ export async function signInWithGoogleCapacitor({
   const response = await fetchImpl(safeExchangeUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify({ code, codeVerifier, redirectUri, platform })
+    body: JSON.stringify({ code, codeVerifier, redirectUri, platform, capability })
   });
   const responseText = await readBoundedExchangeResponse(response);
   if (!response.ok) {
@@ -212,7 +226,9 @@ export async function signInWithGoogleCapacitor({
   try { body = JSON.parse(responseText); } catch { throw new Error('exchange_malformed_response'); }
   const profile = sanitizeGoogleProfile(body?.profile);
   if (!profile) throw new Error('exchange_malformed_response');
-  return { profile };
+  const driveSession = capability === 'drive-readonly' ? sanitizeDriveSession(body?.driveSession) : null;
+  if (capability === 'drive-readonly' && !driveSession) throw new Error('exchange_malformed_drive_session');
+  return { profile, ...(driveSession ? { driveSession } : {}) };
 }
 
 /**
@@ -268,9 +284,45 @@ export function createCapacitorAuthBridge({
         signingIn = false;
       }
     },
+    async connectDrive() {
+      if (!clientId) return { ok: false, error: 'not_configured' };
+      if (signingIn) return { ok: false, error: 'sign_in_already_in_progress' };
+      signingIn = true;
+      emit({ type: 'drive-connecting' });
+      try {
+        const { profile, driveSession } = await signInWithGoogleCapacitor({
+          clientId, platform, exchangeUrl, redirectUri, capability: 'drive-readonly',
+          openBrowser, closeBrowser, onUrlOpen, onBrowserFinished,
+          fetchImpl, cryptoImpl, timeoutMs
+        });
+        saveProfile(localStorage, profile);
+        saveDriveSession(localStorage, driveSession);
+        // Drive consent also verifies the Yayra identity. Emit the ordinary
+        // account event first so the avatar/account state updates immediately
+        // when the deep link returns, matching desktop and web callbacks.
+        emit({ type: 'signed-in', profile });
+        emit({ type: 'drive-connected', profile, expiresAt: driveSession.expiresAt });
+        return { ok: true, profile, expiresAt: driveSession.expiresAt };
+      } catch (err) {
+        const message = err && err.message ? err.message : String(err);
+        emit({ type: 'drive-error', message });
+        return { ok: false, error: message };
+      } finally {
+        signingIn = false;
+      }
+    },
+    async downloadDriveFile(fileId) {
+      try {
+        const result = await downloadDelegatedDriveFile({ fileId, exchangeUrl, sessionStorage: localStorage, fetchImpl });
+        return { ok: true, ...result };
+      } catch (err) {
+        return { ok: false, error: err?.message || String(err) };
+      }
+    },
     async signOut() {
       clearProfile(localStorage);
       emit({ type: 'signed-out' });
+      await revokeDelegatedDriveSession({ exchangeUrl, sessionStorage: localStorage, fetchImpl });
       return { ok: true };
     },
     async getSession() {

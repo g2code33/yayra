@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
   CALLBACK_PATH,
+  DRIVE_SCOPES,
+  DRIVE_SESSION_KEY,
   PENDING_KEY,
   PROFILE_KEY,
   beginSignIn,
@@ -10,11 +12,17 @@ import {
   clearProfile,
   completeSignIn,
   createWebAuthBridge,
+  downloadDelegatedDriveFile,
+  driveDownloadUrlForExchange,
+  driveRevokeUrlForExchange,
   generatePkcePair,
   generateState,
+  loadDriveSession,
   loadProfile,
   normalizeGoogleProductOrigin,
   parseCallbackParams,
+  revokeDelegatedDriveSession,
+  saveDriveSession,
   saveProfile
 } from '../src/services/googleAuthWeb.js';
 import { resolveWebGoogleAuthConfig } from '../src/config/googleAuthWeb.js';
@@ -76,6 +84,23 @@ test('web authorization URL carries PKCE S256 + account chooser and NEVER a clie
   // refresh token should ever be requested (nowhere safe to store it).
   assert.equal(url.searchParams.get('client_secret'), null);
   assert.equal(url.searchParams.get('access_type'), null);
+});
+
+test('Drive authorization is a separate explicit consent with only drive.readonly and offline return capability', async () => {
+  const session = fakeStorage();
+  let target = '';
+  await beginSignIn({
+    clientId: CLIENT_ID,
+    origin: ORIGIN,
+    returnTo: '/downloads',
+    capability: 'drive-readonly',
+    sessionStorage: session,
+    navigate: (url) => { target = url; }
+  });
+  const parsed = new URL(target);
+  assert.equal(parsed.searchParams.get('scope'), DRIVE_SCOPES.join(' '));
+  assert.equal(parsed.searchParams.get('access_type'), 'offline');
+  assert.equal(JSON.parse(session.getItem(PENDING_KEY)).capability, 'drive-readonly');
 });
 
 test('web authorization URL rejects broad scopes and malformed PKCE/state inputs', () => {
@@ -185,7 +210,13 @@ test('completeSignIn posts code+verifier+redirectUri to the worker and returns p
   assert.equal(requests[0].url, EXCHANGE_URL);
   assert.equal(requests[0].options.method, 'POST');
   const body = JSON.parse(requests[0].options.body);
-  assert.deepEqual(body, { code: 'auth-code-1', codeVerifier: VALID_WEB_VERIFIER, redirectUri: 'https://yayra.pages.dev/auth/callback' });
+  assert.deepEqual(body, {
+    code: 'auth-code-1',
+    codeVerifier: VALID_WEB_VERIFIER,
+    redirectUri: 'https://yayra.pages.dev/auth/callback',
+    platform: 'web',
+    capability: 'profile'
+  });
   // No token-ish material may leave completeSignIn.
   assert.deepEqual(result, {
     profile: { sub: '108', name: 'Ama Mensah', email: 'ama@example.com', picture: 'https://lh3.googleusercontent.com/a/photo' },
@@ -194,6 +225,85 @@ test('completeSignIn posts code+verifier+redirectUri to the worker and returns p
   assert.equal(JSON.stringify(result).includes('leaked-token'), false);
   // Pending stash is single-use.
   assert.equal(session.getItem(PENDING_KEY), null);
+});
+
+test('Drive callback returns only an opaque persistent session and delegated download stays origin-scoped', async () => {
+  const pending = pendingSession({ capability: 'drive-readonly' });
+  const sessionId = 'D'.repeat(43);
+  let exchangeBody;
+  const completed = await completeSignIn({
+    search: `?code=drive-code&state=${VALID_WEB_STATE}`,
+    origin: ORIGIN,
+    exchangeUrl: EXCHANGE_URL,
+    sessionStorage: pending,
+    fetchImpl: async (_url, options) => {
+      exchangeBody = JSON.parse(options.body);
+      return new Response(JSON.stringify({
+        profile: { sub: '108', name: 'Ama', email: 'ama@example.com' },
+        driveSession: { id: sessionId, expiresAt: '2099-01-01T00:00:00.000Z', scope: 'drive.readonly' }
+      }), { status: 200 });
+    }
+  });
+  assert.equal(exchangeBody.capability, 'drive-readonly');
+  assert.equal(completed.driveSession.id, sessionId);
+  assert.equal(JSON.stringify(completed).includes('access_token'), false);
+
+  const persistentStorage = fakeStorage();
+  saveDriveSession(persistentStorage, completed.driveSession);
+  assert.equal(loadDriveSession(persistentStorage).id, sessionId, 'opaque Drive access survives a Yayra restart');
+  const calls = [];
+  const downloaded = await downloadDelegatedDriveFile({
+    fileId: 'file-1234567890',
+    exchangeUrl: EXCHANGE_URL,
+    sessionStorage: persistentStorage,
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return new Response(new Uint8Array([0x50, 0x4b, 0x03, 0x04]), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+          'Content-Disposition': "attachment; filename*=UTF-8''Research%20Methodology.pptx",
+          'Content-Length': '4'
+        }
+      });
+    }
+  });
+  assert.equal(calls[0].url, driveDownloadUrlForExchange(EXCHANGE_URL, 'file-1234567890'));
+  assert.equal(calls[0].options.headers.Authorization, `YayraDrive ${sessionId}`);
+  assert.equal(downloaded.filename, 'Research Methodology.pptx');
+  assert.deepEqual([...new Uint8Array(await downloaded.blob.arrayBuffer())], [0x50, 0x4b, 0x03, 0x04]);
+  assert.equal(persistentStorage.getItem(DRIVE_SESSION_KEY).includes('ya29'), false);
+
+  let revokeCall;
+  const revoked = await revokeDelegatedDriveSession({
+    exchangeUrl: EXCHANGE_URL,
+    sessionStorage: persistentStorage,
+    fetchImpl: async (url, options) => {
+      revokeCall = { url, options };
+      return new Response(JSON.stringify({ ok: true, providerRevoked: true }), { status: 200 });
+    }
+  });
+  assert.deepEqual(revoked, { ok: true, revoked: true });
+  assert.equal(revokeCall.url, driveRevokeUrlForExchange(EXCHANGE_URL));
+  assert.equal(revokeCall.options.headers.Authorization, `YayraDrive ${sessionId}`);
+  assert.equal(persistentStorage.getItem(DRIVE_SESSION_KEY), null, 'logout removes the local capability before its network request');
+});
+
+test('Drive logout removes the local capability even when Worker revocation is offline', async () => {
+  const storage = fakeStorage();
+  saveDriveSession(storage, {
+    id: 'R'.repeat(43),
+    expiresAt: '2099-01-01T00:00:00.000Z',
+    scope: 'drive.readonly'
+  });
+  const result = await revokeDelegatedDriveSession({
+    exchangeUrl: EXCHANGE_URL,
+    sessionStorage: storage,
+    fetchImpl: async () => { throw new Error('offline'); },
+    timeoutMs: 20
+  });
+  assert.deepEqual(result, { ok: false, revoked: false });
+  assert.equal(storage.getItem(DRIVE_SESSION_KEY), null);
 });
 
 test('completeSignIn rejects a CSRF state mismatch and still consumes the pending attempt', async () => {

@@ -117,15 +117,14 @@ const api = {
       return () => ipcRenderer.removeListener(WEBVIEW_EVENT_CHANNEL, listener);
     }
   },
-  // "Sign in with Google" for Yayra's own app-level identity (not for
-  // browsing Google services logged in - Google forbids that for any
-  // embedded surface, see electron/webviewBridge.cjs). Presence of
-  // `window.yayra.auth` is how the renderer knows this desktop build
-  // supports real Google sign-in; it is absent on web/PWA/mobile builds
-  // until those platforms get their own implementation. See
-  // electron/googleAuth.cjs for the full flow.
+  // Callback-returning Google OAuth. Chrome owns the provider ceremony;
+  // the verified result returns to Yayra and persists through the encrypted
+  // main-process store. Scoped Drive API access stays behind IPC, so neither
+  // Google bearer tokens nor refresh tokens enter renderer JavaScript.
   auth: {
     signIn: () => ipcRenderer.invoke('yayra:auth-sign-in'),
+    connectDrive: () => ipcRenderer.invoke('yayra:auth-connect-drive'),
+    downloadDriveFile: (fileId) => ipcRenderer.invoke('yayra:auth-download-drive-file', { fileId }),
     signOut: () => ipcRenderer.invoke('yayra:auth-sign-out'),
     getSession: () => ipcRenderer.invoke('yayra:auth-get-session'),
     openAccountPage: () => ipcRenderer.invoke('yayra:auth-open-account-page'),

@@ -16,6 +16,11 @@ const buckets = new Map();
 const AUTH_LIMIT = 20;
 const AUTH_MAX_BODY_BYTES = 16 * 1024;
 const authBuckets = new Map();
+const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
+const DRIVE_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
+const DRIVE_MAX_FILE_BYTES = 300 * 1024 * 1024;
+const DRIVE_SESSION_PREFIX = 'drive-session:';
+
 
 // --- /api/ai : Yayra's managed AI, backed by a POOL of NVIDIA keys -------
 // NVIDIA's NIM endpoint is OpenAI-compatible; the Worker holds MANY API
@@ -37,27 +42,32 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.protocol !== 'https:' && url.hostname !== 'localhost') return new Response('HTTPS required', { status: 400 });
-    if (!['/updates/manifest.json', '/api/suggestions', '/api/latest-release', '/api/ai', '/auth/google/exchange'].includes(url.pathname)) {
+    if (!['/updates/manifest.json', '/api/suggestions', '/api/latest-release', '/api/ai', '/api/drive/download', '/api/drive/session/revoke', '/auth/google/exchange'].includes(url.pathname)) {
       return new Response('not found', { status: 404 });
     }
 
     const isGoogleExchange = url.pathname === '/auth/google/exchange';
-    const authOrigin = isGoogleExchange ? authorizeGoogleExchangeOrigin(request, env) : null;
-    const headers = isGoogleExchange ? googleAuthHeaders(authOrigin) : baseHeaders();
-    if (isGoogleExchange && authOrigin === false) {
+    const isDriveDownload = url.pathname === '/api/drive/download';
+    const isDriveRevoke = url.pathname === '/api/drive/session/revoke';
+    const isDelegatedGoogleRoute = isGoogleExchange || isDriveDownload || isDriveRevoke;
+    const authOrigin = isDelegatedGoogleRoute ? authorizeGoogleExchangeOrigin(request, env) : null;
+    const headers = isDelegatedGoogleRoute ? googleAuthHeaders(authOrigin) : baseHeaders();
+    if (isDelegatedGoogleRoute && authOrigin === false) {
       return new Response(JSON.stringify({ error: 'origin_not_allowed' }), { status: 403, headers });
     }
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers });
     const ip = request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || 'unknown';
     const now = Date.now();
     if (!take(ip, now)) return new Response('rate limited', { status: 429, headers });
-    if (isGoogleExchange && !takeFrom(authBuckets, ip, now, WINDOW_MS, AUTH_LIMIT)) {
+    if (isDelegatedGoogleRoute && !takeFrom(authBuckets, ip, now, WINDOW_MS, AUTH_LIMIT)) {
       return new Response(JSON.stringify({ error: 'rate_limited' }), { status: 429, headers });
     }
 
     if (url.pathname === '/api/suggestions') return proxySuggestions(request, url, headers, ctx);
     if (url.pathname === '/api/latest-release') return proxyLatestRelease(request, headers, env, ctx);
     if (url.pathname === '/api/ai') return answerWithNvidiaPool(request, headers, env, ip);
+    if (isDriveDownload) return downloadDelegatedDriveFile(request, url, headers, env, authOrigin);
+    if (isDriveRevoke) return revokeDelegatedDriveSession(request, headers, env, authOrigin);
     if (isGoogleExchange) return exchangeGoogleAuthCode(request, headers, env, authOrigin);
     return serveManifest(request, env, headers);
   }
@@ -438,8 +448,8 @@ function googleAuthHeaders(allowedOrigin) {
     pragma: 'no-cache',
     'referrer-policy': 'no-referrer',
     'x-content-type-options': 'nosniff',
-    'access-control-allow-methods': 'POST, OPTIONS',
-    'access-control-allow-headers': 'Content-Type',
+    'access-control-allow-methods': 'GET, POST, OPTIONS',
+    'access-control-allow-headers': 'Authorization, Content-Type',
     vary: 'Origin',
     ...(typeof allowedOrigin === 'string' ? { 'access-control-allow-origin': allowedOrigin } : {})
   };
@@ -487,19 +497,26 @@ async function exchangeGoogleAuthCode(request, headers, env, authorizedOrigin = 
     return new Response(JSON.stringify({ error: 'invalid_json' }), { status: 400, headers });
   }
   if (!body || typeof body !== 'object' || Array.isArray(body)
-    || Object.keys(body).some((key) => !['code', 'codeVerifier', 'redirectUri', 'platform'].includes(key))) {
+    || Object.keys(body).some((key) => !['code', 'codeVerifier', 'redirectUri', 'platform', 'capability'].includes(key))) {
     return new Response(JSON.stringify({ error: 'invalid_request' }), { status: 400, headers });
   }
   const code = typeof body.code === 'string' ? body.code : '';
   const codeVerifier = typeof body.codeVerifier === 'string' ? body.codeVerifier : '';
   const redirectUri = typeof body.redirectUri === 'string' ? body.redirectUri : '';
   const platform = typeof body.platform === 'string' ? body.platform : 'web';
+  const capability = body.capability === undefined ? 'profile' : body.capability;
+  if (!['profile', 'drive-readonly'].includes(capability)) {
+    return new Response(JSON.stringify({ error: 'invalid_capability' }), { status: 400, headers });
+  }
   if (!['web', 'android', 'ios'].includes(platform)) {
     return new Response(JSON.stringify({ error: 'invalid_platform' }), { status: 400, headers });
   }
   const client = resolveGoogleClient(env, platform);
   if (!client) {
     return new Response(JSON.stringify({ error: 'not_configured' }), { status: 501, headers });
+  }
+  if (capability === 'drive-readonly' && !delegatedDriveConfigured(env)) {
+    return new Response(JSON.stringify({ error: 'drive_session_not_configured' }), { status: 501, headers });
   }
   if (!code || !codeVerifier || !redirectUri) {
     return new Response(JSON.stringify({ error: 'missing_fields' }), { status: 400, headers });
@@ -590,10 +607,342 @@ async function exchangeGoogleAuthCode(request, headers, env, authorizedOrigin = 
       if (parsedPicture.protocol === 'https:' && !parsedPicture.username && !parsedPicture.password) picture = parsedPicture.toString();
     } catch { /* optional profile image is dropped */ }
   }
-  // Profile only. Explicitly reconstruct the object so no token-ish field
-  // can ever ride along, and drop the tokens on the floor right here.
+  // Explicitly reconstruct every client-facing object so no Google token can
+  // ride along. The ordinary identity flow still drops tokens immediately.
   const profile = { sub, name, email, picture };
-  return new Response(JSON.stringify({ profile }), { status: 200, headers });
+  if (capability !== 'drive-readonly') {
+    return new Response(JSON.stringify({ profile }), { status: 200, headers });
+  }
+
+  const grantedScopes = new Set(String(tokens.scope || '').split(/\s+/).filter(Boolean));
+  if (!grantedScopes.has(DRIVE_SCOPE)) {
+    return new Response(JSON.stringify({ error: 'drive_scope_not_granted' }), { status: 403, headers });
+  }
+  try {
+    const driveSession = await createDelegatedDriveSession(env, {
+      accessToken,
+      refreshToken: typeof tokens.refresh_token === 'string' ? tokens.refresh_token : '',
+      expiresIn: Number(tokens.expires_in),
+      platform,
+      sub,
+      origin: typeof authorizedOrigin === 'string' ? authorizedOrigin : null
+    });
+    return new Response(JSON.stringify({ profile, driveSession }), { status: 200, headers });
+  } catch (error) {
+    console.log(`[auth] delegated Drive session creation failed: ${error?.message || error}`);
+    return new Response(JSON.stringify({ error: 'drive_session_unavailable' }), { status: 503, headers });
+  }
+}
+
+function delegatedDriveConfigured(env) {
+  return Boolean(env?.GOOGLE_DRIVE_SESSIONS
+    && typeof env.GOOGLE_DRIVE_SESSIONS.get === 'function'
+    && typeof env.GOOGLE_DRIVE_SESSIONS.put === 'function'
+    && typeof env.GOOGLE_DRIVE_SESSIONS.delete === 'function'
+    && typeof env.GOOGLE_DRIVE_SESSION_SECRET === 'string'
+    && env.GOOGLE_DRIVE_SESSION_SECRET.length >= 32);
+}
+
+function base64UrlEncode(bytes) {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function base64UrlDecode(value) {
+  const normalized = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+  const padded = normalized + '='.repeat((4 - (normalized.length % 4 || 4)) % 4);
+  const binary = atob(padded);
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+async function delegatedSessionKey(secret) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(secret));
+  return crypto.subtle.importKey('raw', digest, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+}
+
+async function sealDelegatedSession(env, value) {
+  const key = await delegatedSessionKey(env.GOOGLE_DRIVE_SESSION_SECRET);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plaintext = new TextEncoder().encode(JSON.stringify(value));
+  const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintext);
+  return `v1.${base64UrlEncode(iv)}.${base64UrlEncode(new Uint8Array(ciphertext))}`;
+}
+
+async function openDelegatedSession(env, value) {
+  if (typeof value !== 'string' || value.length > 16 * 1024) throw new Error('invalid_session_record');
+  const [version, ivValue, cipherValue, extra] = value.split('.');
+  if (version !== 'v1' || !ivValue || !cipherValue || extra !== undefined) throw new Error('invalid_session_record');
+  const iv = base64UrlDecode(ivValue);
+  const ciphertext = base64UrlDecode(cipherValue);
+  if (iv.byteLength !== 12 || !ciphertext.byteLength) throw new Error('invalid_session_record');
+  const key = await delegatedSessionKey(env.GOOGLE_DRIVE_SESSION_SECRET);
+  const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+  const parsed = JSON.parse(new TextDecoder().decode(plaintext));
+  if (!parsed || typeof parsed !== 'object' || typeof parsed.accessToken !== 'string'
+    || typeof parsed.platform !== 'string' || typeof parsed.sub !== 'string'
+    || !Number.isFinite(parsed.expiresAt) || !Number.isFinite(parsed.sessionExpiresAt)) {
+    throw new Error('invalid_session_record');
+  }
+  return parsed;
+}
+
+async function createDelegatedDriveSession(env, {
+  accessToken,
+  refreshToken,
+  expiresIn,
+  platform,
+  sub,
+  origin
+}) {
+  if (!delegatedDriveConfigured(env)) throw new Error('drive_session_not_configured');
+  const id = base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)));
+  const now = Date.now();
+  const sessionExpiresAt = now + DRIVE_SESSION_TTL_SECONDS * 1000;
+  const session = {
+    accessToken,
+    refreshToken: typeof refreshToken === 'string' ? refreshToken : '',
+    expiresAt: now + (Number.isFinite(expiresIn) && expiresIn > 0 ? Math.min(expiresIn, 86_400) : 3600) * 1000,
+    sessionExpiresAt,
+    platform,
+    sub,
+    origin
+  };
+  await env.GOOGLE_DRIVE_SESSIONS.put(
+    `${DRIVE_SESSION_PREFIX}${id}`,
+    await sealDelegatedSession(env, session),
+    { expirationTtl: DRIVE_SESSION_TTL_SECONDS }
+  );
+  return { id, expiresAt: new Date(sessionExpiresAt).toISOString(), scope: 'drive.readonly' };
+}
+
+async function refreshDelegatedDriveSession(env, id, session) {
+  if (session.expiresAt > Date.now() + 60_000) return session;
+  if (!session.refreshToken || session.sessionExpiresAt <= Date.now()) throw new Error('drive_reconnect_required');
+  const client = resolveGoogleClient(env, session.platform);
+  if (!client) throw new Error('drive_reconnect_required');
+  const params = new URLSearchParams({
+    client_id: client.clientId,
+    refresh_token: session.refreshToken,
+    grant_type: 'refresh_token'
+  });
+  if (client.clientSecret) params.set('client_secret', client.clientSecret);
+  const response = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString()
+  });
+  if (!response.ok) throw new Error('drive_reconnect_required');
+  const tokens = await response.json();
+  if (typeof tokens?.access_token !== 'string' || !tokens.access_token
+    || tokens.access_token.length > 8192 || /[\u0000-\u0020\u007f]/.test(tokens.access_token)) {
+    throw new Error('drive_reconnect_required');
+  }
+  const next = {
+    ...session,
+    accessToken: tokens.access_token,
+    refreshToken: typeof tokens.refresh_token === 'string' && tokens.refresh_token
+      ? tokens.refresh_token
+      : session.refreshToken,
+    expiresAt: Date.now() + (Number(tokens.expires_in) > 0 ? Math.min(Number(tokens.expires_in), 86_400) : 3600) * 1000
+  };
+  const remainingSeconds = Math.max(60, Math.ceil((next.sessionExpiresAt - Date.now()) / 1000));
+  await env.GOOGLE_DRIVE_SESSIONS.put(
+    `${DRIVE_SESSION_PREFIX}${id}`,
+    await sealDelegatedSession(env, next),
+    { expirationTtl: remainingSeconds }
+  );
+  return next;
+}
+
+function delegatedSessionId(request) {
+  const authorization = request.headers.get('authorization') || '';
+  const match = /^YayraDrive ([A-Za-z0-9_-]{43})$/.exec(authorization);
+  return match ? match[1] : null;
+}
+
+async function revokeDelegatedDriveSession(request, headers, env, authorizedOrigin) {
+  if (request.method !== 'POST') {
+    return new Response(JSON.stringify({ error: 'method not allowed' }), { status: 405, headers });
+  }
+  if (!delegatedDriveConfigured(env)) {
+    return new Response(JSON.stringify({ error: 'drive_session_not_configured' }), { status: 501, headers });
+  }
+  const id = delegatedSessionId(request);
+  if (!id) return new Response(JSON.stringify({ error: 'drive_session_required' }), { status: 401, headers });
+
+  const key = `${DRIVE_SESSION_PREFIX}${id}`;
+  let session;
+  try {
+    const sealed = await env.GOOGLE_DRIVE_SESSIONS.get(key);
+    if (!sealed) return new Response(JSON.stringify({ error: 'drive_reconnect_required' }), { status: 401, headers });
+    session = await openDelegatedSession(env, sealed);
+  } catch {
+    try { await env.GOOGLE_DRIVE_SESSIONS.delete(key); } catch { /* best effort */ }
+    return new Response(JSON.stringify({ error: 'drive_session_invalid' }), { status: 401, headers });
+  }
+  if ((session.origin || null) !== (typeof authorizedOrigin === 'string' ? authorizedOrigin : null)) {
+    return new Response(JSON.stringify({ error: 'drive_session_origin_mismatch' }), { status: 403, headers });
+  }
+
+  // Invalidate Yayra's opaque capability first. Provider revocation is then
+  // best-effort: a Google outage must never leave a supposedly signed-out
+  // Yayra session usable. No token or upstream body is returned or logged.
+  try { await env.GOOGLE_DRIVE_SESSIONS.delete(key); }
+  catch { return new Response(JSON.stringify({ error: 'drive_session_unavailable' }), { status: 503, headers }); }
+
+  const token = session.refreshToken || session.accessToken;
+  let providerRevoked = false;
+  if (typeof token === 'string' && token) {
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), 5_000) : null;
+    try {
+      const response = await fetch('https://oauth2.googleapis.com/revoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ token }).toString(),
+        ...(controller ? { signal: controller.signal } : {})
+      });
+      providerRevoked = response.ok;
+    } catch { /* local session is already irreversibly revoked */ }
+    finally { if (timer) clearTimeout(timer); }
+  }
+  return new Response(JSON.stringify({ ok: true, providerRevoked }), { status: 200, headers });
+}
+
+function safeDownloadFilename(value, fallback = 'Google Drive download') {
+  const clean = String(value || '')
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .trim()
+    .slice(0, 180);
+  return clean || fallback;
+}
+
+const GOOGLE_WORKSPACE_EXPORTS = Object.freeze({
+  'application/vnd.google-apps.document': {
+    mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', extension: '.docx'
+  },
+  'application/vnd.google-apps.spreadsheet': {
+    mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', extension: '.xlsx'
+  },
+  'application/vnd.google-apps.presentation': {
+    mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', extension: '.pptx'
+  },
+  'application/vnd.google-apps.drawing': { mime: 'application/pdf', extension: '.pdf' }
+});
+
+function boundedDriveBody(body, maxBytes = DRIVE_MAX_FILE_BYTES) {
+  const reader = body?.getReader?.();
+  if (!reader) return body;
+  let total = 0;
+  return new ReadableStream({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        const chunk = value instanceof Uint8Array ? value : new Uint8Array(value || []);
+        total += chunk.byteLength;
+        if (total > maxBytes) {
+          try { await reader.cancel('drive_file_too_large'); } catch { /* best effort */ }
+          controller.error(new Error('drive_file_too_large'));
+          return;
+        }
+        controller.enqueue(chunk);
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      try { await reader.cancel(reason); } catch { /* best effort */ }
+    }
+  });
+}
+
+async function downloadDelegatedDriveFile(request, url, headers, env, authorizedOrigin) {
+  if (request.method !== 'GET') {
+    return new Response(JSON.stringify({ error: 'method not allowed' }), { status: 405, headers });
+  }
+  if (!delegatedDriveConfigured(env)) {
+    return new Response(JSON.stringify({ error: 'drive_session_not_configured' }), { status: 501, headers });
+  }
+  const id = delegatedSessionId(request);
+  const fileId = url.searchParams.get('fileId') || '';
+  if (!id) return new Response(JSON.stringify({ error: 'drive_session_required' }), { status: 401, headers });
+  if (!/^[A-Za-z0-9_-]{10,200}$/.test(fileId)) {
+    return new Response(JSON.stringify({ error: 'invalid_file_id' }), { status: 400, headers });
+  }
+
+  const key = `${DRIVE_SESSION_PREFIX}${id}`;
+  let session;
+  try {
+    const sealed = await env.GOOGLE_DRIVE_SESSIONS.get(key);
+    if (!sealed) return new Response(JSON.stringify({ error: 'drive_reconnect_required' }), { status: 401, headers });
+    session = await openDelegatedSession(env, sealed);
+    if (session.sessionExpiresAt <= Date.now()) throw new Error('drive_reconnect_required');
+    if ((session.origin || null) !== (typeof authorizedOrigin === 'string' ? authorizedOrigin : null)) {
+      return new Response(JSON.stringify({ error: 'drive_session_origin_mismatch' }), { status: 403, headers });
+    }
+    session = await refreshDelegatedDriveSession(env, id, session);
+  } catch (error) {
+    try { await env.GOOGLE_DRIVE_SESSIONS.delete?.(key); } catch { /* optional KV delete */ }
+    return new Response(JSON.stringify({ error: error?.message === 'drive_reconnect_required'
+      ? 'drive_reconnect_required'
+      : 'drive_session_invalid' }), { status: 401, headers });
+  }
+
+  const authHeaders = { Authorization: `Bearer ${session.accessToken}`, Accept: 'application/json' };
+  const metadataUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=id,name,mimeType,size,capabilities%28canDownload%29&supportsAllDrives=true`;
+  let metadataResponse;
+  try { metadataResponse = await fetch(metadataUrl, { headers: authHeaders }); }
+  catch { return new Response(JSON.stringify({ error: 'drive_upstream_unavailable' }), { status: 502, headers }); }
+  if (!metadataResponse.ok) {
+    const status = metadataResponse.status === 404 ? 404 : metadataResponse.status === 403 ? 403 : 502;
+    return new Response(JSON.stringify({ error: status === 404 ? 'drive_file_not_found' : status === 403 ? 'drive_file_not_downloadable' : 'drive_upstream_failed' }), { status, headers });
+  }
+  let metadata;
+  try { metadata = await metadataResponse.json(); } catch { metadata = null; }
+  if (!metadata || metadata.capabilities?.canDownload === false) {
+    return new Response(JSON.stringify({ error: 'drive_file_not_downloadable' }), { status: 403, headers });
+  }
+  const declaredSize = Number(metadata.size);
+  if (Number.isFinite(declaredSize) && declaredSize > DRIVE_MAX_FILE_BYTES) {
+    return new Response(JSON.stringify({ error: 'drive_file_too_large' }), { status: 413, headers });
+  }
+
+  const exportInfo = GOOGLE_WORKSPACE_EXPORTS[metadata.mimeType];
+  const mediaUrl = exportInfo
+    ? `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/export?mimeType=${encodeURIComponent(exportInfo.mime)}`
+    : `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true`;
+  let mediaResponse;
+  try { mediaResponse = await fetch(mediaUrl, { headers: { Authorization: `Bearer ${session.accessToken}` } }); }
+  catch { return new Response(JSON.stringify({ error: 'drive_upstream_unavailable' }), { status: 502, headers }); }
+  if (!mediaResponse.ok || !mediaResponse.body) {
+    return new Response(JSON.stringify({ error: mediaResponse.status === 403 ? 'drive_file_not_downloadable' : 'drive_download_failed' }), {
+      status: mediaResponse.status === 403 ? 403 : 502,
+      headers
+    });
+  }
+  const upstreamLength = Number(mediaResponse.headers.get('content-length'));
+  if (Number.isFinite(upstreamLength) && upstreamLength > DRIVE_MAX_FILE_BYTES) {
+    try { await mediaResponse.body.cancel(); } catch { /* best effort */ }
+    return new Response(JSON.stringify({ error: 'drive_file_too_large' }), { status: 413, headers });
+  }
+
+  let filename = safeDownloadFilename(metadata.name);
+  if (exportInfo && !filename.toLowerCase().endsWith(exportInfo.extension)) filename += exportInfo.extension;
+  const responseHeaders = {
+    ...headers,
+    'content-type': exportInfo?.mime || mediaResponse.headers.get('content-type') || 'application/octet-stream',
+    'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
+    'cache-control': 'private, no-store, max-age=0',
+    'x-yayra-drive-fallback': 'delegated'
+  };
+  if (Number.isFinite(upstreamLength) && upstreamLength >= 0) responseHeaders['content-length'] = String(upstreamLength);
+  return new Response(boundedDriveBody(mediaResponse.body), { status: 200, headers: responseHeaders });
 }
 
 function readManifest(env) {

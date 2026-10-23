@@ -1403,7 +1403,10 @@ function registerIpcBridges() {
     // preload, nothing exposed to the page) - see autofillPreload.cjs.
     autofillPreloadPath: path.join(__dirname, 'autofillPreload.cjs'),
     websitePasskeyProvider,
-    consumeWebsitePasskeyGrant: devicePasskeyBridge.consumeWebsiteGrant
+    consumeWebsitePasskeyGrant: devicePasskeyBridge.consumeWebsiteGrant,
+    // Per-profile and private page sessions are created lazily by the native
+    // view bridge; attach each one to the same real download tracker.
+    attachDownloadSession: (pageSession) => downloadsBridge?.attachSession?.(pageSession)
   });
 
   // "Sign in with Google" for Yayra's own app-level identity. The system
@@ -1472,7 +1475,16 @@ function registerIpcBridges() {
     fs,
     sessions: [session.fromPartition('persist:yayra-webview'), session.defaultSession],
     downloadsStore,
-    getMainWindow: () => mainWindow
+    getMainWindow: () => mainWindow,
+    onDownloadStarted: ({ webContents, url, filename, mimeType }) => {
+      webviewBridge?.noteDownloadHandoff?.(webContents, { url, filename, mimeType });
+    },
+    // Every completed local file joins the central Documents library. Opening
+    // a supported row in Yayra still reads capped bytes through the existing
+    // bridge, preserving the original download on disk byte-for-byte.
+    onDownloadCompleted: async (record) => {
+      if (record?.path) await documentLibrary.recordPath(record.path);
+    }
   });
 
 

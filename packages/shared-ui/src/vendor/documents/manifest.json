@@ -1,7 +1,7 @@
 {
   "pptxRenderer.mjs": {
-    "bytes": 249523,
-    "sha256": "14971ca2921ce5c7f208668c7b77e05a0efc47f9d981a99e53677c9d91c17173"
+    "bytes": 262608,
+    "sha256": "05f6dc5955dc7b9a431a078dcc017ff566de5320b861aa8013a2e29c80529c8a"
   },
   "docxPreview.mjs": {
     "bytes": 285456,
@@ -10,5 +10,13 @@
   "xlsx.mjs": {
     "bytes": 992986,
     "sha256": "12cebfdfcb26dd600e8e15870b958e34c85d4c9dbab3627cd78ecfc48a5fbdd9"
+  },
+  "legacyOffice.mjs": {
+    "bytes": 882223,
+    "sha256": "2c1e5f547c01c06d07884cc9b1fb2f39e53f18800b28cda3f3121b299d6875e3"
+  },
+  "metafile.mjs": {
+    "bytes": 1245014,
+    "sha256": "fb06dfacc91d4951be8f6f941bd36ad6152c81123768e43989ff76941c8f9199"
   }
 }

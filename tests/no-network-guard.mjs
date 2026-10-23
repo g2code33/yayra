@@ -16,5 +16,14 @@ http.get = blocked('http.get');
 https.request = blocked('https.request');
 https.get = blocked('https.get');
 if (globalThis.fetch) {
-  globalThis.fetch = blocked('fetch');
+  const localFetch = globalThis.fetch.bind(globalThis);
+  globalThis.fetch = function guardedFetch(input, init) {
+    const url = typeof input === 'string' || input instanceof URL
+      ? String(input)
+      : String(input?.url || '');
+    // Reading an in-memory Blob or data URL is part of offline rendering, not
+    // network access. Keep those paths testable while every remote fetch fails.
+    if (/^(?:blob|data):/i.test(url)) return localFetch(input, init);
+    throw new Error('network disabled for tests: fetch');
+  };
 }

@@ -48,6 +48,109 @@ function timed(promise, ms, message) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+function defaultLegacyOfficeWorkerFactory() {
+  if (typeof Worker !== 'function') return null;
+  return new Worker(new URL('./legacyOfficeWorker.js', import.meta.url), {
+    type: 'module',
+    name: 'yayra-legacy-office'
+  });
+}
+
+function normaliseLegacyConversionResult(value) {
+  const bytes = byteArray(value?.bytes ?? value);
+  if (!bytes.byteLength) throw new Error('Legacy Office conversion returned no viewing bytes');
+  return {
+    bytes,
+    warnings: Array.isArray(value?.warnings)
+      ? value.warnings.map((item) => String(item || '').trim()).filter(Boolean).slice(0, 24)
+      : [],
+    usedWorker: Boolean(value?.usedWorker)
+  };
+}
+
+/**
+ * Build a disposable, macro-free OOXML viewing copy of a Word/PowerPoint
+ * 97-2003 file. A copied ArrayBuffer is transferred to a short-lived worker;
+ * callers retain their source buffer byte-for-byte for Download/Open original.
+ */
+export async function convertLegacyOfficeBytes(format, value, {
+  password = undefined,
+  timeoutMs = DEFAULT_TIMEOUT,
+  signal = undefined,
+  workerFactory = defaultLegacyOfficeWorkerFactory,
+  moduleLoader = () => import('../vendor/documents/legacyOffice.mjs')
+} = {}) {
+  if (format !== 'doc' && format !== 'ppt') throw new TypeError('Legacy Office format must be doc or ppt');
+  if (signal?.aborted) throw new Error('Legacy Office conversion was cancelled');
+  // byteArray always allocates, so a worker can never detach the caller's
+  // DocumentStore-owned buffer.
+  const source = byteArray(value);
+  if (!source.byteLength) throw new Error('Legacy Office file is empty');
+
+  let worker = null;
+  if (typeof workerFactory === 'function') {
+    try { worker = workerFactory(); } catch { worker = null; }
+  }
+  if (worker) {
+    const id = `${format}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    const conversion = new Promise((resolve, reject) => {
+      const onMessage = (event) => {
+        const response = event?.data || {};
+        if (String(response.id || '') !== id) return;
+        if (!response.ok) {
+          const error = new Error(String(response.error?.message || 'The legacy Office file could not be converted.'));
+          error.name = String(response.error?.name || 'LegacyOfficeConversionError');
+          if (response.error?.code) error.code = String(response.error.code);
+          reject(error);
+          return;
+        }
+        try {
+          resolve(normaliseLegacyConversionResult({
+            bytes: response.bytes,
+            warnings: response.warnings,
+            usedWorker: true
+          }));
+        } catch (error) { reject(error); }
+      };
+      const onError = () => reject(new Error('Legacy Office conversion worker failed'));
+      if (typeof worker.addEventListener === 'function') {
+        worker.addEventListener('message', onMessage);
+        worker.addEventListener('error', onError, { once: true });
+        worker.addEventListener('messageerror', onError, { once: true });
+      } else {
+        worker.onmessage = onMessage;
+        worker.onerror = onError;
+        worker.onmessageerror = onError;
+      }
+      try {
+        worker.postMessage({ id, format, bytes: source.buffer, password }, [source.buffer]);
+      } catch (error) { reject(error); }
+    });
+    let onAbort = null;
+    const abort = signal ? new Promise((_, reject) => {
+      onAbort = () => reject(new Error('Legacy Office conversion was cancelled'));
+      signal.addEventListener('abort', onAbort, { once: true });
+    }) : null;
+    try {
+      return await timed(abort ? Promise.race([conversion, abort]) : conversion,
+        timeoutMs, `Legacy ${format.toUpperCase()} conversion timed out`);
+    } finally {
+      if (onAbort) signal.removeEventListener('abort', onAbort);
+      try { worker.terminate?.(); } catch { /* already stopped */ }
+    }
+  }
+
+  // Worker-less webviews and test environments keep a compatible fallback.
+  // Yield first so the loading state can paint before synchronous parsing.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  if (signal?.aborted) throw new Error('Legacy Office conversion was cancelled');
+  const module = await timed(moduleLoader(), timeoutMs, 'Legacy Office engine load timed out');
+  if (signal?.aborted) throw new Error('Legacy Office conversion was cancelled');
+  const converted = module.convertLegacyOffice(format, source, { password });
+  if (signal?.aborted) throw new Error('Legacy Office conversion was cancelled');
+  return normaliseLegacyConversionResult(converted);
+}
+
 function clearHost(host) {
   if (!host) return;
   if (typeof host.replaceChildren === 'function') host.replaceChildren();
@@ -174,6 +277,8 @@ export function createPptxViewer({
   fileName = 'presentation.pptx',
   onStateChange = null,
   moduleLoader = () => import('../vendor/documents/pptxRenderer.mjs'),
+  prepareBytes = null,
+  documentKind = 'pptx',
   loadTimeoutMs = DEFAULT_TIMEOUT
 } = {}) {
   const viewerState = state;
@@ -187,6 +292,7 @@ export function createPptxViewer({
   let engine = null;
   let disposed = false;
   let loadToken = 0;
+  let loadAbort = null;
   let renderToken = 0;
   let textIndex = null;
   let textIndexPromise = null;
@@ -310,17 +416,37 @@ export function createPptxViewer({
 
   async function load(bytes) {
     const token = ++loadToken;
+    loadAbort?.abort?.();
+    loadAbort = new AbortController();
+    const signal = loadAbort.signal;
+    const legacy = documentKind === 'ppt';
     disposed = false;
     updates.patch({
-      viewer: 'pptx', status: 'loading', loadingStage: 'Opening presentation…', progress: null,
-      error: null, numPages: 0, page: 1, matches: [], matchIndex: -1
+      viewer: documentKind,
+      status: 'loading',
+      loadingStage: legacy ? 'Converting PowerPoint 97–2003 locally…' : 'Opening presentation…',
+      progress: null, error: null, numPages: 0, page: 1, matches: [], matchIndex: -1,
+      conversionWarnings: [], transformedForViewing: legacy
     });
     try {
-      engine = await timed(moduleLoader(), loadTimeoutMs, 'PPTX engine load timed out');
-      if (token !== loadToken || disposed) return viewerState;
-      const blob = new Blob([byteArray(bytes)], { type: mimeForDocument('pptx', fileName) });
-      deck = await timed(engine.openPptxDeck(blob, { lazyMedia: true }), loadTimeoutMs, 'PPTX parse timed out');
-      if (token !== loadToken || disposed) { deck?.dispose?.(); return viewerState; }
+      const enginePromise = timed(moduleLoader(), loadTimeoutMs, 'PowerPoint engine load timed out');
+      const preparationPromise = typeof prepareBytes === 'function'
+        ? Promise.resolve(prepareBytes(bytes, { signal, timeoutMs: loadTimeoutMs }))
+        : Promise.resolve({ bytes: byteArray(bytes), warnings: [] });
+      const [loadedEngine, preparedValue] = await Promise.all([enginePromise, preparationPromise]);
+      engine = loadedEngine;
+      const prepared = normaliseLegacyConversionResult(preparedValue);
+      if (token !== loadToken || disposed || signal.aborted) return viewerState;
+      updates.patch({
+        loadingStage: legacy ? 'Laying out the local viewing copy…' : 'Opening presentation…',
+        conversionWarnings: prepared.warnings,
+        conversionUsedWorker: prepared.usedWorker
+      });
+      const blob = new Blob([prepared.bytes], {
+        type: mimeForDocument('pptx', 'yayra-viewing-copy.pptx')
+      });
+      deck = await timed(engine.openPptxDeck(blob, { lazyMedia: true }), loadTimeoutMs, 'PowerPoint parse timed out');
+      if (token !== loadToken || disposed || signal.aborted) { deck?.dispose?.(); return viewerState; }
       if (!deck?.slideCount) throw new Error('No slides found');
       updates.patch({
         status: 'ready', loadingStage: '', progress: 100, numPages: deck.slideCount,
@@ -329,17 +455,19 @@ export function createPptxViewer({
         zoom: viewerState.zoom || 1,
         showNotes: viewerState.showNotes !== false,
         aspectRatio: `${Math.round(deck.slideWidth)} × ${Math.round(deck.slideHeight)}`,
-        engineName: routeDocument('pptx').engine
+        engineName: routeDocument(documentKind).engine
       });
       if (!root) buildRoot();
       if (root && host) moveRoot(root, host);
       await renderCurrent();
     } catch (error) {
-      if (token !== loadToken || disposed) return viewerState;
-      console.error?.('[yayra:pptx] presentation open failed', error);
+      if (token !== loadToken || disposed || signal.aborted) return viewerState;
+      console.error?.(`[yayra:${documentKind}] presentation open failed`, error);
       updates.patch({
         status: 'error', loadingStage: '', progress: null,
-        error: 'This presentation could not be read. It may be corrupted, password-protected, or an older binary .ppt file.'
+        error: legacy
+          ? 'This PowerPoint 97–2003 file could not be opened. It may be corrupted, password-protected, or use unsupported legacy objects. The unchanged original is still available.'
+          : 'This presentation could not be read. It may be corrupted or password-protected. The unchanged original is still available.'
       });
     }
     return viewerState;
@@ -543,6 +671,8 @@ export function createPptxViewer({
   function destroy() {
     disposed = true;
     loadToken += 1;
+    loadAbort?.abort?.();
+    loadAbort = null;
     renderToken += 1;
     if (prefetchTimer) clearTimeout(prefetchTimer);
     prefetchTimer = null;
@@ -705,6 +835,8 @@ function markDomText(root, query) {
 export function createDocxViewer({
   container, state, fileName = 'document.docx', onStateChange = null,
   moduleLoader = () => import('../vendor/documents/docxPreview.mjs'),
+  prepareBytes = null,
+  documentKind = 'docx',
   loadTimeoutMs = DEFAULT_TIMEOUT
 } = {}) {
   const viewerState = state;
@@ -715,14 +847,35 @@ export function createDocxViewer({
   let body = null;
   let disposed = false;
   let loadToken = 0;
+  let loadAbort = null;
 
   async function load(bytes) {
     const token = ++loadToken;
+    loadAbort?.abort?.();
+    loadAbort = new AbortController();
+    const signal = loadAbort.signal;
+    const legacy = documentKind === 'doc';
     disposed = false;
-    updates.patch({ viewer: 'docx', status: 'loading', loadingStage: 'Laying out Word document…', progress: null, error: null, numPages: 1, page: 1 });
+    updates.patch({
+      viewer: documentKind,
+      status: 'loading',
+      loadingStage: legacy ? 'Converting Word 97–2003 locally…' : 'Laying out Word document…',
+      progress: null, error: null, numPages: 1, page: 1,
+      conversionWarnings: [], transformedForViewing: legacy
+    });
     try {
-      const module = await timed(moduleLoader(), loadTimeoutMs, 'DOCX engine load timed out');
-      if (token !== loadToken || disposed) return viewerState;
+      const modulePromise = timed(moduleLoader(), loadTimeoutMs, 'Word engine load timed out');
+      const preparationPromise = typeof prepareBytes === 'function'
+        ? Promise.resolve(prepareBytes(bytes, { signal, timeoutMs: loadTimeoutMs }))
+        : Promise.resolve({ bytes: byteArray(bytes), warnings: [] });
+      const [module, preparedValue] = await Promise.all([modulePromise, preparationPromise]);
+      const prepared = normaliseLegacyConversionResult(preparedValue);
+      if (token !== loadToken || disposed || signal.aborted) return viewerState;
+      updates.patch({
+        loadingStage: legacy ? 'Laying out the local viewing copy…' : 'Laying out Word document…',
+        conversionWarnings: prepared.warnings,
+        conversionUsedWorker: prepared.usedWorker
+      });
       const doc = host?.ownerDocument || document;
       root = doc.createElement('div');
       root.className = 'fb-docx-reader';
@@ -738,7 +891,9 @@ export function createDocxViewer({
       pageWrap.appendChild(body);
       root.appendChild(pageWrap);
       if (host) moveRoot(root, host);
-      const blob = new Blob([byteArray(bytes)], { type: mimeForDocument('docx', fileName) });
+      const blob = new Blob([prepared.bytes], {
+        type: mimeForDocument('docx', 'yayra-viewing-copy.docx')
+      });
       await timed(module.renderAsync(blob, body, styleHost, {
         inWrapper: true,
         ignoreWidth: false,
@@ -748,14 +903,22 @@ export function createDocxViewer({
         renderFootnotes: true,
         renderEndnotes: true,
         useBase64URL: true
-      }), loadTimeoutMs, 'DOCX rendering timed out');
-      if (token !== loadToken || disposed) return viewerState;
-      updates.patch({ status: 'ready', loadingStage: '', progress: 100, zoom: viewerState.zoom || 1, engineName: routeDocument('docx').engine });
+      }), loadTimeoutMs, 'Word rendering timed out');
+      if (token !== loadToken || disposed || signal.aborted) return viewerState;
+      updates.patch({
+        status: 'ready', loadingStage: '', progress: 100,
+        zoom: viewerState.zoom || 1, engineName: routeDocument(documentKind).engine
+      });
       pageWrap.style.transform = `scale(${viewerState.zoom || 1})`;
     } catch (error) {
-      if (token !== loadToken || disposed) return viewerState;
-      console.error?.('[yayra:docx] render failed', error);
-      updates.patch({ status: 'error', loadingStage: '', progress: null, error: 'This Word document could not be rendered. It may be corrupted, password-protected, or an older binary .doc file.' });
+      if (token !== loadToken || disposed || signal.aborted) return viewerState;
+      console.error?.(`[yayra:${documentKind}] render failed`, error);
+      updates.patch({
+        status: 'error', loadingStage: '', progress: null,
+        error: legacy
+          ? 'This Word 97–2003 file could not be opened. It may be corrupted, password-protected, or use unsupported legacy objects. The unchanged original is still available.'
+          : 'This Word document could not be rendered. It may be corrupted or password-protected. The unchanged original is still available.'
+      });
     }
     return viewerState;
   }
@@ -777,7 +940,15 @@ export function createDocxViewer({
     return viewerState;
   }
   function attach(next, listener) { host = next || null; updates.setListener(listener); if (root && host) moveRoot(root, host); updates.emit(); return Promise.resolve(viewerState); }
-  function destroy() { disposed = true; loadToken += 1; clearHost(host); root = pageWrap = body = null; updates.patch({ status: 'idle' }); }
+  function destroy() {
+    disposed = true;
+    loadToken += 1;
+    loadAbort?.abort?.();
+    loadAbort = null;
+    clearHost(host);
+    root = pageWrap = body = null;
+    updates.patch({ status: 'idle' });
+  }
   const controller = {
     get state() { return viewerState; }, load, attach, destroy, setZoom, fitToWidth, fitToPage, search, nextMatch,
     setPage: async () => viewerState, nextPage: async () => viewerState, prevPage: async () => viewerState,
@@ -804,6 +975,7 @@ function displayedCell(cell) {
 export function createSpreadsheetViewer({
   container, state, fileName = 'spreadsheet.xlsx', onStateChange = null,
   moduleLoader = () => import('../vendor/documents/xlsx.mjs'),
+  documentKind = 'xlsx',
   loadTimeoutMs = DEFAULT_TIMEOUT
 } = {}) {
   const viewerState = state;
@@ -950,13 +1122,13 @@ export function createSpreadsheetViewer({
   async function load(bytes) {
     const loadToken = ++token;
     disposed = false;
-    updates.patch({ viewer: 'xlsx', status: 'loading', loadingStage: 'Reading workbook…', progress: null, error: null, numPages: 0, page: 1, rowPage: 1 });
+    updates.patch({ viewer: documentKind, status: 'loading', loadingStage: 'Reading workbook…', progress: null, error: null, numPages: 0, page: 1, rowPage: 1 });
     try {
       XLSX = await timed(moduleLoader(), loadTimeoutMs, 'Spreadsheet engine load timed out');
       if (disposed || loadToken !== token) return viewerState;
       workbook = XLSX.read(byteArray(bytes), { type: 'array', cellStyles: true, cellDates: true });
       if (!workbook?.SheetNames?.length) throw new Error('No worksheets found');
-      updates.patch({ status: 'ready', loadingStage: '', progress: 100, numPages: workbook.SheetNames.length, page: 1, sheetNames: [...workbook.SheetNames], engineName: routeDocument('xlsx').engine });
+      updates.patch({ status: 'ready', loadingStage: '', progress: 100, numPages: workbook.SheetNames.length, page: 1, sheetNames: [...workbook.SheetNames], engineName: routeDocument(documentKind).engine });
       renderSheet();
     } catch (error) {
       if (disposed || loadToken !== token) return viewerState;
@@ -1064,11 +1236,11 @@ export function createUnsupportedViewer({ container, state, fileName = 'document
     root.style.cssText = 'width:100%;min-height:100%;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;';
     const card = doc.createElement('div');
     card.style.cssText = 'width:min(520px,100%);padding:28px;border:1px solid var(--fb-border-glass,rgba(255,255,255,.12));border-radius:16px;background:var(--fb-bg-elevated,#141824);color:var(--fb-text-primary,#e2e8f0);box-shadow:0 16px 50px rgba(0,0,0,.35);text-align:center;';
-    const title = doc.createElement('h2'); title.textContent = 'This original file needs a desktop app'; title.style.cssText = 'margin:0 0 10px;font-size:1.1rem;';
-    const legacyOffice = /\.(?:doc|ppt)$/i.test(String(fileName || ''));
+    const title = doc.createElement('h2'); title.textContent = 'No safe built-in view for this file'; title.style.cssText = 'margin:0 0 10px;font-size:1.1rem;';
+    const legacyOffice = /\.(?:doc|ppt|xls)$/i.test(String(fileName || ''));
     const copy = doc.createElement('p');
     copy.textContent = legacyOffice
-      ? `${fileName} is an older binary Office format. Yayra will not pretend to render it or leave you on a loading screen.`
+      ? `${fileName} could not be identified as a valid Word, PowerPoint or Excel 97–2003 file. The unchanged original is still available.`
       : `${fileName} does not have a safe built-in Yayra viewer. Open the unchanged original with its desktop app.`;
     copy.style.cssText = 'margin:0;color:var(--fb-text-secondary,#a8b0bf);line-height:1.55;';
     card.appendChild(title); card.appendChild(copy);
@@ -1093,10 +1265,40 @@ export function createUnsupportedViewer({ container, state, fileName = 'document
   };
 }
 
+function legacyPreparation(format, options) {
+  if (typeof options.prepareBytes === 'function') return options.prepareBytes;
+  return (bytes, context = {}) => convertLegacyOfficeBytes(format, bytes, {
+    signal: context.signal,
+    timeoutMs: context.timeoutMs,
+    password: options.password,
+    workerFactory: options.legacyWorkerFactory,
+    moduleLoader: options.legacyModuleLoader
+  });
+}
+
+export function createLegacyDocViewer(options = {}) {
+  return createDocxViewer({
+    ...options,
+    documentKind: 'doc',
+    prepareBytes: legacyPreparation('doc', options)
+  });
+}
+
+export function createLegacyPptViewer(options = {}) {
+  return createPptxViewer({
+    ...options,
+    documentKind: 'ppt',
+    prepareBytes: legacyPreparation('ppt', options)
+  });
+}
+
 export function createViewerForKind(kind, options = {}) {
   switch (kind) {
+    case 'ppt': return createLegacyPptViewer(options);
     case 'pptx': return createPptxViewer(options);
+    case 'doc': return createLegacyDocViewer(options);
     case 'docx': return createDocxViewer(options);
+    case 'xls': return createSpreadsheetViewer({ ...options, documentKind: 'xls' });
     case 'xlsx': return createSpreadsheetViewer(options);
     case 'image': return createImageViewer(options);
     case 'text': return createTextViewer(options);

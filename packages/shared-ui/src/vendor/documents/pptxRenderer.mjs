@@ -3576,7 +3576,18 @@ var MATH_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math";
 var MATH_STRICT_NS = "http://purl.oclc.org/ooxml/officeDocument/math";
 var DRAWING_2010_NS = "http://schemas.microsoft.com/office/drawing/2010/main";
 var POWERPOINT_2010_NS = "http://schemas.microsoft.com/office/powerpoint/2010/main";
+var DIAGRAM_DRAWING_NS = "http://schemas.microsoft.com/office/drawing/2008/diagram";
 var localTag = (el) => (el.localName || el.tagName.split(":").pop() || el.tagName).toLowerCase();
+var childByLocalName = (el, name) => {
+  if (!el) return null;
+  const wanted = name.toLowerCase();
+  return Array.from(el.children).find((candidate) => localTag(candidate) === wanted) || null;
+};
+var descendantsByLocalName = (el, name) => {
+  if (!el) return [];
+  const wanted = name.toLowerCase();
+  return Array.from(el.getElementsByTagName("*")).filter((candidate) => localTag(candidate) === wanted);
+};
 var inNamespace = (el, namespace, local) => el.namespaceURI === namespace && (!local || localTag(el) === local.toLowerCase());
 var isMathElement = (el, local) => (el.namespaceURI === MATH_NS || el.namespaceURI === MATH_STRICT_NS) && (!local || localTag(el) === local.toLowerCase());
 function localAttribute(el, name) {
@@ -4442,8 +4453,11 @@ function resolveZipPath(fromDir, target) {
   }
   return parts.join("/");
 }
+function mediaExtension(path) {
+  return path.toLowerCase().split(/[?#]/, 1)[0].split(".").pop() || "";
+}
 function mediaMimeForPath(path) {
-  const extension = path.toLowerCase().split(/[?#]/, 1)[0].split(".").pop() || "";
+  const extension = mediaExtension(path);
   const mimeByExtension = {
     mp4: "video/mp4",
     m4v: "video/mp4",
@@ -4468,9 +4482,22 @@ function mediaMimeForPath(path) {
     svg: "image/svg+xml",
     bmp: "image/bmp",
     tif: "image/tiff",
-    tiff: "image/tiff"
+    tiff: "image/tiff",
+    emf: "image/emf",
+    wmf: "image/wmf"
   };
   return mimeByExtension[extension] || "";
+}
+var metafileModule = null;
+async function convertMetafileBlob(bytes) {
+  try {
+    const modulePath = "./metafile.mjs";
+    metafileModule ??= import(modulePath);
+    const converter = await metafileModule;
+    return await converter.convertMetafileToSafeSvg(bytes);
+  } catch {
+    return null;
+  }
 }
 async function loadRelsFor(zip, partPath) {
   const idx = partPath.lastIndexOf("/");
@@ -4488,6 +4515,69 @@ async function loadRelsFor(zip, partPath) {
         type: rel.getAttribute("Type") || "",
         target: rel.getAttribute("Target") || ""
       });
+    }
+  }
+  return out;
+}
+function diagramPart(model, drawing, drawingPath) {
+  return { model, drawing, drawingPath, imagePaths: /* @__PURE__ */ new Map(), imageUrls: /* @__PURE__ */ new Map() };
+}
+async function loadSlideDiagrams(zip, slideDoc, slidePath, slideRels, loadRels) {
+  const out = /* @__PURE__ */ new Map();
+  const slideDir = slidePath.slice(0, slidePath.lastIndexOf("/"));
+  for (const relIds of descendantsByLocalName(slideDoc, "relIds")) {
+    const dmRid = localAttribute(relIds, "dm");
+    if (!dmRid || out.has(dmRid)) continue;
+    const dmRel = slideRels.get(dmRid);
+    if (!dmRel || !dmRel.type.endsWith("/diagramData")) {
+      out.set(dmRid, diagramPart(null, null));
+      continue;
+    }
+    const modelPath = resolveZipPath(slideDir, dmRel.target);
+    const modelFile = zip.file(modelPath);
+    if (!modelFile) {
+      out.set(dmRid, diagramPart(null, null));
+      continue;
+    }
+    try {
+      const modelDoc = new DOMParser().parseFromString(await modelFile.async("text"), "text/xml");
+      const model = modelDoc.documentElement;
+      const modelRels = await loadRels(modelPath);
+      const drawingRef = descendantsByLocalName(modelDoc, "dataModelExt")[0];
+      const drawingRid = localAttribute(drawingRef, "relId");
+      let drawingRel = drawingRid ? modelRels.get(drawingRid) : void 0;
+      let drawingDir = modelPath.slice(0, modelPath.lastIndexOf("/"));
+      if (!drawingRel && drawingRid) {
+        drawingRel = slideRels.get(drawingRid);
+        drawingDir = slideDir;
+      }
+      if (!drawingRel) {
+        drawingRel = Array.from(modelRels.values()).find((rel) => rel.type.endsWith("/diagramDrawing"));
+      }
+      if (!drawingRel) {
+        drawingRel = Array.from(slideRels.values()).find((rel) => rel.type.endsWith("/diagramDrawing"));
+        drawingDir = slideDir;
+      }
+      if (!drawingRel) {
+        out.set(dmRid, diagramPart(model, null));
+        continue;
+      }
+      const drawingPath = resolveZipPath(drawingDir, drawingRel.target);
+      const drawingFile = zip.file(drawingPath);
+      if (!drawingFile) {
+        out.set(dmRid, diagramPart(model, null, drawingPath));
+        continue;
+      }
+      const drawingDoc = new DOMParser().parseFromString(await drawingFile.async("text"), "text/xml");
+      const part = diagramPart(model, drawingDoc.documentElement, drawingPath);
+      const drawingRels = await loadRels(drawingPath);
+      const partDir = drawingPath.slice(0, drawingPath.lastIndexOf("/"));
+      for (const [rid, rel] of drawingRels) {
+        if (rel.type.endsWith("/image")) part.imagePaths.set(rid, resolveZipPath(partDir, rel.target));
+      }
+      out.set(dmRid, part);
+    } catch {
+      out.set(dmRid, diagramPart(null, null));
     }
   }
   return out;
@@ -4783,6 +4873,24 @@ function parseTable(gf, t) {
   return shape;
 }
 var isTitlePlaceholder = (phType) => phType === "title" || phType === "ctrTitle";
+function imageRelationshipIds(blip) {
+  if (!blip) return [];
+  const preferred = [];
+  const secondary = [];
+  const add = (target, value) => {
+    if (value && !preferred.includes(value) && !secondary.includes(value)) target.push(value);
+  };
+  for (const descendant of Array.from(blip.getElementsByTagName("*"))) {
+    const tag = localTag(descendant);
+    if (tag === "svgblip") add(preferred, localAttribute(descendant, "embed") || localAttribute(descendant, "link"));
+    else if (tag === "imglayer") add(secondary, localAttribute(descendant, "embed") || localAttribute(descendant, "link"));
+  }
+  add(secondary, localAttribute(blip, "embed") || localAttribute(blip, "link"));
+  return [...preferred, ...secondary];
+}
+function resolvedImageUrls(ids, urls) {
+  return ids.map((id) => urls.get(id)).filter((url) => Boolean(url));
+}
 function defaultSizePtFor(phType, isTitle) {
   if (phType === "ctrTitle") return 44;
   if (isTitle) return 32;
@@ -4791,7 +4899,9 @@ function defaultSizePtFor(phType, isTitle) {
   return 18;
 }
 function parseSp(sp, ctx) {
-  const spPr = child(sp, "p:spPr");
+  const diagramShape = inNamespace(sp, DIAGRAM_DRAWING_NS);
+  const presentationChild = (tag) => child(sp, `p:${tag}`) || (diagramShape ? childByLocalName(sp, tag) : null);
+  const spPr = presentationChild("spPr");
   const ph = sp.getElementsByTagName("p:ph")[0];
   const declaredPhType = ph?.getAttribute("type") || "";
   const phIdx = ph?.getAttribute("idx") || "0";
@@ -4811,7 +4921,7 @@ function parseSp(sp, ctx) {
   const lineColor = ln ? solidColor(child(ln, "a:solidFill")) : void 0;
   const lineW = ln?.getAttribute("w") ? emuToPx(parseInt(ln.getAttribute("w"), 10)) : void 0;
   const inheritedLevels = placeholder?.levels ?? (ctx.layout ? masterLevelsFor(ctx.layout.masterStyles, phType) : []);
-  let text = parseText(child(sp, "p:txBody"), defaultSizePtFor(phType, isTitle), inheritedLevels);
+  let text = parseText(presentationChild("txBody"), defaultSizePtFor(phType, isTitle), inheritedLevels);
   if (text && !text.anchor && placeholder?.anchor) text.anchor = placeholder.anchor;
   const hasTextContent = () => Boolean(text?.paragraphs.some(
     (paragraph) => paragraph.runs.some((run) => run.text || run.mathMl)
@@ -4827,8 +4937,11 @@ function parseSp(sp, ctx) {
   }
   const shapeBlipFill = spPr ? child(spPr, "a:blipFill") : null;
   const shapeBlip = shapeBlipFill ? child(shapeBlipFill, "a:blip") : null;
-  const imageRid = shapeBlip?.getAttribute("r:embed") || shapeBlip?.getAttribute("r:link") || void 0;
-  const imageUrl = imageRid ? ctx.imageUrls.get(imageRid) : void 0;
+  const imageRids = imageRelationshipIds(shapeBlip);
+  const imageUrls = resolvedImageUrls(imageRids, ctx.imageUrls);
+  const imagePaths = imageRids.map((rid) => ctx.imagePaths.get(rid)).filter((path) => Boolean(path));
+  const imageRid = imageRids[0];
+  const imageUrl = imageUrls[0];
   if (imageUrl && !hasTextContent()) ctx.imageList.push(imageUrl);
   const shape = {
     id: ctx.nextId(),
@@ -4841,7 +4954,10 @@ function parseSp(sp, ctx) {
     geom: prst || (text ? "rect" : void 0),
     fill,
     imageUrl: imageRid && !hasTextContent() ? imageUrl : void 0,
+    imageUrls: imageRid && !hasTextContent() && imageUrls.length ? imageUrls : void 0,
     imageRid: imageRid && !hasTextContent() ? imageRid : void 0,
+    imageRids: imageRid && !hasTextContent() ? imageRids : void 0,
+    imagePaths: imageRid && !hasTextContent() && imagePaths.length ? imagePaths : void 0,
     textScale: (ctx.t.sx + ctx.t.sy) / 2,
     isTitle,
     placeholderType: ph ? phType : void 0
@@ -4855,12 +4971,17 @@ function parseSp(sp, ctx) {
   return shape;
 }
 function parsePic(pic, ctx) {
-  const spPr = child(pic, "p:spPr");
+  const diagramShape = inNamespace(pic, DIAGRAM_DRAWING_NS);
+  const presentationChild = (tag) => child(pic, `p:${tag}`) || (diagramShape ? childByLocalName(pic, tag) : null);
+  const spPr = presentationChild("spPr");
   const box = applyT(ctx.t, parseXfrm(spPr));
-  const blipFill = child(pic, "p:blipFill");
+  const blipFill = presentationChild("blipFill");
   const blip = blipFill ? child(blipFill, "a:blip") : null;
-  const rid = blip?.getAttribute("r:embed") || blip?.getAttribute("r:link") || void 0;
-  const url = rid ? ctx.imageUrls.get(rid) : void 0;
+  const imageRids = imageRelationshipIds(blip);
+  const imageUrls = resolvedImageUrls(imageRids, ctx.imageUrls);
+  const imagePaths = imageRids.map((imageRid) => ctx.imagePaths.get(imageRid)).filter((path) => Boolean(path));
+  const rid = imageRids[0];
+  const url = imageUrls[0];
   if (url) ctx.imageList.push(url);
   const videoEl = pic.getElementsByTagName("a:videoFile")[0] ?? pic.getElementsByTagName("p14:media")[0];
   const videoRid = videoEl?.getAttribute("r:link") || videoEl?.getAttribute("r:embed") || void 0;
@@ -4875,7 +4996,10 @@ function parsePic(pic, ctx) {
     rot: box.rot,
     geom: child(spPr, "a:prstGeom")?.getAttribute("prst") || "rect",
     imageUrl: url,
+    imageUrls: imageUrls.length ? imageUrls : void 0,
     imageRid: rid || void 0,
+    imageRids: imageRids.length ? imageRids : void 0,
+    imagePaths: imagePaths.length ? imagePaths : void 0,
     videoUrl,
     videoRid,
     textScale: 1,
@@ -4893,8 +5017,8 @@ function parsePic(pic, ctx) {
   return shape;
 }
 function parseCxnSp(cxn, ctx) {
-  const box = applyT(ctx.t, parseXfrm(child(cxn, "p:spPr")));
-  const spPr = child(cxn, "p:spPr");
+  const spPr = child(cxn, "p:spPr") || (inNamespace(cxn, DIAGRAM_DRAWING_NS) ? childByLocalName(cxn, "spPr") : null);
+  const box = applyT(ctx.t, parseXfrm(spPr));
   const ln = spPr ? child(spPr, "a:ln") : null;
   const color = ln ? solidColor(child(ln, "a:solidFill")) : void 0;
   const w = ln?.getAttribute("w") ? emuToPx(parseInt(ln.getAttribute("w"), 10)) : 2;
@@ -4911,6 +5035,80 @@ function parseCxnSp(cxn, ctx) {
     isTitle: false
   };
 }
+function diagramModelTexts(model) {
+  if (!model) return [];
+  const values = [];
+  for (const point of descendantsByLocalName(model, "pt")) {
+    const text = descendantsByLocalName(point, "t").filter((node) => inNamespace(node, DRAWING_NS, "t")).map((node) => node.textContent || "").join(" ").replace(/\s+/g, " ").trim();
+    if (text && !values.includes(text)) values.push(text);
+  }
+  return values.slice(0, 64);
+}
+function nativeDiagramFallback(gf, model, ctx) {
+  const frame = applyT(ctx.t, parseXfrm(gf));
+  const labels = diagramModelTexts(model);
+  const effective = labels.length ? labels : ["SmartArt diagram unavailable"];
+  const columns = Math.max(1, Math.ceil(Math.sqrt(effective.length)));
+  const rows = Math.max(1, Math.ceil(effective.length / columns));
+  const gap = Math.max(4, Math.min(12, Math.min(frame.w, frame.h) * 0.03));
+  const nodeWidth = Math.max(1, (frame.w - gap * (columns - 1)) / columns);
+  const nodeHeight = Math.max(1, (frame.h - gap * (rows - 1)) / rows);
+  return effective.map((label, index) => ({
+    id: ctx.nextId(),
+    type: "text",
+    x: frame.x + index % columns * (nodeWidth + gap),
+    y: frame.y + Math.floor(index / columns) * (nodeHeight + gap),
+    w: nodeWidth,
+    h: nodeHeight,
+    rot: frame.rot,
+    geom: "roundRect",
+    fill: labels.length ? "#4472c4" : "#e2e8f0",
+    borderColor: labels.length ? "#2f5597" : "#94a3b8",
+    borderWidth: 1,
+    text: {
+      paragraphs: [{ runs: [{ text: label, color: labels.length ? "#ffffff" : "#334155" }], level: 0, align: "center" }],
+      anchor: "ctr",
+      fontScale: 1,
+      defaultSizePt: Math.max(8, Math.min(18, nodeHeight / 5)),
+      levels: []
+    },
+    textScale: (ctx.t.sx + ctx.t.sy) / 2,
+    isTitle: false
+  }));
+}
+function parseDiagramFrame(gf, ctx) {
+  const graphicData = gf.getElementsByTagName("a:graphicData")[0] || descendantsByLocalName(gf, "graphicData")[0];
+  const relIds = graphicData && descendantsByLocalName(graphicData, "relIds")[0];
+  const dmRid = localAttribute(relIds || null, "dm");
+  const part = dmRid ? ctx.diagrams.get(dmRid) : void 0;
+  const drawingTree = part?.drawing && descendantsByLocalName(part.drawing, "spTree")[0];
+  if (drawingTree) {
+    const rawFrame = parseXfrm(gf);
+    const frame = applyT(ctx.t, rawFrame);
+    const localT = {
+      sx: rawFrame.w > 0 ? frame.w / rawFrame.w : ctx.t.sx,
+      sy: rawFrame.h > 0 ? frame.h / rawFrame.h : ctx.t.sy,
+      dx: frame.x,
+      dy: frame.y
+    };
+    const parsed = [];
+    const drawingCtx = {
+      ...ctx,
+      t: localT,
+      imagePaths: part?.imagePaths || /* @__PURE__ */ new Map(),
+      imageUrls: part?.imageUrls || /* @__PURE__ */ new Map(),
+      push: (shape) => parsed.push(shape)
+    };
+    for (const node of Array.from(drawingTree.children)) parseShapeNode(node, drawingCtx);
+    if (parsed.length) return parsed;
+  }
+  const code = part?.model ? "pptx/smartart-native-fallback" : "pptx/smartart-unresolved";
+  const message = part?.model ? `Slide ${ctx.slideNumber}: SmartArt cached drawing is missing; using a simplified local layout.` : `Slide ${ctx.slideNumber}: SmartArt relationships could not be resolved.`;
+  if (!ctx.diagnostics.some((item) => item.code === code && item.message === message)) {
+    ctx.diagnostics.push({ code, severity: part?.model ? "warning" : "error", message });
+  }
+  return nativeDiagramFallback(gf, part?.model || null, ctx);
+}
 function parseGraphicFrame(gf, ctx) {
   const graphicData = gf.getElementsByTagName("a:graphicData")[0];
   const uri = graphicData?.getAttribute("uri") || "";
@@ -4922,6 +5120,9 @@ function parseGraphicFrame(gf, ctx) {
       ctx.tableTexts.push(...rows.flatMap((row) => row));
     }
     return shape;
+  }
+  if (uri.includes("/diagram") || graphicData && descendantsByLocalName(graphicData, "relIds").length) {
+    return parseDiagramFrame(gf, ctx);
   }
   if (uri.includes("/chart")) {
     const box = applyT(ctx.t, parseXfrm(gf));
@@ -4965,31 +5166,48 @@ function parseShapeNode(node, ctx) {
     for (const c of Array.from(fallback.children)) parsed += parseShapeNode(c, ctx);
     return parsed;
   }
-  if (inNamespace(node, PRESENTATION_NS, "sp")) {
+  const drawingShape = node.namespaceURI === PRESENTATION_NS || node.namespaceURI === DIAGRAM_DRAWING_NS;
+  const tag = localTag(node);
+  if (drawingShape && tag === "sp") {
     const shape = parseSp(node, ctx);
     if (!shape) return 0;
     ctx.push(shape);
     return 1;
   }
-  if (inNamespace(node, PRESENTATION_NS, "pic")) {
+  if (drawingShape && tag === "pic") {
     ctx.push(parsePic(node, ctx));
     return 1;
   }
-  if (inNamespace(node, PRESENTATION_NS, "cxnsp")) {
+  if (drawingShape && tag === "cxnsp") {
     ctx.push(parseCxnSp(node, ctx));
     return 1;
   }
   if (inNamespace(node, PRESENTATION_NS, "graphicframe")) {
     const shape = parseGraphicFrame(node, ctx);
-    if (!shape) return 0;
+    if (!shape) {
+      const code = "pptx/graphic-frame-unsupported";
+      if (!ctx.diagnostics.some((item) => item.code === code)) {
+        ctx.diagnostics.push({
+          code,
+          severity: "warning",
+          message: `Slide ${ctx.slideNumber}: a graphic frame could not be rendered locally.`
+        });
+      }
+      return 0;
+    }
+    if (Array.isArray(shape)) {
+      shape.forEach(ctx.push);
+      return shape.length;
+    }
     ctx.push(shape);
     return 1;
   }
-  if (inNamespace(node, PRESENTATION_NS, "grpsp")) return parseGroup(node, ctx);
+  if (drawingShape && tag === "grpsp") return parseGroup(node, ctx);
   return 0;
 }
 function parseGroup(grp, ctx) {
-  const xfrm = child(child(grp, "p:grpSpPr"), "a:xfrm");
+  const groupProperties = child(grp, "p:grpSpPr") || (inNamespace(grp, DIAGRAM_DRAWING_NS) ? childByLocalName(grp, "grpSpPr") : null);
+  const xfrm = child(groupProperties, "a:xfrm");
   let t = ctx.t;
   if (xfrm) {
     const num = (el, attr) => {
@@ -5060,9 +5278,16 @@ async function openPptxDeck(blob, opts) {
     const media = zip.file(path);
     if (!media) return void 0;
     try {
-      const rawBlob = await media.async("blob");
-      const mime = mediaMimeForPath(path);
-      const typedBlob = mime && rawBlob.type !== mime ? rawBlob.slice(0, rawBlob.size, mime) : rawBlob;
+      const extension = mediaExtension(path);
+      let typedBlob;
+      if (extension === "emf" || extension === "wmf") {
+        const source = await media.async("uint8array");
+        typedBlob = await convertMetafileBlob(source) || new Blob([source], { type: mediaMimeForPath(path) });
+      } else {
+        const rawBlob = await media.async("blob");
+        const mime = mediaMimeForPath(path);
+        typedBlob = mime && rawBlob.type !== mime ? rawBlob.slice(0, rawBlob.size, mime) : rawBlob;
+      }
       const url = URL.createObjectURL(typedBlob);
       if (!alive) {
         try {
@@ -5091,8 +5316,13 @@ async function openPptxDeck(blob, opts) {
     if (!content) return null;
     const doc = new DOMParser().parseFromString(content, "text/xml");
     const rels = await loadRelsCached(slidePath);
+    const diagrams = await loadSlideDiagrams(zip, doc, slidePath, rels, loadRelsCached);
     const imageUrls = /* @__PURE__ */ new Map();
+    const imagePaths = /* @__PURE__ */ new Map();
     const videoUrls = /* @__PURE__ */ new Map();
+    for (const [rid, rel] of rels) {
+      if (rel.type.endsWith("/image")) imagePaths.set(rid, resolveZipPath("ppt/slides", rel.target));
+    }
     if (!lazyMedia) {
       for (const [rid, rel] of rels) {
         const isImage = rel.type.endsWith("/image");
@@ -5112,6 +5342,18 @@ async function openPptxDeck(blob, opts) {
             }
           }
         } catch {
+        }
+      }
+      for (const part of diagrams.values()) {
+        for (const [rid, path] of part.imagePaths) {
+          const url = await urlFor(path, i + 1);
+          if (!url) continue;
+          part.imageUrls.set(rid, url);
+          const list = slideLoadedPaths.get(i + 1) ?? [];
+          if (!list.includes(path)) {
+            list.push(path);
+            slideLoadedPaths.set(i + 1, list);
+          }
         }
       }
     }
@@ -5142,10 +5384,14 @@ async function openPptxDeck(blob, opts) {
     const shapes = [];
     const tableTexts = [];
     const imageList = [];
+    const diagnostics = [];
     const ctx = {
       t: IDENTITY,
       imageUrls,
+      imagePaths,
       videoUrls,
+      diagrams,
+      diagnostics,
       layout,
       sw: slideWidth,
       sh: slideHeight,
@@ -5195,6 +5441,28 @@ async function openPptxDeck(blob, opts) {
     body.forEach((p) => parts.push(p));
     tableTexts.forEach((p) => parts.push(p));
     if (notes) parts.push(`Notes: ${notes}`);
+    for (const shape of shapes) {
+      if (shape.type !== "image" && shape.type !== "video") continue;
+      const paths = shape.imagePaths || [];
+      const hasPackagedSource = paths.some((path) => Boolean(zip.file(path))) || (shape.imageRids || []).some((rid) => {
+        const rel = rels.get(rid);
+        return Boolean(rel?.type.endsWith("/image") && zip.file(resolveZipPath("ppt/slides", rel.target)));
+      });
+      if (!hasPackagedSource && !diagnostics.some((item) => item.code === "pptx/image-relationship-unresolved")) {
+        diagnostics.push({
+          code: "pptx/image-relationship-unresolved",
+          severity: "error",
+          message: `Slide ${i + 1}: an image relationship has no readable package part.`
+        });
+      }
+    }
+    if (!shapes.length && !backgroundImageUrl && !background) {
+      diagnostics.push({
+        code: "pptx/unexplained-blank-slide",
+        severity: "warning",
+        message: `Slide ${i + 1} contains no renderable shapes or background.`
+      });
+    }
     return {
       slideNumber: i + 1,
       title,
@@ -5204,7 +5472,8 @@ async function openPptxDeck(blob, opts) {
       text: parts.join("\n"),
       background,
       backgroundImageUrl,
-      shapes
+      shapes,
+      diagnostics: diagnostics.length ? diagnostics : void 0
     };
   };
   const parsedSlides = /* @__PURE__ */ new Map();
@@ -5304,15 +5573,23 @@ async function openPptxDeck(blob, opts) {
           }
         }
         for (const shape of slide.shapes) {
-          if (!shape.imageRid || shape.imageUrl) continue;
-          const rel = job.rels.get(shape.imageRid);
-          if (!rel || !rel.type.endsWith("/image")) continue;
-          const path = resolveZipPath("ppt/slides", rel.target);
-          const url = await urlFor(path, slideNumber);
-          if (!url) continue;
-          note(path);
-          shape.imageUrl = url;
-          if (!slide.images.includes(url)) slide.images.push(url);
+          const imageRids = shape.imageRids?.length ? shape.imageRids : shape.imageRid ? [shape.imageRid] : [];
+          const paths = shape.imagePaths?.length ? shape.imagePaths : imageRids.map((rid) => {
+            const rel = job.rels.get(rid);
+            return rel?.type.endsWith("/image") ? resolveZipPath("ppt/slides", rel.target) : "";
+          }).filter(Boolean);
+          if (!paths.length || shape.imageUrl && shape.imageUrls?.length === paths.length) continue;
+          const urls = [];
+          for (const path of paths) {
+            const url = await urlFor(path, slideNumber);
+            if (!url) continue;
+            note(path);
+            if (!urls.includes(url)) urls.push(url);
+          }
+          if (!urls.length) continue;
+          shape.imageUrls = urls;
+          shape.imageUrl = urls[0];
+          for (const url of urls) if (!slide.images.includes(url)) slide.images.push(url);
         }
         loadedPreviewMedia.add(slideNumber);
       }
@@ -5367,10 +5644,11 @@ async function openPptxDeck(blob, opts) {
       const content = await zip.file(slidePath)?.async("text");
       if (!content) continue;
       let text = "";
+      let slideDoc = null;
       try {
-        const doc = new DOMParser().parseFromString(content, "text/xml");
+        slideDoc = new DOMParser().parseFromString(content, "text/xml");
         const lines = [];
-        walkEffectiveElements(doc.documentElement, (element) => {
+        walkEffectiveElements(slideDoc.documentElement, (element) => {
           if (!inNamespace(element, DRAWING_NS, "p")) return;
           const line = parseParagraph(element, { n: 0 }).runs.map((run) => run.text).join("");
           if (line.trim()) lines.push(line);
@@ -5378,8 +5656,20 @@ async function openPptxDeck(blob, opts) {
         text = lines.join("\n");
       } catch {
       }
-      let notes = "";
       const rels = await loadRelsCached(slidePath);
+      if (slideDoc) {
+        try {
+          const diagrams = await loadSlideDiagrams(zip, slideDoc, slidePath, rels, loadRelsCached);
+          const diagramLines = [];
+          for (const part of diagrams.values()) {
+            const values = part.drawing ? descendantsByLocalName(part.drawing, "t").map((node) => (node.textContent || "").trim()).filter(Boolean) : diagramModelTexts(part.model);
+            for (const value of values) if (!diagramLines.includes(value)) diagramLines.push(value);
+          }
+          if (diagramLines.length) text = [text, ...diagramLines].filter(Boolean).join("\n");
+        } catch {
+        }
+      }
+      let notes = "";
       const notesRel = Array.from(rels.values()).find((r) => r.type.endsWith("/notesSlide"));
       const notesPath = notesRel ? resolveZipPath("ppt/slides", notesRel.target) : `ppt/notesSlides/notesSlide${i + 1}.xml`;
       const notesFile = zip.file(notesPath);

@@ -75,6 +75,77 @@ export CLOUDFLARE_PROJECT_NAME='yayra'
 npm run deploy:cloudflare
 ```
 
+## 3a. Google OAuth and delegated Drive sessions
+
+The Worker is the token-isolation boundary for Web/PWA and Capacitor. Basic
+Google sign-in uses `/auth/google/exchange` and returns only a verified profile.
+The separately consented Drive fallback stores Google credentials encrypted in
+Cloudflare KV and gives the app only an opaque, origin-bound capability for
+`/api/drive/download`; `/api/drive/session/revoke` deletes it on logout before
+best-effort provider revocation.
+
+Create the applicable OAuth client bindings as Worker secrets (never `[vars]`):
+
+```bash
+npx --yes wrangler@4 secret put GOOGLE_WEB_CLIENT_ID --config wrangler.worker.toml
+npx --yes wrangler@4 secret put GOOGLE_WEB_CLIENT_SECRET --config wrangler.worker.toml
+npx --yes wrangler@4 secret put GOOGLE_ANDROID_CLIENT_ID --config wrangler.worker.toml
+npx --yes wrangler@4 secret put GOOGLE_IOS_CLIENT_ID --config wrangler.worker.toml
+```
+
+Android/iOS client IDs are public identifiers but are secrets here only to keep
+all deployment-specific OAuth configuration out of the repository; native
+Google client types do not have client secrets. Omit a platform binding if that
+platform is not shipped.
+
+Provision production and preview KV namespaces once:
+
+```bash
+npx --yes wrangler@4 kv namespace create GOOGLE_DRIVE_SESSIONS --config wrangler.worker.toml
+npx --yes wrangler@4 kv namespace create GOOGLE_DRIVE_SESSIONS --preview --config wrangler.worker.toml
+```
+
+Copy the IDs printed by Wrangler into the committed deployment configuration:
+
+```toml
+[[kv_namespaces]]
+binding = "GOOGLE_DRIVE_SESSIONS"
+id = "<production namespace id>"
+preview_id = "<preview namespace id>"
+```
+
+Namespace IDs identify storage and are safe to commit. KV values are not:
+Yayra seals every record with AES-GCM before `put`, applies a 30-day KV TTL,
+and binds it to the initiating exact origin. Now generate a distinct encryption
+secret directly into Wrangler:
+
+```bash
+openssl rand -base64 48 | npx --yes wrangler@4 secret put GOOGLE_DRIVE_SESSION_SECRET --config wrangler.worker.toml
+```
+
+The secret must be at least 32 characters. Never reuse an OAuth client secret,
+Cloudflare API token, NVIDIA key, or package-signing key. Rotating this value or
+deleting the namespace intentionally invalidates every delegated session; users
+will be prompted to reconnect. Deploy after adding the binding:
+
+```bash
+npm run deploy:cloudflare:worker
+```
+
+Verify configuration without revealing secret values:
+
+```bash
+npx --yes wrangler@4 kv namespace list
+npx --yes wrangler@4 secret list --config wrangler.worker.toml
+```
+
+The Drive routes return `501 drive_session_not_configured` unless the KV binding
+supports `get`, `put`, and `delete` and the encryption secret is present. This
+is intentional fail-closed behavior. Keep
+`GOOGLE_WEB_ALLOWED_ORIGINS`/`GOOGLE_NATIVE_ALLOWED_ORIGINS` exact, register
+matching callbacks in Google Cloud, and read `docs/GOOGLE_SIGNIN.md` for the
+OAuth client matrix, threat model, revocation behavior, and manual tests.
+
 ## 3b. Yayra AI: the NVIDIA key pool (`/api/ai`)
 
 The Worker's `/api/ai` route powers the built-in "Ask Yayra AI" (managed mode — users never need their own key). It calls NVIDIA's OpenAI-compatible NIM endpoint (`https://integrate.api.nvidia.com/v1/chat/completions`) using a **pool of many API keys** so users are spread out and never crowd a single key: each request starts at a rotating position in the pool, rate-limited (429) keys are benched for a minute, and dead keys (401/403) are benched for ten.

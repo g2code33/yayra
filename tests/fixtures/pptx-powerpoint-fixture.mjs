@@ -276,10 +276,12 @@ export const buildPowerPointDeck = async (opts = {}) => {
  *   • the slide-number placeholder has no geometry on the slide or layout and
  *     must inherit its lower-right transform from the master.
  */
-export const buildPowerPointCompatibilityMathDeck = async () => {
+export const buildPowerPointCompatibilityMathDeck = async ({ omitDiagramDrawing = false } = {}) => {
   const zip = new JSZip();
   const MC = 'http://schemas.openxmlformats.org/markup-compatibility/2006';
   const A14 = 'http://schemas.microsoft.com/office/drawing/2010/main';
+  const ASVG = 'http://schemas.microsoft.com/office/drawing/2016/SVG/main';
+  const DGM = 'http://schemas.openxmlformats.org/drawingml/2006/diagram';
   const M = 'http://schemas.openxmlformats.org/officeDocument/2006/math';
 
   zip.file('ppt/presentation.xml', `<?xml version="1.0"?>
@@ -329,7 +331,7 @@ export const buildPowerPointCompatibilityMathDeck = async () => {
 </Relationships>`);
 
   zip.file('ppt/slides/slide1.xml', `<?xml version="1.0"?>
-<p:sld xmlns:p="${P}" xmlns:a="${A}" xmlns:r="${R}" xmlns:mc="${MC}" xmlns:a14="${A14}" xmlns:m="${M}" xmlns:u="urn:unsupported">
+<p:sld xmlns:p="${P}" xmlns:a="${A}" xmlns:r="${R}" xmlns:mc="${MC}" xmlns:a14="${A14}" xmlns:asvg="${ASVG}" xmlns:dgm="${DGM}" xmlns:m="${M}" xmlns:u="urn:unsupported">
   <p:cSld><p:spTree>
     <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>
     <p:sp>
@@ -375,6 +377,16 @@ export const buildPowerPointCompatibilityMathDeck = async () => {
         </p:sp>
       </mc:Fallback>
     </mc:AlternateContent>
+    <p:graphicFrame>
+      <p:nvGraphicFramePr><p:cNvPr id="9" name="Organisation SmartArt"/><p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr>
+      <p:xfrm><a:off x="7620000" y="4572000"/><a:ext cx="3175000" cy="635000"/></p:xfrm>
+      <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram"><dgm:relIds r:dm="rId5" r:lo="rId5" r:qs="rId5" r:cs="rId5"/></a:graphicData></a:graphic>
+    </p:graphicFrame>
+    <p:pic>
+      <p:nvPicPr><p:cNvPr id="8" name="SVG alternative"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>
+      <p:blipFill><a:blip r:embed="rId3"><a:extLst><a:ext uri="{96DAC541-7B7A-43D3-8B79-37D633B846F1}"><asvg:svgBlip r:embed="rId4"/></a:ext></a:extLst></a:blip><a:stretch><a:fillRect/></a:stretch></p:blipFill>
+      <p:spPr><a:xfrm><a:off x="9144000" y="5029200"/><a:ext cx="1524000" cy="762000"/></a:xfrm><a:prstGeom prst="rect"/></p:spPr>
+    </p:pic>
     <p:sp>
       <p:nvSpPr><p:cNvPr id="6" name="Slide Number"/><p:nvPr><p:ph idx="12"/></p:nvPr></p:nvSpPr>
       <p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:fld id="{A1}" type="slidenum"><a:rPr/><a:t>11</a:t></a:fld></a:p></p:txBody>
@@ -384,8 +396,30 @@ export const buildPowerPointCompatibilityMathDeck = async () => {
   zip.file('ppt/slides/_rels/slide1.xml.rels', `<Relationships xmlns="${REL_NS}">
   <Relationship Id="rId1" Type="${REL('slideLayout')}" Target="../slideLayouts/slideLayout1.xml"/>
   <Relationship Id="rId2" Type="${REL('image')}" Target="../media/math-fallback.png"/>
+  <Relationship Id="rId3" Type="${REL('image')}" Target="../media/legacy-diagram.emf"/>
+  <Relationship Id="rId4" Type="${REL('image')}" Target="../media/legacy-diagram.svg"/>
+  <Relationship Id="rId5" Type="${REL('diagramData')}" Target="../diagrams/data1.xml"/>
+  ${omitDiagramDrawing ? '' : '<Relationship Id="rId6" Type="http://schemas.microsoft.com/office/2007/relationships/diagramDrawing" Target="../diagrams/drawing1.xml"/>'}
+</Relationships>`);
+  zip.file('ppt/diagrams/data1.xml', `<?xml version="1.0"?>
+<dgm:dataModel xmlns:dgm="${DGM}" xmlns:a="${A}" xmlns:dsp="http://schemas.microsoft.com/office/drawing/2008/diagram">
+  <dgm:ptLst><dgm:pt modelId="{A}"><dgm:prSet/><dgm:t><a:txBody><a:bodyPr/><a:p><a:r><a:t>Director</a:t></a:r></a:p></a:txBody></dgm:t></dgm:pt></dgm:ptLst>
+  <dgm:extLst><a:ext uri="http://schemas.microsoft.com/office/drawing/2008/diagram"><dsp:dataModelExt relId="rId6" minVer="${DGM}"/></a:ext></dgm:extLst>
+</dgm:dataModel>`);
+  if (!omitDiagramDrawing) zip.file('ppt/diagrams/drawing1.xml', `<?xml version="1.0"?>
+<dsp:drawing xmlns:dsp="http://schemas.microsoft.com/office/drawing/2008/diagram" xmlns:a="${A}" xmlns:r="${R}"><dsp:spTree>
+  <dsp:nvGrpSpPr><dsp:cNvPr id="0" name=""/><dsp:cNvGrpSpPr/></dsp:nvGrpSpPr><dsp:grpSpPr/>
+  <dsp:sp modelId="{A}"><dsp:nvSpPr><dsp:cNvPr id="1" name="Director"/><dsp:cNvSpPr/></dsp:nvSpPr><dsp:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1270000" cy="635000"/></a:xfrm><a:prstGeom prst="roundRect"/><a:solidFill><a:srgbClr val="4472C4"/></a:solidFill></dsp:spPr><dsp:txBody><a:bodyPr anchor="ctr"/><a:p><a:pPr algn="ctr"/><a:r><a:rPr sz="1800"/><a:t>Director</a:t></a:r></a:p></dsp:txBody></dsp:sp>
+  <dsp:sp modelId="{B}"><dsp:nvSpPr><dsp:cNvPr id="2" name="Operations"/><dsp:cNvSpPr/></dsp:nvSpPr><dsp:spPr><a:xfrm><a:off x="1905000" y="0"/><a:ext cx="1270000" cy="635000"/></a:xfrm><a:prstGeom prst="roundRect"/><a:solidFill><a:srgbClr val="70AD47"/></a:solidFill></dsp:spPr><dsp:txBody><a:bodyPr anchor="ctr"/><a:p><a:pPr algn="ctr"/><a:r><a:rPr sz="1800"/><a:t>Operations</a:t></a:r></a:p></dsp:txBody></dsp:sp>
+  <dsp:pic><dsp:nvPicPr><dsp:cNvPr id="3" name="SmartArt badge"/><dsp:cNvPicPr/></dsp:nvPicPr><dsp:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></dsp:blipFill><dsp:spPr><a:xfrm><a:off x="1524000" y="190500"/><a:ext cx="190500" cy="190500"/></a:xfrm><a:prstGeom prst="ellipse"/></dsp:spPr></dsp:pic>
+</dsp:spTree></dsp:drawing>`);
+  if (!omitDiagramDrawing) zip.file('ppt/diagrams/_rels/drawing1.xml.rels', `<Relationships xmlns="${REL_NS}">
+  <Relationship Id="rId1" Type="${REL('image')}" Target="../media/smartart-badge.png"/>
 </Relationships>`);
   zip.file('ppt/media/math-fallback.png', PNG_BYTES);
+  zip.file('ppt/media/smartart-badge.png', PNG_BYTES);
+  zip.file('ppt/media/legacy-diagram.emf', new Uint8Array([1, 2, 3, 4]));
+  zip.file('ppt/media/legacy-diagram.svg', '<svg xmlns="http://www.w3.org/2000/svg" width="160" height="80"><rect width="160" height="80" fill="#2457c5"/><text x="80" y="46" text-anchor="middle" fill="white">SVG fallback</text></svg>');
   return zip.generateAsync({ type: 'uint8array' });
 };
 

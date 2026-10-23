@@ -2,6 +2,8 @@ package com.yayra.floating.android
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.DownloadManager
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -10,9 +12,12 @@ import android.util.Base64
 import android.os.Message
 import android.os.Handler
 import android.os.Looper
+import android.os.Environment
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.CookieManager
+import android.webkit.URLUtil
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -96,6 +101,9 @@ class YayraTabWebviewManager(
         var currentUrl: String? = null
         var lastReportedUrl: String? = null
         var mainFrameFailed: Boolean = false
+        var mainFrameGeneration: Long = 0L
+        var lastDownloadAt: Long = 0L
+        var lastDownloadUrl: String? = null
         var pointerTheme: String = "system"
         var pointerSize: String = "normal"
     }
@@ -145,6 +153,72 @@ class YayraTabWebviewManager(
             return builder.build().toString()
         }
         return uri.buildUpon().scheme("https").fragment(null).build().toString()
+    }
+
+    private fun isGoogleDriveDownloadUrl(value: String?): Boolean {
+        if (value.isNullOrBlank() || value.length > 8192) return false
+        return try {
+            val uri = Uri.parse(value)
+            if (!uri.scheme.equals("https", ignoreCase = true) || !uri.userInfo.isNullOrEmpty()) return false
+            val host = uri.host?.lowercase() ?: return false
+            val path = (uri.path ?: "/").lowercase()
+            if ((host == "drive.google.com" || host == "docs.google.com") && path == "/uc") {
+                uri.getQueryParameter("export") == "download" || uri.getQueryParameter("confirm") != null
+            } else {
+                host == "drive.usercontent.google.com" && (path == "/download" || path.startsWith("/download/"))
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun enqueueDownload(
+        entry: TabEntry,
+        url: String?,
+        userAgent: String?,
+        contentDisposition: String?,
+        mimeType: String?,
+        contentLength: Long
+    ) {
+        if (url.isNullOrBlank() || (!url.startsWith("https://", true) && !url.startsWith("http://", true))) return
+        val filename = URLUtil.guessFileName(url, contentDisposition, mimeType)
+        try {
+            val request = DownloadManager.Request(Uri.parse(url)).apply {
+                setMimeType(mimeType?.takeIf { it.isNotBlank() } ?: "application/octet-stream")
+                CookieManager.getInstance().getCookie(url)
+                    ?.replace("\r", "")?.replace("\n", "")
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { addRequestHeader("Cookie", it) }
+                userAgent?.replace("\r", "")?.replace("\n", "")
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { addRequestHeader("User-Agent", it) }
+                setTitle(filename)
+                setDescription("Downloading with Yayra")
+                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                setAllowedOverMetered(true)
+                setAllowedOverRoaming(false)
+                setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename)
+            }
+            val manager = activity.getSystemService(Context.DOWNLOAD_SERVICE) as? DownloadManager
+                ?: throw IllegalStateException("DownloadManager unavailable")
+            val downloadId = manager.enqueue(request)
+            entry.lastDownloadAt = System.currentTimeMillis()
+            entry.lastDownloadUrl = url
+            entry.mainFrameFailed = false
+            emitEvent(entry.id, "loading-stop")
+            emitEvent(entry.id, "download-handoff") { data ->
+                data.put("url", url)
+                data.put("filename", filename)
+                data.put("mimeType", mimeType ?: "application/octet-stream")
+                data.put("contentLength", contentLength)
+                data.put("downloadId", downloadId)
+            }
+        } catch (error: Exception) {
+            emitEvent(entry.id, "engine-error") { data ->
+                data.put("error", "download_enqueue_failed")
+                data.put("message", error.message ?: "Android could not start the download")
+            }
+        }
     }
 
     private fun emitEvent(id: String, type: String, extra: (JSObject) -> Unit = {}) {
@@ -212,6 +286,10 @@ class YayraTabWebviewManager(
                         settings.allowContentAccess = false
                         settings.cacheMode = WebSettings.LOAD_DEFAULT
                         settings.setSupportMultipleWindows(true)
+                        setDownloadListener { downloadUrl, userAgent, disposition, mimeType, contentLength ->
+                            val liveEntry = tabs[id] ?: return@setDownloadListener
+                            enqueueDownload(liveEntry, downloadUrl, userAgent, disposition, mimeType, contentLength)
+                        }
                         webViewClient = object : WebViewClient() {
                             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                                 val targetUri = request?.url ?: return false
@@ -245,18 +323,46 @@ class YayraTabWebviewManager(
                             }
 
                             override fun onPageStarted(view: WebView?, target: String?, favicon: Bitmap?) {
-                                tabs[id]?.mainFrameFailed = false
+                                tabs[id]?.let {
+                                    it.mainFrameGeneration += 1L
+                                    it.mainFrameFailed = false
+                                }
                                 emitEvent(id, "loading-start") { d -> d.put("url", target ?: "") }
                             }
 
                             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
                                 if (request?.isForMainFrame != true) return
                                 val failedUrl = request.url?.toString() ?: view?.url ?: ""
-                                tabs[id]?.mainFrameFailed = true
-                                emitEvent(id, "fail-load") { d ->
-                                    d.put("url", failedUrl)
-                                    d.put("errorCode", error?.errorCode ?: -1)
-                                    d.put("errorDescription", error?.description?.toString() ?: "net::ERR_FAILED")
+                                val errorCode = error?.errorCode ?: -1
+                                val description = error?.description?.toString() ?: "net::ERR_FAILED"
+                                val failedGeneration = tabs[id]?.mainFrameGeneration ?: return
+                                val delayedDriveFailure = errorCode == WebViewClient.ERROR_UNKNOWN && isGoogleDriveDownloadUrl(failedUrl)
+                                if (delayedDriveFailure) tabs[id]?.mainFrameFailed = true
+                                val reportFailure = report@{
+                                    val liveEntry = tabs[id] ?: return@report
+                                    // Never let a delayed error from a retired
+                                    // Drive navigation cover a newer page.
+                                    if (liveEntry.mainFrameGeneration != failedGeneration) return@report
+                                    val recentDownload = liveEntry.lastDownloadAt > 0L
+                                        && System.currentTimeMillis() - liveEntry.lastDownloadAt <= 10_000L
+                                    if (recentDownload && (liveEntry.lastDownloadUrl == failedUrl || isGoogleDriveDownloadUrl(failedUrl))) {
+                                        liveEntry.mainFrameFailed = false
+                                    } else {
+                                        liveEntry.mainFrameFailed = true
+                                        emitEvent(id, "fail-load") { d ->
+                                            d.put("url", failedUrl)
+                                            d.put("errorCode", errorCode)
+                                            d.put("errorDescription", description)
+                                        }
+                                    }
+                                }
+                                // Android WebView can report ERROR_UNKNOWN
+                                // just before its DownloadListener receives a
+                                // successful Drive Content-Disposition handoff.
+                                if (delayedDriveFailure) {
+                                    main.postDelayed({ reportFailure() }, 2_000L)
+                                } else {
+                                    reportFailure()
                                 }
                             }
 

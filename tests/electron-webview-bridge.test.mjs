@@ -5,6 +5,7 @@ import {
   requiresYayraGoogleAccountConnection,
   requiresSystemBrowserAuth,
   secureSystemBrowserAuthUrl,
+  isGoogleDriveDownloadUrl,
   sanitizeBounds,
   buildBrowserUserAgent,
   buildContextMenuTemplate,
@@ -83,6 +84,21 @@ test('secureSystemBrowserAuthUrl: upgrades exact auth routes and repairs Google 
   const unsafe = new URL('https://accounts.google.com/v3/signin/rejected');
   unsafe.searchParams.set('continue', 'javascript:alert(1)');
   assert.equal(secureSystemBrowserAuthUrl(unsafe.toString()), 'https://accounts.google.com/ServiceLogin');
+});
+
+test('Drive download classifier accepts only trusted Content-Disposition routes', () => {
+  for (const url of [
+    'https://drive.google.com/uc?export=download&id=file-123',
+    'https://docs.google.com/uc?id=file-123&confirm=t',
+    'https://drive.usercontent.google.com/download?id=file-123&export=download&confirm=t'
+  ]) assert.equal(isGoogleDriveDownloadUrl(url), true, url);
+  for (const url of [
+    'https://drive.google.com/drive/my-drive',
+    'https://drive.google.com/file/d/file-123/view',
+    'https://drive.google.com.evil.example/uc?export=download&id=x',
+    'http://drive.google.com/uc?export=download&id=x',
+    'https://drive.usercontent.google.com.evil.example/download?id=x'
+  ]) assert.equal(isGoogleDriveDownloadUrl(url), false, url);
 });
 
 test('buildBrowserUserAgent: never includes the Electron identity token, on any platform', () => {
@@ -300,7 +316,7 @@ function createFakeWebContentsView() {
   };
 }
 
-function makeHarness({ authHosts, autofillPreloadPath, pageUnresponsiveReloadDelayMs, pageUnresponsiveReloadCooldownMs, webauthnSession, Dialog, openExternalImpl } = {}) {
+function makeHarness({ authHosts, autofillPreloadPath, pageUnresponsiveReloadDelayMs, pageUnresponsiveReloadCooldownMs, downloadHandoffGraceMs, attachDownloadSession, webauthnSession, Dialog, openExternalImpl } = {}) {
   const handlers = new Map();
   const listeners = new Map();
   const ipcMain = {
@@ -358,6 +374,8 @@ function makeHarness({ authHosts, autofillPreloadPath, pageUnresponsiveReloadDel
     autofillPreloadPath,
     pageUnresponsiveReloadDelayMs,
     pageUnresponsiveReloadCooldownMs,
+    downloadHandoffGraceMs,
+    attachDownloadSession,
     logger: { error: () => {}, warn: () => {} }
   });
 
@@ -386,6 +404,43 @@ test('webview bridge: superseded ERR_ABORTED navigation is silent but a final ER
   assert.ok(sentEvents.some((event) => event.payload.type === 'fail-load' && event.payload.errorCode === -2), 'a genuine active failure is still surfaced');
   webContents.emit('did-fail-load', {}, -2, 'net::ERR_FAILED (-2)', 'https://example.com/iframe', false);
   assert.equal(sentEvents.filter((event) => event.payload.type === 'fail-load').length, 1, 'subframe errors are not misreported as top-level navigation failures');
+});
+
+test('webview bridge: Drive ERR_FAILED is correlated with will-download instead of becoming a false site failure', async () => {
+  const { bridge, handlers, views, sentEvents } = makeHarness({ downloadHandoffGraceMs: 5 });
+  const driveUrl = 'https://drive.google.com/uc?export=download&id=file-123';
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-drive', url: driveUrl });
+  const webContents = views[0].webContents;
+  webContents.emit('did-fail-load', {}, -2, 'net::ERR_FAILED (-2)', driveUrl, true);
+  assert.equal(sentEvents.some((event) => event.payload.type === 'fail-load'), false, 'Drive handoff failure waits for native download evidence');
+  assert.equal(bridge.noteDownloadHandoff(webContents, {
+    url: driveUrl,
+    filename: 'Research Methodology.pptx',
+    mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+  }), true);
+  assert.equal(sentEvents.some((event) => event.payload.type === 'download-handoff'
+    && event.payload.filename === 'Research Methodology.pptx'), true);
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.equal(sentEvents.some((event) => event.payload.type === 'fail-load'), false, 'the canceled failure timer cannot overwrite a confirmed download');
+
+  const staleUrl = 'https://drive.google.com/uc?export=download&id=retired';
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-drive-retired', url: staleUrl });
+  views[1].webContents.emit('did-fail-load', {}, -2, 'net::ERR_FAILED (-2)', staleUrl, true);
+  const successesBeforeErrorDocument = sentEvents.filter((event) => event.payload.type === 'load-succeeded').length;
+  views[1].webContents.emit('did-finish-load');
+  assert.equal(sentEvents.filter((event) => event.payload.type === 'load-succeeded').length, successesBeforeErrorDocument,
+    'Chromium error-document completion cannot win the Drive correlation window');
+  views[1].webContents.emit('did-start-loading');
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.equal(sentEvents.some((event) => event.payload.type === 'fail-load' && event.payload.url === staleUrl), false,
+    'a delayed Drive error cannot cover a newer loading generation');
+
+  const unresolvedUrl = 'https://drive.google.com/uc?export=download&id=missing';
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-drive-failed', url: unresolvedUrl });
+  views[2].webContents.emit('did-fail-load', {}, -2, 'net::ERR_FAILED (-2)', unresolvedUrl, true);
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  assert.equal(sentEvents.some((event) => event.payload.type === 'fail-load' && event.payload.url === unresolvedUrl), true,
+    'a Drive request with no real download still fails honestly after the bounded grace period');
 });
 
 test('webview bridge: positive main-frame completion is distinct from loading-stop for recovery', async () => {

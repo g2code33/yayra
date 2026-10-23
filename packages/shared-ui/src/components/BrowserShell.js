@@ -50,6 +50,9 @@ import { YayraAiService, AI_DEFAULTS, describeAiReason } from '../services/aiSer
 import { ExtensionManager, BUILT_IN_EXTENSIONS } from '../../../browser-contract/src/extensions/ExtensionManager.js';
 
 const MAX_DOCUMENT_SIZE_MB = Math.floor(MAX_DOCUMENT_BYTES / (1024 * 1024));
+const isPowerPointDocument = (kind) => kind === 'pptx' || kind === 'ppt';
+const isWordDocument = (kind) => kind === 'docx' || kind === 'doc';
+const isSpreadsheetDocument = (kind) => kind === 'xlsx' || kind === 'xls';
 
 /**
  * =========================================================================
@@ -3866,7 +3869,7 @@ export class BrowserShell {
       ? 'Google is connected to Yayra'
       : (signingIn ? 'Finish connecting Google' : (failed ? 'Google connection did not finish' : 'Connect Google to Yayra'));
     const body = connected
-      ? `${escapeHtml(account.profile.email || account.profile.name || 'Your Google account')} is now your Yayra account. Google keeps ${escapeHtml(productLabel)} website cookies in the secure system browser, while Yayra keeps only the verified profile returned by OAuth.`
+      ? `${escapeHtml(account.profile.email || account.profile.name || 'Your Google account')} is connected to Yayra and stays signed in here on this device. Supported Google actions use the verified OAuth connection after Chrome returns to Yayra. For security, Chrome cookies are never copied; services such as Drive use a scoped Google API session instead.`
       : (signingIn
         ? 'Complete the Google consent page in your secure system browser. Its verified one-time callback will return the account to Yayra automatically.'
         : (failed
@@ -4322,7 +4325,10 @@ export class BrowserShell {
       canGoForward: evt.canGoForward,
       isLoading: evt.isLoading,
       errorCode: evt.errorCode,
-      errorDescription: evt.errorDescription
+      errorDescription: evt.errorDescription,
+      filename: evt.filename,
+      mimeType: evt.mimeType,
+      downloadId: evt.downloadId
     });
   }
 
@@ -4930,6 +4936,18 @@ export class BrowserShell {
         break;
       case 'favicon-updated':
         tab.favicon = evt.favicon || tab.favicon;
+        break;
+      case 'download-handoff':
+        // A Content-Disposition response intentionally retires the document
+        // navigation. Chromium may pair it with ERR_FAILED (-2); the native
+        // engines correlate the real download first and this event clears any
+        // stale failure card without pretending a page loaded.
+        this.updateTabLoading(tabId, false);
+        this._clearSiteFailure(tabId);
+        this.showTransientNotice(evt.filename
+          ? `Download started: ${evt.filename}`
+          : 'Download started in Yayra.');
+        if (tabId === this.state.activeTabId) this.requestRender();
         break;
       case 'fail-load': {
         this.updateTabLoading(tabId, false);
@@ -10396,7 +10414,7 @@ export class BrowserShell {
       try {
         if (typeof viewer?.preparePrint === 'function') {
           const kind = tab.docState?.viewer;
-          this.showTransientNotice(kind === 'pptx'
+          this.showTransientNotice(isPowerPointDocument(kind)
             ? 'Preparing every slide for printing…'
             : 'Preparing every page for printing…');
           const ready = await viewer.preparePrint();
@@ -10473,6 +10491,56 @@ export class BrowserShell {
 
   _isWebsiteUrl(url) {
     return /^https?:\/\//i.test(String(url || ''));
+  }
+
+  _driveFileIdFromUrl(value) {
+    try {
+      const parsed = new URL(String(value || ''));
+      const host = parsed.hostname.toLowerCase();
+      if (!['drive.google.com', 'docs.google.com', 'drive.usercontent.google.com'].includes(host)) return null;
+      let id = parsed.searchParams.get('id') || '';
+      if (!id && host === 'drive.google.com') id = /^\/file\/d\/([A-Za-z0-9_-]+)/.exec(parsed.pathname)?.[1] || '';
+      return /^[A-Za-z0-9_-]{10,200}$/.test(id) ? id : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async _downloadDriveFileThroughApi(tabId, url) {
+    const fileId = this._driveFileIdFromUrl(url);
+    if (!fileId || typeof this.authBridge?.downloadDriveFile !== 'function') return { ok: false, error: 'drive_api_unavailable' };
+    if (!this._driveFallbackInflight) this._driveFallbackInflight = new Map();
+    if (this._driveFallbackInflight.has(tabId)) return this._driveFallbackInflight.get(tabId);
+    const attempt = (async () => {
+      let result = await this.authBridge.downloadDriveFile(fileId);
+      if (!result?.ok && /drive_reconnect_required|drive_session_required/i.test(String(result?.error || ''))
+        && typeof this.authBridge.connectDrive === 'function') {
+        const connected = await this.authBridge.connectDrive();
+        // Web/PWA returns pending because its full-page OAuth redirect now
+        // owns control. Native mobile returns only after the verified deep
+        // link, so it can retry immediately without exposing Google tokens.
+        if (!connected?.ok || connected.pending) return connected || { ok: false, error: 'drive_reconnect_required' };
+        result = await this.authBridge.downloadDriveFile(fileId);
+      }
+      if (!result?.ok || (!result.blob && !result.data)) return result || { ok: false, error: 'drive_download_failed' };
+      let bytes;
+      if (result.blob?.arrayBuffer) bytes = new Uint8Array(await result.blob.arrayBuffer());
+      else if (result.data instanceof Uint8Array) bytes = new Uint8Array(result.data.buffer, result.data.byteOffset, result.data.byteLength).slice();
+      else if (result.data instanceof ArrayBuffer) bytes = new Uint8Array(result.data.slice(0));
+      else if (Array.isArray(result.data?.data)) bytes = Uint8Array.from(result.data.data);
+      else return { ok: false, error: 'drive_download_malformed' };
+      if (!bytes.length || bytes.length > MAX_DOCUMENT_BYTES) return { ok: false, error: 'drive_file_too_large' };
+      this._clearSiteFailure(tabId);
+      this.addDocumentTab({
+        name: result.filename || result.name || 'Google Drive download',
+        bytes,
+        mime: result.mimeType || result.blob?.type || 'application/octet-stream'
+      });
+      this.showTransientNotice(`Opened from Google Drive: ${result.filename || result.name || 'download'}`);
+      return { ok: true };
+    })().finally(() => this._driveFallbackInflight.delete(tabId));
+    this._driveFallbackInflight.set(tabId, attempt);
+    return attempt;
   }
 
   _siteFailureFor(tabOrId) {
@@ -10766,6 +10834,8 @@ export class BrowserShell {
     const retryStatus = failure.inFlight
       ? `Trying again now${failure.retryCount ? ` (attempt ${failure.retryCount})` : ''}\u2026`
       : 'Automatic retry is on. The delay is capped at 30 seconds.';
+    const driveFileId = this._driveFileIdFromUrl(failure.url || url);
+    const driveApiAvailable = Boolean(driveFileId && typeof this.authBridge?.downloadDriveFile === 'function');
 
     const fallback = document.createElement('section');
     fallback.className = 'fb-network-recovery fb-offline-fallback';
@@ -10790,6 +10860,7 @@ export class BrowserShell {
         <code class="fb-network-recovery-code">${escapeHtml(errorName)}</code>
         <div class="fb-network-recovery-actions">
           <button type="button" class="fb-btn fb-offline-retry-btn">Try again</button>
+          ${driveApiAvailable ? '<button type="button" class="fb-btn fb-btn-primary fb-drive-api-download-btn">Download through Drive API</button>' : ''}
           <span class="fb-network-recovery-status">${escapeHtml(retryStatus)}</span>
         </div>
         <p class="fb-network-recovery-promise">Yayra will reload this active site automatically when the connection returns. Other open pages stay live.</p>
@@ -10807,6 +10878,21 @@ export class BrowserShell {
         });
       }
       if (current) this._retrySiteRecovery(tabId, { reason: 'manual' });
+    });
+    fallback.querySelector('.fb-drive-api-download-btn')?.addEventListener('click', async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      button.textContent = 'Connecting securely…';
+      const result = await this._downloadDriveFileThroughApi(tabId, failure.url || url);
+      if (result?.pending) {
+        button.textContent = 'Finish in Chrome, then return to Yayra';
+        return;
+      }
+      if (!result?.ok) {
+        button.disabled = false;
+        button.textContent = 'Download through Drive API';
+        this.showTransientNotice(`Google Drive download could not finish${result?.error ? ` (${result.error})` : ''}.`);
+      }
     });
     return fallback;
   }
@@ -18908,9 +18994,9 @@ export class BrowserShell {
 
   documentCategoryForKind(kind) {
     if (kind === 'pdf') return 'pdf';
-    if (kind === 'pptx') return 'presentation';
-    if (kind === 'docx') return 'document';
-    if (kind === 'xlsx') return 'spreadsheet';
+    if (isPowerPointDocument(kind)) return 'presentation';
+    if (isWordDocument(kind)) return 'document';
+    if (isSpreadsheetDocument(kind)) return 'spreadsheet';
     if (kind === 'image') return 'image';
     if (kind === 'text') return 'text';
     return 'other';
@@ -19505,7 +19591,7 @@ export class BrowserShell {
     tab.isDocument = true;
     tab.docId = doc.id;
     tab.docState = createDocumentViewerState(doc.type);
-    if (doc.type === 'pptx') {
+    if (isPowerPointDocument(doc.type)) {
       tab.docState.notesColor = normalizePptxNotesColor(
         this.state.settings.pptxNotesColor
       );
@@ -19568,7 +19654,7 @@ export class BrowserShell {
     const capabilities = documentRoute.capabilities;
     const state = tab.docState || createDocumentViewerState(documentKind);
     tab.docState = state;
-    if (documentKind === 'pptx') {
+    if (isPowerPointDocument(documentKind)) {
       state.notesColor = normalizePptxNotesColor(
         this.state.settings.pptxNotesColor || state.notesColor
       );
@@ -19678,6 +19764,15 @@ export class BrowserShell {
     nameEl.title = tab.title || 'Document';
     nameEl.style.cssText = 'max-width:min(420px,42vw); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:650;';
     bar.appendChild(nameEl);
+    let viewingCopyBadge = null;
+    if (documentKind === 'doc' || documentKind === 'ppt') {
+      viewingCopyBadge = document.createElement('span');
+      viewingCopyBadge.className = 'fb-doc-local-viewing-copy';
+      viewingCopyBadge.textContent = 'Local viewing copy · original unchanged';
+      viewingCopyBadge.title = documentRoute.limitations;
+      viewingCopyBadge.style.cssText = 'max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 6px;border:1px solid rgba(125,211,252,.3);border-radius:999px;color:#bae6fd;background:rgba(14,116,144,.14);font-size:.62rem;font-weight:650;';
+      bar.appendChild(viewingCopyBadge);
+    }
     const spacerA = document.createElement('span');
     spacerA.style.cssText = 'flex:1;';
     bar.appendChild(spacerA);
@@ -19689,7 +19784,7 @@ export class BrowserShell {
     let notesColorControl = null;
     let notesColorInput = null;
     let notesColorSwatch = null;
-    if (documentKind === 'pptx' && capabilities.notes) {
+    if (isPowerPointDocument(documentKind) && capabilities.notes) {
       notesColorControl = document.createElement('label');
       notesColorControl.className = 'fb-doc-notes-color-control';
       notesColorControl.dataset.notesColor = state.notesColor;
@@ -19740,7 +19835,7 @@ export class BrowserShell {
 
     const hasDesktopDocumentBridge = typeof this.systemBridge?.documents?.openExternal === 'function';
     const originalTitle = `Open this ${documentRoute.shortLabel.toLowerCase()} with the system default app`;
-    const printTitle = documentKind === 'pptx'
+    const printTitle = isPowerPointDocument(documentKind)
       ? 'Print every slide in this presentation (Ctrl+P)'
       : documentKind === 'pdf'
         ? 'Print every PDF page (Ctrl+P)'
@@ -19755,7 +19850,7 @@ export class BrowserShell {
     bar.appendChild(mkBtn('\u2b07 Download', 'Download the unchanged original file', () => {
       void downloadOriginal();
     }, 'fb-doc-download-btn'));
-    if (documentKind === 'pptx') {
+    if (isPowerPointDocument(documentKind)) {
       bar.appendChild(mkBtn('\u25b6 Present', 'Start slideshow from slide 1 (F5)', () => {
         this.startDocumentSlideshow(tab.id, { fromBeginning: true });
       }, 'fb-doc-btn-present-first'));
@@ -19814,7 +19909,7 @@ export class BrowserShell {
       if (event.key === 'Escape') { event.preventDefault(); closeMenu(); overflowButton.focus?.(); }
     });
     if (hasDesktopDocumentBridge) addMenuAction('Desktop app', originalTitle, openOriginal);
-    const closeLabel = documentKind === 'pptx' ? 'Close presentation' : `Close ${documentRoute.shortLabel}`;
+    const closeLabel = isPowerPointDocument(documentKind) ? 'Close presentation' : `Close ${documentRoute.shortLabel}`;
     addMenuAction(closeLabel, `Close this ${documentRoute.label.toLowerCase()} tab`, () => this.closeTab(tab.id), { danger: true });
     overflow.appendChild(overflowButton);
     overflow.appendChild(menu);
@@ -19825,7 +19920,7 @@ export class BrowserShell {
     bar2.className = 'fb-doc-toolbar fb-doc-toolbar2';
     bar2.style.cssText = 'flex:none; display:flex; align-items:center; gap:5px; padding:3px 10px; background:var(--fb-bg-surface,#11141d); border-bottom:1px solid rgba(255,255,255,0.08); font-size:0.76rem; color:var(--fb-text-primary,#dfe4ee); flex-wrap:wrap;';
 
-    const pageNoun = documentKind === 'pptx' ? 'slide' : documentKind === 'xlsx' ? 'sheet' : 'page';
+    const pageNoun = isPowerPointDocument(documentKind) ? 'slide' : isSpreadsheetDocument(documentKind) ? 'sheet' : 'page';
     const pageInput = document.createElement('input');
     pageInput.type = 'number';
     pageInput.className = 'fb-doc-page-input';
@@ -19849,8 +19944,8 @@ export class BrowserShell {
       bar2.appendChild(mkBtn('\u203a', `Next ${pageNoun} (Right)`, () => activeViewer()?.nextPage?.()));
     }
     if (capabilities.view && capabilities.presentation) {
-      const showNoun = documentKind === 'pptx' ? 'slideshow' : 'PDF presentation';
-      const currentLabel = documentKind === 'pptx' ? '\u25b6 From current slide' : '\u25b6 From current page';
+      const showNoun = isPowerPointDocument(documentKind) ? 'slideshow' : 'PDF presentation';
+      const currentLabel = isPowerPointDocument(documentKind) ? '\u25b6 From current slide' : '\u25b6 From current page';
       bar2.appendChild(mkBtn(currentLabel, `Start ${showNoun} from the selected ${pageNoun} (Shift+F5)`, () => {
         this.startDocumentSlideshow(tab.id);
       }, 'fb-doc-btn-present-current'));
@@ -19869,7 +19964,7 @@ export class BrowserShell {
     if (capabilities.rotate) bar2.appendChild(mkBtn('\u21bb', 'Rotate 90\u00b0 (R)', () => activeViewer()?.rotate?.(90), 'fb-doc-btn-rotate'));
     if (capabilities.nightMode) bar2.appendChild(mkBtn('\u263d', 'Night reading mode (N)', () => { activeViewer()?.setNight?.(!tab.docState?.night); }, 'fb-doc-btn-night'));
     if (capabilities.outline || capabilities.thumbnails) {
-      bar2.appendChild(mkBtn('\u2630', documentKind === 'pptx' ? 'Slide thumbnails' : 'Outline and page thumbnails', () => {
+      bar2.appendChild(mkBtn('\u2630', isPowerPointDocument(documentKind) ? 'Slide thumbnails' : 'Outline and page thumbnails', () => {
         tab.docState.sidebarOpen = !tab.docState.sidebarOpen;
         if (this._activeDocViewer?.tabId === tab.id) this._activeDocViewer.rerenderSidebar?.();
         else this.render();
@@ -19882,7 +19977,7 @@ export class BrowserShell {
     const searchInput = document.createElement('input');
     searchInput.type = 'text';
     searchInput.className = 'fb-doc-search-input';
-    searchInput.placeholder = documentKind === 'xlsx' ? 'Find in sheet (Ctrl+F)' : `Find in ${pageNoun === 'slide' ? 'presentation' : 'document'} (Ctrl+F)`;
+    searchInput.placeholder = isSpreadsheetDocument(documentKind) ? 'Find in sheet (Ctrl+F)' : `Find in ${pageNoun === 'slide' ? 'presentation' : 'document'} (Ctrl+F)`;
     searchInput.setAttribute('aria-label', searchInput.placeholder);
     searchInput.style.cssText = 'width:174px; padding:5px 9px; border-radius:7px; border:1px solid var(--fb-border-glass,rgba(255,255,255,0.12)); background:var(--fb-bg-glass-input,#101218); color:inherit; font-size:0.78rem;';
     let searchTimer = null;
@@ -19925,7 +20020,7 @@ export class BrowserShell {
       return b;
     };
     if (capabilities.outline) sidebarTabs.appendChild(mkTabBtn('Outline', 'outline'));
-    if (capabilities.thumbnails) sidebarTabs.appendChild(mkTabBtn(documentKind === 'pptx' ? 'Slides' : 'Pages', 'thumbnails'));
+    if (capabilities.thumbnails) sidebarTabs.appendChild(mkTabBtn(isPowerPointDocument(documentKind) ? 'Slides' : 'Pages', 'thumbnails'));
     const sidebarBody = document.createElement('div');
     sidebarBody.className = 'fb-doc-sidebar-body';
     sidebar.appendChild(sidebarTabs);
@@ -20014,7 +20109,7 @@ export class BrowserShell {
         if (state.sidebarTab === 'thumbnails') {
           const count = state.numPages || 0;
           if (!count) {
-            sidebarBody.innerHTML = `<div style="color:var(--fb-text-secondary,#9aa3b2); padding:8px;">No ${documentKind === 'pptx' ? 'slides' : 'pages'} yet.</div>`;
+            sidebarBody.innerHTML = `<div style="color:var(--fb-text-secondary,#9aa3b2); padding:8px;">No ${isPowerPointDocument(documentKind) ? 'slides' : 'pages'} yet.</div>`;
             return;
           }
           for (let p = 1; p <= count; p += 1) {
@@ -20025,7 +20120,7 @@ export class BrowserShell {
             thumb.setAttribute('aria-label', `Go to ${pageNoun} ${p}`);
             thumb.style.cssText = `margin:0 auto 10px; width:140px; min-height:44px; padding:4px; border:1px solid ${p === state.page ? 'var(--fb-accent-primary,#6d5df2)' : 'var(--fb-border-glass,rgba(255,255,255,0.12))'}; border-radius:7px; cursor:pointer; text-align:center; background:var(--fb-bg-glass-input,#0e111a); overflow:hidden;`;
             const label = document.createElement('div');
-            label.textContent = `${documentKind === 'pptx' ? 'Slide ' : ''}${p}`;
+            label.textContent = `${isPowerPointDocument(documentKind) ? 'Slide ' : ''}${p}`;
             label.style.cssText = 'padding:3px 0; color:var(--fb-text-secondary,#9aa3b2); font-size:0.7rem;';
             thumb.appendChild(label);
             thumb.addEventListener('click', () => activeViewer()?.setPage?.(p));
@@ -20067,7 +20162,7 @@ export class BrowserShell {
       try {
         pageInput.value = String(state.page || 1);
         pageInput.max = String(state.numPages || 1);
-        const sheetName = documentKind === 'xlsx' ? state.sheetNames?.[(state.page || 1) - 1] : '';
+        const sheetName = isSpreadsheetDocument(documentKind) ? state.sheetNames?.[(state.page || 1) - 1] : '';
         pageLabel.textContent = sheetName ? `${sheetName} · ${state.page} / ${state.numPages}` : `/ ${state.numPages || '-'}`;
         zoomLabel.textContent = `${Math.round((state.zoom || 1) * 100)}%`;
         matchLabel.textContent = state.searchPending
@@ -20079,6 +20174,13 @@ export class BrowserShell {
         if (nightBtn) nightBtn.style.background = state.night ? 'rgba(109,93,242,0.45)' : 'rgba(255,255,255,0.07)';
         const notesBtn = bar2.querySelector('.fb-doc-btn-notes');
         if (notesBtn) notesBtn.style.background = state.showNotes ? 'rgba(109,93,242,0.45)' : 'rgba(255,255,255,0.07)';
+        if (viewingCopyBadge) {
+          const warnings = Array.isArray(state.conversionWarnings) ? state.conversionWarnings : [];
+          viewingCopyBadge.textContent = warnings.length
+            ? `Local viewing copy · ${warnings.length} simplification${warnings.length === 1 ? '' : 's'} · original unchanged`
+            : 'Local viewing copy · original unchanged';
+          viewingCopyBadge.title = [documentRoute.limitations, ...warnings].filter(Boolean).join('\n');
+        }
         if (notesColorControl && notesColorInput) {
           const color = normalizePptxNotesColor(state.notesColor);
           state.notesColor = color;
@@ -20123,7 +20225,7 @@ export class BrowserShell {
             row.style.cssText = `padding:6px 8px; margin-bottom:4px; border-radius:6px; cursor:pointer; background:${i === state.matchIndex ? 'rgba(109,93,242,0.35)' : 'rgba(255,255,255,0.04)'}; line-height:1.4;`;
             const pageNumber = document.createElement('strong');
             pageNumber.style.cssText = 'color:var(--fb-text-secondary,#9aa3b2);';
-            pageNumber.textContent = `${documentKind === 'pptx' ? 'slide' : documentKind === 'xlsx' ? 'sheet' : 'p.'}${m.page}`;
+            pageNumber.textContent = `${isPowerPointDocument(documentKind) ? 'slide' : isSpreadsheetDocument(documentKind) ? 'sheet' : 'p.'}${m.page}`;
             const snippet = document.createElement('span');
             snippet.textContent = ` \u2014 ${String(m.snippet || '').slice(0, 90)}`;
             row.appendChild(pageNumber);
@@ -20236,7 +20338,7 @@ export class BrowserShell {
     const session = this._documentViewerSessions?.get(tabId);
     const viewer = session?.viewer;
     const documentKind = doc?.type;
-    const isPowerPoint = documentKind === 'pptx';
+    const isPowerPoint = isPowerPointDocument(documentKind);
     const isPdf = documentKind === 'pdf';
     if (!tab || (!isPowerPoint && !isPdf) || !viewer || session.state?.status !== 'ready') {
       this.showTransientNotice('Wait for the PDF or presentation to finish opening, then choose Present.');
@@ -21185,7 +21287,7 @@ export class BrowserShell {
     const activeDocument = activeDocumentTab?.docId ? this.documentStore?.get(activeDocumentTab.docId) : null;
     // Presentation start keys own F5 while a PPTX or PDF tab is active.
     // Shift+F5 begins at the current slide/page; plain F5 begins at 1.
-    if (e.key === 'F5' && !e.ctrlKey && !e.metaKey && !e.altKey && ['pptx', 'pdf'].includes(activeDocument?.type)) {
+    if (e.key === 'F5' && !e.ctrlKey && !e.metaKey && !e.altKey && ['pptx', 'ppt', 'pdf'].includes(activeDocument?.type)) {
       e.preventDefault();
       this.startDocumentSlideshow(activeDocumentTab.id, { fromBeginning: !e.shiftKey });
     }

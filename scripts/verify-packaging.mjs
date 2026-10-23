@@ -66,6 +66,9 @@ const builtDocumentAssets = [
   ['dist/packages/shared-ui/src/vendor/documents/pptxRenderer.mjs', 150_000],
   ['dist/packages/shared-ui/src/vendor/documents/docxPreview.mjs', 200_000],
   ['dist/packages/shared-ui/src/vendor/documents/xlsx.mjs', 700_000],
+  ['dist/packages/shared-ui/src/vendor/documents/legacyOffice.mjs', 700_000],
+  ['dist/packages/shared-ui/src/vendor/documents/LEGACY-OFFICE-NOTICES.md', 5_000],
+  ['dist/packages/shared-ui/src/services/legacyOfficeWorker.js', 500],
   ['dist/packages/shared-ui/src/vendor/documents/manifest.json', 100]
 ];
 if (existsSync(path.join(root, 'dist'))) {

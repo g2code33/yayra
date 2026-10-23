@@ -27,7 +27,7 @@ function fakeAuthStore() {
   let session = null;
   return {
     save: ({ profile, tokens }) => { session = { profile, tokens }; },
-    load: () => (session ? { profile: session.profile, savedAt: '2026-01-01T00:00:00.000Z' } : null),
+    load: () => (session ? { profile: session.profile, tokens: session.tokens, savedAt: '2026-01-01T00:00:00.000Z' } : null),
     clear: () => { session = null; }
   };
 }
@@ -226,17 +226,46 @@ test('authBridge: sign-out clears the stored session and emits signed-out', asyn
   const ipcMain = fakeIpcMain();
   const win = fakeWindow();
   const authStore = fakeAuthStore();
-  authStore.save({ profile: { sub: '1' }, tokens: { access_token: 'x' } });
+  authStore.save({ profile: { sub: '1' }, tokens: { access_token: 'access-x', refresh_token: 'refresh-y' } });
   const shell = { openExternal: async () => {} };
+  const revocations = [];
+  const fetchImpl = async (url, options) => {
+    revocations.push({ url, options });
+    return new Response('', { status: 200 });
+  };
 
-  createAuthBridge({ ipcMain, shell, getMainWindow: () => win, authStore, clientId: 'c', clientSecret: 's', signInImpl: async () => ({}) });
+  createAuthBridge({ ipcMain, shell, getMainWindow: () => win, authStore, clientId: 'c', clientSecret: 's', fetchImpl, signInImpl: async () => ({}) });
 
   const result = await ipcMain.invoke('yayra:auth-sign-out');
   assert.deepEqual(result, { ok: true });
   assert.deepEqual(await ipcMain.invoke('yayra:auth-get-session'), { signedIn: false });
+  assert.equal(revocations.length, 1);
+  assert.equal(revocations[0].url, 'https://oauth2.googleapis.com/revoke');
+  assert.equal(new URLSearchParams(revocations[0].options.body).get('token'), 'refresh-y');
 
   const events = win.sent.filter((e) => e.channel === AUTH_EVENT_CHANNEL).map((e) => e.payload.type);
   assert.deepEqual(events, ['signed-out']);
+});
+
+test('authBridge: local sign-out stays successful when Google revocation is unavailable', async () => {
+  const ipcMain = fakeIpcMain();
+  const authStore = fakeAuthStore();
+  authStore.save({ profile: { sub: '1' }, tokens: { access_token: 'access-x' } });
+  const warnings = [];
+  createAuthBridge({
+    ipcMain,
+    shell: { openExternal: async () => {} },
+    getMainWindow: () => fakeWindow(),
+    authStore,
+    clientId: 'c',
+    clientSecret: 's',
+    fetchImpl: () => { throw new Error('offline'); },
+    signInImpl: async () => ({}),
+    logger: { warn: (message) => warnings.push(message), error: () => {} }
+  });
+  assert.deepEqual(await ipcMain.invoke('yayra:auth-sign-out'), { ok: true });
+  assert.deepEqual(await ipcMain.invoke('yayra:auth-get-session'), { signedIn: false });
+  assert.equal(warnings.length, 1);
 });
 
 test('authBridge: Google account management always opens the one hardcoded URL in the system browser', async () => {

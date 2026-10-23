@@ -23,6 +23,9 @@ const documentAssets = [
   ['./packages/shared-ui/src/vendor/documents/pptxRenderer.mjs', 150_000],
   ['./packages/shared-ui/src/vendor/documents/docxPreview.mjs', 200_000],
   ['./packages/shared-ui/src/vendor/documents/xlsx.mjs', 700_000],
+  ['./packages/shared-ui/src/vendor/documents/legacyOffice.mjs', 700_000],
+  ['./packages/shared-ui/src/vendor/documents/LEGACY-OFFICE-NOTICES.md', 5_000],
+  ['./packages/shared-ui/src/services/legacyOfficeWorker.js', 500],
   ['./packages/shared-ui/src/vendor/documents/manifest.json', 100]
 ];
 for (const [asset, minimumBytes] of documentAssets) {

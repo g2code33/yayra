@@ -7,15 +7,17 @@
  * Responsibilities, in order:
  *   1. Validate the callback (CSRF state vs the sessionStorage stash) and
  *      hand the one-shot code + PKCE verifier to the Cloudflare Worker for
- *      the server-side exchange (profile only ever comes back).
- *   2. Persist the profile the same way the shell reads it.
+ *      the server-side exchange (profile plus, only for explicit Drive
+ *      consent, an opaque Yayra capability; Google tokens never come back).
+ *   2. Persist the profile and optional opaque Drive capability the same way
+ *      the shell reads them.
  *   3. Return the user to where they started the sign-in, replacing this
  *      page in history so Back never lands on a dead callback URL full of
  *      consumed OAuth parameters.
  * On any failure: show the error honestly with a way back into the app -
  * never a blank page.
  */
-import { completeSignIn, saveProfile } from '../services/googleAuthWeb.js';
+import { completeSignIn, saveDriveSession, saveProfile } from '../services/googleAuthWeb.js';
 import { resolveWebGoogleAuthConfig } from '../config/googleAuthWeb.js';
 
 const statusEl = document.getElementById('auth-status');
@@ -28,7 +30,7 @@ async function run() {
     return fail('Google sign-in is not configured for this deployment.');
   }
   try {
-    const { profile, returnTo } = await completeSignIn({
+    const { profile, driveSession, returnTo } = await completeSignIn({
       search: window.location.search,
       origin: window.location.origin,
       pathname: window.location.pathname,
@@ -37,7 +39,13 @@ async function run() {
       fetchImpl: window.fetch.bind(window)
     });
     saveProfile(window.localStorage, profile);
-    if (statusEl) statusEl.textContent = `Signed in as ${profile.email} — returning to Yayra…`;
+    // The value is an opaque, origin-bound, Drive-readonly capability — not a
+    // Google token. Persist it so the reflected Yayra connection survives a
+    // browser/PWA restart; the Worker keeps encrypted Google credentials.
+    if (driveSession) saveDriveSession(window.localStorage, driveSession);
+    if (statusEl) statusEl.textContent = driveSession
+      ? `Google Drive connected for ${profile.email} — returning to Yayra…`
+      : `Signed in as ${profile.email} — returning to Yayra…`;
     // Only ever return to a same-origin path - a stored absolute URL (which
     // beginSignIn never writes, but defense in depth) must not become an
     // open redirect.

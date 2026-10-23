@@ -31,23 +31,21 @@
  *   definition, so this client never touches one: the callback page POSTs
  *   `{ code, codeVerifier, redirectUri }` to the update worker's
  *   `/auth/google/exchange` endpoint (worker/update-worker.mjs), which
- *   holds the secret as a Worker secret binding, performs the
- *   code-for-token exchange and the userinfo fetch server-side, and
- *   returns ONLY the basic profile (sub/name/email/picture).
+ *   holds the secret as a Worker binding and performs token exchange and
+ *   userinfo server-side. Basic identity returns ONLY the sanitized profile.
+ *   A separate, explicit Drive-readonly consent encrypts scoped credentials
+ *   in Worker KV and returns only an opaque origin-bound Yayra capability.
  *
  * SECURITY TRADE-OFF versus Electron's OS keychain - be explicit:
  *   Electron encrypts raw OAuth tokens at rest with safeStorage (OS
  *   keychain: Keychain/libsecret/DPAPI - see electron/authStore.cjs). A
  *   browser has NO equivalent: anything persisted (localStorage,
  *   IndexedDB, even a non-HttpOnly cookie) is readable by any same-origin
- *   script. Instead of storing tokens weakly, this design ensures RAW
- *   TOKENS NEVER REACH THE BROWSER AT ALL - the worker consumes them
- *   server-side and discards them, returning only the profile. What IS
- *   persisted client-side (localStorage) is exactly what the UI shows
- *   anyway: display name, email, avatar URL. Consequence: the web session
- *   is "profile-only" - Yayra cannot call Google APIs on the user's behalf
- *   later (it has no tokens), which is fine because the openid/email/
- *   profile scopes are all Yayra uses anywhere.
+ *   script. Instead of storing Google credentials weakly, RAW GOOGLE TOKENS
+ *   NEVER REACH THE BROWSER. Profile tokens are discarded after userinfo;
+ *   delegated Drive credentials stay AES-GCM-encrypted in Worker KV and are
+ *   refreshed/revoked only there. localStorage contains display profile data
+ *   and, when granted, a random scoped capability—not a bearer/refresh token.
  *
  * Every external effect (storage, navigation, fetch, randomness, hashing)
  * is dependency-injected so the URL construction, state round trip, and
@@ -60,8 +58,11 @@
 
 export const GOOGLE_AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
 export const DEFAULT_SCOPES = ['openid', 'email', 'profile'];
+export const DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
+export const DRIVE_SCOPES = [...DEFAULT_SCOPES, DRIVE_READONLY_SCOPE];
 export const CALLBACK_PATH = '/auth/callback';
 export const PENDING_KEY = 'yayra:google-auth:pending';
+export const DRIVE_SESSION_KEY = 'yayra:google-drive:delegated-session';
 
 export function normalizeGoogleProductOrigin(value) {
   if (typeof value !== 'string' || value.length === 0 || value.length > 512) return null;
@@ -140,6 +141,114 @@ export function validatedExchangeUrl(value) {
   }
 }
 
+function driveApiUrlForExchange(exchangeUrl, pathname) {
+  const safeExchangeUrl = new URL(validatedExchangeUrl(exchangeUrl));
+  safeExchangeUrl.pathname = pathname;
+  safeExchangeUrl.search = '';
+  return safeExchangeUrl;
+}
+
+export function driveDownloadUrlForExchange(exchangeUrl, fileId) {
+  const safeExchangeUrl = driveApiUrlForExchange(exchangeUrl, '/api/drive/download');
+  if (typeof fileId !== 'string' || !/^[A-Za-z0-9_-]{10,200}$/.test(fileId)) throw new Error('invalid_drive_file_id');
+  safeExchangeUrl.searchParams.set('fileId', fileId);
+  return safeExchangeUrl.toString();
+}
+
+export function driveRevokeUrlForExchange(exchangeUrl) {
+  return driveApiUrlForExchange(exchangeUrl, '/api/drive/session/revoke').toString();
+}
+
+function driveFilenameFromResponse(response) {
+  const disposition = response?.headers?.get?.('content-disposition') || '';
+  const encoded = /filename\*=UTF-8''([^;]+)/i.exec(disposition)?.[1];
+  if (encoded) {
+    try { return decodeURIComponent(encoded).replace(/[\\/:*?"<>|\u0000-\u001f\u007f]/g, '_').slice(0, 180); }
+    catch { /* use generic fallback */ }
+  }
+  return 'Google Drive download';
+}
+
+export async function downloadDelegatedDriveFile({
+  fileId,
+  exchangeUrl,
+  sessionStorage,
+  fetchImpl = globalThis.fetch,
+  maxBytes = 300 * 1024 * 1024
+}) {
+  const session = loadDriveSession(sessionStorage);
+  if (!session) throw new Error('drive_reconnect_required');
+  const response = await fetchImpl(driveDownloadUrlForExchange(exchangeUrl, fileId), {
+    method: 'GET',
+    headers: { Authorization: `YayraDrive ${session.id}`, Accept: 'application/octet-stream' }
+  });
+  if (!response.ok) {
+    const text = await readBoundedExchangeResponse(response);
+    const code = safeExchangeErrorCode(text);
+    if (response.status === 401) sessionStorage.removeItem(DRIVE_SESSION_KEY);
+    throw new Error(`drive_download_failed:${response.status}:${code}`);
+  }
+  const declared = Number(response.headers?.get?.('content-length'));
+  if (Number.isFinite(declared) && (declared < 0 || declared > maxBytes)) throw new Error('drive_file_too_large');
+  const reader = response.body?.getReader?.();
+  let blob;
+  if (reader) {
+    const chunks = [];
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value || []);
+      total += chunk.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch { /* best effort */ }
+        throw new Error('drive_file_too_large');
+      }
+      chunks.push(chunk);
+    }
+    blob = new Blob(chunks, { type: response.headers?.get?.('content-type') || 'application/octet-stream' });
+  } else {
+    blob = await response.blob();
+    if (blob.size > maxBytes) throw new Error('drive_file_too_large');
+  }
+  return {
+    blob,
+    filename: driveFilenameFromResponse(response),
+    mimeType: blob.type || 'application/octet-stream'
+  };
+}
+
+export async function revokeDelegatedDriveSession({
+  exchangeUrl,
+  sessionStorage,
+  fetchImpl = globalThis.fetch,
+  timeoutMs = 5000
+}) {
+  const session = loadDriveSession(sessionStorage);
+  // Local logout is authoritative and immediate even when the Worker or
+  // Google is unavailable. The opaque capability cannot be recovered from
+  // browser storage after this point.
+  sessionStorage?.removeItem?.(DRIVE_SESSION_KEY);
+  if (!session) return { ok: true, revoked: false };
+
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = controller && Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? setTimeout(() => controller.abort(), Math.min(timeoutMs, 30_000))
+    : null;
+  try {
+    const response = await fetchImpl(driveRevokeUrlForExchange(exchangeUrl), {
+      method: 'POST',
+      headers: { Authorization: `YayraDrive ${session.id}`, Accept: 'application/json' },
+      ...(controller ? { signal: controller.signal } : {})
+    });
+    return { ok: response.ok, revoked: response.ok };
+  } catch {
+    return { ok: false, revoked: false };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export async function readBoundedExchangeResponse(response, maxBytes = MAX_EXCHANGE_RESPONSE_BYTES) {
   const rawLength = response?.headers?.get?.('content-length');
   if (rawLength !== null && rawLength !== undefined && rawLength !== '') {
@@ -205,12 +314,46 @@ export function sanitizeGoogleProfile(value) {
   return { sub, name, email, picture };
 }
 
+export function sanitizeDriveSession(value) {
+  if (!value || typeof value !== 'object') return null;
+  const id = typeof value.id === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value.id) ? value.id : null;
+  const expiresAt = typeof value.expiresAt === 'string' && Number.isFinite(Date.parse(value.expiresAt))
+    ? value.expiresAt
+    : null;
+  if (!id || !expiresAt || value.scope !== 'drive.readonly') return null;
+  return { id, expiresAt, scope: 'drive.readonly' };
+}
+
+export function saveDriveSession(sessionStorage, value) {
+  const session = sanitizeDriveSession(value);
+  if (!session) throw new Error('invalid_drive_session');
+  sessionStorage.setItem(DRIVE_SESSION_KEY, JSON.stringify(session));
+  return session;
+}
+
+export function loadDriveSession(sessionStorage, now = () => Date.now()) {
+  const raw = sessionStorage?.getItem?.(DRIVE_SESSION_KEY);
+  if (!raw || raw.length > 4096) return null;
+  try {
+    const session = sanitizeDriveSession(JSON.parse(raw));
+    if (!session || Date.parse(session.expiresAt) <= Number(now())) {
+      sessionStorage?.removeItem?.(DRIVE_SESSION_KEY);
+      return null;
+    }
+    return session;
+  } catch {
+    sessionStorage?.removeItem?.(DRIVE_SESSION_KEY);
+    return null;
+  }
+}
+
 /**
  * Same parameter set as the Electron flow (including `prompt=consent
- * select_account` so "Switch account" shows Google's account chooser), with
- * one deliberate difference: NO offline access is requested. A refresh
- * token would be a long-lived credential with nowhere safe to live in a
- * browser; the one-shot code is all this flow needs.
+ * select_account` so "Switch account" shows Google's account chooser).
+ * Ordinary profile sign-in never asks for offline access. The separate,
+ * explicit Drive-readonly consent does: its refresh credential is returned
+ * only to the Worker, encrypted there, while browser code receives an opaque
+ * origin-bound capability that it can revoke.
  */
 export function buildAuthorizationUrl({ clientId, redirectUri, state, codeChallenge, scopes = DEFAULT_SCOPES }) {
   if (typeof clientId !== 'string' || clientId.length > 255
@@ -218,8 +361,13 @@ export function buildAuthorizationUrl({ clientId, redirectUri, state, codeChalle
   if (typeof redirectUri !== 'string' || !redirectUri || redirectUri.length > 2048) throw new Error('invalid_redirect_uri');
   if (typeof state !== 'string' || !/^[A-Za-z0-9_-]{16,256}$/.test(state)) throw new Error('invalid_state');
   if (typeof codeChallenge !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(codeChallenge)) throw new Error('invalid_code_challenge');
-  if (!Array.isArray(scopes) || scopes.length !== DEFAULT_SCOPES.length
-    || scopes.some((scope, index) => scope !== DEFAULT_SCOPES[index])) throw new Error('invalid_scopes');
+  const validProfileScopes = Array.isArray(scopes)
+    && scopes.length === DEFAULT_SCOPES.length
+    && scopes.every((scope, index) => scope === DEFAULT_SCOPES[index]);
+  const validDriveScopes = Array.isArray(scopes)
+    && scopes.length === DRIVE_SCOPES.length
+    && scopes.every((scope, index) => scope === DRIVE_SCOPES[index]);
+  if (!validProfileScopes && !validDriveScopes) throw new Error('invalid_scopes');
   const url = new URL(GOOGLE_AUTH_ENDPOINT);
   url.searchParams.set('client_id', clientId);
   url.searchParams.set('redirect_uri', redirectUri);
@@ -229,6 +377,7 @@ export function buildAuthorizationUrl({ clientId, redirectUri, state, codeChalle
   url.searchParams.set('code_challenge', codeChallenge);
   url.searchParams.set('code_challenge_method', 'S256');
   url.searchParams.set('prompt', 'consent select_account');
+  if (validDriveScopes) url.searchParams.set('access_type', 'offline');
   return url.toString();
 }
 
@@ -241,11 +390,13 @@ export async function beginSignIn({
   clientId,
   origin,
   returnTo = '/',
+  capability = 'profile',
   sessionStorage,
   cryptoImpl = globalThis.crypto,
   navigate
 }) {
   if (!clientId) throw new Error('not_configured');
+  if (!['profile', 'drive-readonly'].includes(capability)) throw new Error('invalid_capability');
   const safeOrigin = validatedWebOrigin(origin);
   const { codeVerifier, codeChallenge } = await generatePkcePair(cryptoImpl);
   const state = generateState(cryptoImpl);
@@ -253,10 +404,12 @@ export async function beginSignIn({
   sessionStorage.setItem(PENDING_KEY, JSON.stringify({
     codeVerifier,
     state,
+    capability,
     returnTo: safeReturnToPath(returnTo, safeOrigin),
     startedAt: new Date().toISOString()
   }));
-  const url = buildAuthorizationUrl({ clientId, redirectUri, state, codeChallenge });
+  const scopes = capability === 'drive-readonly' ? DRIVE_SCOPES : DEFAULT_SCOPES;
+  const url = buildAuthorizationUrl({ clientId, redirectUri, state, codeChallenge, scopes });
   navigate(url);
   return url;
 }
@@ -316,6 +469,7 @@ export async function completeSignIn({
     || !/^[A-Za-z0-9_-]{8,256}$/.test(pending.state)
     || typeof pending.codeVerifier !== 'string'
     || !/^[A-Za-z0-9._~-]{43,128}$/.test(pending.codeVerifier)
+    || (pending.capability !== undefined && !['profile', 'drive-readonly'].includes(pending.capability))
     || typeof pending.startedAt !== 'string') {
     throw new Error('corrupt_pending_sign_in');
   }
@@ -332,13 +486,16 @@ export async function completeSignIn({
   if (parsed.state !== pending.state) throw new Error('state_mismatch');
   if (!parsed.ok) throw new Error(parsed.error);
 
+  const capability = pending.capability === 'drive-readonly' ? 'drive-readonly' : 'profile';
   const response = await fetchImpl(safeExchangeUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify({
       code: parsed.code,
       codeVerifier: pending.codeVerifier,
-      redirectUri: `${safeOrigin}${CALLBACK_PATH}`
+      redirectUri: `${safeOrigin}${CALLBACK_PATH}`,
+      platform: 'web',
+      capability
     })
   });
   const responseText = await readBoundedExchangeResponse(response);
@@ -350,10 +507,15 @@ export async function completeSignIn({
   const profile = sanitizeGoogleProfile(body?.profile);
   if (!profile) throw new Error('exchange_malformed_response');
   // Belt-and-braces: even if a future worker regression leaked token fields,
-  // never let them past this seam. Profile only - same contract as the
-  // Electron bridge (electron/authBridge.cjs).
+  // never let them past this seam. Drive receives only an opaque, scoped
+  // delegated-session id; raw Google access/refresh tokens stay in the Worker.
+  const driveSession = capability === 'drive-readonly'
+    ? sanitizeDriveSession(body?.driveSession)
+    : null;
+  if (capability === 'drive-readonly' && !driveSession) throw new Error('exchange_malformed_drive_session');
   return {
     profile,
+    ...(driveSession ? { driveSession } : {}),
     returnTo: safeReturnToPath(pending.returnTo, safeOrigin)
   };
 }
@@ -399,6 +561,7 @@ export function createWebAuthBridge({
   localStorage,
   sessionStorage,
   cryptoImpl = globalThis.crypto,
+  fetchImpl = globalThis.fetch,
   navigate,
   openWindow,
   getPath = () => '/'
@@ -426,9 +589,42 @@ export function createWebAuthBridge({
         return { ok: false, error: message };
       }
     },
+    async connectDrive() {
+      if (!clientId) return { ok: false, error: 'not_configured' };
+      emit({ type: 'drive-connecting' });
+      try {
+        await beginSignIn({
+          clientId,
+          origin,
+          returnTo: getPath(),
+          capability: 'drive-readonly',
+          sessionStorage,
+          cryptoImpl,
+          navigate
+        });
+        return { ok: true, pending: true };
+      } catch (err) {
+        const message = err && err.message ? err.message : String(err);
+        emit({ type: 'drive-error', message });
+        return { ok: false, error: message };
+      }
+    },
+    async downloadDriveFile(fileId) {
+      try {
+        const result = await downloadDelegatedDriveFile({ fileId, exchangeUrl, sessionStorage: localStorage, fetchImpl });
+        return { ok: true, ...result };
+      } catch (err) {
+        return { ok: false, error: err?.message || String(err) };
+      }
+    },
+    async getDriveSession() {
+      const session = loadDriveSession(localStorage);
+      return session ? { connected: true, expiresAt: session.expiresAt } : { connected: false };
+    },
     async signOut() {
       clearProfile(localStorage);
       emit({ type: 'signed-out' });
+      await revokeDelegatedDriveSession({ exchangeUrl, sessionStorage: localStorage, fetchImpl });
       return { ok: true };
     },
     async getSession() {

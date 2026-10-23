@@ -68,6 +68,31 @@ const GOOGLE_INTERACTIVE_SIGNIN_PATH = /^\/(?:signin\/(?:v2|challenge|identifier
 const GOOGLE_ACCOUNT_PORTAL_PATH = /^\/(?:ManageAccount(?:\/|$)|signin\/?$)?$/i;
 const GOOGLE_REJECTED_SIGNIN_PATH = /^\/(?:signin\/rejected|v3\/signin\/rejected)(?:\/|$)/i;
 const MAX_AUTH_HANDOFF_URL_LENGTH = 8192;
+const DOWNLOAD_HANDOFF_GRACE_MS = 2_000;
+const DOWNLOAD_HANDOFF_TTL_MS = 10_000;
+
+/**
+ * Google Drive turns authenticated /uc download navigations into a native
+ * Content-Disposition handoff. Chromium reports that canceled document load
+ * as ERR_FAILED (-2) even though the download is healthy. Keep the predicate
+ * deliberately narrow so ordinary Drive page failures remain visible.
+ */
+function isGoogleDriveDownloadUrl(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 8192) return false;
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password) return false;
+    const host = parsed.hostname.toLowerCase();
+    const path = parsed.pathname.toLowerCase();
+    if ((host === 'drive.google.com' || host === 'docs.google.com') && path === '/uc') {
+      return parsed.searchParams.get('export') === 'download' || parsed.searchParams.has('confirm');
+    }
+    return host === 'drive.usercontent.google.com'
+      && (path === '/download' || path.startsWith('/download/'));
+  } catch {
+    return false;
+  }
+}
 
 const WEBVIEW_EVENT_CHANNEL = 'yayra:webview-event';
 const PAGE_UNRESPONSIVE_RELOAD_DELAY_MS = 15_000;
@@ -1293,10 +1318,14 @@ function createWebviewBridge({
   // Main-process one-shot grant consumer from passkeyBridge.cjs. Renderer
   // booleans are never trusted as user verification.
   consumeWebsitePasskeyGrant = null,
+  // Main wires every per-profile/private Session into downloadsBridge. This
+  // callback is optional in tests and non-Electron hosts.
+  attachDownloadSession = null,
   sitePasskeyCompletionTimeoutMs = SITE_PASSKEY_COMPLETION_TIMEOUT_MS,
   logger = console,
   pageUnresponsiveReloadDelayMs = PAGE_UNRESPONSIVE_RELOAD_DELAY_MS,
-  pageUnresponsiveReloadCooldownMs = PAGE_UNRESPONSIVE_RELOAD_COOLDOWN_MS
+  pageUnresponsiveReloadCooldownMs = PAGE_UNRESPONSIVE_RELOAD_COOLDOWN_MS,
+  downloadHandoffGraceMs = DOWNLOAD_HANDOFF_GRACE_MS
 }) {
   // key -> { view, lastUrl, tabId, hostWc, hostWin }
   // key namespaces the renderer-chosen tabId by the webContents that asked
@@ -1304,6 +1333,7 @@ function createWebviewBridge({
   // BrowserShell instance whose generated ids ("tab-1", "tab-2", ...) would
   // otherwise collide and steal each other's native views.
   const views = new Map();
+  const entriesByWebContents = new WeakMap();
   // One discoverable-credential chooser per persistent/private Session.
   // Without this Electron cancels navigator.credentials.get() whenever an
   // authenticator returns accounts, making valid site passkeys look broken.
@@ -1319,6 +1349,51 @@ function createWebviewBridge({
       clearTimeout(entry.pageUnresponsiveReloadTimer);
       entry.pageUnresponsiveReloadTimer = null;
     }
+  }
+
+  function cancelDownloadFailureTimer(entry) {
+    if (!entry?.downloadFailureTimer) return;
+    clearTimeout(entry.downloadFailureTimer);
+    entry.downloadFailureTimer = null;
+  }
+
+  function noteDownloadHandoff(webContents, details = {}) {
+    const entry = webContents ? entriesByWebContents.get(webContents) : null;
+    if (!entry) return false;
+    cancelDownloadFailureTimer(entry);
+    entry.mainFrameFailed = false;
+    entry.lastDownloadHandoffAt = Date.now();
+    entry.lastDownloadUrl = typeof details.url === 'string' ? details.url : '';
+    sendTo(entry, 'loading-stop');
+    sendTo(entry, 'download-handoff', {
+      url: entry.lastDownloadUrl || entry.requestedUrl || entry.lastUrl || '',
+      filename: typeof details.filename === 'string' ? details.filename : '',
+      mimeType: typeof details.mimeType === 'string' ? details.mimeType : ''
+    });
+    return true;
+  }
+
+  function recentDownloadHandoff(entry) {
+    return Boolean(entry?.lastDownloadHandoffAt
+      && Date.now() - entry.lastDownloadHandoffAt <= DOWNLOAD_HANDOFF_TTL_MS);
+  }
+
+  function deferGoogleDownloadFailure(entry, failure) {
+    if (!isGoogleDriveDownloadUrl(failure.url) && !recentDownloadHandoff(entry)) return false;
+    if (recentDownloadHandoff(entry)) return true;
+    cancelDownloadFailureTimer(entry);
+    const failedGeneration = entry.loadGeneration;
+    // Suppress did-finish-load for Chromium's internal error page while the
+    // native download event gets its bounded chance to prove success.
+    entry.mainFrameFailed = true;
+    entry.downloadFailureTimer = setTimeout(() => {
+      entry.downloadFailureTimer = null;
+      if (entry.loadGeneration !== failedGeneration
+        || recentDownloadHandoff(entry) || entry.view.webContents.isDestroyed?.()) return;
+      sendTo(entry, 'fail-load', failure);
+    }, Math.max(0, Number(downloadHandoffGraceMs) || DOWNLOAD_HANDOFF_GRACE_MS));
+    entry.downloadFailureTimer?.unref?.();
+    return true;
   }
 
   function websitePasskeyInfo(entry, request = null) {
@@ -1945,6 +2020,8 @@ function createWebviewBridge({
       // Each top-level loading generation must prove itself independently.
       // Electron can emit did-finish-load for its own network error document
       // after did-fail-load, so the failure listener below latches that state.
+      entry.loadGeneration += 1;
+      cancelDownloadFailureTimer(entry);
       entry.mainFrameFailed = false;
       // A user-initiated reload/navigation is already the recovery action.
       const wasUnresponsive = entry.pageUnresponsive;
@@ -2004,8 +2081,13 @@ function createWebviewBridge({
       // one (e.g. the user typed a new URL before the previous one settled)
       // and is not a real failure worth surfacing.
       if (!isMainFrame || errorCode === -3) return;
+      const failure = { errorCode, errorDescription, url: validatedUrl };
+      // Drive's successful Content-Disposition handoff is surfaced by
+      // Electron as ERR_FAILED (-2). Give will-download a short correlation
+      // window; if no download arrives the genuine failure still appears.
+      if (errorCode === -2 && deferGoogleDownloadFailure(entry, failure)) return;
       entry.mainFrameFailed = true;
-      sendTo(entry, 'fail-load', { errorCode, errorDescription, url: validatedUrl });
+      sendTo(entry, 'fail-load', failure);
     });
     // Chrome-equivalent native right-click menu. A WebContentsView (unlike
     // a plain <webview> tag) shows NO context menu at all by default, so
@@ -2072,6 +2154,7 @@ function createWebviewBridge({
     // differs from Firefox's, rather than leaving a white backdrop and the
     // browser's broken-image glyph in the corner.
     installMediaCompatibility(view.webContents.session, logger);
+    try { attachDownloadSession?.(view.webContents.session); } catch { /* download tracking remains optional */ }
     // Pre-paint background: Chromium's default surface is WHITE, which
     // flashes whenever a view is created/hidden/resized inside Yayra's
     // dark chrome. Pages paint their own background the moment they
@@ -2090,6 +2173,10 @@ function createWebviewBridge({
       profileId: String(profileId || 'default'),
       requestedUrl: null,
       mainFrameFailed: false,
+      loadGeneration: 0,
+      downloadFailureTimer: null,
+      lastDownloadHandoffAt: 0,
+      lastDownloadUrl: '',
       pointerTheme: 'system',
       pointerSize: 'normal',
       pageUnresponsive: false,
@@ -2097,6 +2184,7 @@ function createWebviewBridge({
       lastPageUnresponsiveReloadAt: 0
     };
     views.set(key, entry);
+    entriesByWebContents.set(view.webContents, entry);
     if (websitePasskeyProvider && typeof websitePasskeyProvider.attach === 'function') {
       try {
         entry.websitePasskeyReady = Promise.resolve(websitePasskeyProvider.attach({
@@ -2192,11 +2280,14 @@ function createWebviewBridge({
         // user navigates again before it settles. This is expected control
         // flow, not a failed final navigation; did-fail-load also filters -3.
         if (/ERR_ABORTED\s*\(-3\)|net::ERR_ABORTED/i.test(description)) return;
+        const failure = { errorCode: -2, errorDescription: description.slice(0, 240), url };
+        if (/ERR_FAILED\s*\(-2\)|net::ERR_FAILED/i.test(description)
+          && deferGoogleDownloadFailure(entry, failure)) return;
         entry.mainFrameFailed = true;
         let host = '';
         try { host = new URL(url).host; } catch { /* never log full user query text */ }
         logger.error(`[yayra:webview] failed to load ${host || 'page'} (loadURL rejected)`);
-        sendTo(entry, 'fail-load', { errorCode: -2, errorDescription: description.slice(0, 240), url });
+        sendTo(entry, 'fail-load', failure);
       });
     }
     return { handedOffToSystemBrowser: false };
@@ -2396,6 +2487,7 @@ function createWebviewBridge({
     const entry = views.get(key);
     if (!entry) return;
     cancelPageUnresponsiveReload(entry);
+    cancelDownloadFailureTimer(entry);
     cancelSitePasskeyRequests(entry, 'AbortError');
     const win = (entry.hostWin && !entry.hostWin.isDestroyed?.()) ? entry.hostWin : getMainWindow();
     if (win && !win.isDestroyed()) {
@@ -2961,8 +3053,9 @@ function createWebviewBridge({
   return {
     destroyAll,
     destroyForWebContents,
+    noteDownloadHandoff,
     // Exposed for tests and for main.cjs lifecycle hooks only.
-    _internal: { views, ensureView, setBounds, setVisible, capture, goBack, goForward, reload, hardReload, clearSiteCache, stop, destroyView }
+    _internal: { views, ensureView, setBounds, setVisible, capture, goBack, goForward, reload, hardReload, clearSiteCache, stop, destroyView, noteDownloadHandoff }
   };
 }
 
@@ -2976,6 +3069,7 @@ module.exports = {
   requiresYayraGoogleAccountConnection,
   requiresSystemBrowserAuth,
   secureSystemBrowserAuthUrl,
+  isGoogleDriveDownloadUrl,
   decodeOpenExternalRequest,
   buildWebAuthnWatchdogScript,
   buildGoogleSearchThinkingWatchdogScript,

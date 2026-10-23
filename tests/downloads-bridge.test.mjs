@@ -23,12 +23,13 @@ function fakeSession() {
   };
 }
 
-function fakeDownloadItem({ filename, url = 'https://example.com/file', totalBytes = 1000 }) {
+function fakeDownloadItem({ filename, url = 'https://example.com/file', mimeType = 'application/octet-stream', totalBytes = 1000 }) {
   const listeners = {};
   let savePath = null;
   return {
     getFilename: () => filename,
     getURL: () => url,
+    getMimeType: () => mimeType,
     getTotalBytes: () => totalBytes,
     getReceivedBytes: () => totalBytes,
     getSavePath: () => savePath,
@@ -55,12 +56,15 @@ test('uniqueSavePath: adds Chrome-style " (1)", " (2)" suffixes on filename coll
   assert.equal(result, path.join(dir, 'report (2).pdf'));
 });
 
-test('downloadsBridge: a real will-download event is tracked, saved under the configured root, and reaches "Completed"', () => {
+test('downloadsBridge: a real will-download event is tracked, correlated to its page, indexed, and reaches "Completed"', async () => {
   const dir = makeTempDir('yayra-dl-store-');
   const downloadsStore = createDownloadsStore({ fs, userDataDir: dir, defaultDownloadsDir: path.join(dir, 'Downloads') });
   const ipcMain = fakeIpcMain();
   const sess = fakeSession();
   const sent = [];
+  const handoffs = [];
+  const completed = [];
+  const sourceWebContents = { id: 42 };
   const mainWindow = { isDestroyed: () => false, webContents: { send: (ch, payload) => sent.push(payload) } };
 
   createDownloadsBridge({
@@ -72,18 +76,23 @@ test('downloadsBridge: a real will-download event is tracked, saved under the co
     sessions: [sess],
     downloadsStore,
     getMainWindow: () => mainWindow,
+    onDownloadStarted: (details) => handoffs.push(details),
+    onDownloadCompleted: (record) => completed.push(record),
     idFactory: () => 'dl-test-1'
   });
 
-  const item = fakeDownloadItem({ filename: 'setup.exe', totalBytes: 2048 });
-  sess.emit('will-download', {}, item);
+  const item = fakeDownloadItem({ filename: 'setup.exe', mimeType: 'application/vnd.microsoft.portable-executable', totalBytes: 2048 });
+  sess.emit('will-download', {}, item, sourceWebContents);
 
   // Started: real path was set under the configured download root.
   assert.ok(item.getSavePath().startsWith(downloadsStore.getDownloadRoot()));
   let { items } = downloadsStore.load();
   assert.equal(items.length, 1);
   assert.equal(items[0].state, 'Downloading');
+  assert.equal(items[0].mimeType, 'application/vnd.microsoft.portable-executable');
   assert.equal(sent.at(-1).type, 'started');
+  assert.equal(handoffs.length, 1);
+  assert.equal(handoffs[0].webContents, sourceWebContents, 'the page that initiated the handoff is preserved for ERR_FAILED correlation');
 
   item._fireUpdated('progressing');
   ({ items } = downloadsStore.load());
@@ -94,6 +103,9 @@ test('downloadsBridge: a real will-download event is tracked, saved under the co
   ({ items } = downloadsStore.load());
   assert.equal(items[0].state, 'Completed');
   assert.equal(sent.at(-1).type, 'done');
+  await Promise.resolve();
+  assert.equal(completed.length, 1, 'completed files are offered to the Documents-library integration');
+  assert.equal(completed[0].path, item.getSavePath());
 });
 
 test('downloadsBridge: never seeds fake history - list() reflects only what has actually been downloaded', async () => {

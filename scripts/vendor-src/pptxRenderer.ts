@@ -135,8 +135,14 @@ export interface PptxShape {
   borderWidth?: number; // px
   text?: PptxText;
   imageUrl?: string;
-  /** Relationship id of an embedded image. Filled even when the bytes are not loaded yet. */
+  /** Ordered local alternatives (for example SVG first, then EMF/PNG). */
+  imageUrls?: string[];
+  /** Relationship id of the preferred embedded image. */
   imageRid?: string;
+  /** All package image relationships in preferred decode order. */
+  imageRids?: string[];
+  /** Resolved OPC package paths for those relationships (internal/lazy use). */
+  imagePaths?: string[];
   /** a:srcRect cropping of the source image, as 0..1 fractions of each edge. */
   crop?: { l: number; t: number; r: number; b: number };
   /**
@@ -158,6 +164,12 @@ export interface PptxShape {
   placeholderType?: string;
 }
 
+export interface PptxDiagnostic {
+  code: string;
+  severity: 'warning' | 'error';
+  message: string;
+}
+
 export interface PptxSlide {
   slideNumber: number;
   title: string;
@@ -171,6 +183,8 @@ export interface PptxSlide {
   /** Full-bleed background picture (p:bg > p:bgPr > a:blipFill), if any. */
   backgroundImageUrl?: string;
   shapes: PptxShape[];
+  /** Visible fidelity failures; unsupported content is never silently blank. */
+  diagnostics?: PptxDiagnostic[];
 }
 
 export interface PptxMediaOptions {
@@ -220,9 +234,22 @@ const MATH_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math';
 const MATH_STRICT_NS = 'http://purl.oclc.org/ooxml/officeDocument/math';
 const DRAWING_2010_NS = 'http://schemas.microsoft.com/office/drawing/2010/main';
 const POWERPOINT_2010_NS = 'http://schemas.microsoft.com/office/powerpoint/2010/main';
+const DIAGRAM_DRAWING_NS = 'http://schemas.microsoft.com/office/drawing/2008/diagram';
 
 const localTag = (el: Element): string =>
   (el.localName || el.tagName.split(':').pop() || el.tagName).toLowerCase();
+
+const childByLocalName = (el: Element | null, name: string): Element | null => {
+  if (!el) return null;
+  const wanted = name.toLowerCase();
+  return Array.from(el.children).find((candidate) => localTag(candidate) === wanted) || null;
+};
+
+const descendantsByLocalName = (el: Element | Document | null, name: string): Element[] => {
+  if (!el) return [];
+  const wanted = name.toLowerCase();
+  return Array.from(el.getElementsByTagName('*')).filter((candidate) => localTag(candidate) === wanted);
+};
 
 const inNamespace = (el: Element, namespace: string, local?: string): boolean =>
   el.namespaceURI === namespace && (!local || localTag(el) === local.toLowerCase());
@@ -1314,8 +1341,12 @@ function resolveZipPath(fromDir: string, target: string): string {
  * media codecs. Preserve the package bytes while giving blob: URLs the MIME
  * PowerPoint's media extension implies.
  */
+function mediaExtension(path: string): string {
+  return path.toLowerCase().split(/[?#]/, 1)[0].split('.').pop() || '';
+}
+
 function mediaMimeForPath(path: string): string {
-  const extension = path.toLowerCase().split(/[?#]/, 1)[0].split('.').pop() || '';
+  const extension = mediaExtension(path);
   const mimeByExtension: Record<string, string> = {
     mp4: 'video/mp4', m4v: 'video/mp4', mov: 'video/quicktime',
     webm: 'video/webm', ogv: 'video/ogg', avi: 'video/x-msvideo',
@@ -1325,8 +1356,23 @@ function mediaMimeForPath(path: string): string {
     png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
     gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
     bmp: 'image/bmp', tif: 'image/tiff', tiff: 'image/tiff',
+    emf: 'image/emf', wmf: 'image/wmf',
   };
   return mimeByExtension[extension] || '';
+}
+
+let metafileModule: Promise<{ convertMetafileToSafeSvg: (value: ArrayBufferView) => Promise<Blob> }> | null = null;
+async function convertMetafileBlob(bytes: Uint8Array): Promise<Blob | null> {
+  try {
+    // Keep the import non-literal so esbuild leaves it as a lazy sibling
+    // module rather than adding the sizeable GDI parser to every PPTX load.
+    const modulePath = './metafile.mjs';
+    metafileModule ??= import(modulePath) as Promise<{ convertMetafileToSafeSvg: (value: ArrayBufferView) => Promise<Blob> }>;
+    const converter = await metafileModule;
+    return await converter.convertMetafileToSafeSvg(bytes);
+  } catch {
+    return null;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1354,6 +1400,79 @@ async function loadRelsFor(zip: JSZip, partPath: string): Promise<Map<string, Re
         type: rel.getAttribute('Type') || '',
         target: rel.getAttribute('Target') || '',
       });
+    }
+  }
+  return out;
+}
+
+function diagramPart(model: Element | null, drawing: Element | null, drawingPath?: string): DiagramPart {
+  return { model, drawing, drawingPath, imagePaths: new Map(), imageUrls: new Map() };
+}
+
+async function loadSlideDiagrams(
+  zip: JSZip,
+  slideDoc: Document,
+  slidePath: string,
+  slideRels: Map<string, Rel>,
+  loadRels: (partPath: string) => Promise<Map<string, Rel>>,
+): Promise<Map<string, DiagramPart>> {
+  const out = new Map<string, DiagramPart>();
+  const slideDir = slidePath.slice(0, slidePath.lastIndexOf('/'));
+  for (const relIds of descendantsByLocalName(slideDoc, 'relIds')) {
+    const dmRid = localAttribute(relIds, 'dm');
+    if (!dmRid || out.has(dmRid)) continue;
+    const dmRel = slideRels.get(dmRid);
+    if (!dmRel || !dmRel.type.endsWith('/diagramData')) {
+      out.set(dmRid, diagramPart(null, null));
+      continue;
+    }
+    const modelPath = resolveZipPath(slideDir, dmRel.target);
+    const modelFile = zip.file(modelPath);
+    if (!modelFile) {
+      out.set(dmRid, diagramPart(null, null));
+      continue;
+    }
+    try {
+      const modelDoc = new DOMParser().parseFromString(await modelFile.async('text'), 'text/xml');
+      const model = modelDoc.documentElement;
+      const modelRels = await loadRels(modelPath);
+      const drawingRef = descendantsByLocalName(modelDoc, 'dataModelExt')[0];
+      const drawingRid = localAttribute(drawingRef, 'relId');
+      let drawingRel = drawingRid ? modelRels.get(drawingRid) : undefined;
+      let drawingDir = modelPath.slice(0, modelPath.lastIndexOf('/'));
+      // Some producers scope the cached drawing relationship to the slide
+      // rather than dataN.xml. Accept either OPC-valid convention.
+      if (!drawingRel && drawingRid) {
+        drawingRel = slideRels.get(drawingRid);
+        drawingDir = slideDir;
+      }
+      if (!drawingRel) {
+        drawingRel = Array.from(modelRels.values()).find((rel) => rel.type.endsWith('/diagramDrawing'));
+      }
+      if (!drawingRel) {
+        drawingRel = Array.from(slideRels.values()).find((rel) => rel.type.endsWith('/diagramDrawing'));
+        drawingDir = slideDir;
+      }
+      if (!drawingRel) {
+        out.set(dmRid, diagramPart(model, null));
+        continue;
+      }
+      const drawingPath = resolveZipPath(drawingDir, drawingRel.target);
+      const drawingFile = zip.file(drawingPath);
+      if (!drawingFile) {
+        out.set(dmRid, diagramPart(model, null, drawingPath));
+        continue;
+      }
+      const drawingDoc = new DOMParser().parseFromString(await drawingFile.async('text'), 'text/xml');
+      const part = diagramPart(model, drawingDoc.documentElement, drawingPath);
+      const drawingRels = await loadRels(drawingPath);
+      const partDir = drawingPath.slice(0, drawingPath.lastIndexOf('/'));
+      for (const [rid, rel] of drawingRels) {
+        if (rel.type.endsWith('/image')) part.imagePaths.set(rid, resolveZipPath(partDir, rel.target));
+      }
+      out.set(dmRid, part);
+    } catch {
+      out.set(dmRid, diagramPart(null, null));
     }
   }
   return out;
@@ -1772,11 +1891,24 @@ function parseTable(gf: Element, t: T): PptxShape {
   return shape;
 }
 
+interface DiagramPart {
+  model: Element | null;
+  drawing: Element | null;
+  drawingPath?: string;
+  imagePaths: Map<string, string>;
+  imageUrls: Map<string, string>;
+}
+
 interface ShapeCtx {
   t: T;
   imageUrls: Map<string, string>;
+  /** Resolved OPC paths for image relationships in this shape part. */
+  imagePaths: Map<string, string>;
   /** Resolved object URLs for embedded video/audio clips, keyed by relationship id. */
   videoUrls: Map<string, string>;
+  /** SmartArt data + cached DrawingML, keyed by the graphic frame's r:dm id. */
+  diagrams: Map<string, DiagramPart>;
+  diagnostics: PptxDiagnostic[];
   layout: LayoutInfo | null;
   sw: number;
   sh: number;
@@ -1790,6 +1922,32 @@ interface ShapeCtx {
 /** Placeholder types that act as the slide title (incl. the title-slide one). */
 export const isTitlePlaceholder = (phType: string): boolean => phType === 'title' || phType === 'ctrTitle';
 
+/**
+ * Modern PowerPoint often keeps an SVG fallback beside an older EMF/WMF
+ * blip. Prefer the browser-native representation, but retain every package
+ * relationship so an image decode failure can advance instead of leaving a
+ * broken-image glyph on the slide.
+ */
+function imageRelationshipIds(blip: Element | null): string[] {
+  if (!blip) return [];
+  const preferred: string[] = [];
+  const secondary: string[] = [];
+  const add = (target: string[], value: string | null) => {
+    if (value && !preferred.includes(value) && !secondary.includes(value)) target.push(value);
+  };
+  for (const descendant of Array.from(blip.getElementsByTagName('*'))) {
+    const tag = localTag(descendant);
+    if (tag === 'svgblip') add(preferred, localAttribute(descendant, 'embed') || localAttribute(descendant, 'link'));
+    else if (tag === 'imglayer') add(secondary, localAttribute(descendant, 'embed') || localAttribute(descendant, 'link'));
+  }
+  add(secondary, localAttribute(blip, 'embed') || localAttribute(blip, 'link'));
+  return [...preferred, ...secondary];
+}
+
+function resolvedImageUrls(ids: string[], urls: Map<string, string>): string[] {
+  return ids.map((id) => urls.get(id)).filter((url): url is string => Boolean(url));
+}
+
 function defaultSizePtFor(phType: string, isTitle: boolean): number {
   if (phType === 'ctrTitle') return 44;
   if (isTitle) return 32;
@@ -1799,7 +1957,10 @@ function defaultSizePtFor(phType: string, isTitle: boolean): number {
 }
 
 function parseSp(sp: Element, ctx: ShapeCtx): PptxShape | null {
-  const spPr = child(sp, 'p:spPr');
+  const diagramShape = inNamespace(sp, DIAGRAM_DRAWING_NS);
+  const presentationChild = (tag: string): Element | null =>
+    child(sp, `p:${tag}`) || (diagramShape ? childByLocalName(sp, tag) : null);
+  const spPr = presentationChild('spPr');
   const ph = sp.getElementsByTagName('p:ph')[0];
   const declaredPhType = ph?.getAttribute('type') || '';
   const phIdx = ph?.getAttribute('idx') || '0';
@@ -1822,7 +1983,7 @@ function parseSp(sp: Element, ctx: ShapeCtx): PptxShape | null {
   const lineW = ln?.getAttribute('w') ? emuToPx(parseInt(ln.getAttribute('w')!, 10)) : undefined;
 
   const inheritedLevels = placeholder?.levels ?? (ctx.layout ? masterLevelsFor(ctx.layout.masterStyles, phType) : []);
-  let text = parseText(child(sp, 'p:txBody'), defaultSizePtFor(phType, isTitle), inheritedLevels);
+  let text = parseText(presentationChild('txBody'), defaultSizePtFor(phType, isTitle), inheritedLevels);
   if (text && !text.anchor && placeholder?.anchor) text.anchor = placeholder.anchor;
   const hasTextContent = () => Boolean(text?.paragraphs.some((paragraph) =>
     paragraph.runs.some((run) => run.text || run.mathMl),
@@ -1843,8 +2004,11 @@ function parseSp(sp: Element, ctx: ShapeCtx): PptxShape | null {
   // rather than p:pic. Preserve that preview if the modern branch is unknown.
   const shapeBlipFill = spPr ? child(spPr, 'a:blipFill') : null;
   const shapeBlip = shapeBlipFill ? child(shapeBlipFill, 'a:blip') : null;
-  const imageRid = shapeBlip?.getAttribute('r:embed') || shapeBlip?.getAttribute('r:link') || undefined;
-  const imageUrl = imageRid ? ctx.imageUrls.get(imageRid) : undefined;
+  const imageRids = imageRelationshipIds(shapeBlip);
+  const imageUrls = resolvedImageUrls(imageRids, ctx.imageUrls);
+  const imagePaths = imageRids.map((rid) => ctx.imagePaths.get(rid)).filter((path): path is string => Boolean(path));
+  const imageRid = imageRids[0];
+  const imageUrl = imageUrls[0];
   if (imageUrl && !hasTextContent()) ctx.imageList.push(imageUrl);
 
   const shape: PptxShape = {
@@ -1858,7 +2022,10 @@ function parseSp(sp: Element, ctx: ShapeCtx): PptxShape | null {
     geom: prst || (text ? 'rect' : undefined),
     fill,
     imageUrl: imageRid && !hasTextContent() ? imageUrl : undefined,
+    imageUrls: imageRid && !hasTextContent() && imageUrls.length ? imageUrls : undefined,
     imageRid: imageRid && !hasTextContent() ? imageRid : undefined,
+    imageRids: imageRid && !hasTextContent() ? imageRids : undefined,
+    imagePaths: imageRid && !hasTextContent() && imagePaths.length ? imagePaths : undefined,
     textScale: (ctx.t.sx + ctx.t.sy) / 2,
     isTitle,
     placeholderType: ph ? phType : undefined,
@@ -1873,17 +2040,21 @@ function parseSp(sp: Element, ctx: ShapeCtx): PptxShape | null {
 }
 
 function parsePic(pic: Element, ctx: ShapeCtx): PptxShape {
-  const spPr = child(pic, 'p:spPr');
+  const diagramShape = inNamespace(pic, DIAGRAM_DRAWING_NS);
+  const presentationChild = (tag: string): Element | null =>
+    child(pic, `p:${tag}`) || (diagramShape ? childByLocalName(pic, tag) : null);
+  const spPr = presentationChild('spPr');
   const box = applyT(ctx.t, parseXfrm(spPr));
-  const blipFill = child(pic, 'p:blipFill');
+  const blipFill = presentationChild('blipFill');
   const blip = blipFill ? child(blipFill, 'a:blip') : null;
-  // Most pictures are embedded (r:embed); a minority (pasted-as-link, or
-  // some third-party exporters) address the same relationship map via
-  // r:link instead — either way the id still resolves through ctx.imageUrls,
-  // which indexes *every* image relationship regardless of which attribute
-  // referenced it.
-  const rid = blip?.getAttribute('r:embed') || blip?.getAttribute('r:link') || undefined;
-  const url = rid ? ctx.imageUrls.get(rid) : undefined;
+  // Most pictures are embedded (r:embed); pasted-as-link producers use
+  // r:link, while newer Office versions can include an asvg:svgBlip beside
+  // an older EMF/WMF source. Keep all local alternatives in decode order.
+  const imageRids = imageRelationshipIds(blip);
+  const imageUrls = resolvedImageUrls(imageRids, ctx.imageUrls);
+  const imagePaths = imageRids.map((imageRid) => ctx.imagePaths.get(imageRid)).filter((path): path is string => Boolean(path));
+  const rid = imageRids[0];
+  const url = imageUrls[0];
   if (url) ctx.imageList.push(url);
 
   // Video (and audio) placeholders: PowerPoint keeps the poster frame as the
@@ -1905,7 +2076,10 @@ function parsePic(pic: Element, ctx: ShapeCtx): PptxShape {
     rot: box.rot,
     geom: child(spPr, 'a:prstGeom')?.getAttribute('prst') || 'rect',
     imageUrl: url,
+    imageUrls: imageUrls.length ? imageUrls : undefined,
     imageRid: rid || undefined,
+    imageRids: imageRids.length ? imageRids : undefined,
+    imagePaths: imagePaths.length ? imagePaths : undefined,
     videoUrl,
     videoRid,
     textScale: 1,
@@ -1925,8 +2099,9 @@ function parsePic(pic: Element, ctx: ShapeCtx): PptxShape {
 }
 
 function parseCxnSp(cxn: Element, ctx: ShapeCtx): PptxShape {
-  const box = applyT(ctx.t, parseXfrm(child(cxn, 'p:spPr')));
-  const spPr = child(cxn, 'p:spPr');
+  const spPr = child(cxn, 'p:spPr')
+    || (inNamespace(cxn, DIAGRAM_DRAWING_NS) ? childByLocalName(cxn, 'spPr') : null);
+  const box = applyT(ctx.t, parseXfrm(spPr));
   const ln = spPr ? child(spPr, 'a:ln') : null;
   const color = ln ? solidColor(child(ln, 'a:solidFill')) : undefined;
   const w = ln?.getAttribute('w') ? emuToPx(parseInt(ln.getAttribute('w')!, 10)) : 2;
@@ -1944,7 +2119,93 @@ function parseCxnSp(cxn: Element, ctx: ShapeCtx): PptxShape {
   };
 }
 
-function parseGraphicFrame(gf: Element, ctx: ShapeCtx): PptxShape | null {
+function diagramModelTexts(model: Element | null): string[] {
+  if (!model) return [];
+  const values: string[] = [];
+  for (const point of descendantsByLocalName(model, 'pt')) {
+    const text = descendantsByLocalName(point, 't')
+      .filter((node) => inNamespace(node, DRAWING_NS, 't'))
+      .map((node) => node.textContent || '')
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (text && !values.includes(text)) values.push(text);
+  }
+  return values.slice(0, 64);
+}
+
+function nativeDiagramFallback(gf: Element, model: Element | null, ctx: ShapeCtx): PptxShape[] {
+  const frame = applyT(ctx.t, parseXfrm(gf));
+  const labels = diagramModelTexts(model);
+  const effective = labels.length ? labels : ['SmartArt diagram unavailable'];
+  const columns = Math.max(1, Math.ceil(Math.sqrt(effective.length)));
+  const rows = Math.max(1, Math.ceil(effective.length / columns));
+  const gap = Math.max(4, Math.min(12, Math.min(frame.w, frame.h) * 0.03));
+  const nodeWidth = Math.max(1, (frame.w - gap * (columns - 1)) / columns);
+  const nodeHeight = Math.max(1, (frame.h - gap * (rows - 1)) / rows);
+  return effective.map((label, index) => ({
+    id: ctx.nextId(),
+    type: 'text',
+    x: frame.x + (index % columns) * (nodeWidth + gap),
+    y: frame.y + Math.floor(index / columns) * (nodeHeight + gap),
+    w: nodeWidth,
+    h: nodeHeight,
+    rot: frame.rot,
+    geom: 'roundRect',
+    fill: labels.length ? '#4472c4' : '#e2e8f0',
+    borderColor: labels.length ? '#2f5597' : '#94a3b8',
+    borderWidth: 1,
+    text: {
+      paragraphs: [{ runs: [{ text: label, color: labels.length ? '#ffffff' : '#334155' }], level: 0, align: 'center' }],
+      anchor: 'ctr',
+      fontScale: 1,
+      defaultSizePt: Math.max(8, Math.min(18, nodeHeight / 5)),
+      levels: [],
+    },
+    textScale: (ctx.t.sx + ctx.t.sy) / 2,
+    isTitle: false,
+  } as PptxShape));
+}
+
+function parseDiagramFrame(gf: Element, ctx: ShapeCtx): PptxShape[] {
+  const graphicData = gf.getElementsByTagName('a:graphicData')[0]
+    || descendantsByLocalName(gf, 'graphicData')[0];
+  const relIds = graphicData && descendantsByLocalName(graphicData, 'relIds')[0];
+  const dmRid = localAttribute(relIds || null, 'dm');
+  const part = dmRid ? ctx.diagrams.get(dmRid) : undefined;
+  const drawingTree = part?.drawing && descendantsByLocalName(part.drawing, 'spTree')[0];
+  if (drawingTree) {
+    const rawFrame = parseXfrm(gf);
+    const frame = applyT(ctx.t, rawFrame);
+    const localT: T = {
+      sx: rawFrame.w > 0 ? frame.w / rawFrame.w : ctx.t.sx,
+      sy: rawFrame.h > 0 ? frame.h / rawFrame.h : ctx.t.sy,
+      dx: frame.x,
+      dy: frame.y,
+    };
+    const parsed: PptxShape[] = [];
+    const drawingCtx: ShapeCtx = {
+      ...ctx,
+      t: localT,
+      imagePaths: part?.imagePaths || new Map(),
+      imageUrls: part?.imageUrls || new Map(),
+      push: (shape) => parsed.push(shape),
+    };
+    for (const node of Array.from(drawingTree.children)) parseShapeNode(node, drawingCtx);
+    if (parsed.length) return parsed;
+  }
+
+  const code = part?.model ? 'pptx/smartart-native-fallback' : 'pptx/smartart-unresolved';
+  const message = part?.model
+    ? `Slide ${ctx.slideNumber}: SmartArt cached drawing is missing; using a simplified local layout.`
+    : `Slide ${ctx.slideNumber}: SmartArt relationships could not be resolved.`;
+  if (!ctx.diagnostics.some((item) => item.code === code && item.message === message)) {
+    ctx.diagnostics.push({ code, severity: part?.model ? 'warning' : 'error', message });
+  }
+  return nativeDiagramFallback(gf, part?.model || null, ctx);
+}
+
+function parseGraphicFrame(gf: Element, ctx: ShapeCtx): PptxShape | PptxShape[] | null {
   const graphicData = gf.getElementsByTagName('a:graphicData')[0];
   const uri = graphicData?.getAttribute('uri') || '';
   if (uri.includes('/table') || (graphicData && child(graphicData, 'a:tbl'))) {
@@ -1955,6 +2216,9 @@ function parseGraphicFrame(gf: Element, ctx: ShapeCtx): PptxShape | null {
       ctx.tableTexts.push(...rows.flatMap((row) => row));
     }
     return shape;
+  }
+  if (uri.includes('/diagram') || (graphicData && descendantsByLocalName(graphicData, 'relIds').length)) {
+    return parseDiagramFrame(gf, ctx);
   }
   if (uri.includes('/chart')) {
     const box = applyT(ctx.t, parseXfrm(gf));
@@ -1985,7 +2249,7 @@ function parseGraphicFrame(gf: Element, ctx: ShapeCtx): PptxShape | null {
     }
     return preview;
   }
-  return null; // SmartArt & other graphic frames: skipped (kept out of text too)
+  return null; // Unknown graphic frames remain explicit diagnostics candidates.
 }
 
 function parseShapeNode(node: Element, ctx: ShapeCtx): number {
@@ -2003,32 +2267,50 @@ function parseShapeNode(node: Element, ctx: ShapeCtx): number {
     for (const c of Array.from(fallback.children)) parsed += parseShapeNode(c, ctx);
     return parsed;
   }
-  if (inNamespace(node, PRESENTATION_NS, 'sp')) {
+  const drawingShape = node.namespaceURI === PRESENTATION_NS || node.namespaceURI === DIAGRAM_DRAWING_NS;
+  const tag = localTag(node);
+  if (drawingShape && tag === 'sp') {
     const shape = parseSp(node, ctx);
     if (!shape) return 0;
     ctx.push(shape);
     return 1;
   }
-  if (inNamespace(node, PRESENTATION_NS, 'pic')) {
+  if (drawingShape && tag === 'pic') {
     ctx.push(parsePic(node, ctx));
     return 1;
   }
-  if (inNamespace(node, PRESENTATION_NS, 'cxnsp')) {
+  if (drawingShape && tag === 'cxnsp') {
     ctx.push(parseCxnSp(node, ctx));
     return 1;
   }
   if (inNamespace(node, PRESENTATION_NS, 'graphicframe')) {
     const shape = parseGraphicFrame(node, ctx);
-    if (!shape) return 0;
+    if (!shape) {
+      const code = 'pptx/graphic-frame-unsupported';
+      if (!ctx.diagnostics.some((item) => item.code === code)) {
+        ctx.diagnostics.push({
+          code,
+          severity: 'warning',
+          message: `Slide ${ctx.slideNumber}: a graphic frame could not be rendered locally.`,
+        });
+      }
+      return 0;
+    }
+    if (Array.isArray(shape)) {
+      shape.forEach(ctx.push);
+      return shape.length;
+    }
     ctx.push(shape);
     return 1;
   }
-  if (inNamespace(node, PRESENTATION_NS, 'grpsp')) return parseGroup(node, ctx);
+  if (drawingShape && tag === 'grpsp') return parseGroup(node, ctx);
   return 0;
 }
 
 function parseGroup(grp: Element, ctx: ShapeCtx): number {
-  const xfrm = child(child(grp, 'p:grpSpPr'), 'a:xfrm');
+  const groupProperties = child(grp, 'p:grpSpPr')
+    || (inNamespace(grp, DIAGRAM_DRAWING_NS) ? childByLocalName(grp, 'grpSpPr') : null);
+  const xfrm = child(groupProperties, 'a:xfrm');
   let t = ctx.t;
   if (xfrm) {
     const num = (el: Element | null, attr: string) => {
@@ -2169,12 +2451,23 @@ export async function openPptxDeck(blob: Blob, opts?: { lazyMedia?: boolean }): 
     const media = zip.file(path);
     if (!media) return undefined;
     try {
-      const rawBlob = await media.async('blob');
-      const mime = mediaMimeForPath(path);
-      // Blob#slice changes metadata without copying the underlying bytes.
-      const typedBlob = mime && rawBlob.type !== mime
-        ? rawBlob.slice(0, rawBlob.size, mime)
-        : rawBlob;
+      const extension = mediaExtension(path);
+      let typedBlob: Blob;
+      if (extension === 'emf' || extension === 'wmf') {
+        const source = await media.async('uint8array');
+        // Browsers do not decode Windows metafiles. Convert the package part
+        // locally to bounded SVG; keep a typed raw Blob only as a last-resort
+        // source so the DOM renderer can retire it cleanly on decode failure.
+        typedBlob = (await convertMetafileBlob(source))
+          || new Blob([source], { type: mediaMimeForPath(path) });
+      } else {
+        const rawBlob = await media.async('blob');
+        const mime = mediaMimeForPath(path);
+        // Blob#slice changes metadata without copying the underlying bytes.
+        typedBlob = mime && rawBlob.type !== mime
+          ? rawBlob.slice(0, rawBlob.size, mime)
+          : rawBlob;
+      }
       const url = URL.createObjectURL(typedBlob);
       if (!alive) {
         try { URL.revokeObjectURL(url); } catch { /* disposed mid-load */ }
@@ -2200,12 +2493,18 @@ export async function openPptxDeck(blob: Blob, opts?: { lazyMedia?: boolean }): 
     if (!content) return null;
     const doc = new DOMParser().parseFromString(content, 'text/xml');
     const rels = await loadRelsCached(slidePath);
+    const diagrams = await loadSlideDiagrams(zip, doc, slidePath, rels, loadRelsCached);
 
     // Embedded images. Eager parses decode every picture of the slide now
     // (callers that omit lazyMedia — and the unit tests — still get URLs
-    // immediately). Lazy decks defer to ensureSlideMedia.
+    // immediately). Lazy decks retain resolved package paths so media from a
+    // cached SmartArt drawing's own relationship part can load too.
     const imageUrls = new Map<string, string>();
+    const imagePaths = new Map<string, string>();
     const videoUrls = new Map<string, string>();
+    for (const [rid, rel] of rels) {
+      if (rel.type.endsWith('/image')) imagePaths.set(rid, resolveZipPath('ppt/slides', rel.target));
+    }
     if (!lazyMedia) {
       for (const [rid, rel] of rels) {
         const isImage = rel.type.endsWith('/image');
@@ -2223,6 +2522,15 @@ export async function openPptxDeck(blob: Blob, opts?: { lazyMedia?: boolean }): 
           }
         } catch {
           /* unreadable media — skip */
+        }
+      }
+      for (const part of diagrams.values()) {
+        for (const [rid, path] of part.imagePaths) {
+          const url = await urlFor(path, i + 1);
+          if (!url) continue;
+          part.imageUrls.set(rid, url);
+          const list = slideLoadedPaths.get(i + 1) ?? [];
+          if (!list.includes(path)) { list.push(path); slideLoadedPaths.set(i + 1, list); }
         }
       }
     }
@@ -2260,10 +2568,14 @@ export async function openPptxDeck(blob: Blob, opts?: { lazyMedia?: boolean }): 
     const shapes: PptxShape[] = [];
     const tableTexts: string[] = [];
     const imageList: string[] = [];
+    const diagnostics: PptxDiagnostic[] = [];
     const ctx: ShapeCtx = {
       t: IDENTITY,
       imageUrls,
+      imagePaths,
       videoUrls,
+      diagrams,
+      diagnostics,
       layout,
       sw: slideWidth,
       sh: slideHeight,
@@ -2339,6 +2651,30 @@ export async function openPptxDeck(blob: Blob, opts?: { lazyMedia?: boolean }): 
     tableTexts.forEach((p) => parts.push(p));
     if (notes) parts.push(`Notes: ${notes}`);
 
+    for (const shape of shapes) {
+      if (shape.type !== 'image' && shape.type !== 'video') continue;
+      const paths = shape.imagePaths || [];
+      const hasPackagedSource = paths.some((path) => Boolean(zip.file(path)))
+        || (shape.imageRids || []).some((rid) => {
+          const rel = rels.get(rid);
+          return Boolean(rel?.type.endsWith('/image') && zip.file(resolveZipPath('ppt/slides', rel.target)));
+        });
+      if (!hasPackagedSource && !diagnostics.some((item) => item.code === 'pptx/image-relationship-unresolved')) {
+        diagnostics.push({
+          code: 'pptx/image-relationship-unresolved',
+          severity: 'error',
+          message: `Slide ${i + 1}: an image relationship has no readable package part.`,
+        });
+      }
+    }
+    if (!shapes.length && !backgroundImageUrl && !background) {
+      diagnostics.push({
+        code: 'pptx/unexplained-blank-slide',
+        severity: 'warning',
+        message: `Slide ${i + 1} contains no renderable shapes or background.`,
+      });
+    }
+
     return {
       slideNumber: i + 1,
       title,
@@ -2349,6 +2685,7 @@ export async function openPptxDeck(blob: Blob, opts?: { lazyMedia?: boolean }): 
       background,
       backgroundImageUrl,
       shapes,
+      diagnostics: diagnostics.length ? diagnostics : undefined,
     };
   };
 
@@ -2462,15 +2799,29 @@ export async function openPptxDeck(blob: Blob, opts?: { lazyMedia?: boolean }): 
         // Posters are ordinary image relationships and remain cheap enough for
         // a static thumbnail. The potentially very large clip stays deferred.
         for (const shape of slide.shapes) {
-          if (!shape.imageRid || shape.imageUrl) continue;
-          const rel = job.rels.get(shape.imageRid);
-          if (!rel || !rel.type.endsWith('/image')) continue;
-          const path = resolveZipPath('ppt/slides', rel.target);
-          const url = await urlFor(path, slideNumber);
-          if (!url) continue;
-          note(path);
-          shape.imageUrl = url;
-          if (!slide.images.includes(url)) slide.images.push(url);
+          const imageRids = shape.imageRids?.length
+            ? shape.imageRids
+            : (shape.imageRid ? [shape.imageRid] : []);
+          const paths = shape.imagePaths?.length
+            ? shape.imagePaths
+            : imageRids.map((rid) => {
+                const rel = job.rels.get(rid);
+                return rel?.type.endsWith('/image') ? resolveZipPath('ppt/slides', rel.target) : '';
+              }).filter(Boolean);
+          if (!paths.length || (shape.imageUrl && shape.imageUrls?.length === paths.length)) continue;
+          const urls: string[] = [];
+          for (const path of paths) {
+            // External relationships are deliberately never fetched. A local
+            // alternate can still render if one exists later in the list.
+            const url = await urlFor(path, slideNumber);
+            if (!url) continue;
+            note(path);
+            if (!urls.includes(url)) urls.push(url);
+          }
+          if (!urls.length) continue;
+          shape.imageUrls = urls;
+          shape.imageUrl = urls[0];
+          for (const url of urls) if (!slide.images.includes(url)) slide.images.push(url);
         }
         loadedPreviewMedia.add(slideNumber);
       }
@@ -2544,10 +2895,11 @@ export async function openPptxDeck(blob: Blob, opts?: { lazyMedia?: boolean }): 
       const content = await zip.file(slidePath)?.async('text');
       if (!content) continue;
       let text = '';
+      let slideDoc: Document | null = null;
       try {
-        const doc = new DOMParser().parseFromString(content, 'text/xml');
+        slideDoc = new DOMParser().parseFromString(content, 'text/xml');
         const lines: string[] = [];
-        walkEffectiveElements(doc.documentElement, (element) => {
+        walkEffectiveElements(slideDoc.documentElement, (element) => {
           if (!inNamespace(element, DRAWING_NS, 'p')) return;
           const line = parseParagraph(element, { n: 0 }).runs.map((run) => run.text).join('');
           if (line.trim()) lines.push(line);
@@ -2556,9 +2908,28 @@ export async function openPptxDeck(blob: Blob, opts?: { lazyMedia?: boolean }): 
       } catch {
         /* unreadable slide — skip */
       }
+      // SmartArt text lives in the cached diagram/data parts, not slide.xml.
+      // Include it without forcing the full visual parse so find-in-deck stays
+      // lightweight and deterministic.
+      const rels = await loadRelsCached(slidePath);
+      if (slideDoc) {
+        try {
+          const diagrams = await loadSlideDiagrams(zip, slideDoc, slidePath, rels, loadRelsCached);
+          const diagramLines: string[] = [];
+          for (const part of diagrams.values()) {
+            const values = part.drawing
+              ? descendantsByLocalName(part.drawing, 't').map((node) => (node.textContent || '').trim()).filter(Boolean)
+              : diagramModelTexts(part.model);
+            for (const value of values) if (!diagramLines.includes(value)) diagramLines.push(value);
+          }
+          if (diagramLines.length) text = [text, ...diagramLines].filter(Boolean).join('\n');
+        } catch {
+          /* unreadable diagram — visual parse reports a fidelity diagnostic */
+        }
+      }
+
       // Speaker notes join the searchable text, matching the visual parse.
       let notes = '';
-      const rels = await loadRelsCached(slidePath);
       const notesRel = Array.from(rels.values()).find((r) => r.type.endsWith('/notesSlide'));
       const notesPath = notesRel
         ? resolveZipPath('ppt/slides', notesRel.target)

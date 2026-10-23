@@ -203,7 +203,11 @@ test('NETWORK RECOVERY source contract: retries are bounded, tab-scoped, and suc
   assert.match(shellSource, /failure\.url !== tab\.url/, 'stale URL generations are canceled');
   assert.match(bridgeSource, /did-finish-load[\s\S]{0,240}load-succeeded/,
     'Electron distinguishes positive completion from did-stop-loading');
-  assert.match(androidSource, /onReceivedError[\s\S]{0,500}fail-load/,
+  const androidErrorHandler = androidSource.slice(
+    androidSource.indexOf('override fun onReceivedError'),
+    androidSource.indexOf('override fun onPageFinished')
+  );
+  assert.match(androidErrorHandler, /fail-load/,
     'Android reports main-frame failures to the same recovery state machine');
   assert.match(androidSource, /load-succeeded/, 'Android also has a positive completion signal');
   const androidFinished = androidSource.slice(

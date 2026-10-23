@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import JSZip from 'jszip';
 import * as FixtureXlsx from '@e965/xlsx';
 import { parseHTML } from 'linkedom';
@@ -56,11 +57,15 @@ const {
   DocumentStore,
   createDocumentViewerState,
   createPdfViewer,
+  sniffCompoundOfficeKind,
   sniffDocumentKind
 } = await import('../packages/shared-ui/src/services/documentWorkspace.js');
 const {
+  convertLegacyOfficeBytes,
   createDocxViewer,
   createImageViewer,
+  createLegacyDocViewer,
+  createLegacyPptViewer,
   createPptxViewer,
   createSpreadsheetViewer,
   createTextViewer,
@@ -68,6 +73,7 @@ const {
   createViewerForKind
 } = await import('../packages/shared-ui/src/services/documentViewers.js');
 const pptxEngine = await import('../packages/shared-ui/src/vendor/documents/pptxRenderer.mjs');
+const metafileEngine = await import('../packages/shared-ui/src/vendor/documents/metafile.mjs');
 const { renderPptxSlide } = await import('../packages/shared-ui/src/services/pptxDomRenderer.js');
 
 function mount(width = 1100, height = 760) {
@@ -109,6 +115,8 @@ async function buildDocx() {
   return zip.generateAsync({ type: 'uint8array' });
 }
 
+const legacyFixture = async (name) => new Uint8Array(await readFile(new URL(`./fixtures/${name}`, import.meta.url)));
+
 function buildWorkbook() {
   const workbook = FixtureXlsx.utils.book_new();
   const doses = FixtureXlsx.utils.aoa_to_sheet([
@@ -133,8 +141,11 @@ const PNG_BYTES = new Uint8Array([
   0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52
 ]);
 
-test('FORMAT ROUTING: signatures outrank spoofed names; MIME and OOXML parts fill missing extensions', async () => {
-  const [pptx, docx] = await Promise.all([buildPowerPointDeck(), buildDocx()]);
+test('FORMAT ROUTING: signatures outrank spoofed names; OOXML and CFB siblings are byte-sniffed', async () => {
+  const [pptx, docx, doc, ppt, xls] = await Promise.all([
+    buildPowerPointDeck(), buildDocx(), legacyFixture('legacy-word.doc'),
+    legacyFixture('legacy-slides.ppt'), legacyFixture('legacy-sheet.xls')
+  ]);
   const xlsx = buildWorkbook();
 
   assert.equal(sniffDocumentKind(PDF_PREFIX, 'renamed.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'), 'pdf');
@@ -142,6 +153,31 @@ test('FORMAT ROUTING: signatures outrank spoofed names; MIME and OOXML parts fil
   assert.equal(sniffDocumentKind(pptx, 'upload.bin'), 'pptx');
   assert.equal(sniffDocumentKind(docx, 'upload.bin'), 'docx');
   assert.equal(sniffDocumentKind(xlsx, 'upload.bin'), 'xlsx');
+  assert.equal(sniffCompoundOfficeKind(doc), 'doc');
+  assert.equal(sniffCompoundOfficeKind(ppt), 'ppt');
+  assert.equal(sniffCompoundOfficeKind(xls), 'xls');
+  assert.equal(sniffDocumentKind(doc, 'spoofed.ppt', 'application/vnd.ms-powerpoint'), 'doc');
+  assert.equal(sniffDocumentKind(ppt, 'spoofed.xls', 'application/vnd.ms-excel'), 'ppt');
+  assert.equal(sniffDocumentKind(xls, 'spoofed.doc', 'application/msword'), 'xls');
+  const unknownCompound = new Uint8Array(512);
+  unknownCompound.set([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+  assert.equal(sniffDocumentKind(unknownCompound, 'spoofed.doc'), 'unsupported', 'an unknown CFB is not trusted as Word by extension');
+
+  // Plausible directory records outside a valid FAT/root tree are embedded
+  // content, not authoritative format evidence.
+  const recordSpoof = new Uint8Array(512);
+  recordSpoof.set([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+  const writeFakeRecord = (offset, name) => {
+    for (let index = 0; index < name.length; index += 1) {
+      recordSpoof[offset + index * 2] = name.charCodeAt(index);
+    }
+    new DataView(recordSpoof.buffer).setUint16(offset + 64, (name.length + 1) * 2, true);
+    recordSpoof[offset + 66] = 2;
+  };
+  writeFakeRecord(128, 'WordDocument');
+  writeFakeRecord(256, '1Table');
+  assert.equal(sniffCompoundOfficeKind(recordSpoof), 'unsupported');
+  assert.equal(sniffDocumentKind(recordSpoof, 'spoofed.doc'), 'unsupported', 'aligned embedded records cannot impersonate root streams');
   assert.equal(sniffDocumentKind(new Uint8Array([1, 2, 3]), 'upload', 'application/pdf; charset=binary'), 'pdf');
   assert.equal(sniffDocumentKind(new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg"/>'), 'art.txt'), 'image');
 
@@ -150,6 +186,11 @@ test('FORMAT ROUTING: signatures outrank spoofed names; MIME and OOXML parts fil
   assert.equal(stored.type, 'pptx');
   assert.equal(stored.route.viewer, 'pptx');
   assert.strictEqual(stored.bytes, pptx, 'the original byte buffer is retained unchanged');
+  const legacyStored = store.add({ name: 'misleading.bin', bytes: doc, mime: 'application/octet-stream' });
+  assert.equal(legacyStored.type, 'doc');
+  assert.equal(legacyStored.route.viewer, 'doc');
+  assert.equal(legacyStored.route.capabilities.view, true);
+  assert.strictEqual(legacyStored.bytes, doc, 'the legacy original—not its viewing copy—belongs to the Documents library');
 });
 
 test('PPTX PROJECTOR COLOURS: tables with automatic text never inherit the white slideshow chrome', () => {
@@ -184,6 +225,47 @@ test('PPTX PROJECTOR COLOURS: tables with automatic text never inherit the white
     renderPptxSlide(host, { slide, width: 960, height: 540 });
     assert.match(host.querySelector('.fb-pptx-slide-canvas').getAttribute('style') || '', /color:\s*#ffffff/i,
       'automatic text also remains readable on genuinely dark authored slides');
+  } finally {
+    removeMount(host);
+  }
+});
+
+test('PPTX METAFILE RECOVERY: embedded WMF/EMF becomes local browser-safe SVG', async () => {
+  const bytes = await legacyFixture('metafile-objects.wmf');
+  const original = bytes.slice();
+  const svgBlob = await metafileEngine.convertMetafileToSafeSvg(bytes);
+  assert.equal(svgBlob.type, 'image/svg+xml');
+  const svg = await svgBlob.text();
+  assert.match(svg, /^<svg/);
+  assert.match(svg, /viewBox=/);
+  assert.match(svg, /<path|<rect|<text/);
+  assert.deepEqual(bytes, original, 'metafile conversion never mutates the package image bytes');
+});
+
+test('PPTX IMAGE RECOVERY: alternate sources are tried and broken-image glyphs are retired', () => {
+  const host = mount(640, 360);
+  try {
+    renderPptxSlide(host, {
+      width: 640,
+      height: 360,
+      slide: {
+        slideNumber: 1,
+        title: 'Image recovery',
+        background: '#ffffff',
+        shapes: [{
+          id: 1, type: 'image', x: 20, y: 20, w: 300, h: 180, rot: 0,
+          imageUrl: 'blob:first-source', imageUrls: ['blob:first-source', 'blob:second-source'],
+          textScale: 1, isTitle: false
+        }]
+      }
+    });
+    const image = host.querySelector('img');
+    assert.equal(image.getAttribute('src'), 'blob:first-source');
+    image.dispatchEvent(new window.Event('error'));
+    assert.equal(image.getAttribute('src'), 'blob:second-source', 'decode failure advances to the packaged alternate');
+    image.dispatchEvent(new window.Event('error'));
+    assert.equal(host.querySelector('img'), null, 'an exhausted source list never leaves the browser broken-image icon');
+    assert.match(host.textContent, /Image unavailable/);
   } finally {
     removeMount(host);
   }
@@ -258,11 +340,33 @@ test('PPTX COMPATIBILITY: AlternateContent math renders and slide numbers inheri
       'the footer is at the lower-right, not the generic upper-left fallback');
     assert.equal(slideNumber.text.paragraphs[0].runs[0].text, '11');
 
+    const director = slide.shapes.find((shape) => shape.text?.paragraphs.some((p) => p.runs.some((r) => r.text === 'Director')));
+    const operations = slide.shapes.find((shape) => shape.text?.paragraphs.some((p) => p.runs.some((r) => r.text === 'Operations')));
+    assert.ok(director && operations, 'SmartArt cached drawing shapes and text are rendered');
+    assert.equal(director.fill, '#4472c4');
+    assert.equal(operations.fill, '#70ad47');
+    assert.ok(Math.abs(director.x - 800) < 0.1 && Math.abs(director.w - 133.33) < 0.1,
+      'cached drawing coordinates are mapped into the graphic frame');
+    assert.ok(operations.x > director.x + director.w, 'organisation nodes preserve their cached placement');
+    const diagramImage = slide.shapes.find((shape) => shape.imagePaths?.includes('ppt/media/smartart-badge.png'));
+    assert.ok(diagramImage, 'images related from the cached diagram part survive rId collisions with slide relationships');
+    assert.equal(slide.diagnostics, undefined, 'a resolved cached SmartArt drawing does not report a false fidelity warning');
+
     const compatibilityImage = slide.shapes.find((shape) => shape.imageRid === 'rId2');
     assert.ok(compatibilityImage, 'an unsupported modern branch uses its p:sp picture fallback');
     assert.equal(compatibilityImage.type, 'image');
     await deck.ensureSlideMedia(1, { includeClips: false });
     assert.match(compatibilityImage.imageUrl, /^blob:/);
+    assert.match(diagramImage.imageUrl, /^blob:/, 'cached SmartArt image bytes resolve from drawing1.xml.rels');
+    assert.equal((await fetch(diagramImage.imageUrl)).headers.get('content-type'), 'image/png');
+
+    const svgAlternative = slide.shapes.find((shape) => shape.imageRid === 'rId4');
+    assert.ok(svgAlternative, 'an SVG alternate is preferred over its legacy EMF source');
+    assert.deepEqual(svgAlternative.imageRids, ['rId4', 'rId3']);
+    assert.equal(svgAlternative.imageUrls.length, 2, 'both local sources remain available for decode fallback');
+    const svgMarkup = await (await fetch(svgAlternative.imageUrl)).text();
+    assert.match(svgMarkup, /^<svg/);
+    assert.match(svgMarkup, /SVG fallback/);
 
     const index = await deck.textIndex();
     assert.match(index[0].text, /margin of error/);
@@ -283,6 +387,24 @@ test('PPTX COMPATIBILITY: AlternateContent math renders and slide numbers inheri
     assert.ok(host.querySelector('mfrac'), 'fraction structure is preserved rather than discarded');
   } finally {
     viewer.destroy();
+    removeMount(host);
+  }
+});
+
+test('PPTX SMARTART RECOVERY: a missing cached drawing gets a searchable native fallback and visible diagnostic', async () => {
+  const bytes = await buildPowerPointCompatibilityMathDeck({ omitDiagramDrawing: true });
+  const deck = await pptxEngine.openPptxDeck(new Blob([bytes]), { lazyMedia: true });
+  const host = mount();
+  try {
+    const slide = await deck.getSlide(1);
+    assert.ok(slide.shapes.some((shape) => shape.text?.paragraphs.some((p) => p.runs.some((r) => r.text === 'Director'))));
+    assert.ok(slide.diagnostics?.some((item) => item.code === 'pptx/smartart-native-fallback'));
+    assert.match((await deck.textIndex())[0].text, /Director/);
+    renderPptxSlide(host, { slide, width: deck.slideWidth, height: deck.slideHeight });
+    assert.match(host.textContent, /Rendering issue/);
+    assert.match(host.querySelector('.fb-pptx-fidelity-warning').getAttribute('aria-label'), /SmartArt cached drawing is missing/);
+  } finally {
+    deck.dispose();
     removeMount(host);
   }
 });
@@ -461,6 +583,153 @@ test('SPREADSHEET REAL ENGINE: worksheets, formatting metadata, formulas, merges
   }
 });
 
+test('LEGACY OFFICE CONVERSION: DOC and PPT become local viewing copies without touching original bytes', async () => {
+  const [doc, ppt] = await Promise.all([
+    legacyFixture('legacy-word.doc'),
+    legacyFixture('legacy-slides.ppt')
+  ]);
+  const docOriginal = doc.slice();
+  const pptOriginal = ppt.slice();
+  const [convertedDoc, convertedPpt] = await Promise.all([
+    convertLegacyOfficeBytes('doc', doc, { workerFactory: () => null }),
+    convertLegacyOfficeBytes('ppt', ppt, { workerFactory: () => null })
+  ]);
+
+  for (const result of [convertedDoc, convertedPpt]) {
+    assert.deepEqual([...result.bytes.subarray(0, 4)], [0x50, 0x4b, 0x03, 0x04], 'the viewing copy is OOXML');
+    assert.deepEqual(result.warnings, []);
+    assert.equal(result.usedWorker, false);
+  }
+  assert.deepEqual(doc, docOriginal, 'Word source bytes remain byte-for-byte unchanged');
+  assert.deepEqual(ppt, pptOriginal, 'PowerPoint source bytes remain byte-for-byte unchanged');
+  assert.notStrictEqual(convertedDoc.bytes.buffer, doc.buffer);
+  assert.notStrictEqual(convertedPpt.bytes.buffer, ppt.buffer);
+});
+
+test('LEGACY DOC VIEWER: styled text, tables, zoom and search reuse the Word controls', async () => {
+  const bytes = await legacyFixture('legacy-word.doc');
+  const original = bytes.slice();
+  const host = mount();
+  const state = createDocumentViewerState('doc');
+  const viewer = createLegacyDocViewer({
+    container: host,
+    state,
+    fileName: 'legacy-word.doc',
+    legacyWorkerFactory: () => null
+  });
+  try {
+    await viewer.load(bytes);
+    assert.equal(state.status, 'ready');
+    assert.equal(state.viewer, 'doc');
+    assert.equal(state.transformedForViewing, true);
+    assert.match(state.engineName, /doc-codec/i);
+    assert.match(host.textContent, /Legacy Clinical Notes/);
+    assert.match(host.textContent, /Atenolol reduces heart rate/);
+    assert.equal(host.querySelectorAll('table').length, 1);
+    await viewer.setZoom(1.5);
+    assert.match(host.querySelector('.fb-docx-scale').style.transform, /1\.5/);
+    await viewer.search('metoprolol');
+    assert.equal(state.matches.length, 1);
+    assert.deepEqual(bytes, original, 'rendering never rewrites or detaches the original DOC');
+  } finally {
+    viewer.destroy();
+    removeMount(host);
+  }
+});
+
+test('LEGACY PPT VIEWER: slides, tables, notes, thumbnails, search and presentation controls are retained', async () => {
+  const bytes = await legacyFixture('legacy-slides.ppt');
+  const original = bytes.slice();
+  const host = mount();
+  const state = createDocumentViewerState('ppt');
+  const viewer = createLegacyPptViewer({
+    container: host,
+    state,
+    fileName: 'legacy-slides.ppt',
+    legacyWorkerFactory: () => null
+  });
+  try {
+    await viewer.load(bytes);
+    assert.equal(state.status, 'ready');
+    assert.equal(state.viewer, 'ppt');
+    assert.equal(state.numPages, 2);
+    assert.equal(state.transformedForViewing, true);
+    assert.match(state.engineName, /ppt-codec/i);
+    assert.match(host.textContent, /Legacy Pharmacology/);
+    assert.match(host.querySelector('.fb-pptx-notes-body').textContent, /check pulse/i);
+
+    await viewer.search('examples only');
+    assert.equal(state.matches.length, 1, 'legacy speaker notes participate in search');
+    assert.equal(state.page, 2);
+    assert.match(host.textContent, /Dose reference/);
+    assert.equal(host.querySelectorAll('table').length, 1, 'the converted legacy table is fully rendered');
+
+    const thumbnail = mount(160, 110);
+    await viewer.renderThumbnail(1, thumbnail);
+    assert.match(thumbnail.textContent, /Legacy Pharmacology/);
+    removeMount(thumbnail);
+    assert.deepEqual(bytes, original, 'rendering never rewrites or detaches the original PPT');
+  } finally {
+    viewer.destroy();
+    removeMount(host);
+  }
+});
+
+test('LEGACY XLS VIEWER: SheetJS opens binary workbooks with sheets and search', async () => {
+  const bytes = await legacyFixture('legacy-sheet.xls');
+  const original = bytes.slice();
+  const host = mount();
+  const state = createDocumentViewerState('xls');
+  const viewer = createViewerForKind('xls', { container: host, state, fileName: 'legacy-sheet.xls' });
+  try {
+    await viewer.load(bytes);
+    assert.equal(state.status, 'ready');
+    assert.equal(state.viewer, 'xls');
+    assert.deepEqual(state.sheetNames, ['Legacy doses']);
+    assert.match(host.textContent, /Atenolol/);
+    await viewer.search('check pulse');
+    assert.equal(state.matches.length, 1);
+    assert.equal(state.matches[0].cell, 'C2');
+    assert.deepEqual(bytes, original, 'the binary XLS is read directly and stays unchanged');
+  } finally {
+    viewer.destroy();
+    removeMount(host);
+  }
+});
+
+test('LEGACY OFFICE WORKER BOUNDARY: only a disposable copy is transferred and the worker is terminated', async () => {
+  const source = await legacyFixture('legacy-word.doc');
+  const original = source.slice();
+  let transferred = null;
+  let terminated = 0;
+  const workerFactory = () => {
+    const listeners = new Map();
+    return {
+      addEventListener(type, listener) { listeners.set(type, listener); },
+      postMessage(request, transfer) {
+        transferred = { request, transfer };
+        queueMicrotask(() => listeners.get('message')?.({
+          data: {
+            id: request.id,
+            ok: true,
+            bytes: new Uint8Array([0x50, 0x4b, 0x03, 0x04]).buffer,
+            warnings: ['fixture warning']
+          }
+        }));
+      },
+      terminate() { terminated += 1; }
+    };
+  };
+  const result = await convertLegacyOfficeBytes('doc', source, { workerFactory });
+  assert.equal(result.usedWorker, true);
+  assert.deepEqual(result.warnings, ['fixture warning']);
+  assert.equal(transferred.transfer.length, 1);
+  assert.strictEqual(transferred.transfer[0], transferred.request.bytes);
+  assert.notStrictEqual(transferred.request.bytes, source.buffer, 'the DocumentStore-owned buffer is never transferred');
+  assert.equal(terminated, 1);
+  assert.deepEqual(source, original);
+});
+
 test('IMAGE AND TEXT: images stay internal, SVG is sanitised, and markup in text never executes', async () => {
   const svgHost = mount();
   const svgState = createDocumentViewerState('image');
@@ -571,18 +840,62 @@ test('PDF CONTINUOUS VIEW: pages are selectable and windowed while outline and t
   }
 });
 
-test('FAILURE AND FALLBACK: corrupt files stop with actionable errors and original-file fallback stays usable', async () => {
+test('FAILURE AND FALLBACK: corrupt or password-locked files stop honestly and originals stay usable', async () => {
   const corruptHost = mount();
   const corruptState = createDocumentViewerState('pptx');
   const corrupt = createPptxViewer({ container: corruptHost, state: corruptState, fileName: 'broken.pptx', loadTimeoutMs: 2000 });
   try {
     await corrupt.load(new Uint8Array([0x50, 0x4b, 0x03, 0x04, 1, 2, 3]));
     assert.equal(corruptState.status, 'error');
-    assert.match(corruptState.error, /corrupted|password-protected|older binary/i);
+    assert.match(corruptState.error, /corrupted|password-protected|unchanged original/i);
     assert.doesNotMatch(corruptState.error, /loading/i);
   } finally {
     corrupt.destroy();
     removeMount(corruptHost);
+  }
+
+  for (const kind of ['doc', 'ppt']) {
+    const host = mount();
+    const state = createDocumentViewerState(kind);
+    const damaged = new Uint8Array(512);
+    damaged.set([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+    const original = damaged.slice();
+    const viewer = createViewerForKind(kind, {
+      container: host,
+      state,
+      fileName: `damaged.${kind}`,
+      legacyWorkerFactory: () => null,
+      loadTimeoutMs: 2000
+    });
+    try {
+      await viewer.load(damaged);
+      assert.equal(state.status, 'error', `${kind} corruption never becomes a false success`);
+      assert.match(state.error, /corrupted|password-protected|unsupported legacy objects/i);
+      assert.doesNotMatch(state.error, /loading/i);
+      assert.deepEqual(damaged, original);
+    } finally {
+      viewer.destroy();
+      removeMount(host);
+    }
+  }
+
+  const passwordHost = mount();
+  const passwordState = createDocumentViewerState('doc');
+  const passwordViewer = createLegacyDocViewer({
+    container: passwordHost,
+    state: passwordState,
+    fileName: 'locked.doc',
+    moduleLoader: async () => ({ renderAsync: async () => {} }),
+    prepareBytes: async () => { throw new Error('Password required'); }
+  });
+  try {
+    await passwordViewer.load(new Uint8Array([1]));
+    assert.equal(passwordState.status, 'error');
+    assert.match(passwordState.error, /password-protected/i);
+    assert.match(passwordState.error, /unchanged original/i);
+  } finally {
+    passwordViewer.destroy();
+    removeMount(passwordHost);
   }
 
   const fallbackHost = mount();
@@ -591,13 +904,13 @@ test('FAILURE AND FALLBACK: corrupt files stop with actionable errors and origin
   const fallback = createUnsupportedViewer({
     container: fallbackHost,
     state: fallbackState,
-    fileName: 'legacy.ppt',
+    fileName: 'unknown.bin',
     onOpenOriginal: () => { opened += 1; }
   });
   try {
     await fallback.load(new Uint8Array([1]));
     assert.equal(fallbackState.status, 'ready');
-    assert.match(fallbackHost.textContent, /needs a desktop app/);
+    assert.match(fallbackHost.textContent, /No safe built-in view/);
     const button = fallbackHost.querySelector('button');
     assert.match(button.textContent, /Open original/);
     button.click();

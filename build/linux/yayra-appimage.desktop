@@ -6,4 +6,4 @@ Type=Application
 Icon=yayra
 StartupWMClass=yayra-appimage
 Categories=Network;WebBrowser;
-MimeType=text/html;text/xml;application/xhtml+xml;application/pdf;x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/yayra;
+MimeType=text/html;text/xml;application/xhtml+xml;application/pdf;application/vnd.openxmlformats-officedocument.presentationml.presentation;application/vnd.ms-powerpoint.presentation.macroenabled.12;application/vnd.ms-powerpoint;application/vnd.openxmlformats-officedocument.wordprocessingml.document;application/msword;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;application/vnd.ms-excel.sheet.macroenabled.12;application/vnd.ms-excel;text/csv;image/jpeg;image/png;image/webp;image/gif;image/bmp;image/avif;image/svg+xml;text/plain;text/markdown;application/json;application/xml;x-scheme-handler/http;x-scheme-handler/https;x-scheme-handler/yayra;

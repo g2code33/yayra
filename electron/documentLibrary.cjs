@@ -20,8 +20,8 @@ const INTERNAL_EXTENSIONS = new Set([
   'pdf', 'pptx', 'pptm', 'docx', 'xlsx', 'xlsm', 'xls', 'csv',
   'jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'avif', 'svg',
   'txt', 'md', 'markdown', 'log', 'json', 'xml', 'yaml', 'yml',
-  // These legacy formats intentionally open the honest fallback surface,
-  // which offers the unchanged original to the system application.
+  // Binary Office 97–2003 is rendered through Yayra's bundled local bridge;
+  // Download/Open-original still uses these exact source bytes.
   'ppt', 'doc'
 ]);
 

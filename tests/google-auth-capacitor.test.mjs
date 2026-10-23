@@ -6,7 +6,7 @@ import {
   createCapacitorAuthBridge,
   signInWithGoogleCapacitor
 } from '../src/services/googleAuthCapacitor.js';
-import { PROFILE_KEY } from '../src/services/googleAuthWeb.js';
+import { DRIVE_SESSION_KEY, PROFILE_KEY } from '../src/services/googleAuthWeb.js';
 import { resolveCapacitorGoogleAuthConfig } from '../src/config/googleAuthCapacitor.js';
 
 const CLIENT_ID = 'android-client-id.apps.googleusercontent.com';
@@ -325,6 +325,69 @@ test('capacitor auth bridge satisfies the BrowserShell contract and persists pro
   assert.deepEqual(await bridge.signOut(), { ok: true });
   assert.deepEqual(await bridge.getSession(), { signedIn: false });
   assert.deepEqual(events, ['signing-in', 'signed-in', 'signed-out']);
+});
+
+test('capacitor Drive consent persists only an opaque capability, downloads internally, and revokes on logout', async () => {
+  const cap = fakeCapacitor();
+  const local = fakeStorage();
+  const sessionId = 'M'.repeat(43);
+  const calls = [];
+  const bridge = createCapacitorAuthBridge({
+    clientId: CLIENT_ID, platform: 'android', exchangeUrl: EXCHANGE_URL,
+    localStorage: local,
+    openBrowser: cap.openBrowser, closeBrowser: cap.closeBrowser,
+    onUrlOpen: cap.onUrlOpen, onBrowserFinished: cap.onBrowserFinished,
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (url === EXCHANGE_URL) {
+        const body = JSON.parse(options.body);
+        assert.equal(body.capability, 'drive-readonly');
+        return new Response(JSON.stringify({
+          profile: { sub: '7', name: 'Ama Mensah', email: 'ama@example.com' },
+          driveSession: { id: sessionId, expiresAt: '2099-01-01T00:00:00.000Z', scope: 'drive.readonly' }
+        }), { status: 200 });
+      }
+      if (String(url).includes('/api/drive/download')) {
+        assert.equal(options.headers.Authorization, `YayraDrive ${sessionId}`);
+        return new Response(new Uint8Array([1, 2, 3]), {
+          status: 200,
+          headers: { 'Content-Type': 'application/pdf', 'Content-Disposition': "attachment; filename*=UTF-8''Paper.pdf", 'Content-Length': '3' }
+        });
+      }
+      if (String(url).includes('/api/drive/session/revoke')) {
+        assert.equal(options.headers.Authorization, `YayraDrive ${sessionId}`);
+        return new Response(JSON.stringify({ ok: true, providerRevoked: true }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    }
+  });
+
+  const events = [];
+  bridge.onEvent((event) => events.push(event.type));
+  const connecting = bridge.connectDrive();
+  await waitFor(() => cap.opened.length === 1);
+  const authorization = new URL(cap.opened[0]);
+  assert.equal(authorization.searchParams.get('scope'), 'openid email profile https://www.googleapis.com/auth/drive.readonly');
+  assert.equal(authorization.searchParams.get('access_type'), 'offline');
+  const state = authorization.searchParams.get('state');
+  cap.deliverUrl(`${DEFAULT_MOBILE_REDIRECT_URI}?code=drive-code&state=${state}`);
+  const connected = await connecting;
+  assert.equal(connected.ok, true);
+  assert.deepEqual(events, ['drive-connecting', 'signed-in', 'drive-connected'],
+    'the verified deep link immediately updates Yayra account state as well as Drive state');
+  assert.equal(JSON.parse(local.getItem(DRIVE_SESSION_KEY)).id, sessionId);
+  assert.equal(JSON.stringify(local.dump()).includes('access_token'), false);
+  assert.equal(JSON.stringify(local.dump()).includes('refresh_token'), false);
+
+  const download = await bridge.downloadDriveFile('file-1234567890');
+  assert.equal(download.ok, true);
+  assert.equal(download.filename, 'Paper.pdf');
+  assert.deepEqual([...new Uint8Array(await download.blob.arrayBuffer())], [1, 2, 3]);
+
+  assert.deepEqual(await bridge.signOut(), { ok: true });
+  assert.deepEqual(events, ['drive-connecting', 'signed-in', 'drive-connected', 'signed-out']);
+  assert.equal(local.getItem(DRIVE_SESSION_KEY), null);
+  assert.equal(calls.some(({ url }) => String(url).includes('/api/drive/session/revoke')), true);
 });
 
 test('capacitor auth bridge reports sign-in errors through the event channel without throwing', async () => {

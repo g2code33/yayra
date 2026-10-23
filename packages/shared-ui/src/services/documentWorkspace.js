@@ -7,6 +7,7 @@ import {
   isAcceptedDocument,
   mimeForDocument,
   routeDocument,
+  sniffCompoundOfficeKind,
   sniffDocumentKind,
   supportedDocumentKinds,
   unsupportedDocumentKinds
@@ -22,6 +23,7 @@ export {
   isAcceptedDocument,
   mimeForDocument,
   routeDocument,
+  sniffCompoundOfficeKind,
   sniffDocumentKind,
   supportedDocumentKinds,
   unsupportedDocumentKinds
@@ -29,8 +31,11 @@ export {
 export {
   createViewerForKind,
   createPptxViewer,
+  createLegacyPptViewer,
   createDocxViewer,
+  createLegacyDocViewer,
   createSpreadsheetViewer,
+  convertLegacyOfficeBytes,
   createImageViewer,
   createTextViewer,
   createUnsupportedViewer,
@@ -104,18 +109,20 @@ export class DocumentStore {
 
 /** Default state shape for a document viewer instance. */
 export function createDocumentViewerState(kind = 'pdf') {
+  const presentation = kind === 'pptx' || kind === 'ppt';
   return {
     viewer: kind,
     status: 'idle', numPages: 0, page: 1, zoom: 1.25,
-    zoomMode: kind === 'pptx' ? 'fit-page' : 'custom',
+    zoomMode: presentation ? 'fit-page' : 'custom',
     query: '', matches: [], matchIndex: -1, error: null,
     progress: null, loadingStage: '',
+    transformedForViewing: false, conversionWarnings: [], conversionUsedWorker: false,
     rotation: 0,          // 0 | 90 | 180 | 270 where the engine supports it
     night: false,
     outline: [],          // flattened PDF TOC: [{ title, page, depth }]
-    sidebarOpen: kind === 'pptx',
-    sidebarTab: kind === 'pptx' ? 'thumbnails' : 'outline',
-    showNotes: kind === 'pptx',
+    sidebarOpen: presentation,
+    sidebarTab: presentation ? 'thumbnails' : 'outline',
+    showNotes: presentation,
     notesColor: DEFAULT_PPTX_NOTES_COLOR,
     slideshowMode: false,
     slidePending: false,

@@ -125,6 +125,36 @@ test('ANDROID: a Google SEARCH opens in-app too (the SERP no longer auto-opens e
   }
 });
 
+test('ANDROID: a Drive download handoff stays in Yayra and clears Chromium/WebView false-failure state', async () => {
+  const android = fakeAndroid();
+  const { shell } = await makeShell();
+  try {
+    const driveUrl = 'https://drive.google.com/uc?export=download&id=file-123';
+    shell.navigateActiveTab(driveUrl);
+    await flush();
+    const tab = shell.getActiveTab();
+    android.deliverEvent({ id: tab.id, type: 'loading-start', url: driveUrl });
+    android.deliverEvent({ id: tab.id, type: 'fail-load', url: driveUrl, errorCode: -1, errorDescription: 'net::ERR_FAILED' });
+    assert.ok(shell._siteFailureFor(tab.id), 'the regression precondition records the raw WebView error');
+    android.deliverEvent({
+      id: tab.id,
+      type: 'download-handoff',
+      url: driveUrl,
+      filename: 'Research Methodology.pptx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      downloadId: 42
+    });
+    await flush();
+    assert.equal(tab.isLoading, false);
+    assert.equal(shell._siteFailureFor(tab.id), null, 'native download evidence retires the false site-failure card');
+    assert.deepEqual(android.calls.browserOpen, [], 'the file is handled by Android DownloadManager, not handed to another browser');
+  } finally {
+    shell.destroy();
+    delete window.Capacitor;
+    delete globalThis.localStorage;
+  }
+});
+
 test('ANDROID: frame-friendly sites keep the iframe engine (the native layer is only for frame-hostile sites)', async () => {
   fakeAndroid();
   const { shell } = await makeShell();
@@ -455,6 +485,15 @@ test('KOTLIN PIN: the native tab engine exists, is safe, and reports through tab
   assert.ok(manager.includes('settings.javaScriptEnabled = true'), 'JS on (a real browser surface)');
   assert.ok(manager.includes('settings.allowFileAccess = false'), 'file access OFF');
   assert.ok(manager.includes('settings.allowContentAccess = false'), 'content access OFF');
+  assert.ok(manager.includes('setDownloadListener'), 'native tabs hand Content-Disposition responses to Android downloads');
+  assert.ok(manager.includes('DownloadManager.Request') && manager.includes('manager.enqueue(request)'), 'Android DownloadManager owns the durable transfer');
+  assert.ok(manager.includes('CookieManager.getInstance().getCookie(url)') && manager.includes('addRequestHeader("Cookie", it)'), 'authenticated Drive cookies follow the download request');
+  assert.ok(manager.includes('addRequestHeader("User-Agent", it)'), 'the page user agent is preserved');
+  assert.ok(manager.includes('isGoogleDriveDownloadUrl') && manager.includes('drive.usercontent.google.com'), 'Drive confirmation redirects are classified narrowly');
+  assert.ok(manager.includes('emitEvent(entry.id, "download-handoff")'), 'the shell receives positive download evidence instead of a false failure');
+  assert.ok(manager.includes('main.postDelayed({ reportFailure() }, 2_000L)'), 'a bounded grace period keeps genuine Drive failures honest');
+  assert.ok(manager.includes('mainFrameGeneration') && manager.includes('liveEntry.mainFrameGeneration != failedGeneration'),
+    'a delayed Drive error cannot cover a newer navigation generation');
   assert.ok(manager.includes('isSystemBrowserAuthUrl(uri)'), 'Google auth is path-classified rather than all of accounts.google.com');
   assert.ok(manager.includes('val GOOGLE_OAUTH_PATH = Regex(') && manager.includes('signin/oauth'), 'Android hands off explicit third-party OAuth routes');
   assert.ok(manager.includes('val GOOGLE_INTERACTIVE_SIGNIN_PATH = Regex(') && manager.includes('v3/signin') && manager.includes('ServiceLogin'),

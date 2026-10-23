@@ -85,18 +85,18 @@ function makeTinyPdfBytes(text = 'Fast local PDF reader') {
   return new Uint8Array(Buffer.from(pdf, 'ascii'));
 }
 
-test('REGISTRY: bundled viewers and explicit legacy fallbacks advertise honest capabilities', () => {
+test('REGISTRY: modern and Office 97–2003 viewers advertise honest bundled capabilities', () => {
   for (const [file, kind] of [
     ['report.pdf', 'pdf'], ['DECK.PPTX', 'pptx'], ['notes.pptm', 'pptx'],
-    ['letter.docx', 'docx'], ['book.xlsx', 'xlsx'], ['old.xls', 'xlsx'],
-    ['table.csv', 'xlsx'], ['photo.webp', 'image'], ['readme.md', 'text'],
-    ['legacy.doc', 'unsupported'], ['legacy.ppt', 'unsupported']
+    ['legacy.ppt', 'ppt'], ['letter.docx', 'docx'], ['legacy.doc', 'doc'],
+    ['book.xlsx', 'xlsx'], ['old.xls', 'xls'], ['table.csv', 'xlsx'],
+    ['photo.webp', 'image'], ['readme.md', 'text']
   ]) assert.equal(classifyDocument(file), kind, file);
-  assert.deepEqual(unsupportedDocumentKinds().sort(), ['doc', 'ppt']);
+  assert.deepEqual(unsupportedDocumentKinds(), []);
   assert.equal(classifyDocument('no-extension'), null);
   assert.equal(classifyDocument(''), null);
 
-  for (const kind of ['pdf', 'pptx', 'docx', 'xlsx', 'image', 'text']) {
+  for (const kind of ['pdf', 'pptx', 'ppt', 'docx', 'doc', 'xlsx', 'xls', 'image', 'text']) {
     assert.equal(DOCUMENT_ENGINES[kind].capabilities.view, true, `${kind} is actually viewable`);
     assert.equal(DOCUMENT_ENGINES[kind].capabilities.edit, false, `${kind} does not claim editing`);
     assert.equal(DOCUMENT_ENGINES[kind].capabilities.save, false, `${kind} does not claim editing the source`);
@@ -107,7 +107,12 @@ test('REGISTRY: bundled viewers and explicit legacy fallbacks advertise honest c
   assert.equal(DOCUMENT_ENGINES.pptx.capabilities.presentation, true);
   assert.equal(DOCUMENT_ENGINES.pptx.capabilities.notes, true);
   assert.equal(DOCUMENT_ENGINES.pptx.capabilities.embeddedVideo, true);
+  assert.equal(DOCUMENT_ENGINES.ppt.capabilities.presentation, true);
+  assert.equal(DOCUMENT_ENGINES.ppt.capabilities.notes, true);
+  assert.equal(DOCUMENT_ENGINES.ppt.capabilities.embeddedVideo, false);
+  assert.equal(DOCUMENT_ENGINES.doc.capabilities.search, true);
   assert.equal(DOCUMENT_ENGINES.xlsx.capabilities.sheets, true);
+  assert.equal(DOCUMENT_ENGINES.xls.capabilities.sheets, true);
   assert.equal(DOCUMENT_ENGINES.image.capabilities.search, false);
   assert.equal(DOCUMENT_ENGINES.unsupported.capabilities.view, false);
 });
@@ -624,7 +629,8 @@ test('DOCUMENT ACTIONS: every file viewer keeps Download/Print visible and uses 
   shell._docEngineOverride = fakePdfjs({ pages: 1 });
   shell._documentEngineOverrides = {
     pptx: fakePptxEngine(),
-    docx: { renderAsync: async () => {} }
+    docx: { renderAsync: async () => {} },
+    doc: { renderAsync: async () => {} }
   };
   try {
     for (const [name, bytes, closeLabel, canPrint = true] of [
@@ -634,7 +640,8 @@ test('DOCUMENT ACTIONS: every file viewer keeps Download/Print visible and uses 
       ['sheet.csv', new TextEncoder().encode('Name,Value\nYayra,1'), 'Close Spreadsheet'],
       ['photo.png', new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), 'Close Image'],
       ['notes.txt', new TextEncoder().encode('All files use More.'), 'Close Text'],
-      ['legacy.doc', new Uint8Array([0xd0, 0xcf, 0x11, 0xe0]), 'Close Original file', false]
+      ['legacy.doc', new Uint8Array(readFileSync(new URL('./fixtures/legacy-word.doc', import.meta.url))), 'Close Word'],
+      ['unknown.bin', new Uint8Array([0xde, 0xad, 0xbe, 0xef]), 'Close Original file', false]
     ]) {
       shell.addDocumentTab({ name, bytes });
       const primary = shell.viewportElement.querySelector('.fb-doc-toolbar-primary');
@@ -858,6 +865,34 @@ test('PPTX NOTES COLOUR: native wheel stays live beside the accessible presentat
     secondShell?.destroy();
     if (priorStorage === undefined) delete globalThis.localStorage;
     else globalThis.localStorage = priorStorage;
+  }
+});
+
+test('LEGACY PPT SHELL: local viewing-copy notice, full controls and projector mode match PPTX', async () => {
+  const { shell } = await bootShell();
+  shell._documentEngineOverrides = { ppt: fakePptxEngine({ slides: 2 }) };
+  try {
+    const bytes = new Uint8Array(readFileSync(new URL('./fixtures/legacy-slides.ppt', import.meta.url)));
+    const source = bytes.slice();
+    const opened = shell.addDocumentTab({ name: 'legacy-slides.ppt', bytes });
+    assert.equal(opened.type, 'ppt');
+    const tab = shell.getActiveTab();
+    const session = shell._documentViewerSessions.get(tab.id);
+    await session.loadPromise;
+    assert.equal(tab.docState.status, 'ready');
+    assert.equal(tab.docState.viewer, 'ppt');
+    assert.match(shell.viewportElement.querySelector('.fb-doc-local-viewing-copy').textContent, /original unchanged/i);
+    assert.ok(shell.viewportElement.querySelector('.fb-doc-btn-present-first'));
+    assert.ok(shell.viewportElement.querySelector('.fb-doc-btn-present-current'));
+    assert.ok(shell.viewportElement.querySelector('.fb-doc-btn-notes'));
+    assert.ok(shell.viewportElement.querySelector('.fb-doc-btn-print'));
+
+    assert.equal(await shell.startDocumentSlideshow(tab.id, { fromBeginning: true }), true);
+    assert.ok(document.getElementById('yayra-pptx-slideshow'));
+    assert.equal(await shell.exitDocumentSlideshow(), true);
+    assert.deepEqual(bytes, source, 'the shell keeps the binary PPT source intact through conversion and projection');
+  } finally {
+    shell.destroy();
   }
 });
 
