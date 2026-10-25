@@ -44,6 +44,20 @@ test('dictionary page renders local results and untrusted definitions as text, n
   } finally { shell.destroy(); container.remove(); }
 });
 
+test('dictionary page keeps readable theme-aware foreground and surface contrast', () => {
+  const { shell, container } = makeShell();
+  const viewport = document.createElement('div');
+  try {
+    shell.renderInternalDictionaryPage(viewport, shell.getActiveTab());
+    const styles = viewport.querySelector('style')?.textContent || '';
+    assert.match(styles, /\.fb-dictionary-page\{[^}]*color:var\(--fb-text-primary/);
+    assert.match(styles, /\.fb-dictionary-page\{[^}]*background:var\(--fb-bg-app/);
+    assert.match(styles, /\.fb-dict-card\{[^}]*background:var\(--fb-bg-surface-elevated/);
+    assert.match(styles, /\.fb-dict-input\{[^}]*color:var\(--fb-text-primary/);
+    assert.match(styles, /\.fb-dict-source\{[^}]*color:var\(--fb-text-secondary/);
+  } finally { shell.destroy(); container.remove(); }
+});
+
 test('dictionary category, source and layout changes immediately rerun the active query', async () => {
   const { shell, container } = makeShell();
   const viewport = document.createElement('div');

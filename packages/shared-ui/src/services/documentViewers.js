@@ -432,7 +432,7 @@ export function createPptxViewer({
       viewer: documentKind,
       status: 'loading',
       loadingStage: legacy ? 'Converting PowerPoint 97–2003 locally…' : 'Opening presentation…',
-      progress: null, error: null, numPages: 0, page: 1, matches: [], matchIndex: -1,
+      progress: null, error: null, numPages: 0, page: Math.max(1, Number(viewerState.page) || 1), matches: [], matchIndex: -1,
       conversionWarnings: [], transformedForViewing: legacy
     });
     try {
@@ -1129,13 +1129,13 @@ export function createSpreadsheetViewer({
   async function load(bytes) {
     const loadToken = ++token;
     disposed = false;
-    updates.patch({ viewer: documentKind, status: 'loading', loadingStage: 'Reading workbook…', progress: null, error: null, numPages: 0, page: 1, rowPage: 1 });
+    updates.patch({ viewer: documentKind, status: 'loading', loadingStage: 'Reading workbook…', progress: null, error: null, numPages: 0, page: Math.max(1, Number(viewerState.page) || 1), rowPage: Math.max(1, Number(viewerState.rowPage) || 1) });
     try {
       XLSX = await timed(moduleLoader(), loadTimeoutMs, 'Spreadsheet engine load timed out');
       if (disposed || loadToken !== token) return viewerState;
       workbook = XLSX.read(byteArray(bytes), { type: 'array', cellStyles: true, cellDates: true });
       if (!workbook?.SheetNames?.length) throw new Error('No worksheets found');
-      updates.patch({ status: 'ready', loadingStage: '', progress: 100, numPages: workbook.SheetNames.length, page: 1, sheetNames: [...workbook.SheetNames], engineName: routeDocument(documentKind).engine });
+      updates.patch({ status: 'ready', loadingStage: '', progress: 100, numPages: workbook.SheetNames.length, page: clamp(viewerState.page || 1, 1, workbook.SheetNames.length), sheetNames: [...workbook.SheetNames], engineName: routeDocument(documentKind).engine });
       renderSheet();
     } catch (error) {
       if (disposed || loadToken !== token) return viewerState;

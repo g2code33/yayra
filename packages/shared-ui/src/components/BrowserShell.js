@@ -531,6 +531,10 @@ export class BrowserShell {
         documentsDefaultSize: 'all',
         documentsShowMissing: true,
         documentsRetentionDays: 0,
+        documentsRememberReadingPosition: true,
+        documentsDefaultZoom: 'fit-width',
+        documentsDefaultNightMode: false,
+        documentViewingProgress: {},
         floatingEnabledByDefault: true,
         startFloatingOnLaunch: true,
         alwaysOnTop: true,
@@ -8555,26 +8559,26 @@ export class BrowserShell {
     page.className = 'fb-internal-page fb-dictionary-page';
     page.innerHTML = `
       <style>
-        .fb-dictionary-page{box-sizing:border-box;min-height:100%;padding:clamp(14px,2.5vw,28px);color:var(--fb-text-primary,#f8fafc);background:var(--fb-bg-primary,#111318);overflow:auto}
+        .fb-dictionary-page{box-sizing:border-box;min-height:100%;padding:clamp(14px,2.5vw,28px);color:var(--fb-text-primary,#f8fafc);background:var(--fb-bg-app,#111318);overflow:auto}
         .fb-dict-wrap{max-width:1040px;margin:0 auto}.fb-dict-heading{display:flex;align-items:center;gap:14px}
         .fb-dict-brand{display:flex;align-items:center;gap:14px;min-width:0}.fb-dict-logo{width:46px;height:46px;flex:0 0 46px;display:grid;place-items:center;border-radius:14px;background:linear-gradient(135deg,rgba(56,189,248,.17),rgba(167,139,250,.19),rgba(244,114,182,.15));border:1px solid rgba(129,140,248,.3)}.fb-dict-logo svg{width:27px;height:27px}
-        .fb-dict-heading h1{margin:0;font-size:clamp(1.45rem,3.3vw,2rem)}.fb-dict-heading p,.fb-dict-muted{margin:.35em 0 0;color:var(--fb-text-muted,#9ca3af);line-height:1.5}
-        .fb-dict-nav,.fb-dict-tools,.fb-dict-card-actions{display:flex;gap:7px;flex-wrap:wrap;align-items:center}.fb-dict-nav{margin:16px 0 20px;padding:4px;width:max-content;max-width:100%;border:1px solid rgba(148,163,184,.2);border-radius:12px;background:rgba(30,41,59,.35)}
+        .fb-dict-heading h1{margin:0;font-size:clamp(1.45rem,3.3vw,2rem)}.fb-dict-heading p,.fb-dict-muted{margin:.35em 0 0;color:var(--fb-text-secondary,#cbd5e1);line-height:1.5}
+        .fb-dict-nav,.fb-dict-tools,.fb-dict-card-actions{display:flex;gap:7px;flex-wrap:wrap;align-items:center}.fb-dict-nav{margin:16px 0 20px;padding:4px;width:max-content;max-width:100%;border:1px solid rgba(148,163,184,.2);border-radius:12px;background:var(--fb-bg-surface,rgba(30,41,59,.72))}
         .fb-dict-btn{border:1px solid rgba(148,163,184,.3);border-radius:9px;padding:9px 12px;background:rgba(148,163,184,.08);color:inherit;cursor:pointer;font:inherit;line-height:1.2}
         .fb-dict-btn:hover{background:rgba(148,163,184,.18)}.fb-dict-btn:focus-visible,.fb-dict-input:focus-visible{outline:2px solid #60a5fa;outline-offset:2px}
-        .fb-dict-nav .fb-dict-btn{border-color:transparent;background:transparent;color:var(--fb-text-muted,#aab2c0);white-space:nowrap}.fb-dict-nav .fb-dict-btn[aria-current=page]{background:linear-gradient(120deg,rgba(37,99,235,.3),rgba(124,58,237,.23));border-color:rgba(96,165,250,.3);color:#fff}
+        .fb-dict-nav .fb-dict-btn{border-color:transparent;background:transparent;color:var(--fb-text-secondary,#cbd5e1);white-space:nowrap}.fb-dict-nav .fb-dict-btn[aria-current=page]{background:linear-gradient(120deg,rgba(37,99,235,.3),rgba(124,58,237,.23));border-color:rgba(96,165,250,.3);color:#fff}
         .fb-dict-btn.primary{background:#2563eb;color:#fff;border-color:#2563eb}.fb-dict-state-btn.is-active{background:linear-gradient(120deg,rgba(16,185,129,.28),rgba(20,184,166,.2));border-color:rgba(52,211,153,.62);color:#d1fae5;box-shadow:0 0 0 1px rgba(52,211,153,.12) inset}.fb-dict-star-btn.is-active{background:linear-gradient(120deg,rgba(245,158,11,.28),rgba(234,179,8,.2));border-color:rgba(251,191,36,.68);color:#fef3c7}.fb-dict-btn.danger{color:#fecaca}.fb-dict-btn:disabled{opacity:.6;cursor:wait}
-        .fb-dict-input{box-sizing:border-box;min-width:0;width:100%;max-width:100%;border:1px solid rgba(148,163,184,.35);border-radius:9px;padding:10px;background:rgba(15,23,42,.8);color:inherit;font:inherit}
-        .fb-dict-search{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:9px;align-items:center}.fb-dict-search .fb-dict-input[type=search]{min-width:0}.fb-dict-filters{grid-column:1/-1;border:1px solid rgba(148,163,184,.2);border-radius:10px;padding:0 12px;background:rgba(30,41,59,.22)}.fb-dict-filters summary{cursor:pointer;padding:10px 0;color:var(--fb-text-muted,#aab2c0)}.fb-dict-filter-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;padding:2px 0 12px}
+        .fb-dict-input{box-sizing:border-box;min-width:0;width:100%;max-width:100%;border:1px solid rgba(148,163,184,.35);border-radius:9px;padding:10px;background:var(--fb-bg-glass-input,rgba(15,23,42,.8));color:var(--fb-text-primary,#f8fafc);font:inherit}
+        .fb-dict-search{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:9px;align-items:center}.fb-dict-search .fb-dict-input[type=search]{min-width:0}.fb-dict-filters{grid-column:1/-1;border:1px solid rgba(148,163,184,.2);border-radius:10px;padding:0 12px;background:var(--fb-bg-surface,rgba(30,41,59,.22))}.fb-dict-filters summary{cursor:pointer;padding:10px 0;color:var(--fb-text-secondary,#cbd5e1)}.fb-dict-filter-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;padding:2px 0 12px}
         .fb-dict-notice{margin:12px 0;padding:10px 13px;border:1px solid rgba(96,165,250,.25);border-radius:10px;background:rgba(37,99,235,.07);line-height:1.45}
         .fb-dict-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:12px;margin-top:16px}
-        .fb-dict-card{border:1px solid rgba(148,163,184,.22);border-radius:13px;padding:15px;background:rgba(30,41,59,.38);min-width:0}
-        .fb-dict-card h2,.fb-dict-card h3{margin:0 0 7px}.fb-dict-def{margin:12px 0;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}.fb-dict-source{font-size:.87rem;color:var(--fb-text-muted,#9ca3af)}
-        .fb-dict-definition{border-top:1px solid rgba(148,163,184,.18);padding-top:8px;margin-top:8px}.fb-dict-example{margin:6px 0 0 16px;color:var(--fb-text-muted,#cbd5e1)}
+        .fb-dict-card{border:1px solid rgba(148,163,184,.22);border-radius:13px;padding:15px;background:var(--fb-bg-surface-elevated,rgba(30,41,59,.78));min-width:0}
+        .fb-dict-card h2,.fb-dict-card h3{margin:0 0 7px}.fb-dict-def{margin:12px 0;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}.fb-dict-source{font-size:.87rem;color:var(--fb-text-secondary,#cbd5e1)}
+        .fb-dict-definition{border-top:1px solid rgba(148,163,184,.18);padding-top:8px;margin-top:8px}.fb-dict-example{margin:6px 0 0 16px;color:var(--fb-text-secondary,#cbd5e1)}
         .fb-dict-list{display:grid;gap:10px;margin-top:14px}.fb-dict-split{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.fb-dict-checkbox{display:flex;align-items:center;gap:8px}
-        .fb-dict-empty{padding:22px 16px;border:1px dashed rgba(148,163,184,.4);border-radius:12px;text-align:center;color:var(--fb-text-muted,#9ca3af)}
-        .fb-dict-link{display:block;width:max-content;max-width:100%;margin-top:7px;color:#93c5fd;text-decoration:underline;overflow-wrap:anywhere}.fb-dict-pack-meta{font-size:.9rem;line-height:1.5;overflow-wrap:anywhere}.fb-dict-license{max-height:240px;overflow:auto;white-space:pre-wrap;font:inherit;font-size:.8rem;line-height:1.45;color:var(--fb-text-muted,#cbd5e1)}
-        .fb-dict-status{min-height:1.3em;margin:8px 0;color:var(--fb-text-muted,#9ca3af)}
+        .fb-dict-empty{padding:22px 16px;border:1px dashed rgba(148,163,184,.4);border-radius:12px;text-align:center;color:var(--fb-text-secondary,#cbd5e1)}
+        .fb-dict-link{display:block;width:max-content;max-width:100%;margin-top:7px;color:#93c5fd;text-decoration:underline;overflow-wrap:anywhere}.fb-dict-pack-meta{font-size:.9rem;line-height:1.5;overflow-wrap:anywhere}.fb-dict-license{max-height:240px;overflow:auto;white-space:pre-wrap;font:inherit;font-size:.8rem;line-height:1.45;color:var(--fb-text-secondary,#cbd5e1)}
+        .fb-dict-status{min-height:1.3em;margin:8px 0;color:var(--fb-text-secondary,#cbd5e1)}
         .fb-dictionary-brand-action{display:inline-flex;align-items:center;gap:8px}.fb-dictionary-brand-action svg{width:20px;height:20px}
         .fb-toolbar-dictionary-btn svg{filter:drop-shadow(0 0 5px rgba(56,189,248,.3))}
         @media(max-width:700px){.fb-dictionary-page{padding:13px}.fb-dict-split,.fb-dict-filter-grid{grid-template-columns:1fr}.fb-dict-card{padding:13px}.fb-dict-nav{width:100%;overflow-x:auto}.fb-dict-search{grid-template-columns:minmax(0,1fr)}.fb-dict-search>.fb-dict-btn{justify-self:start}}
@@ -9638,6 +9642,22 @@ export class BrowserShell {
               <input type="checkbox" id="fb-in-documents-show-missing" ${this.state.settings.documentsShowMissing !== false ? 'checked' : ''} />
             </div>
             <div class="fb-setting-toggle-row">
+              <div><strong>Remember each file’s reading position</strong><p>Resume the last page, slide, sheet, zoom, and long-document scroll position when you reopen a file, including after an app restart.</p></div>
+              <input type="checkbox" id="fb-in-documents-remember-position" ${this.state.settings.documentsRememberReadingPosition !== false ? 'checked' : ''} />
+            </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-documents-default-zoom">Default document view</label>
+              <select id="fb-in-documents-default-zoom" class="fb-select">
+                <option value="fit-width" ${(this.state.settings.documentsDefaultZoom || 'fit-width') === 'fit-width' ? 'selected' : ''}>Fit width</option>
+                <option value="fit-page" ${this.state.settings.documentsDefaultZoom === 'fit-page' ? 'selected' : ''}>Fit page or slide</option>
+                <option value="100" ${this.state.settings.documentsDefaultZoom === '100' ? 'selected' : ''}>100% zoom</option>
+              </select>
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Start supported readers in night mode</strong><p>Use a dark reading surface when the file viewer supports it. This does not alter the original file.</p></div>
+              <input type="checkbox" id="fb-in-documents-night-default" ${this.state.settings.documentsDefaultNightMode === true ? 'checked' : ''} />
+            </div>
+            <div class="fb-setting-toggle-row">
               <div><strong>Start slideshows in true fullscreen</strong><p>Use the entire display for a projector when browser fullscreen permission is available.</p></div>
               <input type="checkbox" id="fb-in-pptx-fullscreen" ${this.state.settings.pptxSlideshowFullscreen !== false ? 'checked' : ''} />
             </div>
@@ -9966,6 +9986,9 @@ export class BrowserShell {
     bindToggle('#fb-in-set-adblock', (on) => { this.state.settings.adBlockEnabled = on; });
     bindToggle('#fb-in-set-restore-session', (on) => { this.state.settings.restoreSessionOnLaunch = on; });
     bindToggle('#fb-in-documents-show-missing', (on) => { this.state.settings.documentsShowMissing = on; });
+    bindToggle('#fb-in-documents-remember-position', (on) => { this.state.settings.documentsRememberReadingPosition = on; });
+    bindToggle('#fb-in-documents-night-default', (on) => { this.state.settings.documentsDefaultNightMode = on; });
+    bindSelect('#fb-in-documents-default-zoom', (value) => { this.state.settings.documentsDefaultZoom = ['fit-width', 'fit-page', '100'].includes(value) ? value : 'fit-width'; });
     bindToggle('#fb-in-pptx-fullscreen', (on) => { this.state.settings.pptxSlideshowFullscreen = on; });
     bindSelect('#fb-in-pptx-projector-display', (value) => { this.state.settings.pptxProjectorDisplayId = value || 'current'; });
     bindToggle('#fb-in-pptx-autohide', (on) => { this.state.settings.pptxSlideshowAutoHideControls = on; });
@@ -14112,7 +14135,11 @@ export class BrowserShell {
         if (source === 'live') record.tabs[existingIndex] = tab;
         return;
       }
-      if (source !== 'live' && record.tabs.some((member) => member.url === tab.url && (member.id || member.groupMemberId))) return;
+      // Distinct durable member ids represent distinct tabs even when the
+      // user intentionally grouped several tabs at the same URL. Only the
+      // rolling session-recovery source may be deduplicated against the
+      // durable catalog's canonical members.
+      if (source === 'restore' && record.tabs.some((member) => member.url === tab.url && (member.id || member.groupMemberId))) return;
       record._keys.set(key, record.tabs.length);
       record.tabs.push(tab);
     };
@@ -14686,12 +14713,15 @@ export class BrowserShell {
       tab.group = null;
       tab.groupMemberId = null;
     }
-    this.state.tabGroupCatalog = [];
+    for (const group of this.state.tabGroupCatalog || []) {
+      group.members = [];
+      group.updatedAt = Date.now();
+    }
     this.persistDurableTabGroups();
     this.render();
     this.showTransientNotice(count > 0
-      ? `${count} tab${count === 1 ? '' : 's'} removed from their group${count === 1 ? '' : 's'}.`
-      : 'No grouped tabs to ungroup.');
+      ? `${count} tab${count === 1 ? '' : 's'} removed from their group${count === 1 ? '' : 's'}. Saved groups remain available until you delete them.`
+      : 'No grouped tabs to ungroup. Saved groups remain available until you delete them.');
   }
 
   /**
@@ -16666,7 +16696,7 @@ export class BrowserShell {
       size: doc.size
     });
     if (!doc.libraryId) this.rememberSessionDocument(doc);
-    const docState = createDocumentViewerState(doc.type);
+    const docState = this.applyDocumentViewingDefaults({ ...normalized, documentRecovery: recoveredDescriptor }, createDocumentViewerState(doc.type));
     if (isPowerPointDocument(doc.type)) {
       docState.notesColor = normalizePptxNotesColor(this.state.settings.pptxNotesColor);
     }
@@ -16759,11 +16789,6 @@ export class BrowserShell {
     const oldDescriptor = this.sanitizeDocumentRecoveryDescriptor(tab.documentRecovery);
     doc.recoveryId = oldDescriptor?.recoveryId || newDocumentRecoveryId();
     this.rememberSessionDocument(doc);
-    const docState = createDocumentViewerState(doc.type);
-    if (isPowerPointDocument(doc.type)) {
-      docState.notesColor = normalizePptxNotesColor(this.state.settings.pptxNotesColor);
-    }
-    docState.status = 'loading';
     const replacement = {
       ...tab,
       title: doc.name,
@@ -16771,7 +16796,6 @@ export class BrowserShell {
       isDocument: true,
       isDocumentRecovery: false,
       docId: doc.id,
-      docState,
       documentRecovery: this.sanitizeDocumentRecoveryDescriptor({
         recoveryId: doc.recoveryId,
         name: doc.name,
@@ -16779,6 +16803,12 @@ export class BrowserShell {
         size: doc.size
       })
     };
+    const docState = this.applyDocumentViewingDefaults(replacement, createDocumentViewerState(doc.type));
+    if (isPowerPointDocument(doc.type)) {
+      docState.notesColor = normalizePptxNotesColor(this.state.settings.pptxNotesColor);
+    }
+    docState.status = 'loading';
+    replacement.docState = docState;
     delete replacement.documentRecoveryError;
     this.state.tabs[index] = replacement;
     this.state.activeTabId = tabId;
@@ -20255,6 +20285,7 @@ export class BrowserShell {
     this._pageSnapshots.delete(tabId); // closed tab, dead preview
 
     const [closedTab] = this.state.tabs.splice(tabIndex, 1);
+    this.persistDocumentViewingProgress(closedTab, { immediate: true });
     // Capture the opaque recovery capability while the in-memory document is
     // still present. Its bytes can then be released without breaking
     // Ctrl+Shift+T or a later session snapshot.
@@ -23387,11 +23418,7 @@ export class BrowserShell {
     settingsButton.type = 'button';
     settingsButton.className = 'fb-btn fb-btn-secondary';
     settingsButton.innerHTML = `${Icons.settings} Settings`;
-    settingsButton.addEventListener('click', () => {
-      this.state.settingsActiveCategory = 'documents';
-      this.state.activeSettingsCategory = 'documents';
-      this.openInternalPage('yayra://settings');
-    });
+    settingsButton.addEventListener('click', () => this.openDocumentSettings());
     const openButton = document.createElement('button');
     openButton.type = 'button';
     openButton.className = 'fb-btn fb-btn-primary fb-documents-open-file';
@@ -23717,6 +23744,100 @@ export class BrowserShell {
     input.click();
   }
 
+  documentViewingProgressKey(tab, doc = null) {
+    if (!tab || tab.isPrivate) return null;
+    const descriptor = this.sanitizeDocumentRecoveryDescriptor(tab.documentRecovery || tab.documentRecoveryDescriptor);
+    const current = doc || this.documentStore?.get(tab.docId);
+    const libraryId = descriptor?.libraryId || current?.libraryId;
+    const recoveryId = descriptor?.recoveryId || current?.recoveryId;
+    if (libraryId) return `library:${libraryId}`;
+    if (recoveryId) return `recovery:${recoveryId}`;
+    return null;
+  }
+
+  applyDocumentViewingDefaults(tab, state) {
+    const settings = this.state.settings || {};
+    const mode = settings.documentsDefaultZoom || 'fit-width';
+    state.night = Boolean(settings.documentsDefaultNightMode);
+    if (mode === '100') {
+      state.zoomMode = 'custom';
+      state.zoom = 1;
+    } else if (mode === 'fit-page' || mode === 'fit-width') {
+      state.zoomMode = mode;
+    }
+    if (settings.documentsRememberReadingPosition === false) return state;
+    const key = this.documentViewingProgressKey(tab);
+    const saved = key && settings.documentViewingProgress?.[key];
+    if (!saved || typeof saved !== 'object') return state;
+    if (Number.isFinite(Number(saved.page)) && Number(saved.page) >= 1) state.page = Math.round(Number(saved.page));
+    if (Number.isFinite(Number(saved.zoom))) state.zoom = Math.max(0.5, Math.min(3, Number(saved.zoom)));
+    if (['custom', 'fit-width', 'fit-page'].includes(saved.zoomMode)) state.zoomMode = saved.zoomMode;
+    if ([0, 90, 180, 270].includes(Number(saved.rotation))) state.rotation = Number(saved.rotation);
+    if (typeof saved.night === 'boolean') state.night = saved.night;
+    if (typeof saved.sidebarOpen === 'boolean') state.sidebarOpen = saved.sidebarOpen;
+    if (['outline', 'thumbnails'].includes(saved.sidebarTab)) state.sidebarTab = saved.sidebarTab;
+    if (typeof saved.showNotes === 'boolean') state.showNotes = saved.showNotes;
+    if (Number.isFinite(Number(saved.scrollProgress))) state.scrollProgress = Math.max(0, Math.min(1, Number(saved.scrollProgress)));
+    return state;
+  }
+
+  persistDocumentViewingProgress(tab, { immediate = false } = {}) {
+    if (!tab || tab.isPrivate || tab.docState?.status !== 'ready'
+      || this.state.settings?.documentsRememberReadingPosition === false) return false;
+    const key = this.documentViewingProgressKey(tab);
+    const state = tab.docState;
+    if (!key || !state) return false;
+    const progress = {
+      page: Math.max(1, Math.round(Number(state.page) || 1)),
+      zoom: Math.max(0.5, Math.min(3, Number(state.zoom) || 1)),
+      zoomMode: ['custom', 'fit-width', 'fit-page'].includes(state.zoomMode) ? state.zoomMode : 'custom',
+      rotation: [0, 90, 180, 270].includes(Number(state.rotation)) ? Number(state.rotation) : 0,
+      night: Boolean(state.night),
+      sidebarOpen: Boolean(state.sidebarOpen),
+      sidebarTab: ['outline', 'thumbnails'].includes(state.sidebarTab) ? state.sidebarTab : 'outline',
+      showNotes: state.showNotes !== false,
+      scrollProgress: Math.max(0, Math.min(1, Number(state.scrollProgress) || 0)),
+      updatedAt: Date.now()
+    };
+    const current = this.state.settings.documentViewingProgress || {};
+    if (JSON.stringify(current[key]) === JSON.stringify({ ...progress, updatedAt: current[key]?.updatedAt })) return false;
+    const next = { ...current, [key]: progress };
+    const orderedKeys = Object.keys(next).sort((a, b) => (Number(next[b]?.updatedAt) || 0) - (Number(next[a]?.updatedAt) || 0));
+    for (const oldKey of orderedKeys.slice(1000)) delete next[oldKey];
+    this.state.settings.documentViewingProgress = next;
+    if (this._documentProgressPersistTimer) clearTimeout(this._documentProgressPersistTimer);
+    const write = () => {
+      this._documentProgressPersistTimer = null;
+      this.persistSettings();
+    };
+    if (immediate) write();
+    else {
+      this._documentProgressPersistTimer = setTimeout(write, 250);
+      this._documentProgressPersistTimer?.unref?.();
+    }
+    return true;
+  }
+
+  restoreDocumentScrollPosition(session) {
+    const ratio = Number(session?.state?.scrollProgress);
+    if (!session?.host || !Number.isFinite(ratio) || ratio <= 0) return;
+    const restore = () => {
+      const candidates = [session.host, ...Array.from(session.host.querySelectorAll?.('*') || [])];
+      const target = candidates
+        .filter((node) => Number(node?.scrollHeight) > Number(node?.clientHeight) + 2)
+        .sort((a, b) => (Number(b.scrollHeight) - Number(b.clientHeight)) - (Number(a.scrollHeight) - Number(a.clientHeight)))[0];
+      if (target) target.scrollTop = Math.round((target.scrollHeight - target.clientHeight) * ratio);
+    };
+    const schedule = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (callback) => setTimeout(callback, 0);
+    schedule(() => schedule(restore));
+  }
+
+  openDocumentSettings() {
+    this.state.settingsActiveCategory = 'documents';
+    this.state.activeSettingsCategory = 'documents';
+    this.openInternalPage('yayra://settings');
+  }
+
   /** Registers a local file and opens a fresh tab. Recognized types use a
    * bundled viewer; unknown formats use the honest original-file fallback. */
   addDocumentTab({ name, bytes, mime = '', libraryId = null }) {
@@ -23749,7 +23870,7 @@ export class BrowserShell {
       mime: doc.mime,
       size: doc.size
     });
-    tab.docState = createDocumentViewerState(doc.type);
+    tab.docState = this.applyDocumentViewingDefaults(tab, createDocumentViewerState(doc.type));
     if (isPowerPointDocument(doc.type)) {
       tab.docState.notesColor = normalizePptxNotesColor(
         this.state.settings.pptxNotesColor
@@ -24097,6 +24218,7 @@ export class BrowserShell {
     bar.appendChild(mkBtn('\u2b07 Download', 'Download the unchanged original file', () => {
       void downloadOriginal();
     }, 'fb-doc-download-btn'));
+    bar.appendChild(mkBtn('Settings', 'Open document and projector settings', () => this.openDocumentSettings(), 'fb-doc-settings-btn'));
     if (isPowerPointDocument(documentKind)) {
       bar.appendChild(mkBtn('\u25b6 Present', 'Start slideshow from slide 1 (F5)', () => {
         this.startDocumentSlideshow(tab.id, { fromBeginning: true });
@@ -24551,6 +24673,14 @@ export class BrowserShell {
         if (!session.disposed) session.sync?.();
       });
     }
+    host.addEventListener?.('scroll', (event) => {
+      const target = event?.target;
+      if (target && Number(target.scrollHeight) > Number(target.clientHeight)) {
+        const range = Number(target.scrollHeight) - Number(target.clientHeight);
+        state.scrollProgress = range > 0 ? Math.max(0, Math.min(1, Number(target.scrollTop || 0) / range)) : 0;
+        this.persistDocumentViewingProgress(tab);
+      }
+    }, true);
     this._activeDocViewer = session;
     sync();
 
@@ -25202,7 +25332,7 @@ export class BrowserShell {
             pdfjs: engine,
             container: session.host,
             state: session.state,
-            onStateChange: () => { if (isCurrent()) session.sync?.(); }
+            onStateChange: () => { if (isCurrent()) { session.sync?.(); this.persistDocumentViewingProgress(this.state.tabs.find((tab) => tab.id === session.tabId)); } }
           });
         } else {
           const override = this._documentEngineOverrides?.[doc.type];
@@ -25211,7 +25341,7 @@ export class BrowserShell {
             state: session.state,
             fileName: doc.name,
             onOpenOriginal: () => session.openOriginal?.(),
-            onStateChange: () => { if (isCurrent()) session.sync?.(); },
+            onStateChange: () => { if (isCurrent()) { session.sync?.(); this.persistDocumentViewingProgress(this.state.tabs.find((tab) => tab.id === session.tabId)); } },
             ...(override ? { moduleLoader: async () => override } : {})
           });
         }
@@ -25219,6 +25349,7 @@ export class BrowserShell {
         session.viewer = viewer;
         if (this.state.activeTabId === session.tabId) this._activeDocViewer = session;
         await viewer.load(doc.bytes);
+        this.restoreDocumentScrollPosition(session);
         if (!isCurrent()) {
           viewer.destroy();
           return;
@@ -25694,6 +25825,11 @@ export class BrowserShell {
   }
 
   destroy() {
+    if (this._documentProgressPersistTimer) {
+      clearTimeout(this._documentProgressPersistTimer);
+      this._documentProgressPersistTimer = null;
+      this.persistSettings();
+    }
     this._destroyed = true;
     for (const [target, type, listener, options] of this._selectionActionBindings || []) {
       try { target.removeEventListener?.(type, listener, options); } catch { /* target already gone */ }

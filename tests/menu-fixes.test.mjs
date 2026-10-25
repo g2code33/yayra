@@ -420,6 +420,42 @@ test('TAB GROUP PICKER: New group opens a visible, keyboard-ready prompt and pub
   }
 });
 
+test('TAB GROUP DURABILITY: closed tabs and ungrouping all preserve the saved group across shell restart', async () => {
+  const storage = makeStorage();
+  const { shell } = await makeShell({ storage });
+  try {
+    shell._textPromptDialog = async () => 'Keep forever';
+    assert.equal(await shell.createTabGroup(), true);
+    await flush();
+    const savedId = shell.state.tabGroupCatalog.find((group) => group.name === 'Keep forever')?.id;
+    assert.ok(savedId, 'creating a group writes its durable catalog record');
+    const memberTabIds = shell.state.tabs.filter((tab) => tab.group?.id === savedId).map((tab) => tab.id);
+    for (const tabId of memberTabIds) shell.closeTab(tabId);
+    await flush();
+    assert.equal(shell.state.tabGroupCatalog.find((group) => group.id === savedId)?.members.length, 2, 'closing member tabs does not prune their saved group links');
+
+    const reopened = await makeShell({ storage });
+    try {
+      const restoredGroup = reopened.shell.getTabGroups().find((group) => group.catalogId === savedId);
+      assert.ok(restoredGroup, 'the group loads from profile storage after a fresh shell starts');
+      assert.equal(restoredGroup.tabs.length, 2, 'closed group members remain available to reopen');
+      reopened.shell.ungroupAllTabs();
+      await flush();
+      assert.ok(reopened.shell.state.tabGroupCatalog.some((group) => group.id === savedId), 'ungrouping members does not mean deleting the group');
+      assert.ok(reopened.shell.getTabGroups().some((group) => group.catalogId === savedId), 'an empty saved group remains available in the group picker');
+      reopened.shell.deleteTabGroup(`catalog::${savedId}`);
+      await flush();
+    } finally { reopened.shell.destroy(); }
+    const afterDelete = await makeShell({ storage });
+    try {
+      assert.equal(afterDelete.shell.state.tabGroupCatalog.some((group) => group.id === savedId), false, 'explicit deletion is the action that removes the saved catalog entry');
+    } finally { afterDelete.shell.destroy(); }
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
 test('TAB GROUP DRAWER: prompt actions dismiss the drawer cleanly, including on Cancel', async () => {
   const { shell } = await makeShell();
   try {

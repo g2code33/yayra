@@ -372,6 +372,86 @@ test('TAB INTEGRATION: a document opens in its OWN tab - never the web frame or 
   }
 });
 
+test('DOCUMENT RESUME: per-file viewing position persists in profile settings and reapplies on reopen', async () => {
+  const stored = {};
+  const settingsRepo = {
+    getSettings: async () => stored.value || null,
+    updateSettings: async (partial) => { stored.value = { ...(stored.value || {}), ...partial }; return stored.value; }
+  };
+  const { shell } = await bootShell({ settingsRepo });
+  try {
+    const descriptor = { recoveryId: 'docrec-progress-fixture-123', name: 'Report.pdf', mime: 'application/pdf', size: 42 };
+    const original = {
+      isPrivate: false,
+      documentRecovery: descriptor,
+      docState: { status: 'ready', page: 13, zoom: 1.5, zoomMode: 'custom', rotation: 90, night: true, sidebarOpen: true, sidebarTab: 'thumbnails', showNotes: false, scrollProgress: 0.42 }
+    };
+    assert.equal(shell.persistDocumentViewingProgress(original, { immediate: true }), true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const key = 'recovery:docrec-progress-fixture-123';
+    assert.equal(stored.value.documentViewingProgress[key].page, 13, 'the last page is saved independently of the tab session');
+    assert.equal(stored.value.documentViewingProgress[key].scrollProgress, 0.42, 'long-document scroll position is also persisted');
+
+    const reopened = { isPrivate: false, documentRecovery: descriptor };
+    const state = shell.applyDocumentViewingDefaults(reopened, createDocumentViewerState('pdf'));
+    assert.equal(state.page, 13, 'PDF and slide viewers can resume at the saved page');
+    assert.equal(state.zoom, 1.5);
+    assert.equal(state.rotation, 90);
+    assert.equal(state.night, true);
+    assert.equal(state.sidebarTab, 'thumbnails');
+    assert.equal(state.scrollProgress, 0.42);
+
+    shell.state.settings.documentsRememberReadingPosition = false;
+    const fresh = shell.applyDocumentViewingDefaults(reopened, createDocumentViewerState('pdf'));
+    assert.equal(fresh.page, 1, 'the user can opt out of keeping reading positions');
+  } finally { shell.destroy(); }
+});
+
+test('DOCUMENT SETTINGS: Files and open document viewers link to document/projector preferences', async () => {
+  const { shell, container } = await bootShell();
+  try {
+    const filesPage = document.createElement('div');
+    shell.renderInternalDocumentsPage(filesPage);
+    const filesSettings = filesPage.querySelector('.fb-documents-header-actions')?.querySelector('button');
+    assert.ok(filesSettings, 'Files exposes a Settings entry point');
+    filesSettings.click();
+    assert.equal(shell.state.settingsActiveCategory, 'documents');
+
+    shell.state.tabs[0].url = 'https://example.test';
+    shell.addDocumentTab({ name: 'note.txt', bytes: new Uint8Array([65]) });
+    shell.render(container);
+    const viewerSettings = container.querySelector('.fb-doc-settings-btn');
+    assert.ok(viewerSettings, 'document viewer has a Settings button');
+    viewerSettings.click();
+    assert.equal(shell.state.settingsActiveCategory, 'documents', 'the viewer button opens relevant settings');
+    const settingsPage = document.createElement('div');
+    shell.renderInternalSettingsPage(settingsPage);
+    assert.ok(settingsPage.querySelector('#fb-in-documents-remember-position'));
+    assert.ok(settingsPage.querySelector('#fb-in-documents-default-zoom'));
+    assert.ok(settingsPage.querySelector('#fb-in-documents-night-default'));
+    assert.ok(settingsPage.querySelector('#fb-in-pptx-projector-display'));
+  } finally { shell.destroy(); container.remove(); }
+});
+
+test('PPTX resume: the viewer honours a saved slide number when opening the deck', async () => {
+  const state = createDocumentViewerState('pptx');
+  state.page = 13;
+  const viewer = createPptxViewer({
+    container: null,
+    state,
+    moduleLoader: async () => ({
+      openPptxDeck: async () => ({
+        slideCount: 20, slideWidth: 1280, slideHeight: 720,
+        getSlide: async (page) => ({ slideNumber: page, text: `Slide ${page}`, shapes: [] }),
+        ensureSlideMedia: async () => {}, dispose() {}
+      })
+    })
+  });
+  await viewer.load(new Uint8Array([1, 2, 3]));
+  assert.equal(state.page, 13, 'opening a PPTX does not reset its saved slide to slide one');
+  viewer.destroy();
+});
+
 test('TAB INTEGRATION: a shell re-render during PDF loading keeps the new viewer mount attached', async () => {
   const { shell, container } = await bootShell();
   let finishLoad;
