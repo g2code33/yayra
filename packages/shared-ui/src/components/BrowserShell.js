@@ -522,6 +522,7 @@ export class BrowserShell {
         // these fields control only how this profile presents/manages it.
         pptxNotesColor: DEFAULT_PPTX_NOTES_COLOR,
         pptxSlideshowFullscreen: true,
+        pptxPresenterView: false,
         pptxProjectorDisplayId: 'current',
         pptxSlideshowAutoHideControls: true,
         documentsDefaultSort: 'opened',
@@ -743,6 +744,7 @@ export class BrowserShell {
     // suppresses web/PWA window.open fallbacks so these controls can never
     // launch the user's external browser.
     this._inAppOnlyGoogleTabs = new Set();
+    this._ownedMediaUrlsByTab = new Map();
     this._nativeWebviewResizeObservers = new Map();
     this._lastAppliedNativePointerConfig = null;
     this._lastAppliedAndroidPointerConfig = null;
@@ -6167,6 +6169,34 @@ export class BrowserShell {
     return false;
   }
 
+  async openBlobMediaInNewTab(sourceUrl, mediaType = 'image', sourceTab = this.getActiveTab()) {
+    const expected = mediaType === 'video' ? 'video/' : 'image/';
+    try {
+      const parsed = new URL(sourceUrl);
+      const currentOrigin = typeof location !== 'undefined' ? location.origin : '';
+      if (parsed.protocol !== 'blob:' || (parsed.origin && currentOrigin && parsed.origin !== currentOrigin)) throw new Error('foreign blob origin');
+      const response = await fetch(sourceUrl);
+      if (!response.ok) throw new Error('media unavailable');
+      const blob = await response.blob();
+      if (!blob.size || blob.size > 100 * 1024 * 1024 || !String(blob.type || '').toLowerCase().startsWith(expected)) {
+        throw new Error('unsupported or oversized media');
+      }
+      const stableUrl = URL.createObjectURL(blob);
+      const tab = this.createNewTab(Boolean(sourceTab?.isPrivate), {
+        afterTabId: sourceTab?.id || null,
+        group: sourceTab?.group || null,
+        render: false
+      });
+      this._ownedMediaUrlsByTab.set(tab.id, stableUrl);
+      this.navigateActiveTab(`yayra://image?kind=${encodeURIComponent(mediaType)}&src=${encodeURIComponent(stableUrl)}`);
+      this.showTransientNotice(mediaType === 'video' ? 'Video opened in a new tab.' : 'Image opened in a new tab.');
+      return true;
+    } catch {
+      this.showTransientNotice(`Could not open this ${mediaType} in a new tab. The original document may have released its media.`);
+      return false;
+    }
+  }
+
   handleShellContextMenuAction(evt) {
     if (evt?.type === 'context-menu-navigation') {
       if (evt.direction === 'back') this.goBack();
@@ -6176,6 +6206,10 @@ export class BrowserShell {
     }
     if (evt?.type !== 'new-window-request' || typeof evt.url !== 'string' || !evt.url) return;
     const source = this.getActiveTab();
+    if (/^blob:/i.test(evt.url) && ['image', 'video'].includes(evt.mediaType)) {
+      void this.openBlobMediaInNewTab(evt.url, evt.mediaType, source);
+      return;
+    }
     if (this.handleDictionaryLookupRequest(evt.url, source)) return;
     this.createNewTab(Boolean(source?.isPrivate), {
       afterTabId: source?.id || null,
@@ -8808,13 +8842,47 @@ export class BrowserShell {
       const mode = document.createElement('select'); mode.className = 'fb-dict-input'; mode.setAttribute('aria-label', 'Result display mode');
       for (const [value, label] of [['separate', 'Separate sources'], ['combined', 'Combine same-word sources']]) { const option = document.createElement('option'); option.value = value; option.textContent = label; mode.appendChild(option); }
       mode.value = route.searchParams.get('mode') === 'combined' ? 'combined' : 'separate';
-      void this.getDictionaryLibrary().store.getActivePacks().then((packs) => {
-        for (const pack of packs) { const option = document.createElement('option'); option.value = pack.id; option.textContent = pack.title; sourcePack.appendChild(option); }
+      let installedPacks = [];
+      const categoryLabel = (value) => ({ general: 'General English', medical: 'Medical', pharmacy: 'Pharmacy', business: 'Business' }[value] || value);
+      const refreshPackOptions = (selectedId = 'all') => {
+        while (sourcePack.firstChild || sourcePack.children?.length) {
+          const child = sourcePack.firstChild || sourcePack.children[0];
+          if (!child) break;
+          sourcePack.removeChild(child);
+        }
+        const categoryPacks = category.value === 'all'
+          ? installedPacks
+          : installedPacks.filter((pack) => pack.category === category.value);
+        const all = document.createElement('option');
+        all.value = 'all';
+        all.textContent = category.value === 'all' ? 'All installed packs' : `All installed ${categoryLabel(category.value)} packs`;
+        sourcePack.appendChild(all);
+        if (!categoryPacks.length && category.value !== 'all') {
+          const empty = document.createElement('option');
+          empty.value = ''; empty.textContent = `No ${categoryLabel(category.value)} packs installed`;
+          empty.disabled = true; sourcePack.appendChild(empty);
+          sourcePack.value = 'all'; sourcePack.disabled = true;
+          sourcePack.setAttribute('aria-label', `No installed dictionary packs in ${categoryLabel(category.value)} category`);
+          return false;
+        }
+        sourcePack.disabled = false;
+        sourcePack.setAttribute('aria-label', category.value === 'all' ? 'Filter by source pack' : `Filter by installed ${categoryLabel(category.value)} pack`);
+        for (const pack of categoryPacks) {
+          const option = document.createElement('option'); option.value = pack.id; option.textContent = pack.title; sourcePack.appendChild(option);
+        }
+        sourcePack.value = categoryPacks.some((pack) => pack.id === selectedId) ? selectedId : 'all';
+        return true;
+      };
+      const installedPacksPromise = this.getDictionaryLibrary().store.getActivePacks().then((packs) => {
+        installedPacks = Array.isArray(packs) ? packs : [];
         const requestedPack = route.searchParams.get('pack');
-        const requestedPackInstalled = packs.some((pack) => pack.id === requestedPack);
-        sourcePack.value = requestedPack && requestedPackInstalled ? requestedPack : 'all';
-        if (requestedPack && !requestedPackInstalled && input.value.trim()) searchWithCurrentFilters();
-      }).catch(() => {});
+        const requestedPackInstalled = installedPacks.some((pack) => pack.id === requestedPack
+          && (category.value === 'all' || pack.category === category.value));
+        refreshPackOptions(requestedPackInstalled ? requestedPack : 'all');
+      }).catch(() => {
+        installedPacks = [];
+        refreshPackOptions('all');
+      });
       const searchButton = document.createElement('button'); searchButton.type = 'submit'; searchButton.className = 'fb-dict-btn primary'; searchButton.textContent = 'Search';
       const filterDetails = document.createElement('details'); filterDetails.className = 'fb-dict-filters';
       filterDetails.open = Boolean(route.searchParams.get('category') || route.searchParams.get('pack') || route.searchParams.get('mode'));
@@ -8851,7 +8919,12 @@ export class BrowserShell {
         event.preventDefault();
         searchWithCurrentFilters();
       });
-      for (const filter of [category, sourcePack, mode]) {
+      category.addEventListener('change', () => {
+        const hasCategoryPacks = refreshPackOptions(sourcePack.value);
+        if (!hasCategoryPacks) status.textContent = `No installed ${categoryLabel(category.value)} dictionary packs. Install a pack in Packs to search this category.`;
+        if (input.value.trim()) searchWithCurrentFilters();
+      });
+      for (const filter of [sourcePack, mode]) {
         filter.addEventListener('change', () => {
           if (input.value.trim()) searchWithCurrentFilters();
         });
@@ -8861,8 +8934,9 @@ export class BrowserShell {
         void (async () => {
           status.textContent = 'Searching installed packs on this device…';
           try {
+            await installedPacksPromise;
             const filters = category.value === 'all' ? {} : { categories: [category.value] };
-            const packFilter = route.searchParams.get('pack');
+            const packFilter = sourcePack.value === 'all' ? '' : sourcePack.value;
             const result = await this.getDictionaryLibrary().search(initialQuery, {
               ...filters,
               ...(packFilter ? { packIds: [packFilter] } : {}),
@@ -9661,6 +9735,10 @@ export class BrowserShell {
               <div><strong>Start slideshows in true fullscreen</strong><p>Use the entire display for a projector when browser fullscreen permission is available.</p></div>
               <input type="checkbox" id="fb-in-pptx-fullscreen" ${this.state.settings.pptxSlideshowFullscreen !== false ? 'checked' : ''} />
             </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Presenter view with next-slide preview</strong><p>Keep presenter controls on this display and show only the current slide on the selected external projector.</p></div>
+              <input type="checkbox" id="fb-in-pptx-presenter-view" ${this.state.settings.pptxPresenterView === true ? 'checked' : ''} />
+            </div>
             <div class="fb-setting-row">
               <label for="fb-in-pptx-projector-display">Projector display</label>
               <div style="display:flex; gap:8px; flex:1; min-width:0;">
@@ -9670,7 +9748,7 @@ export class BrowserShell {
                 <button type="button" class="fb-btn" id="fb-in-pptx-refresh-displays">Detect displays</button>
               </div>
             </div>
-            <p id="fb-pptx-projector-help">Choose an external monitor for the next slideshow. Yayra restores this window to its previous display and size when the presentation ends.</p>
+            <p id="fb-pptx-projector-help">Choose an external monitor for the audience display. With Presenter view enabled, this window stays with you and only the current slide is projected.</p>
             <div class="fb-setting-toggle-row">
               <div><strong>Auto-hide slideshow controls</strong><p>Hide projector controls after a short idle period; move the pointer to bring them back.</p></div>
               <input type="checkbox" id="fb-in-pptx-autohide" ${this.state.settings.pptxSlideshowAutoHideControls !== false ? 'checked' : ''} />
@@ -9990,6 +10068,7 @@ export class BrowserShell {
     bindToggle('#fb-in-documents-night-default', (on) => { this.state.settings.documentsDefaultNightMode = on; });
     bindSelect('#fb-in-documents-default-zoom', (value) => { this.state.settings.documentsDefaultZoom = ['fit-width', 'fit-page', '100'].includes(value) ? value : 'fit-width'; });
     bindToggle('#fb-in-pptx-fullscreen', (on) => { this.state.settings.pptxSlideshowFullscreen = on; });
+    bindToggle('#fb-in-pptx-presenter-view', (on) => { this.state.settings.pptxPresenterView = on; });
     bindSelect('#fb-in-pptx-projector-display', (value) => { this.state.settings.pptxProjectorDisplayId = value || 'current'; });
     bindToggle('#fb-in-pptx-autohide', (on) => { this.state.settings.pptxSlideshowAutoHideControls = on; });
     const projectorDisplaySelect = page.querySelector('#fb-in-pptx-projector-display');
@@ -10027,7 +10106,9 @@ export class BrowserShell {
         }
         projectorDisplaySelect.disabled = false;
         if (projectorHelp) projectorHelp.textContent = displays?.length > 1
-          ? 'Choose an external monitor for the next slideshow. Yayra restores this window to its previous display and size when the presentation ends.'
+          ? (this.state.settings.pptxPresenterView === true
+            ? 'Presenter view keeps your controls and next-slide preview here while the selected external display shows only the current slide.'
+            : 'Choose an external monitor for the next slideshow. Yayra restores this window to its previous display and size when the presentation ends.')
           : 'Only one display is connected. Connect a projector or monitor, then choose Detect displays.';
       } catch {
         if (projectorHelp) projectorHelp.textContent = 'Could not detect displays. Reconnect the projector and try Detect displays.';
@@ -11314,17 +11395,22 @@ export class BrowserShell {
     const page = document.createElement('div');
     page.className = 'fb-internal-page fb-local-image-page';
     let source = '';
+    let kind = 'image';
     try {
-      source = new URLSearchParams(String(activeTab?.url || '').split('?')[1] || '').get('src') || '';
+      const params = new URLSearchParams(String(activeTab?.url || '').split('?')[1] || '');
+      source = params.get('src') || '';
+      kind = params.get('kind') === 'video' ? 'video' : 'image';
     } catch { /* malformed copied URL */ }
     const allowed = source.length <= 2_000_000 && (
       /^blob:/i.test(source)
-      || /^data:image\/(?:png|jpe?g|gif|webp|bmp|avif|svg\+xml)(?:;[^,]*)?,/i.test(source)
+      || (kind === 'video'
+        ? /^data:video\/(?:mp4|webm|ogg)(?:;[^,]*)?,/i.test(source)
+        : /^data:image\/(?:png|jpe?g|gif|webp|bmp|avif|svg\+xml)(?:;[^,]*)?,/i.test(source))
       || (() => {
         try {
           const local = new URL(source);
-          return local.protocol === 'file:' && !local.username && !local.password
-            && /\.(?:png|jpe?g|gif|webp|bmp|avif|svg)$/i.test(local.pathname);
+          const extension = kind === 'video' ? /\.(?:mp4|webm|ogv)$/i : /\.(?:png|jpe?g|gif|webp|bmp|avif|svg)$/i;
+          return local.protocol === 'file:' && !local.username && !local.password && extension.test(local.pathname);
         } catch { return false; }
       })()
     );
@@ -11336,20 +11422,27 @@ export class BrowserShell {
       notice.textContent = 'This image address is invalid or is no longer available. Blob image addresses only last for the current Yayra session.';
       container.appendChild(notice);
     } else {
-      const image = document.createElement('img');
-      image.className = 'fb-local-image';
-      image.alt = 'Image opened from a local document';
-      image.draggable = false;
-      image.referrerPolicy = 'no-referrer';
-      image.addEventListener('error', () => {
-        image.remove();
+      const media = document.createElement(kind === 'video' ? 'video' : 'img');
+      media.className = 'fb-local-image';
+      if (kind === 'video') {
+        media.controls = true;
+        media.playsInline = true;
+        media.preload = 'metadata';
+        media.setAttribute('aria-label', 'Video opened from a local document');
+      } else {
+        media.alt = 'Image opened from a local document';
+        media.draggable = false;
+        media.referrerPolicy = 'no-referrer';
+      }
+      media.addEventListener('error', () => {
+        media.remove();
         const notice = document.createElement('p');
         notice.className = 'fb-local-image-notice';
-        notice.textContent = 'Yayra could not reopen this image. The original image address may only be available in the tab or document where it was created.';
+        notice.textContent = `Yayra could not reopen this ${kind}. The original media address may only be available in the tab or document where it was created.`;
         container.appendChild(notice);
       }, { once: true });
-      image.src = source;
-      container.appendChild(image);
+      media.src = source;
+      container.appendChild(media);
     }
     page.appendChild(container);
     viewport.appendChild(page);
@@ -17206,6 +17299,7 @@ export class BrowserShell {
         ${profilesHtml}
         <div class="fb-account-dropdown-actions">
           <button class="fb-btn fb-btn-primary fb-account-services-btn" style="width:100%; justify-content:flex-start;">${Icons.google} Google services in Yayra</button>
+          <button class="fb-btn fb-btn-secondary fb-account-google-btn" style="width:100%; justify-content:flex-start;">${Icons.google} Google</button>
           <button class="fb-btn fb-btn-secondary fb-account-manage-btn" style="width:100%; justify-content:flex-start;">${Icons.externalLink} Manage Google Account</button>
           <button class="fb-btn fb-btn-secondary fb-account-settings-btn" style="width:100%; justify-content:flex-start;">${Icons.info} Yayra account settings</button>
           <button class="fb-btn fb-btn-secondary fb-account-switch-btn" style="width:100%; justify-content:flex-start;">${Icons.userCircle} Switch account</button>
@@ -17231,6 +17325,7 @@ export class BrowserShell {
         <div class="fb-account-dropdown-actions">
           <button class="fb-btn fb-btn-primary fb-account-signin-btn" style="width:100%;" ${isSigningIn ? 'disabled' : ''}>${isSigningIn ? 'Signing in&hellip;' : 'Sign in to Google services'}</button>
           <button class="fb-btn fb-btn-secondary fb-account-services-btn" style="width:100%; justify-content:flex-start;">${Icons.google} Open Google services</button>
+          <button class="fb-btn fb-btn-secondary fb-account-google-btn" style="width:100%; justify-content:flex-start;">${Icons.google} Google</button>
           <button class="fb-btn fb-btn-secondary fb-account-settings-btn" style="width:100%; justify-content:flex-start;">${Icons.info} Yayra account settings</button>
         </div>
       `;
@@ -17249,6 +17344,11 @@ export class BrowserShell {
     dropdown.querySelector('.fb-account-services-btn')?.addEventListener('click', () => {
       this.state.isAccountMenuOpen = false;
       this.openInternalPage('yayra://google-services');
+    });
+    dropdown.querySelector('.fb-account-google-btn')?.addEventListener('click', () => {
+      this.state.isAccountMenuOpen = false;
+      this.createNewTab(Boolean(this.getActiveTab()?.isPrivate), { render: false });
+      this.navigateActiveTab('https://www.google.com/');
     });
     dropdown.querySelector('.fb-account-switch-btn')?.addEventListener('click', () => this.switchGoogleAccount());
     dropdown.querySelector('.fb-account-signout-btn')?.addEventListener('click', () => this.signOutOfGoogle());
@@ -20283,6 +20383,8 @@ export class BrowserShell {
     this._gmailViews.delete(tabId);
     this._inAppOnlyGoogleTabs.delete(tabId);
     this._pageSnapshots.delete(tabId); // closed tab, dead preview
+    const ownedMediaUrl = this._ownedMediaUrlsByTab.get(tabId);
+    if (ownedMediaUrl) { try { URL.revokeObjectURL(ownedMediaUrl); } catch { /* already released */ } this._ownedMediaUrlsByTab.delete(tabId); }
 
     const [closedTab] = this.state.tabs.splice(tabIndex, 1);
     this.persistDocumentViewingProgress(closedTab, { immediate: true });
@@ -20825,14 +20927,16 @@ export class BrowserShell {
         try { imageSource = new URL(trimmed).protocol === 'blob:'; } catch { imageSource = false; }
       } else if (/^data:image\/(?:png|jpe?g|gif|webp|bmp|avif|svg\+xml)(?:;[^,]*)?,/i.test(trimmed)) {
         imageSource = true;
+      } else if (/^data:video\/(?:mp4|webm|ogg)(?:;[^,]*)?,/i.test(trimmed)) {
+        imageSource = true;
       } else if (/^file:/i.test(trimmed)) {
         try {
           const local = new URL(trimmed);
           imageSource = local.protocol === 'file:' && !local.username && !local.password
-            && /\.(?:png|jpe?g|gif|webp|bmp|avif|svg)$/i.test(local.pathname);
+            && /\.(?:png|jpe?g|gif|webp|bmp|avif|svg|mp4|m4v|mov|webm|ogv|ogg)$/i.test(local.pathname);
         } catch { imageSource = false; }
       }
-      if (imageSource) return `yayra://image?src=${encodeURIComponent(trimmed)}`;
+      if (imageSource) return `yayra://image?${/^data:video\//i.test(trimmed) || /^file:.*\.(?:mp4|m4v|mov|webm|ogv|ogg)(?:[?#]|$)/i.test(trimmed) ? 'kind=video&' : ''}src=${encodeURIComponent(trimmed)}`;
     }
     if (trimmed === 'settings') return 'yayra://settings';
     if (trimmed === 'google' || trimmed === 'google services' || trimmed === 'google-services') return 'yayra://google-services';
@@ -24739,6 +24843,21 @@ export class BrowserShell {
     surface.className = 'fb-pptx-slideshow-surface';
     const host = document.createElement('div');
     host.className = 'fb-document-slideshow-host fb-pptx-slideshow-host';
+    const nextPreview = document.createElement('aside');
+    nextPreview.className = 'fb-pptx-presenter-preview';
+    nextPreview.hidden = true;
+    nextPreview.setAttribute('aria-label', 'Next slide preview');
+    const nextHeading = document.createElement('strong');
+    nextHeading.className = 'fb-pptx-presenter-preview-heading';
+    nextHeading.textContent = 'Up next';
+    const nextStage = document.createElement('div');
+    nextStage.className = 'fb-pptx-presenter-preview-stage';
+    nextPreview.appendChild(nextHeading);
+    nextPreview.appendChild(nextStage);
+    const nextCaption = document.createElement('span');
+    nextCaption.className = 'fb-pptx-presenter-preview-caption';
+    nextCaption.textContent = 'Slide 2';
+    nextPreview.appendChild(nextCaption);
     const blank = document.createElement('div');
     blank.className = 'fb-pptx-slideshow-blank';
     blank.hidden = true;
@@ -24751,6 +24870,7 @@ export class BrowserShell {
     laser.hidden = true;
     laser.setAttribute('aria-hidden', 'true');
     surface.appendChild(host);
+    surface.appendChild(nextPreview);
     surface.appendChild(ink);
     surface.appendChild(laser);
     surface.appendChild(blank);
@@ -24898,6 +25018,10 @@ export class BrowserShell {
       navigator,
       viewer,
       session,
+      presenterView: false,
+      nextPreview,
+      nextStage,
+      nextCaption,
       tabId,
       documentKind,
       isPowerPoint,
@@ -24914,6 +25038,9 @@ export class BrowserShell {
       hideTimer: null,
       resizeTimer: null,
       jumpTimer: null,
+      projectionTimer: null,
+      projectionCaptureInProgress: false,
+      projectionDirty: false,
       wheelAt: 0,
       enteredFullscreen: false,
       projectorWindowMoved: false,
@@ -24927,11 +25054,25 @@ export class BrowserShell {
     tab.docState.slideshowMode = true;
 
     const projectorDisplayId = String(this.state.settings.pptxProjectorDisplayId || 'current');
-    if (projectorDisplayId !== 'current' && typeof this.windowControls?.moveToDisplay === 'function') {
+    const presenterRequested = isPowerPoint && this.state.settings.pptxPresenterView === true
+      && projectorDisplayId !== 'current'
+      && typeof this.windowControls?.openProjection === 'function'
+      && typeof this.windowControls?.captureProjectionFrame === 'function';
+    if (presenterRequested) {
+      try {
+        show.presenterView = Boolean(await this.windowControls.openProjection(projectorDisplayId));
+      } catch { show.presenterView = false; }
+    }
+    if (show.presenterView) {
+      overlay.classList.add('is-presenter-view');
+      nextPreview.hidden = false;
+      show.presenterProjectionOpen = true;
+    } else if (projectorDisplayId !== 'current' && typeof this.windowControls?.moveToDisplay === 'function') {
       try { show.projectorWindowMoved = Boolean(await this.windowControls.moveToDisplay(projectorDisplayId)); }
       catch { show.projectorWindowMoved = false; }
+      if (presenterRequested) this.showTransientNotice('Presenter view could not open the projector. The slideshow opened on the selected display instead.');
     }
-    const fullscreenWanted = this.state.settings.pptxSlideshowFullscreen !== false;
+    const fullscreenWanted = !show.presenterView && this.state.settings.pptxSlideshowFullscreen !== false;
     let fullscreenPromise = null;
     if (fullscreenWanted && typeof overlay.requestFullscreen === 'function') {
       try {
@@ -24961,6 +25102,42 @@ export class BrowserShell {
         context.lineJoin = 'round';
       }
     };
+    const queueProjectionFrame = () => {
+      if (!show.presenterView || !show.active || typeof this.windowControls?.captureProjectionFrame !== 'function') return;
+      if (show.projectionTimer || show.projectionCaptureInProgress) {
+        show.projectionDirty = true;
+        return;
+      }
+      show.projectionTimer = setTimeout(async () => {
+        show.projectionTimer = null;
+        if (!show.active || !show.presenterView) return;
+        const frameTarget = host.querySelector?.('.fb-pptx-stage') || host;
+        const rect = frameTarget.getBoundingClientRect?.();
+        if (!rect || rect.width < 1 || rect.height < 1) return;
+        show.projectionCaptureInProgress = true;
+        const hidden = [];
+        for (const element of overlay.querySelectorAll?.('.fb-pptx-slideshow-chrome, .fb-pptx-slideshow-dialog, .fb-pptx-presenter-preview, .fb-pptx-notes') || []) {
+          hidden.push([element, element.style?.visibility || '']);
+          if (element.style) element.style.visibility = 'hidden';
+        }
+        try {
+          await this.windowControls.captureProjectionFrame({
+            x: Math.max(0, rect.left), y: Math.max(0, rect.top),
+            width: rect.width, height: rect.height
+          });
+        } catch { /* the presenter view remains available if the projector disconnects */ }
+        finally {
+          for (const [element, visibility] of hidden) {
+            if (element.style) element.style.visibility = visibility;
+          }
+          show.projectionCaptureInProgress = false;
+          if (show.projectionDirty && show.active) {
+            show.projectionDirty = false;
+            queueProjectionFrame();
+          }
+        }
+      }, 90);
+    };
     const syncSlideshow = () => {
       if (!show.active) return;
       const page = Number(session.state.page || 1);
@@ -24972,6 +25149,13 @@ export class BrowserShell {
       nextButton.disabled = page >= Number(session.state.numPages || 1);
       notesButton?.classList?.toggle('is-active', Boolean(session.state.showNotes));
       notesButton?.setAttribute?.('aria-pressed', String(Boolean(session.state.showNotes)));
+      if (show.presenterView && isPowerPoint) {
+        const nextPage = page + 1;
+        show.nextCaption.textContent = nextPage <= Number(session.state.numPages || 1) ? `Slide ${nextPage}` : 'End of presentation';
+        show.nextStage.textContent = '';
+        if (nextPage <= Number(session.state.numPages || 1)) void viewer.renderThumbnail?.(nextPage, show.nextStage);
+        queueProjectionFrame();
+      }
       if (show.lastPage !== page) {
         show.lastPage = page;
         clearInk();
@@ -25011,6 +25195,7 @@ export class BrowserShell {
       if (show.pointerMode === 'hidden') overlay.style.setProperty('cursor', 'none', 'important');
       else if (typeof overlay.style.removeProperty === 'function') overlay.style.removeProperty('cursor');
       else overlay.style.setProperty('cursor', '');
+      if (show.pointerMode === 'laser') queueProjectionFrame();
       reveal();
     }
 
@@ -25024,6 +25209,7 @@ export class BrowserShell {
       blackButton.textContent = next === 'white' ? 'White' : 'Black';
       blackButton.title = next ? `Resume the ${pageNoun} show` : 'Toggle black screen (B or period)';
       blackButton.setAttribute('aria-label', blackButton.title);
+      queueProjectionFrame();
       reveal();
     }
 
@@ -25077,6 +25263,7 @@ export class BrowserShell {
         laser.hidden = false;
         laser.style.left = `${event.clientX}px`;
         laser.style.top = `${event.clientY}px`;
+        queueProjectionFrame();
       }
     };
     const localInkPoint = (event) => {
@@ -25101,6 +25288,7 @@ export class BrowserShell {
         context.stroke();
       }
       show.lastPoint = next;
+      queueProjectionFrame();
       event.preventDefault();
     };
     const stopInk = (event) => {
@@ -25256,6 +25444,7 @@ export class BrowserShell {
     await viewer.fitToPage?.();
     sizeInk();
     syncSlideshow();
+    if (show.presenterView) queueProjectionFrame();
     reveal();
     overlay.focus?.();
     await fullscreenPromise;
@@ -25273,6 +25462,10 @@ export class BrowserShell {
     show.active = false;
     this._documentSlideshow = null;
     this._pptxSlideshow = null;
+    if (show.projectionTimer) clearTimeout(show.projectionTimer);
+    if (show.presenterProjectionOpen && typeof this.windowControls?.closeProjection === 'function') {
+      try { await this.windowControls.closeProjection(); } catch { /* projector may already be closed */ }
+    }
     for (const cleanup of show.cleanup || []) {
       try { cleanup(); } catch { /* teardown is best effort */ }
     }
@@ -25877,6 +26070,8 @@ export class BrowserShell {
         try { window.removeEventListener('unhandledrejection', this._errorShieldOnRejection); } catch { /* shim */ }
       }
     }
+    for (const url of this._ownedMediaUrlsByTab?.values?.() || []) { try { URL.revokeObjectURL(url); } catch { /* already released */ } }
+    this._ownedMediaUrlsByTab?.clear?.();
     this.stopBackgroundUpdateChecks();
     this.stopBackgroundRefresh();
     if (this._renderFallbackTimer) {

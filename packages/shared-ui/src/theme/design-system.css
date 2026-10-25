@@ -10581,6 +10581,73 @@ button.fb-site-passkey-indicator {
   padding: 0;
 }
 
+.fb-pptx-slideshow.is-presenter-view .fb-pptx-slideshow-host {
+  inset: 54px auto 70px 0;
+  width: 70%;
+  height: auto;
+}
+
+.fb-pptx-slideshow.is-presenter-view .fb-pptx-slideshow-host .fb-pptx-stage {
+  max-width: 100%;
+  max-height: 100%;
+}
+
+.fb-pptx-presenter-preview {
+  position: absolute;
+  top: 50%;
+  right: clamp(18px, 3vw, 48px);
+  display: flex;
+  width: min(25vw, 420px);
+  max-height: 78vh;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px;
+  border: 1px solid rgba(148, 163, 184, .24);
+  border-radius: 18px;
+  background: rgba(15, 18, 27, .94);
+  box-shadow: 0 24px 65px rgba(0, 0, 0, .42);
+  transform: translateY(-50%);
+}
+
+.fb-pptx-presenter-preview[hidden] { display: none !important; }
+
+.fb-pptx-presenter-preview-heading {
+  color: #c7d2fe;
+  font-size: .85rem;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.fb-pptx-presenter-preview-stage {
+  display: grid;
+  min-height: 100px;
+  aspect-ratio: 16 / 9;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 10px;
+  background: #050505;
+}
+
+.fb-pptx-presenter-preview-stage .fb-pptx-stage {
+  max-width: 100% !important;
+  max-height: 100% !important;
+  box-shadow: none !important;
+}
+
+.fb-pptx-presenter-preview-caption {
+  color: #cbd5e1;
+  font-size: .8rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.fb-pptx-slideshow.is-presenter-view .fb-pptx-slideshow-top,
+.fb-pptx-slideshow.is-presenter-view .fb-pptx-slideshow-controls {
+  left: 35%;
+}
+
+.fb-pptx-slideshow.is-presenter-view .fb-pptx-slideshow-title { max-width: 50vw; }
+
 .fb-pptx-slideshow-host .fb-pptx-reader {
   position: relative;
   width: 100% !important;
@@ -10894,6 +10961,10 @@ button.fb-site-passkey-indicator {
 }
 
 @media (max-width: 700px) {
+  .fb-pptx-slideshow.is-presenter-view .fb-pptx-slideshow-host { inset: 48px 8px auto; width: auto; height: 54vh; }
+  .fb-pptx-presenter-preview { top: auto; right: 12px; bottom: 64px; width: min(42vw, 300px); max-height: 30vh; padding: 9px; gap: 6px; transform: none; }
+  .fb-pptx-slideshow.is-presenter-view .fb-pptx-slideshow-top,
+  .fb-pptx-slideshow.is-presenter-view .fb-pptx-slideshow-controls { left: 50%; }
   .fb-pptx-slideshow-top { top: 7px; }
   .fb-pptx-slideshow-controls { bottom: 7px; }
   .fb-pptx-slideshow-button { padding-inline: 8px; }

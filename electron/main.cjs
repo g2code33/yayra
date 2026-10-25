@@ -53,6 +53,7 @@ const MAX_DOCUMENT_BYTES = 300 * 1024 * 1024;
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 let mainWindow;
 const projectorWindowRestoreStates = new Map();
+const externalProjectionWindows = new Map();
 const contextMenuNavigationStates = new WeakMap();
 let downloadsBridge = null;
 // Yayra-owned real Chrome profile for genuinely signed-in Google websites.
@@ -1136,6 +1137,81 @@ function registerIpcBridges() {
       return true;
     } catch { return false; }
   });
+  ipcMain.handle('yayra:projection-open', async (event, { displayId } = {}) => {
+    const owner = senderWindow(event);
+    if (!owner || displayId == null || String(displayId) === 'current') return false;
+    const key = event.sender.id;
+    const existing = externalProjectionWindows.get(key);
+    if (existing?.window && !existing.window.isDestroyed()) {
+      existing.window.focus();
+      return true;
+    }
+    let display;
+    try { display = screen.getAllDisplays().find((item) => String(item.id) === String(displayId)); } catch { return false; }
+    const bounds = display?.bounds;
+    if (!bounds || !Number(bounds.width) || !Number(bounds.height)) return false;
+    let projector;
+    try {
+      projector = new BrowserWindow({
+        x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height,
+        frame: false, show: false, backgroundColor: '#000000', fullscreen: true,
+        webPreferences: {
+          preload: path.join(__dirname, 'projectorPreload.cjs'),
+          contextIsolation: true, nodeIntegration: false, sandbox: true,
+          backgroundThrottling: false
+        }
+      });
+      const state = { window: projector, latestFrame: '' };
+      externalProjectionWindows.set(key, state);
+      projector.on('closed', () => {
+        if (externalProjectionWindows.get(key) === state) externalProjectionWindows.delete(key);
+      });
+      owner.once('destroyed', () => {
+        try { if (!projector.isDestroyed()) projector.close(); } catch { /* app is closing */ }
+      });
+      projector.webContents.on('did-finish-load', () => {
+        if (state.latestFrame && !projector.isDestroyed()) projector.webContents.send('yayra:projector-frame', state.latestFrame);
+        try { projector.setFullScreen(true); } catch { /* bounds still cover the selected display */ }
+        if (!projector.isDestroyed()) projector.show();
+        if (!owner.isDestroyed()) owner.focus();
+      });
+      await projector.loadFile(path.join(__dirname, 'projector.html'));
+      return true;
+    } catch (error) {
+      externalProjectionWindows.delete(key);
+      try { if (projector && !projector.isDestroyed()) projector.close(); } catch { /* failed window */ }
+      console.warn('[yayra] Could not open external projector window:', error?.message || error);
+      return false;
+    }
+  });
+  ipcMain.handle('yayra:projection-capture-frame', async (event, { bounds } = {}) => {
+    const owner = senderWindow(event);
+    const projection = externalProjectionWindows.get(event.sender.id);
+    if (!owner || !projection?.window || projection.window.isDestroyed()) return false;
+    const x = Math.max(0, Math.floor(Number(bounds?.x) || 0));
+    const y = Math.max(0, Math.floor(Number(bounds?.y) || 0));
+    const width = Math.min(8192, Math.floor(Number(bounds?.width) || 0));
+    const height = Math.min(8192, Math.floor(Number(bounds?.height) || 0));
+    if (!width || !height || width * height > 25_000_000) return false;
+    try {
+      const image = await owner.webContents.capturePage({ x, y, width, height });
+      if (!image || image.isEmpty?.()) return false;
+      const frame = `data:image/png;base64,${image.toPNG().toString('base64')}`;
+      if (frame.length > 36_000_000) return false;
+      projection.latestFrame = frame;
+      if (!projection.window.isDestroyed() && projection.window.webContents.isLoading() === false) {
+        projection.window.webContents.send('yayra:projector-frame', frame);
+      }
+      return true;
+    } catch { return false; }
+  });
+  ipcMain.handle('yayra:projection-close', (event) => {
+    const key = event.sender.id;
+    const projection = externalProjectionWindows.get(key);
+    externalProjectionWindows.delete(key);
+    try { if (projection?.window && !projection.window.isDestroyed()) projection.window.close(); } catch { /* already closed */ }
+    return Boolean(projection);
+  });
   ipcMain.handle('yayra:window-close', (event) => {
     senderWindow(event)?.close();
   });
@@ -1988,7 +2064,7 @@ async function createProfileWindow(profileId, initialUrl = null, { isPrivate = f
       tabId: null,
       send: (_tabId, type, payload) => {
         if (type === 'new-window-request' && payload?.url) {
-          win.webContents.send(CONTEXT_MENU_ACTION_CHANNEL, { type, url: payload.url });
+          win.webContents.send(CONTEXT_MENU_ACTION_CHANNEL, { type, url: payload.url, ...(payload.mediaType ? { mediaType: payload.mediaType } : {}) });
         } else if (type === 'context-menu-navigation') {
           win.webContents.send(CONTEXT_MENU_ACTION_CHANNEL, { type, direction: payload?.direction });
         }
@@ -2079,7 +2155,7 @@ function createWindow() {
       tabId: null,
       send: (_tabId, type, payload) => {
         if (type === 'new-window-request' && payload?.url) {
-          win.webContents.send(CONTEXT_MENU_ACTION_CHANNEL, { type, url: payload.url });
+          win.webContents.send(CONTEXT_MENU_ACTION_CHANNEL, { type, url: payload.url, ...(payload.mediaType ? { mediaType: payload.mediaType } : {}) });
         } else if (type === 'context-menu-navigation') {
           win.webContents.send(CONTEXT_MENU_ACTION_CHANNEL, { type, direction: payload?.direction });
         }

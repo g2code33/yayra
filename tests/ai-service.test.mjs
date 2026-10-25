@@ -233,6 +233,31 @@ test('Shell: local blob image addresses open in Yayra instead of becoming a Goog
   assert.ok(container.querySelector('.fb-local-image-page'), 'image viewer renders in the new tab');
 });
 
+test('Shell: embedded blob media is copied into a durable new-tab URL and video opens with controls', async () => {
+  const { shell, container } = makeShell();
+  const priorFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }) });
+  try {
+    const source = shell.getActiveTab();
+    const opened = await shell.openBlobMediaInNewTab('blob:yayra://app/pptx-media', 'video', source);
+    assert.equal(opened, true);
+    const tab = shell.getActiveTab();
+    assert.match(tab.url, /^yayra:\/\/image\?kind=video&src=/);
+    assert.match(decodeURIComponent(new URLSearchParams(tab.url.split('?')[1]).get('src')), /^blob:/);
+    assert.ok(shell._ownedMediaUrlsByTab.has(tab.id), 'the renderer owns the copied media URL until its tab closes');
+    const viewport = document.createElement('div');
+    shell.renderInternalImagePage(viewport, tab);
+    const video = viewport.querySelector('video');
+    assert.ok(video, 'standalone viewer creates a native video player');
+    assert.equal(video.controls, true);
+    shell.closeTab(tab.id);
+    assert.equal(shell._ownedMediaUrlsByTab.has(tab.id), false, 'closing the media tab releases its blob URL');
+  } finally {
+    globalThis.fetch = priorFetch;
+    shell.destroy(); container.remove();
+  }
+});
+
 test('Shell: asking appends user + assistant messages from the provider', async () => {
   const aiService = fakeAnsweringService('Paris.');
   const { shell, container } = makeShell({ aiService });

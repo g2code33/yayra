@@ -1051,6 +1051,21 @@ test('buildContextMenuTemplate: right-clicking an image offers Open/Save/Copy Im
   assert.deepEqual(written, ['https://example.com/cat.png']);
 });
 
+test('buildContextMenuTemplate: embedded video opens in a new tab and preserves its media type', () => {
+  const sent = [];
+  const wc = { canGoBack: () => false, canGoForward: () => false, inspectElement: () => {} };
+  const template = buildContextMenuTemplate({
+    params: { mediaType: 'video', srcURL: 'blob:yayra://app/pptx-video' },
+    wc, tabId: 'tab-video', send: (tabId, type, payload) => sent.push({ tabId, type, payload }),
+    clipboard: { writeText: () => {} }
+  });
+  findItem(template, 'Open Video in New Tab').click();
+  assert.deepEqual(sent[0], {
+    tabId: 'tab-video', type: 'new-window-request',
+    payload: { url: 'blob:yayra://app/pptx-video', mediaType: 'video' }
+  });
+});
+
 test('buildContextMenuTemplate: selected text offers Copy + Search Google for "..."', () => {
   const sent = [];
   const wc = { canGoBack: () => false, canGoForward: () => false, inspectElement: () => {}, copy: () => {} };

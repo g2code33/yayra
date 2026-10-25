@@ -430,6 +430,7 @@ test('DOCUMENT SETTINGS: Files and open document viewers link to document/projec
     assert.ok(settingsPage.querySelector('#fb-in-documents-default-zoom'));
     assert.ok(settingsPage.querySelector('#fb-in-documents-night-default'));
     assert.ok(settingsPage.querySelector('#fb-in-pptx-projector-display'));
+    assert.ok(settingsPage.querySelector('#fb-in-pptx-presenter-view'));
   } finally { shell.destroy(); container.remove(); }
 });
 
@@ -1254,6 +1255,49 @@ test('PPTX SLIDESHOW: dedicated projector surface mounts the live deck, hides no
       || shell.viewportElement.querySelector('.fb-pptx-reader'), 'the live deck returns to the normal viewer');
   } finally {
     shell.destroy();
+  }
+});
+
+test('PPTX presenter view keeps controls and next slide with the presenter, projecting only the current slide', async () => {
+  const container = document.createElement('div');
+  const previousYayra = window.yayra;
+  const bridgeCalls = [];
+  window.yayra = { ...(previousYayra || {}), windowControls: {
+    close: async () => {},
+    openProjection: async (displayId) => { bridgeCalls.push(['open', displayId]); return true; },
+    captureProjectionFrame: async (bounds) => { bridgeCalls.push(['capture', bounds]); return true; },
+    closeProjection: async () => { bridgeCalls.push(['close']); return true; }
+  } };
+  const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+  shell._documentEngineOverrides = { pptx: fakePptxEngine({ slides: 3 }) };
+  try {
+    await shell.initialize();
+    shell.render(container);
+    shell.addDocumentTab({ name: 'speaker-view.pptx', bytes: new Uint8Array([1, 2, 3]) });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const tab = shell.getActiveTab();
+    shell.state.settings.pptxPresenterView = true;
+    shell.state.settings.pptxProjectorDisplayId = 'display-2';
+    assert.equal(await shell.startDocumentSlideshow(tab.id), true);
+    const show = shell._documentSlideshow;
+    assert.equal(show.presenterView, true);
+    assert.ok(show.overlay.classList.contains('is-presenter-view'));
+    assert.equal(show.nextPreview.hidden, false);
+    assert.match(show.nextCaption.textContent, /Slide 2/);
+    assert.deepEqual(bridgeCalls[0], ['open', 'display-2']);
+    assert.equal(show.projectorWindowMoved, false, 'the presenter window is not moved onto the audience display');
+    const mockRect = () => ({ x: 80, y: 60, left: 80, top: 60, right: 980, bottom: 566, width: 900, height: 506 });
+    show.host.getBoundingClientRect = mockRect;
+    const stage = show.host.querySelector('.fb-pptx-stage');
+    if (stage) stage.getBoundingClientRect = mockRect;
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    assert.ok(bridgeCalls.some(([kind]) => kind === 'capture'), `the external audience window receives a current-slide frame (calls: ${JSON.stringify(bridgeCalls)})`);
+    assert.equal(await shell.exitDocumentSlideshow(), true);
+    assert.ok(bridgeCalls.some(([kind]) => kind === 'close'));
+  } finally {
+    shell.destroy();
+    if (previousYayra === undefined) delete window.yayra;
+    else window.yayra = previousYayra;
   }
 });
 

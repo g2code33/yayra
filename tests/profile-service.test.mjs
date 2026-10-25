@@ -231,6 +231,24 @@ test('Shell: account dropdown lists profiles and switching works from it', () =>
   assert.equal(shell.state.isAccountMenuOpen, false, 'menu closes after switching');
 });
 
+test('account dropdown keeps Google services and a separate Google shortcut directly together', () => {
+  const { shell, container } = makeShell();
+  try {
+    shell.state.isAccountMenuOpen = true;
+    shell.render(container);
+    const services = container.querySelector('.fb-account-services-btn');
+    const google = container.querySelector('.fb-account-google-btn');
+    assert.ok(services);
+    assert.ok(google);
+    assert.equal(services.parentElement, google.parentElement, 'both shortcuts belong to the same account action group');
+    assert.ok(services.parentElement.children.indexOf(google) === services.parentElement.children.indexOf(services) + 1,
+      'Google sits directly below Open Google services');
+    google.click();
+    assert.equal(shell.getActiveTab().url, 'https://www.google.com/');
+    assert.equal(shell.state.isAccountMenuOpen, false);
+  } finally { shell.destroy(); container.remove(); }
+});
+
 test('Shell: "Add profile" creates and switches to a brand-new profile', () => {
   const { shell, container, profileService } = makeShell();
   shell.state.isAccountMenuOpen = true;

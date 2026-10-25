@@ -1348,6 +1348,7 @@ function buildContextMenuTemplate({ params, wc, tabId, send, clipboard, navigati
   const template = [];
   const isLink = !!(params && params.linkURL);
   const isImage = !!(params && params.mediaType === 'image' && params.srcURL);
+  const isVideo = !!(params && params.mediaType === 'video' && params.srcURL);
   const isEditable = !!(params && params.isEditable);
   const hasSelection = !!(params && params.selectionText && params.selectionText.trim());
 
@@ -1358,12 +1359,14 @@ function buildContextMenuTemplate({ params, wc, tabId, send, clipboard, navigati
     );
   }
 
-  if (isImage) {
+  if (isImage || isVideo) {
     if (template.length) template.push({ type: 'separator' });
+    const kind = isVideo ? 'video' : 'image';
+    const label = isVideo ? 'Video' : 'Image';
     template.push(
-      { label: 'Open Image in New Tab', click: () => send(tabId, 'new-window-request', { url: params.srcURL }) },
-      { label: 'Save Image As\u2026', click: () => wc.downloadURL(params.srcURL) },
-      { label: 'Copy Image Address', click: () => clipboard.writeText(params.srcURL) }
+      { label: `Open ${label} in New Tab`, click: () => send(tabId, 'new-window-request', { url: params.srcURL, mediaType: kind }) },
+      ...(!isVideo ? [{ label: 'Save Image As\u2026', click: () => wc.downloadURL(params.srcURL) }] : []),
+      { label: `Copy ${label} Address`, click: () => clipboard.writeText(params.srcURL) }
     );
   }
 

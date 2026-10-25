@@ -77,6 +77,35 @@ test('dictionary category, source and layout changes immediately rerun the activ
   } finally { shell.destroy(); container.remove(); }
 });
 
+test('dictionary pack choices always follow the selected category and explain an empty installed category', async () => {
+  const { shell, container } = makeShell();
+  const store = new MemoryDictionaryStore();
+  for (const [id, category] of [['general-fixture', 'general'], ['medical-fixture', 'medical']]) {
+    await store.savePack({
+      id, title: `${category} fixture`, category, version: '1', datasetVersion: '1',
+      source: 'Fixture', license: 'CC BY 4.0', attribution: 'Fixture', sourceUrl: 'https://example.test', enabled: true
+    }, []);
+  }
+  shell.dictionaryLibrary = new DictionaryLibrary({ profileId: 'default', store });
+  try {
+    const viewport = document.createElement('div');
+    shell.renderInternalDictionaryPage(viewport, { id: 'tab-packs-filter', url: 'yayra://dictionary' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const category = viewport.querySelector('[aria-label="Filter by dictionary category"]');
+    const pack = viewport.querySelector('[aria-label="Filter by source pack"]');
+    category.value = 'medical';
+    category.dispatchEvent(new Event('change', { bubbles: true }));
+    assert.deepEqual(pack.children.map((option) => option.value), ['all', 'medical-fixture']);
+    assert.match(pack.children[0].textContent, /Medical/);
+    assert.ok(!pack.children.some((option) => option.value === 'general-fixture'), 'General packs never appear under Medical');
+    category.value = 'business';
+    category.dispatchEvent(new Event('change', { bubbles: true }));
+    assert.equal(pack.disabled, true);
+    assert.match(pack.textContent, /No Business packs installed/);
+    assert.match(viewport.textContent, /No installed Business dictionary packs/);
+  } finally { shell.destroy(); container.remove(); }
+});
+
 test('Dictionary is a working side-drawer destination and pack source links have independent spacing', () => {
   const { shell, container } = makeShell();
   try {
