@@ -700,7 +700,17 @@ function buildTextSelectionActionsScript() {
       };
       var onPointerUp = function () { pointerSelecting = false; schedule(); };
       var onSelectionChange = function () { schedule(); };
-      var onKeyDown = function (event) { if (event.key === 'Escape') hide(true); };
+      var onKeyDown = function (event) {
+        if (event.key === 'Escape') { hide(true); return; }
+        var key = String(event.key || '').toLowerCase();
+        if (!(key === 'd' && (event.ctrlKey || event.metaKey) && event.altKey && event.shiftKey)) return;
+        var snapshot = readSnapshot();
+        var selected = String(snapshot?.text || '').trim().slice(0, MAX_QUERY);
+        if (!selected) return;
+        event.preventDefault(); event.stopPropagation();
+        hide(true);
+        openAction('yayra://dictionary?q=' + encodeURIComponent(selected));
+      };
       var onScroll = function () { hide(true); };
       var cleanup = function () {
         if (updateHandle !== null) {

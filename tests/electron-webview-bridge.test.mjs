@@ -144,6 +144,8 @@ test('native selection actions are page-local, bounded, editable-aware, and non-
   assert.match(script, /\['password','hidden'/, 'password and non-text fields are never read into the toolbar');
   assert.match(script, /MAX_COPY = 100000/);
   assert.match(script, /MAX_QUERY = 2000/);
+  assert.match(script, /key === 'd' && \(event\.ctrlKey \|\| event\.metaKey\) && event\.altKey && event\.shiftKey/, 'the selected-text shortcut works inside a native desktop web page');
+  assert.match(script, /yayra:\/\/dictionary\?q=/, 'the shortcut routes the selected word directly to local dictionary search');
   assert.match(script, /navigator\.clipboard[\s\S]*document\.execCommand|document\.execCommand[\s\S]*navigator\.clipboard/, 'copy has native and async clipboard paths');
   assert.match(script, /window\.open\(url, '_blank', 'noopener,noreferrer'\)/, 'explicit Search/AI actions use the existing safe new-tab route');
   assert.doesNotMatch(script, /ipcRenderer|sendTo\(/, 'selected text never crosses Electron IPC');

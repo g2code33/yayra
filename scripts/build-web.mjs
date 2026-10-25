@@ -56,7 +56,7 @@ execFileSync(process.execPath, [path.join(root, 'scripts', 'generate-update-mani
 
 let precache = (await listFiles(dist))
   .map((file) => `./${file}`)
-  .filter((file) => file !== './sw.js' && file !== './precache-manifest.json')
+  .filter((file) => file !== './sw.js' && file !== './precache-manifest.json' && !file.endsWith('.yayrapack'))
   .sort();
 const swPath = path.join(dist, 'sw.js');
 let sw = await readFile(swPath, 'utf8');

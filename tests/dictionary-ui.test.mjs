@@ -35,9 +35,24 @@ test('dictionary page renders local results and untrusted definitions as text, n
     shell.renderInternalDictionaryPage(viewport, { id: 'tab-1', url: 'yayra://dictionary?q=safe', isPrivate: false });
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.match(viewport.textContent, /Offline Dictionary/);
+    assert.ok(viewport.querySelector('.fb-dict-logo'), 'the dictionary page has its coloured brand mark');
+    assert.equal(viewport.querySelectorAll('[data-dict-view]').length, 3, 'one compact set of page tabs replaces duplicate nav rows');
     assert.match(viewport.textContent, /literal text/);
     assert.equal(viewport.querySelector('img'), null);
     assert.equal(viewport.querySelector('script'), null);
+  } finally { shell.destroy(); container.remove(); }
+});
+
+test('Dictionary entry point and selection shortcut are visible in Settings', () => {
+  const { shell, container } = makeShell();
+  try {
+    shell.state.settingsActiveCategory = 'dictionary';
+    const viewport = document.createElement('div');
+    shell.renderInternalSettingsPage(viewport);
+    assert.ok(viewport.querySelector('#sec-dictionary'));
+    assert.ok(viewport.querySelector('.fb-in-open-dictionary'));
+    assert.match(viewport.textContent, /Ctrl\/Command \+ Alt \+ Shift \+ D/);
+    assert.ok(viewport.querySelector('[data-cat="dictionary"]'));
   } finally { shell.destroy(); container.remove(); }
 });
 

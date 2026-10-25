@@ -3695,6 +3695,14 @@ export class BrowserShell {
     documentsBtn.addEventListener('click', () => this.openInternalPage('yayra://documents'));
     toolbarActions.appendChild(documentsBtn);
 
+    const dictionaryBtn = document.createElement('button');
+    dictionaryBtn.className = 'fb-action-btn fb-btn-dictionary fb-toolbar-dictionary-btn fb-toolbar-action-btn';
+    dictionaryBtn.setAttribute('title', 'Offline Dictionary · Ctrl+Alt+Shift+D on selected text');
+    dictionaryBtn.setAttribute('aria-label', 'Open Offline Dictionary');
+    dictionaryBtn.innerHTML = Icons.dictionary;
+    dictionaryBtn.addEventListener('click', () => this.openInternalPage('yayra://dictionary'));
+    toolbarActions.appendChild(dictionaryBtn);
+
     // Requirement 10: Extensions & Shields Button (Transparent, Compact, Matching Star Size)
     const extBtn = document.createElement('button');
     extBtn.className = 'fb-action-btn fb-btn-extensions fb-toolbar-extensions-btn fb-toolbar-action-btn';
@@ -3864,6 +3872,7 @@ export class BrowserShell {
       { className: 'fb-mobile-tab-overview', icon: Icons.tabs, title: 'Show all tabs', action: () => this.openModal('tab-switcher') },
       { className: 'fb-mobile-tab-downloads', icon: Icons.download, title: 'Downloads', action: () => this.openInternalPage('yayra://downloads') },
       { className: 'fb-mobile-tab-documents', icon: Icons.document, title: 'Documents', action: () => this.openInternalPage('yayra://documents') },
+      { className: 'fb-mobile-tab-dictionary', icon: Icons.dictionary, title: 'Offline Dictionary', action: () => this.openInternalPage('yayra://dictionary') },
       { className: 'fb-mobile-tab-bookmarks', icon: Icons.bookmark, title: 'Bookmarks', action: () => this.openInternalPage('yayra://bookmarks') },
       { className: 'fb-mobile-tab-privacy', icon: Icons.shield, title: 'Privacy and shields', action: () => this.openInternalPage('yayra://permissions') },
       { className: 'fb-mobile-tab-history', icon: Icons.history, title: 'History', action: () => this.openInternalPage('yayra://history') }
@@ -8525,34 +8534,36 @@ export class BrowserShell {
     page.className = 'fb-internal-page fb-dictionary-page';
     page.innerHTML = `
       <style>
-        .fb-dictionary-page{box-sizing:border-box;min-height:100%;padding:clamp(16px,3vw,32px);color:var(--fb-text-primary,#f8fafc);background:var(--fb-bg-primary,#111318);overflow:auto}
-        .fb-dict-wrap{max-width:1120px;margin:0 auto}.fb-dict-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap}
-        .fb-dict-heading h1{margin:0;font-size:clamp(1.5rem,4vw,2.1rem)}.fb-dict-heading p,.fb-dict-muted{color:var(--fb-text-muted,#9ca3af);line-height:1.5}
-        .fb-dict-nav,.fb-dict-tools,.fb-dict-card-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fb-dict-nav{margin:18px 0}
-        .fb-dict-btn{border:1px solid rgba(148,163,184,.3);border-radius:9px;padding:9px 12px;background:rgba(148,163,184,.1);color:inherit;cursor:pointer;font:inherit}
-        .fb-dict-btn:hover{background:rgba(148,163,184,.2)}.fb-dict-btn:focus-visible,.fb-dict-input:focus-visible{outline:2px solid #60a5fa;outline-offset:2px}
-        .fb-dict-btn.primary{background:#2563eb;color:#fff;border-color:#2563eb}.fb-dict-btn.danger{color:#fecaca}
-        .fb-dict-input{box-sizing:border-box;min-width:160px;max-width:100%;border:1px solid rgba(148,163,184,.35);border-radius:9px;padding:10px;background:rgba(15,23,42,.8);color:inherit;font:inherit}
-        .fb-dict-search{display:flex;gap:9px;flex-wrap:wrap}.fb-dict-search .fb-dict-input[type=search]{flex:1 1 280px}
-        .fb-dict-notice{margin:14px 0;padding:12px 14px;border:1px solid rgba(245,158,11,.3);border-radius:10px;background:rgba(245,158,11,.08);line-height:1.5}
-        .fb-dict-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:12px;margin-top:18px}
-        .fb-dict-card{border:1px solid rgba(148,163,184,.25);border-radius:14px;padding:16px;background:rgba(30,41,59,.45);min-width:0}
-        .fb-dict-card h2,.fb-dict-card h3{margin:0 0 7px}.fb-dict-def{margin:14px 0;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}.fb-dict-source{font-size:.87rem;color:var(--fb-text-muted,#9ca3af)}
+        .fb-dictionary-page{box-sizing:border-box;min-height:100%;padding:clamp(14px,2.5vw,28px);color:var(--fb-text-primary,#f8fafc);background:var(--fb-bg-primary,#111318);overflow:auto}
+        .fb-dict-wrap{max-width:1040px;margin:0 auto}.fb-dict-heading{display:flex;align-items:center;gap:14px}
+        .fb-dict-brand{display:flex;align-items:center;gap:14px;min-width:0}.fb-dict-logo{width:46px;height:46px;flex:0 0 46px;display:grid;place-items:center;border-radius:14px;background:linear-gradient(135deg,rgba(56,189,248,.17),rgba(167,139,250,.19),rgba(244,114,182,.15));border:1px solid rgba(129,140,248,.3)}.fb-dict-logo svg{width:27px;height:27px}
+        .fb-dict-heading h1{margin:0;font-size:clamp(1.45rem,3.3vw,2rem)}.fb-dict-heading p,.fb-dict-muted{margin:.35em 0 0;color:var(--fb-text-muted,#9ca3af);line-height:1.5}
+        .fb-dict-nav,.fb-dict-tools,.fb-dict-card-actions{display:flex;gap:7px;flex-wrap:wrap;align-items:center}.fb-dict-nav{margin:16px 0 20px;padding:4px;width:max-content;max-width:100%;border:1px solid rgba(148,163,184,.2);border-radius:12px;background:rgba(30,41,59,.35)}
+        .fb-dict-btn{border:1px solid rgba(148,163,184,.3);border-radius:9px;padding:9px 12px;background:rgba(148,163,184,.08);color:inherit;cursor:pointer;font:inherit;line-height:1.2}
+        .fb-dict-btn:hover{background:rgba(148,163,184,.18)}.fb-dict-btn:focus-visible,.fb-dict-input:focus-visible{outline:2px solid #60a5fa;outline-offset:2px}
+        .fb-dict-nav .fb-dict-btn{border-color:transparent;background:transparent;color:var(--fb-text-muted,#aab2c0);white-space:nowrap}.fb-dict-nav .fb-dict-btn[aria-current=page]{background:linear-gradient(120deg,rgba(37,99,235,.3),rgba(124,58,237,.23));border-color:rgba(96,165,250,.3);color:#fff}
+        .fb-dict-btn.primary{background:#2563eb;color:#fff;border-color:#2563eb}.fb-dict-btn.danger{color:#fecaca}.fb-dict-btn:disabled{opacity:.6;cursor:wait}
+        .fb-dict-input{box-sizing:border-box;min-width:0;width:100%;max-width:100%;border:1px solid rgba(148,163,184,.35);border-radius:9px;padding:10px;background:rgba(15,23,42,.8);color:inherit;font:inherit}
+        .fb-dict-search{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:9px;align-items:center}.fb-dict-search .fb-dict-input[type=search]{min-width:0}.fb-dict-filters{grid-column:1/-1;border:1px solid rgba(148,163,184,.2);border-radius:10px;padding:0 12px;background:rgba(30,41,59,.22)}.fb-dict-filters summary{cursor:pointer;padding:10px 0;color:var(--fb-text-muted,#aab2c0)}.fb-dict-filter-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;padding:2px 0 12px}
+        .fb-dict-notice{margin:12px 0;padding:10px 13px;border:1px solid rgba(96,165,250,.25);border-radius:10px;background:rgba(37,99,235,.07);line-height:1.45}
+        .fb-dict-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:12px;margin-top:16px}
+        .fb-dict-card{border:1px solid rgba(148,163,184,.22);border-radius:13px;padding:15px;background:rgba(30,41,59,.38);min-width:0}
+        .fb-dict-card h2,.fb-dict-card h3{margin:0 0 7px}.fb-dict-def{margin:12px 0;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}.fb-dict-source{font-size:.87rem;color:var(--fb-text-muted,#9ca3af)}
         .fb-dict-definition{border-top:1px solid rgba(148,163,184,.18);padding-top:8px;margin-top:8px}.fb-dict-example{margin:6px 0 0 16px;color:var(--fb-text-muted,#cbd5e1)}
         .fb-dict-list{display:grid;gap:10px;margin-top:14px}.fb-dict-split{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.fb-dict-checkbox{display:flex;align-items:center;gap:8px}
-        .fb-dict-empty{padding:26px 16px;border:1px dashed rgba(148,163,184,.4);border-radius:12px;text-align:center;color:var(--fb-text-muted,#9ca3af)}
-        .fb-dict-link{color:#93c5fd;text-decoration:underline}.fb-dict-pack-meta{font-size:.9rem;line-height:1.55;overflow-wrap:anywhere}
-        .fb-dict-status{min-height:1.5em;margin:10px 0;color:var(--fb-text-muted,#9ca3af)}
-        @media(max-width:620px){.fb-dictionary-page{padding:14px}.fb-dict-split{grid-template-columns:1fr}.fb-dict-card{padding:13px}}
+        .fb-dict-empty{padding:22px 16px;border:1px dashed rgba(148,163,184,.4);border-radius:12px;text-align:center;color:var(--fb-text-muted,#9ca3af)}
+        .fb-dict-link{color:#93c5fd;text-decoration:underline}.fb-dict-pack-meta{font-size:.9rem;line-height:1.5;overflow-wrap:anywhere}.fb-dict-license{max-height:240px;overflow:auto;white-space:pre-wrap;font:inherit;font-size:.8rem;line-height:1.45;color:var(--fb-text-muted,#cbd5e1)}
+        .fb-dict-status{min-height:1.3em;margin:8px 0;color:var(--fb-text-muted,#9ca3af)}
+        .fb-dictionary-brand-action{display:inline-flex;align-items:center;gap:8px}.fb-dictionary-brand-action svg{width:20px;height:20px}
+        .fb-toolbar-dictionary-btn svg{filter:drop-shadow(0 0 5px rgba(56,189,248,.3))}
+        @media(max-width:700px){.fb-dictionary-page{padding:13px}.fb-dict-split,.fb-dict-filter-grid{grid-template-columns:1fr}.fb-dict-card{padding:13px}.fb-dict-nav{width:100%;overflow-x:auto}.fb-dict-search{grid-template-columns:minmax(0,1fr)}.fb-dict-search>.fb-dict-btn{justify-self:start}}
       </style>
       <div class="fb-dict-wrap">
-        <div class="fb-dict-heading"><div><h1>Offline Dictionary</h1><p>Search only the dictionary packs installed on this device. Local lookups are not sent to a server.</p></div>
-          <div class="fb-dict-tools"><button type="button" class="fb-dict-btn" data-dict-view="packs">Manage packs</button><button type="button" class="fb-dict-btn" data-dict-view="saved">My vocabulary</button></div>
-        </div>
+        <div class="fb-dict-heading"><div class="fb-dict-brand"><span class="fb-dict-logo">${Icons.dictionary}</span><div><h1>Offline Dictionary</h1><p>Search your downloaded dictionary on this device. Lookups stay local.</p></div></div></div>
         <nav class="fb-dict-nav" aria-label="Dictionary pages">
-          <button type="button" class="fb-dict-btn" data-dict-view="search">Dictionary</button>
-          <button type="button" class="fb-dict-btn" data-dict-view="packs">Dictionary packs</button>
-          <button type="button" class="fb-dict-btn" data-dict-view="saved">Saved vocabulary</button>
+          <button type="button" class="fb-dict-btn" data-dict-view="search">Search</button>
+          <button type="button" class="fb-dict-btn" data-dict-view="packs">Packs</button>
+          <button type="button" class="fb-dict-btn" data-dict-view="saved">My vocabulary</button>
         </nav>
         <div class="fb-dict-content"></div>
       </div>`;
@@ -8561,7 +8572,11 @@ export class BrowserShell {
       try { return new URL(activeTab?.url || 'yayra://dictionary', 'https://yayra.invalid'); } catch { return new URL('https://yayra.invalid'); }
     };
     const route = parseRoute();
-    const view = route.searchParams.get('view') || (route.protocol === 'yayra:' && route.hostname === 'vocabulary' ? 'saved' : 'search');
+    const requestedView = route.searchParams.get('view') || (route.protocol === 'yayra:' && route.hostname === 'vocabulary' ? 'saved' : 'search');
+    const view = ['search', 'packs', 'saved'].includes(requestedView) ? requestedView : 'search';
+    page.querySelectorAll('[data-dict-view]').forEach((button) => {
+      if (button.dataset.dictView === view) button.setAttribute('aria-current', 'page');
+    });
     const routeSearch = (params) => {
       const next = new URLSearchParams(params);
       this.navigateActiveTab(`yayra://dictionary${next.size ? `?${next.toString()}` : ''}`);
@@ -8597,6 +8612,7 @@ export class BrowserShell {
     const appendStatus = (container, text, className = 'fb-dict-status') => {
       const status = document.createElement('p'); status.className = className; status.setAttribute('role', 'status'); status.textContent = text; container.appendChild(status); return status;
     };
+    const formatDictionaryBytes = (value) => `${(Math.max(0, Number(value) || 0) / (1024 * 1024)).toFixed(1)} MB`;
     const switchTo = (nextView, extra = {}) => routeSearch(nextView === 'search' ? extra : { view: nextView, ...extra });
 
     if (view === 'packs') {
@@ -8624,8 +8640,8 @@ export class BrowserShell {
       });
       const integrityNote = document.createElement('div'); integrityNote.className = 'fb-dict-notice';
       integrityNote.textContent = durableDictionaryStorage
-        ? 'No downloadable source pack is enabled yet. wordnet-db 3.1.14 identifies its database payload as WordNet 3.1, but its bundled Princeton licence is headed “WordNet Release 3.0” and carries the 3.0 copyright notice; that data-version/licence mismatch is unresolved. Medical, Pharmacy and Business datasets are also unverified. No corpus is redistributed until exact source rights are confirmed.'
-        : 'Persistent IndexedDB storage is unavailable in this build, so pack import is disabled to avoid data loss. Also, no downloadable source pack is enabled: the candidate WordNet data has an unresolved data-version/licence mismatch, and other category sources are unverified.';
+        ? 'General English is available as a verified 6.6 MB WordNet 3.0 download. Medical, Pharmacy and Business packs are not included until their sources and redistribution licences are confirmed.'
+        : 'Persistent IndexedDB storage is unavailable in this build. Downloads and imports are disabled so dictionary data cannot be lost when the session closes.';
       section.appendChild(integrityNote);
       const list = document.createElement('div'); list.className = 'fb-dict-list'; section.appendChild(list);
       content.appendChild(section);
@@ -8636,14 +8652,15 @@ export class BrowserShell {
           const card = document.createElement('article'); card.className = 'fb-dict-card';
           const title = document.createElement('h3'); title.textContent = pack.title; card.appendChild(title);
           const state = document.createElement('p'); state.className = 'fb-dict-muted';
-          state.textContent = pack.installed ? `${pack.enabled ? 'Enabled' : 'Disabled'} · ${Number(pack.entryCount || 0).toLocaleString()} entries · version ${pack.version}` : (pack.available ? 'Available to install' : 'Not installed — no verified downloadable source');
+          state.textContent = pack.installed ? `${pack.enabled ? 'Enabled' : 'Disabled'} · ${Number(pack.entryCount || 0).toLocaleString()} terms · dataset ${pack.datasetVersion || pack.version}` : (pack.available ? `Ready to download · ${formatDictionaryBytes(pack.downloadSize)}` : 'Unavailable — source licence not verified');
           card.appendChild(state);
           const description = document.createElement('p'); description.className = 'fb-dict-pack-meta'; description.textContent = pack.description || ''; card.appendChild(description);
           if (pack.installed) {
             const metadata = document.createElement('p'); metadata.className = 'fb-dict-pack-meta';
-            metadata.textContent = `Source: ${pack.source || 'Not provided'} · Dataset: ${pack.datasetVersion || pack.version} · Licence: ${pack.license || 'Not provided'} · Attribution: ${pack.attribution || 'Not provided'} · SHA-256: ${pack.checksum || 'Unavailable'}`;
+            metadata.textContent = `Source: ${pack.source || 'Not provided'} · Dataset: ${pack.datasetVersion || pack.version} · Licence: ${pack.license || 'Not provided'} · Attribution: ${pack.attribution || 'Not provided'} · Pack integrity: ${pack.checksum || 'Unavailable'}`;
             card.appendChild(metadata);
-            if (pack.sourceUrl) { const link = document.createElement('a'); link.className = 'fb-dict-link'; link.href = pack.sourceUrl; link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = 'Open source information'; card.appendChild(link); }
+            if (pack.sourceUrl) { const link = document.createElement('a'); link.className = 'fb-dict-link'; link.href = pack.sourceUrl; link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = 'Open source archive'; card.appendChild(link); }
+            if (pack.licenseText) { const license = document.createElement('details'); const summary = document.createElement('summary'); summary.textContent = 'Read the complete licence'; const text = document.createElement('p'); text.className = 'fb-dict-license'; text.textContent = pack.licenseText; license.appendChild(summary); license.appendChild(text); card.appendChild(license); }
             const actions = document.createElement('div'); actions.className = 'fb-dict-card-actions';
             const toggle = makeButton(pack.enabled ? 'Disable pack' : 'Enable pack', async () => { await this.getDictionaryLibrary().manager.setEnabled(pack.id, !pack.enabled); this.render(); });
             const remove = makeButton('Remove pack', async () => {
@@ -8651,8 +8668,30 @@ export class BrowserShell {
               await this.getDictionaryLibrary().manager.remove(pack.id); this.render();
             }, 'danger');
             actions.appendChild(toggle); actions.appendChild(remove); card.appendChild(actions);
+          } else if (pack.available) {
+            const progress = document.createElement('p'); progress.className = 'fb-dict-status'; progress.setAttribute('role', 'status'); progress.setAttribute('aria-live', 'polite');
+            const installButton = makeButton(`Download & install · ${formatDictionaryBytes(pack.downloadSize)}`, async () => {
+              installButton.disabled = true;
+              progress.textContent = 'Starting the local pack download…';
+              try {
+                const result = await this.getDictionaryLibrary().manager.install(pack.id, { onProgress: (event) => {
+                  if (event.state === 'downloading') progress.textContent = `Downloading ${formatDictionaryBytes(event.loaded)} of ${formatDictionaryBytes(event.total)} (${Math.round(event.progress * 100)}%). You can retry if the connection drops.`;
+                  else if (event.state === 'verifying') progress.textContent = 'Checking the pack checksum…';
+                  else if (event.state === 'installing') progress.textContent = 'Verified. Installing and indexing 147,806 terms for offline search…';
+                } });
+                progress.textContent = result.duplicate ? 'This pack is already installed.' : 'General English is installed and ready for offline search.';
+                this.render();
+              } catch (error) {
+                progress.textContent = this.dictionaryErrorMessage(error);
+                installButton.disabled = false;
+              }
+            }, 'primary');
+            installButton.disabled = !durableDictionaryStorage;
+            const actions = document.createElement('div'); actions.className = 'fb-dict-card-actions'; actions.appendChild(installButton); card.appendChild(actions); card.appendChild(progress);
+            if (pack.licenseUrl) { const licenseLink = document.createElement('a'); licenseLink.className = 'fb-dict-link'; licenseLink.href = pack.licenseUrl; licenseLink.target = '_blank'; licenseLink.rel = 'noopener noreferrer'; licenseLink.textContent = 'Read Princeton WordNet 3.0 licence'; card.appendChild(licenseLink); }
+            if (pack.sourceUrl) { const link = document.createElement('a'); link.className = 'fb-dict-link'; link.href = pack.sourceUrl; link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = 'Verify source archive'; card.appendChild(link); }
           } else {
-            const note = document.createElement('p'); note.className = 'fb-dict-muted'; note.textContent = 'This source is unavailable; importing an unrelated or unlicensed dataset is not recommended.'; card.appendChild(note);
+            const note = document.createElement('p'); note.className = 'fb-dict-muted'; note.textContent = 'No verified source dataset is available for this category yet.'; card.appendChild(note);
           }
           list.appendChild(card);
         }
@@ -8738,11 +8777,15 @@ export class BrowserShell {
         for (const pack of packs) { const option = document.createElement('option'); option.value = pack.id; option.textContent = pack.title; sourcePack.appendChild(option); }
         sourcePack.value = packs.some((pack) => pack.id === route.searchParams.get('pack')) ? route.searchParams.get('pack') : 'all';
       }).catch(() => {});
-      const searchButton = document.createElement('button'); searchButton.type = 'submit'; searchButton.className = 'fb-dict-btn primary'; searchButton.textContent = 'Search offline';
-      form.appendChild(input); form.appendChild(category); form.appendChild(sourcePack); form.appendChild(mode); form.appendChild(searchButton); section.appendChild(form);
+      const searchButton = document.createElement('button'); searchButton.type = 'submit'; searchButton.className = 'fb-dict-btn primary'; searchButton.textContent = 'Search';
+      const filterDetails = document.createElement('details'); filterDetails.className = 'fb-dict-filters';
+      filterDetails.open = Boolean(route.searchParams.get('category') || route.searchParams.get('pack') || route.searchParams.get('mode'));
+      const filterSummary = document.createElement('summary'); filterSummary.textContent = 'Filters and result layout'; filterDetails.appendChild(filterSummary);
+      const filterGrid = document.createElement('div'); filterGrid.className = 'fb-dict-filter-grid'; filterGrid.appendChild(category); filterGrid.appendChild(sourcePack); filterGrid.appendChild(mode); filterDetails.appendChild(filterGrid);
+      form.appendChild(input); form.appendChild(searchButton); form.appendChild(filterDetails); section.appendChild(form);
       const status = appendStatus(section, this.getDictionaryLibrary().store.persistent === false
         ? 'Persistent local storage is unavailable; this session cannot retain packs or vocabulary after closing.'
-        : 'Search is limited to enabled local packs. No installed pack? Import one under Dictionary packs.');
+        : 'Search is limited to enabled local packs. Download General English under Packs to start searching offline.');
       const compareBar = document.createElement('div'); compareBar.className = 'fb-dict-tools';
       const compareButton = makeButton('Compare selected (2)', async () => {
         if (this._dictionaryCompareSelection?.length !== 2) { status.textContent = 'Select exactly two definitions to compare.'; return; }
@@ -8784,6 +8827,12 @@ export class BrowserShell {
             if (!activeTab?.isPrivate) await this.getDictionaryLibrary().recordHistory(initialQuery, false);
           } catch (error) { status.textContent = this.dictionaryErrorMessage(error); }
         })();
+      } else {
+        void this.getDictionaryLibrary().store.getActivePacks().then((packs) => {
+          if (packs.length) return;
+          status.textContent = 'To search offline, download the General English pack once. No word lookup leaves this device.';
+          section.appendChild(makeButton('Get General English pack', () => routeSearch({ view: 'packs' }), 'primary'));
+        }).catch(() => {});
       }
     }
     viewport.appendChild(page);
@@ -8884,7 +8933,10 @@ export class BrowserShell {
         this.navigateActiveTab(`yayra://dictionary?q=${encodeURIComponent(suggestion.term)}`); this.render();
       }));
     } else {
-      const empty = document.createElement('div'); empty.className = 'fb-dict-empty'; empty.textContent = result.query ? 'No local result. Install or import a pack that covers this term; no remote search was performed.' : 'Enter a word or phrase to search enabled packs.'; output.appendChild(empty);
+      const empty = document.createElement('div'); empty.className = 'fb-dict-empty'; empty.textContent = result.query ? 'No local result. No network lookup was made.' : 'Enter a word or phrase to search enabled packs.'; output.appendChild(empty);
+      if (result.query) output.appendChild(makeButton('Manage or download dictionary packs', () => {
+        this.navigateActiveTab('yayra://dictionary?view=packs'); this.render();
+      }, 'primary'));
     }
   }
 
@@ -8898,6 +8950,15 @@ export class BrowserShell {
       'dictionary-import-metadata-date-invalid': 'Build and update dates must use YYYY-MM-DD.',
       'dictionary-import-no-valid-entries': 'No entries with valid terms and definitions were found.',
       'dictionary-import-file-too-large': 'The selected pack is too large to import.',
+      'dictionary-import-license-text-invalid': 'The pack’s bundled licence text is invalid or too long.',
+      'dictionary-persistent-storage-required': 'This browser cannot store a dictionary pack persistently; the pack was not downloaded.',
+      'dictionary-download-unavailable': 'Dictionary downloads are unavailable in this build.',
+      'dictionary-download-failed': 'The dictionary pack could not be downloaded. Check the connection and retry.',
+      'dictionary-download-too-large': 'The downloaded file is larger than the published pack limit.',
+      'dictionary-download-incomplete': 'The download was interrupted. Retry to resume where supported.',
+      'dictionary-gzip-not-supported': 'This browser cannot unpack the verified dictionary file. Update the app or use a supported browser.',
+      'pack-integrity-verifier-unavailable': 'This browser cannot verify the pack checksum, so it was not installed.',
+      'pack-checksum-mismatch': 'The dictionary pack checksum did not match. It was not installed; retry the download.',
       'dictionary-storage-upgrade-blocked': 'Close other Yayra windows and retry the dictionary storage upgrade.',
       'no-verified-downloadable-dictionary-packs': 'There are no verified downloadable dictionary packs yet. Import a licensed pack instead.'
     };
@@ -8961,7 +9022,7 @@ export class BrowserShell {
           ${Icons.lightning || Icons.settings} <span>Shortcuts</span>
         </button>
         <button class="fb-settings-nav-item ${activeCat === 'dictionary' ? 'active' : ''}" data-cat="dictionary" data-category="dictionary">
-          ${Icons.search} <span>Dictionary & Vocabulary</span>
+          ${Icons.dictionary} <span>Dictionary & Vocabulary</span>
         </button>
         <button class="fb-settings-nav-item ${activeCat === 'downloads' ? 'active' : ''}" data-cat="downloads" data-category="downloads">
           ${Icons.download} <span>Downloads</span>
@@ -9532,8 +9593,8 @@ export class BrowserShell {
           </section>
 
           <section class="fb-settings-group-card" id="sec-dictionary" style="${activeCat === 'dictionary' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
-            <h3 class="fb-settings-group-title">${Icons.search} Dictionary & Vocabulary</h3>
-            <p>Search verified dictionary packs offline and keep personal vocabulary separately from pack data. No dictionary source pack is bundled until its exact licence and dataset version are confirmed.</p>
+            <h3 class="fb-settings-group-title">${Icons.dictionary} Dictionary & Vocabulary</h3>
+            <p>Download the Princeton WordNet 3.0 General English pack once, then search it offline. Your saved vocabulary remains separate. Medical, Pharmacy and Business packs are not yet available because their source licences are unverified.</p>
             <div class="fb-setting-row">
               <label for="fb-dictionary-destination">Selection lookup destination</label>
               <select id="fb-dictionary-destination" class="fb-select">
@@ -9543,19 +9604,19 @@ export class BrowserShell {
               </select>
             </div>
             <div class="fb-setting-row">
-              <label for="fb-dictionary-global-shortcut">Global lookup shortcut</label>
+              <label for="fb-dictionary-global-shortcut">Desktop-wide shortcut (copy first in other apps)</label>
               <select id="fb-dictionary-global-shortcut" class="fb-select" ${this.dictionaryHostBridge ? '' : 'disabled'}>
                 <option value="CommandOrControl+Alt+D" ${(this.state.settings.dictionaryGlobalLookupShortcut || 'CommandOrControl+Alt+D') === 'CommandOrControl+Alt+D' ? 'selected' : ''}>Ctrl/Command + Alt + D</option>
                 <option value="CommandOrControl+Alt+K" ${this.state.settings.dictionaryGlobalLookupShortcut === 'CommandOrControl+Alt+K' ? 'selected' : ''}>Ctrl/Command + Alt + K</option>
               </select>
             </div>
             <div class="fb-setting-toggle-row">
-              <div><strong>Enable desktop-wide dictionary lookup</strong><p>Opt in to read the clipboard only when you press the shortcut. First select and copy the text yourself. Yayra does not simulate Copy, overwrite or restore your clipboard, or read it in the background. Platform hotkey support can vary (including Wayland).</p></div>
+              <div><strong>Enable desktop-wide dictionary lookup</strong><p>Inside Yayra, select text and press Ctrl/Command + Alt + Shift + D for an immediate local lookup without using the clipboard. In another desktop app, first copy the selected text, then press the enabled system shortcut. Clipboard text is read only on that explicit keypress; Yayra never copies for you, overwrites/restores the clipboard, or reads it in the background. OS support and shortcut availability vary (including Wayland).</p></div>
               <input type="checkbox" id="fb-dictionary-global-enabled" ${this.state.settings.dictionaryGlobalLookupEnabled ? 'checked' : ''} ${this.dictionaryHostBridge ? '' : 'disabled'} />
             </div>
             <p id="fb-dictionary-global-status" class="fb-performance-status" aria-live="polite">${this.dictionaryHostBridge ? 'The global lookup shortcut is off until you opt in.' : 'System-wide lookup is available only in supported desktop builds.'}</p>
             <div class="fb-tab-group-settings-toolbar">
-              <button type="button" class="fb-btn fb-btn-primary fb-in-open-dictionary">Open Offline Dictionary</button>
+              <button type="button" class="fb-btn fb-btn-primary fb-in-open-dictionary fb-dictionary-brand-action">${Icons.dictionary} <span>Open Offline Dictionary</span></button>
               <button type="button" class="fb-btn fb-btn-secondary fb-in-open-vocabulary">Open My Vocabulary</button>
             </div>
           </section>
@@ -25277,10 +25338,19 @@ export class BrowserShell {
       this.createNewTab(true);
     }
     // Ctrl+L or Alt+D: Focus Omnibox
-    else if (((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l') || (e.altKey && e.key.toLowerCase() === 'd')) {
+    else if (((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l') || (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.key.toLowerCase() === 'd')) {
       e.preventDefault();
       this.omniboxInput?.focus();
       this.omniboxInput?.select();
+    }
+    // Ctrl/Command+Alt+Shift+D: look up the current Yayra selection without
+    // touching the clipboard. Native website views receive the same combo in
+    // their page-local selection script.
+    else if ((e.ctrlKey || e.metaKey) && e.altKey && e.shiftKey && e.key.toLowerCase() === 'd') {
+      e.preventDefault();
+      const selected = this._currentSelectionText();
+      if (selected) this.openSelectionInDictionary(selected);
+      else this.openInternalPage('yayra://dictionary');
     }
     // Ctrl+Shift+B: Toggle the bookmarks bar
     else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'b') {

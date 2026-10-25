@@ -79,3 +79,10 @@ textarea { display: block; min-height: 6rem; width: min(100%, 42rem); }
 #app .fb-browser-viewport {
   padding: 0;
 }
+
+/* Branded one-tap entry to Yayra's offline dictionary. */
+.fb-btn-dictionary{border:1px solid rgba(99,102,241,.38)!important;background:linear-gradient(135deg,rgba(14,165,233,.12),rgba(139,92,246,.16),rgba(236,72,153,.1))!important;color:#dbeafe!important}
+.fb-btn-dictionary:hover{background:linear-gradient(135deg,rgba(14,165,233,.23),rgba(139,92,246,.25),rgba(236,72,153,.18))!important}
+.fb-btn-dictionary svg{filter:drop-shadow(0 0 5px rgba(56,189,248,.35))}
+.fb-dictionary-brand-action{display:inline-flex;align-items:center;gap:8px}
+.fb-dictionary-brand-action svg{width:20px;height:20px}

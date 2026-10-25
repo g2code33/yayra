@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { gunzipSync } from 'node:zlib';
 import { normalizeDictionaryTerm, searchDictionary, validateDictionaryEntry, compareDictionaryEntries } from '../packages/shared-ui/src/services/dictionaryEngine.js';
 import { MemoryDictionaryStore } from '../packages/shared-ui/src/services/dictionaryStore.js';
 import { DictionaryPackManager, verifyPackIntegrity, bytesToBase64, DICTIONARY_PACK_CATALOG } from '../packages/shared-ui/src/services/dictionaryPackManager.js';
@@ -60,7 +62,8 @@ test('pack import requires provenance and stores an integrity checksum', async (
   const bad = JSON.parse(createFixturePack());
   delete bad.metadata.license;
   await assert.rejects(manager.importPack(JSON.stringify(bad)), /dictionary-import-metadata-license-required/);
-  assert.equal(DICTIONARY_PACK_CATALOG.some((pack) => pack.available), false);
+  assert.equal(DICTIONARY_PACK_CATALOG.find((pack) => pack.id === 'wordnet-30')?.available, true);
+  assert.equal(DICTIONARY_PACK_CATALOG.filter((pack) => pack.available).length, 1, 'only the verified General English dataset is downloadable');
 });
 
 test('dictionary checksum verification uses declared SHA-256 / SHA-512 algorithms', async () => {
@@ -69,6 +72,40 @@ test('dictionary checksum verification uses declared SHA-256 / SHA-512 algorithm
   const integrity = `sha256-${bytesToBase64(digest)}`;
   assert.equal(await verifyPackIntegrity(bytes, integrity), true);
   await assert.rejects(verifyPackIntegrity(bytes, 'sha256-AAAA'), /pack-checksum-mismatch/);
+});
+
+test('bundled WordNet 3.0 pack is checksum-pinned, correctly licensed, and contains searchable definitions', async () => {
+  const descriptor = DICTIONARY_PACK_CATALOG.find((pack) => pack.id === 'wordnet-30');
+  const bytes = new Uint8Array(await readFile(new URL('../public/dictionary-packs/wordnet-3.0-v1.yayrapack', import.meta.url)));
+  assert.equal(bytes.length, descriptor.downloadSize);
+  assert.equal(await verifyPackIntegrity(bytes, descriptor.integrity), true);
+  const pack = JSON.parse(gunzipSync(bytes).toString('utf8'));
+  assert.equal(pack.format, 'yayra-dictionary-pack');
+  assert.equal(pack.metadata.datasetVersion, '3.0');
+  assert.match(pack.metadata.licenseText, /WordNet 3\.0 Copyright 2006 by Princeton University/);
+  assert.equal(pack.entries.length, 147806);
+  assert.ok(pack.entries.find((entry) => entry.term === 'bank')?.definitions.some((definition) => /financial institution/.test(definition.text)));
+});
+
+test('resumable dictionary download requests only the missing byte range and persists completion', async () => {
+  const bytes = new TextEncoder().encode('dictionary-data');
+  const prefix = bytes.slice(0, 5);
+  const remainder = bytes.slice(prefix.length);
+  const store = new MemoryDictionaryStore();
+  const url = 'https://app.example.test/dictionary-packs/pack.yayrapack';
+  const integrity = 'sha512-pinned';
+  await store.savePartial('resume-pack', { url, integrity, bytes: prefix, complete: false });
+  const requests = [];
+  const manager = new DictionaryPackManager({ store, fetchImpl: async (_url, options) => {
+    requests.push(options);
+    return new Response(remainder, { status: 206, headers: { 'content-range': `bytes ${prefix.length}-${bytes.length - 1}/${bytes.length}`, 'content-length': String(remainder.length) } });
+  } });
+  const result = await manager.downloadVerifiedAsset({ id: 'resume-pack', integrity, downloadSize: bytes.length }, url, { url, integrity, bytes: prefix }, () => {});
+  assert.deepEqual(result, bytes);
+  assert.equal(requests[0].headers.Range, `bytes=${prefix.length}-`);
+  const partial = await store.getPartial('resume-pack');
+  assert.equal(partial.complete, true);
+  assert.deepEqual(partial.bytes, bytes);
 });
 
 test('pack removal never deletes profile-owned saved words, stars, highlights, or notes', async () => {

@@ -27,6 +27,22 @@ test('selection dictionary action opens a local lookup in a new private-matched 
   } finally { shell.destroy(); container.remove(); }
 });
 
+test('the in-Yayra desktop keyboard shortcut looks up the selected word without reading clipboard data', () => {
+  const { shell, container } = makeShell();
+  try {
+    let lookedUp = '';
+    let prevented = false;
+    shell._currentSelectionText = () => 'selected medicine';
+    shell.openSelectionInDictionary = (text) => { lookedUp = text; return true; };
+    shell.handleGlobalKeyDown({
+      key: 'd', ctrlKey: true, metaKey: false, altKey: true, shiftKey: true,
+      preventDefault() { prevented = true; }
+    });
+    assert.equal(prevented, true);
+    assert.equal(lookedUp, 'selected medicine');
+  } finally { shell.destroy(); container.remove(); }
+});
+
 test('configured current-tab lookup stays in the source tab', () => {
   const { shell, container } = makeShell();
   try {
