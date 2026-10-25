@@ -16,7 +16,11 @@ if (JSON.stringify(precache) !== JSON.stringify(expected)) {
 }
 for (const [dictionaryPack, licenseFile] of [
   ['./dictionary-packs/wordnet-3.0-v1.yayrapack', './dictionary-packs/WORDNET-LICENSE-3.0.txt'],
-  ['./dictionary-packs/oewn-2025-v1.yayrapack', './dictionary-packs/OPEN-ENGLISH-WORDNET-LICENSE-2025.md']
+  ['./dictionary-packs/oewn-2025-v1.yayrapack', './dictionary-packs/OPEN-ENGLISH-WORDNET-LICENSE-2025.md'],
+  ['./dictionary-packs/gcide-0.54-v1.yayrapack', './dictionary-packs/GCIDE-LICENSE-0.54.md'],
+  ['./dictionary-packs/gcide-medical-0.54-v1.yayrapack', './dictionary-packs/GCIDE-LICENSE-0.54.md'],
+  ['./dictionary-packs/gcide-pharmacy-0.54-v1.yayrapack', './dictionary-packs/GCIDE-LICENSE-0.54.md'],
+  ['./dictionary-packs/fibo-business-2026q2-v1.yayrapack', './dictionary-packs/FIBO-LICENSE-Q2-2026.txt']
 ]) {
   if (!existsSync(path.join(dist, dictionaryPack.slice(2)))) fail(`bundled dictionary download asset is missing: ${dictionaryPack}`);
   if (precache.includes(dictionaryPack)) fail(`large dictionary pack must be downloaded only on explicit user request, not precached: ${dictionaryPack}`);

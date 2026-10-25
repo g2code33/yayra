@@ -8,7 +8,19 @@ const CHROME_INPUT_RECOVERY_CHANNEL = 'yayra:chrome-input-recover';
 const CONTEXT_MENU_ACTION_CHANNEL = 'yayra:context-menu-action';
 const CONTEXT_MENU_NAV_STATE_CHANNEL = 'yayra:context-menu-navigation-state';
 const dictionaryLookupListeners = new Set();
+const miniPageListeners = new Set();
+const pendingMiniPages = [];
 let pendingDictionaryLookup = null;
+ipcRenderer.on('yayra:overlay-mini-open-page', (_event, payload) => {
+  const safePayload = payload && typeof payload === 'object' ? payload : {};
+  if (!miniPageListeners.size) {
+    pendingMiniPages.push(safePayload);
+    if (pendingMiniPages.length > 50) pendingMiniPages.shift();
+  }
+  for (const callback of miniPageListeners) {
+    try { callback(safePayload); } catch { /* isolated renderer listener */ }
+  }
+});
 ipcRenderer.on('yayra:overlay-dictionary-lookup', (_event, payload) => {
   const safePayload = payload && typeof payload === 'object' ? payload : {};
   if (!dictionaryLookupListeners.size) pendingDictionaryLookup = safePayload;
@@ -274,6 +286,16 @@ const api = {
     openFullFromMini: (url = null) => ipcRenderer.send('yayra:overlay-mini-open-full', { url }),
     // Explicit dictionary lookup handoff: preserves an existing mini window and its tabs.
     openDictionaryLookup: (url) => ipcRenderer.invoke('yayra:overlay-open-dictionary-lookup', { url }),
+    // Open a specific main-window tab in the mini without replacing the mini's other tabs.
+    openPageInMini: (url) => ipcRenderer.invoke('yayra:overlay-open-mini-page', { url }),
+    onOpenPage: (callback) => {
+      if (typeof callback !== 'function') return () => {};
+      miniPageListeners.add(callback);
+      for (const payload of pendingMiniPages.splice(0)) {
+        try { callback(payload); } catch { /* isolated renderer listener */ }
+      }
+      return () => miniPageListeners.delete(callback);
+    },
     onDictionaryLookup: (callback) => {
       if (typeof callback !== 'function') return () => {};
       dictionaryLookupListeners.add(callback);

@@ -828,6 +828,26 @@ function createOverlayBridge({
     } catch { return false; }
   }
 
+  function openPageInMini(page) {
+    if (!mainPreloadPath || typeof page !== 'string' || page.length > 8192) return false;
+    let parsed;
+    try { parsed = new URL(page); } catch { return false; }
+    if (parsed.username || parsed.password || !['http:', 'https:', 'yayra:'].includes(parsed.protocol)) return false;
+    if (parsed.protocol === 'yayra:' && !/^[a-z0-9-]+$/i.test(parsed.hostname)) return false;
+    const url = page;
+    if (!miniWin || miniWin.isDestroyed()) return Boolean(openMiniPanelAt(url));
+    const deliver = () => {
+      try { if (miniWin && !miniWin.isDestroyed()) miniWin.webContents.send('yayra:overlay-mini-open-page', { url }); } catch { /* mini closed */ }
+    };
+    try {
+      miniWin.show?.();
+      miniWin.focus?.();
+      if (typeof miniWin.webContents?.isLoading === 'function' && miniWin.webContents.isLoading()) miniWin.webContents.once('did-finish-load', deliver);
+      else deliver();
+      return true;
+    } catch { return false; }
+  }
+
   function destroyMiniWindow() {
     miniTopmostTimer = stopTopmostGuard(miniTopmostTimer);
     if (miniWin && !miniWin.isDestroyed()) miniWin.close();
@@ -1564,6 +1584,7 @@ function createOverlayBridge({
   }
 
   ipcMain.handle('yayra:overlay-open-dictionary-lookup', (_event, payload = {}) => openDictionaryLookupInMini(payload.url));
+  ipcMain.handle('yayra:overlay-open-mini-page', (_event, payload = {}) => openPageInMini(payload.url));
   ipcMain.handle('yayra:overlay-get-settings', () => overlayStore.load());
   ipcMain.handle('yayra:overlay-set-enabled', (_e, enabled) => setEnabled(enabled));
   ipcMain.handle('yayra:overlay-set-launch-at-startup', (_e, enabled) => setLaunchAtStartup(enabled));
@@ -1684,6 +1705,7 @@ function createOverlayBridge({
     handleRadialAction,
     openMiniPanelAt,
     openDictionaryLookupInMini,
+    openPageInMini,
     setWheelItems,
     initializeOnStartup,
     applyLoginItemSettings

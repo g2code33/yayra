@@ -9,12 +9,12 @@
  *     the user quit again without browsing - or the app auto-reopened
  *     after an update - the offer was gone forever.
  *  2. MINI-SHELL CLOBBER: the bubble's mini panel runs its own shell on
- *     the SAME profile storage; every bubble use snapshotted the mini's
- *     empty tab list over the main window's session.
+ *     the SAME profile storage; it must write to a separate mini-prefixed
+ *     session key rather than replacing the main window's snapshot.
  *
- * Pinned here: the offer survives idle runs and mini-panel usage, the
- * prompt renders (ABOVE the frequent tiles), "No thanks" answers it for
- * good, and "Restore all" consumes it.
+ * Pinned here: the offer survives idle runs and mini-panel usage, mini and
+ * main sessions remain independent, the prompt renders (ABOVE the frequent
+ * tiles), "No thanks" answers it for good, and "Restore all" consumes it.
  */
 
 import test from 'node:test';
@@ -175,9 +175,46 @@ test('"Restore pages?" bar PERSISTS through searches, tab switches and renders u
   }
 });
 
-test('mini shell never writes the session snapshot (static pin)', () => {
+test('mini shell keeps a separate profile-scoped snapshot and does not consume main-browser close choices', async () => {
+  disk.clear();
+  const { shell: main } = await boot();
+  main.state.tabs.push({ id: 'main-session', title: 'Main session', url: 'https://main.example.test/', isLoading: false, isPrivate: false, favicon: null });
+  main.render();
+  await sleep(900);
+  const mainSnapshot = disk.get(KEY);
+  assert.deepEqual(diskTabs(), ['https://main.example.test/']);
+
+  const { shell: mini } = await boot({ isMiniShell: true });
+  mini.state.tabs.push({ id: 'mini-session', title: 'Mini session', url: 'https://mini.example.test/', isLoading: false, isPrivate: false, favicon: null });
+  mini.render();
+  await sleep(900);
+  const miniKey = 'yayra:p:default:mini:last-session-tabs';
+  assert.deepEqual(JSON.parse(disk.get(miniKey))?.tabs?.map((tab) => tab.url), ['https://mini.example.test/']);
+  assert.equal(disk.get(KEY), mainSnapshot, 'mini navigation never overwrites the main browser snapshot');
+  assert.equal(mini.closeSessionStorageKey(), 'yayra:mini:close-session:default');
+
+  const mainCloseKey = 'yayra:close-session:default';
+  const mainCloseChoice = JSON.stringify({ mode: 'recent', profileId: 'default', tabs: [{ url: 'https://main-close.example.test/' }] });
+  disk.set(mainCloseKey, mainCloseChoice);
+  disk.set('yayra:close-session', mainCloseChoice);
+  await mini.restoreCloseSession();
+  assert.equal(disk.get(mainCloseKey), mainCloseChoice, 'mini ignores the main browser close choice');
+  assert.equal(disk.get('yayra:close-session'), mainCloseChoice, 'mini does not migrate/remove the legacy main close choice');
+  assert.equal(mini.state.recentTabsOffer, null, 'no main-session close prompt leaks into mini');
+
+  const miniReload = await boot({ isMiniShell: true });
+  assert.deepEqual(miniReload.shell.state.continueTabs.map((tab) => tab.url), ['https://mini.example.test/'],
+    'the next mini launch restores only the mini window’s own tabs');
+  const mainReload = await boot();
+  assert.deepEqual(mainReload.shell.state.continueTabs.map((tab) => tab.url), ['https://main.example.test/'],
+    'the main browser still restores its own independent tab snapshot');
+  await mainReload.shell.restoreCloseSession();
+  assert.equal(disk.has(mainCloseKey), false, 'the main shell alone consumes its scoped close choice');
+  assert.equal(mainReload.shell.state.recentTabsOffer?.[0]?.url, 'https://main-close.example.test/');
+
   const src = fs.readFileSync(new URL('../packages/shared-ui/src/components/BrowserShell.js', import.meta.url), 'utf8');
-  assert.match(src, /if \(this\.options\?\.isMiniShell\) return;/, 'queueSessionSnapshot mini guard');
+  assert.match(src, /scoped\.get\(`mini:\$\{key\}`\)/, 'mini sessions use their own key namespace within the profile');
   const mainJs = fs.readFileSync(new URL('../src/browser/main.js', import.meta.url), 'utf8');
   assert.match(mainJs, /isMiniShell,/, 'main.js passes the mini flag into the shell');
+  assert.match(mainJs, /onOpenPage\?\.\(\(\{ url \} = \{\}\) => browserShell\.openUrlHandoff/, 'mini listens for main-tab handoffs');
 });

@@ -44,7 +44,7 @@ test('highlighted read-only text offers Copy, Search and Ask Yayra AI, then dism
     };
     const toolbar = shell.showSelectionToolbar(snapshot);
     assert.ok(toolbar);
-    assert.deepEqual(labels(toolbar), ['Copy', 'Search', 'Ask Yayra AI', 'Ask Yayra Dictionary', 'Save selection']);
+    assert.deepEqual(labels(toolbar), ['Copy', 'Search', 'Ask Yayra AI', 'Ask Yayra Dictionary', 'Save selection', 'Highlight']);
     assert.equal(toolbar.getAttribute('role'), 'toolbar');
     assert.equal(document.body.querySelector('.fb-selection-actions'), toolbar);
 
@@ -76,7 +76,7 @@ test('editable highlights add Cut and remove exactly the selected field range', 
       rect: { left: 20, right: 220, top: 40, bottom: 70, width: 200, height: 30 }
     };
     const toolbar = shell.showSelectionToolbar(snapshot);
-    assert.deepEqual(labels(toolbar), ['Copy', 'Cut', 'Paste', 'Search', 'Ask Yayra AI', 'Ask Yayra Dictionary', 'Save selection']);
+    assert.deepEqual(labels(toolbar), ['Copy', 'Cut', 'Paste', 'Search', 'Ask Yayra AI', 'Ask Yayra Dictionary', 'Save selection', 'Highlight']);
 
     shell._writeSelectionText = async (text) => text === 'beta';
     await shell.cutSelectionSnapshot(snapshot);

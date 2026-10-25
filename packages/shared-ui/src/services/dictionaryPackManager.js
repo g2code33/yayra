@@ -32,16 +32,60 @@ export const DICTIONARY_PACK_CATALOG = Object.freeze([
     description: 'Updated community-maintained English word senses. Download once to search offline; the 2025 core edition excludes proper names.'
   }),
   Object.freeze({
-    id: 'medical-open', title: 'Medical', category: 'medical', available: false,
-    description: 'No medical terminology dataset is bundled. Clinical and medical content requires a verified redistribution licence and is not medical advice.'
+    id: 'gcide-054', title: 'General English — GCIDE 0.54', category: 'general', available: true,
+    version: '0.54.0', datasetVersion: '0.54', packVersion: '1.0.0',
+    source: 'GCIDE 0.54 pinned GitHub mirror snapshot; based on Webster 1913 with WordNet additions and later volunteer revisions.',
+    sourceUrl: 'https://codeload.github.com/GitMirroring/gcide/zip/9fbf5adae3e59c79b1d020d79e99d1d7fd65a5ce',
+    sourceIntegrity: 'sha256-/RawZVH1el0QE7Ty/kR/ZQBq2EFPN9JVJRw/HqABar4=',
+    downloadUrl: './dictionary-packs/gcide-0.54-v1.yayrapack',
+    integrity: 'sha512-JYo871n96wJb7f5MIhtXKyXDIj2lNYZZNFROpeDX4f0liFoRbTll6woScX8efOsEGV9/bZDLyUoGigkaKtryrQ==',
+    downloadSize: 6_098_656,
+    license: 'GNU General Public License version 3 or later (GPL-3.0-or-later).',
+    licenseUrl: './dictionary-packs/GCIDE-LICENSE-0.54.md',
+    attribution: 'GCIDE copyright 1992–2021 Patrick J. Cassidy; 2012–2024 Sergey Poznyakoff; other contributors. Complete source notices and GPL text are included.',
+    description: '114,757 indexed headwords from the historical Webster 1913-based GCIDE corpus with WordNet additions. GPL-3.0-or-later; definitions are preserved from the source.'
   }),
   Object.freeze({
-    id: 'pharmacy-open', title: 'Pharmacy', category: 'pharmacy', available: false,
-    description: 'No pharmacy dataset is bundled until a source with verified redistribution rights and attribution is selected.'
+    id: 'gcide-medical-054', title: 'Medical — GCIDE 0.54', category: 'medical', available: true,
+    version: '0.54.0', datasetVersion: '0.54', packVersion: '1.0.0',
+    source: 'Medical and anatomy subject-tagged entries extracted from the pinned GCIDE 0.54 source snapshot.',
+    sourceUrl: 'https://codeload.github.com/GitMirroring/gcide/zip/9fbf5adae3e59c79b1d020d79e99d1d7fd65a5ce',
+    sourceIntegrity: 'sha256-/RawZVH1el0QE7Ty/kR/ZQBq2EFPN9JVJRw/HqABar4=',
+    downloadUrl: './dictionary-packs/gcide-medical-0.54-v1.yayrapack',
+    integrity: 'sha512-AHvUmFK10apkj/Uzpkz/ike+s6vgktdiTDfTiuNSpD+y6a+AfMav2wBEzD+N56EW5iLpjXQvwkuhQ2HVRIwKpQ==',
+    downloadSize: 408_117,
+    license: 'GNU General Public License version 3 or later (GPL-3.0-or-later).',
+    licenseUrl: './dictionary-packs/GCIDE-LICENSE-0.54.md',
+    attribution: 'GCIDE copyright 1992–2021 Patrick J. Cassidy; 2012–2024 Sergey Poznyakoff; other contributors. Complete source notices and GPL text are included.',
+    description: '5,761 historically sourced entries explicitly tagged for medical, anatomy, surgery, physiology, or related subjects. Not current clinical guidance or medical advice.'
   }),
   Object.freeze({
-    id: 'business-open', title: 'Business', category: 'business', available: false,
-    description: 'No business terminology dataset is bundled until a source with verified redistribution rights and attribution is selected.'
+    id: 'gcide-pharmacy-054', title: 'Pharmacy — GCIDE 0.54', category: 'pharmacy', available: true,
+    version: '0.54.0', datasetVersion: '0.54', packVersion: '1.0.0',
+    source: 'Pharmacy and pharmacology subject-tagged entries extracted from the pinned GCIDE 0.54 source snapshot.',
+    sourceUrl: 'https://codeload.github.com/GitMirroring/gcide/zip/9fbf5adae3e59c79b1d020d79e99d1d7fd65a5ce',
+    sourceIntegrity: 'sha256-/RawZVH1el0QE7Ty/kR/ZQBq2EFPN9JVJRw/HqABar4=',
+    downloadUrl: './dictionary-packs/gcide-pharmacy-0.54-v1.yayrapack',
+    integrity: 'sha512-PP1YWoXmmPzaUDLj4VQqDnNcDKpOyonCwhBgSglTIN2msOyUu4iKzPX1thfFH/OIPVFlumWsec4zmaYa07PEmg==',
+    downloadSize: 21_998,
+    license: 'GNU General Public License version 3 or later (GPL-3.0-or-later).',
+    licenseUrl: './dictionary-packs/GCIDE-LICENSE-0.54.md',
+    attribution: 'GCIDE copyright 1992–2021 Patrick J. Cassidy; 2012–2024 Sergey Poznyakoff; other contributors. Complete source notices and GPL text are included.',
+    description: '61 historically sourced entries explicitly tagged Pharmacy or Pharmacology in GCIDE 0.54. Small and incomplete; not a current drug database, formulary, or prescribing guide.'
+  }),
+  Object.freeze({
+    id: 'fibo-business-2026q2', title: 'Finance & Business — FIBO Q2 2026', category: 'business', available: true,
+    version: '2026.2.0', datasetVersion: 'Q2 2026', packVersion: '1.0.0',
+    source: 'Financial Industry Business Ontology Q2 2026 release at the pinned EDM Council commit; indexes locally defined class labels and definitions.',
+    sourceUrl: 'https://codeload.github.com/edmcouncil/fibo/zip/f59157fe156e3d91b1c045222d0a7dc06b7d78a2',
+    sourceIntegrity: 'sha256-gJnfRhY2gWFL9TrbZOrv5ynBmkk1PF7gGSXJzvPKbxM=',
+    downloadUrl: './dictionary-packs/fibo-business-2026q2-v1.yayrapack',
+    integrity: 'sha512-Kra57xeFaAClKfCZ2hEQuL/KWjLuoz8zcWFJyfvSdP1zJF5mgXm/1zEFSckLCfQKebXIScu3vlX+sSQn8i6/7A==',
+    downloadSize: 123_189,
+    license: 'MIT License; Copyright (c) 2020 Enterprise Data Management Council.',
+    licenseUrl: './dictionary-packs/FIBO-LICENSE-Q2-2026.txt',
+    attribution: 'Financial Industry Business Ontology (FIBO), Enterprise Data Management Council (EDM Council), Q2 2026. FIBO is an EDM Council trademark; no endorsement is implied.',
+    description: '2,667 finance and business terms with definitions from the Q2 2026 FIBO release. Terminology only—not current market data or legal advice.'
   })
 ]);
 
@@ -62,7 +106,9 @@ export async function verifyPackIntegrity(bytes, integrity, subtle = globalThis.
 
 const MAX_IMPORT_BYTES = 50 * 1024 * 1024;
 const MAX_IMPORT_ENTRIES = 200_000;
-const MAX_LICENSE_TEXT_LENGTH = 30_000;
+// GCIDE carries the complete GPL-3.0 text plus upstream source notices (~36 KB).
+// Keep the cap generous enough for full redistribution notices, never truncate them.
+const MAX_LICENSE_TEXT_LENGTH = 100_000;
 const MAX_COMPRESSED_DOWNLOAD_BYTES = 20 * 1024 * 1024;
 const PARTIAL_SAVE_INTERVAL = 1024 * 1024;
 

@@ -64,7 +64,7 @@ test('pack import requires provenance and stores an integrity checksum', async (
   await assert.rejects(manager.importPack(JSON.stringify(bad)), /dictionary-import-metadata-license-required/);
   assert.equal(DICTIONARY_PACK_CATALOG.find((pack) => pack.id === 'wordnet-30')?.available, true);
   assert.equal(DICTIONARY_PACK_CATALOG.find((pack) => pack.id === 'oewn-2025')?.available, true);
-  assert.equal(DICTIONARY_PACK_CATALOG.filter((pack) => pack.available).length, 2, 'only verified, attributed English datasets are downloadable');
+  assert.equal(DICTIONARY_PACK_CATALOG.filter((pack) => pack.available).length, 6, 'only verified, attributed English datasets are downloadable');
 });
 
 test('pack import preserves complete license notices longer than the legacy 5 KB limit', async () => {
@@ -120,6 +120,42 @@ test('Open English WordNet 2025 pack is pinned, attributed, and safely sized for
   const license = await readFile(new URL('../public/dictionary-packs/OPEN-ENGLISH-WORDNET-LICENSE-2025.md', import.meta.url), 'utf8');
   assert.match(license, /Open English WordNet WNDB distribution notice/);
   assert.match(license, /WordNet 3\.1 Copyright 2011 by Princeton University/);
+});
+
+test('GCIDE 0.54 and FIBO Q2 2026 packs pass integrity, redistribution, scope, and manager-import checks', async () => {
+  const descriptors = [
+    { id: 'gcide-054', file: 'gcide-0.54-v1.yayrapack', count: 114757, version: '0.54', category: 'general', term: 'pomegranate', definition: /fruit of the tree/i, license: /GNU GENERAL PUBLIC LICENSE/i },
+    { id: 'gcide-medical-054', file: 'gcide-medical-0.54-v1.yayrapack', count: 5761, version: '0.54', category: 'medical', term: 'myocarditis', definition: /inflammation of the myocardium/i, license: /GNU GENERAL PUBLIC LICENSE/i },
+    { id: 'gcide-pharmacy-054', file: 'gcide-pharmacy-0.54-v1.yayrapack', count: 61, version: '0.54', category: 'pharmacy', term: 'Aspirin', definition: /acetyl salicylic acid/i, license: /GNU GENERAL PUBLIC LICENSE/i },
+    { id: 'fibo-business-2026q2', file: 'fibo-business-2026q2-v1.yayrapack', count: 2667, version: 'Q2 2026', category: 'business', term: 'credit agreement', definition: /contractual agreement/i, license: /MIT License/i }
+  ];
+  for (const expected of descriptors) {
+    const descriptor = DICTIONARY_PACK_CATALOG.find((pack) => pack.id === expected.id);
+    assert.ok(descriptor?.available, `${expected.id} is available in the pack manager`);
+    assert.equal(descriptor.category, expected.category);
+    const bytes = new Uint8Array(await readFile(new URL(`../public/dictionary-packs/${expected.file}`, import.meta.url)));
+    assert.equal(bytes.length, descriptor.downloadSize, `${expected.id} catalog size matches asset`);
+    assert.ok(bytes.length < 20 * 1024 * 1024, `${expected.id} stays within the download cap`);
+    assert.equal(await verifyPackIntegrity(bytes, descriptor.integrity), true, `${expected.id} pack checksum`);
+    const source = gunzipSync(bytes);
+    assert.ok(source.length < 50 * 1024 * 1024, `${expected.id} stays within the import cap`);
+    const pack = JSON.parse(source.toString('utf8'));
+    assert.equal(pack.metadata.id, expected.id);
+    assert.equal(pack.metadata.datasetVersion, expected.version);
+    assert.equal(pack.metadata.category, expected.category);
+    assert.equal(pack.metadata.sourceIntegrity, descriptor.sourceIntegrity);
+    assert.equal(pack.entries.length, expected.count);
+    assert.match(pack.metadata.licenseText, expected.license);
+    assert.match(pack.metadata.attribution, /GCIDE|EDM Council/);
+    assert.match(pack.entries.find((entry) => entry.term.toLowerCase() === expected.term.toLowerCase())?.definitions[0]?.text || '', expected.definition);
+    assert.match(pack.metadata.description, /historical|not current|terminology/i, `${expected.id} accurately scopes the vocabulary`);
+    const store = new MemoryDictionaryStore();
+    const manager = new DictionaryPackManager({ store });
+    const installed = await manager.importPack(pack.entries.length ? source.toString('utf8') : '');
+    assert.equal(installed.ok, true, `${expected.id} imports through the real pack manager`);
+    assert.equal(installed.pack.entryCount, expected.count);
+    assert.equal(installed.pack.licenseText, pack.metadata.licenseText, 'complete source notices are preserved without truncation');
+  }
 });
 
 test('resumable dictionary download requests only the missing byte range and persists completion', async () => {

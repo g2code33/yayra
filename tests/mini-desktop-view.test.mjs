@@ -67,6 +67,27 @@ test('MINI DEFAULTS TO DESKTOP: no stored preference = the desktop view, exactly
   }
 });
 
+test('COMPACT MINI TOOLBAR: bookmark, Downloads, Documents, Dictionary and menu stay visible while the address field can shrink', async () => {
+  const { shell, container } = await bootMini();
+  try {
+    for (const selector of ['.fb-omnibox-star', '.fb-toolbar-downloads-btn', '.fb-toolbar-documents-btn', '.fb-toolbar-dictionary-btn', '.fb-menu-btn']) {
+      assert.ok(container.querySelector(selector), `${selector} remains rendered in mini chrome`);
+    }
+    assert.ok(container.querySelector('.fb-omnibox-input'), 'the address/search field remains available');
+    const css = readFileSync(new URL('../packages/shared-ui/src/theme/design-system.css', import.meta.url), 'utf8');
+    assert.match(css, /\.fb-mini-navbar \.fb-omnibox-container\s*\{[^}]*flex:\s*1 1 0;[^}]*min-width:\s*0;/,
+      'the omnibox is the flexible, shrinkable toolbar region');
+    assert.match(css, /\.fb-mini-navbar \.fb-toolbar-action-btn\s*\{[^}]*flex:\s*0 0 28px;/,
+      'toolbar actions keep a fixed visible hit target');
+    assert.match(css, /\.fb-mini-navbar \.fb-omnibox-star\s*\{[^}]*flex:\s*0 0 24px;/,
+      'bookmark action does not collapse when the window narrows');
+    assert.match(css, /\.fb-mini-navbar \.fb-omnibox-input\s*\{[^}]*flex:\s*1 1 0;[^}]*min-width:\s*0;/,
+      'text input can shrink without clipping toolbar actions');
+  } finally {
+    shell.destroy();
+  }
+});
+
 test('MOBILE PREF STILL WORKS: the compact view renders WITH its back/forward buttons (the un-clipped bottom bar)', async () => {
   const { shell, container } = await bootMini({ pref: 'mobile' });
   try {

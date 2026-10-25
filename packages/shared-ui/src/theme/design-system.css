@@ -5215,40 +5215,65 @@ button.fb-site-passkey-indicator {
 }
 
 .fb-mini-navbar {
+  box-sizing: border-box;
+  width: 100%;
   flex: 0 0 46px;
   height: 46px;
   min-width: 0;
-  padding: 0 8px;
-  gap: 6px;
+  padding: 0 6px;
+  gap: 4px;
+  overflow: hidden;
 }
 
 .fb-mini-navbar .fb-nav-controls,
 .fb-mini-navbar .fb-toolbar-actions {
   gap: 2px;
   flex: 0 0 auto;
+  min-width: max-content;
 }
 
 .fb-mini-navbar .fb-nav-btn,
-.fb-mini-navbar .fb-action-btn {
+.fb-mini-navbar .fb-action-btn,
+.fb-mini-navbar .fb-toolbar-action-btn {
+  box-sizing: border-box;
   width: 28px;
   height: 28px;
+  min-width: 28px;
+  flex: 0 0 28px;
 }
 
 .fb-mini-navbar .fb-omnibox-container {
+  box-sizing: border-box;
+  flex: 1 1 0;
+  width: 0;
   min-width: 0;
   height: 32px;
-  gap: 5px;
-  padding: 0 8px;
+  gap: 3px;
+  padding: 0 4px;
+  overflow: hidden;
 }
 
 .fb-mini-navbar .fb-toolbar-brand {
-  gap: 4px;
-  padding: 2px 4px;
-  margin-right: 0;
+  display: none;
 }
 
-.fb-mini-navbar .fb-toolbar-brand-text {
-  display: none;
+.fb-mini-navbar .fb-omnibox-security,
+.fb-mini-navbar .fb-omnibox-group-btn,
+.fb-mini-navbar .fb-site-passkey-indicator,
+.fb-mini-navbar .fb-update-chip,
+.fb-mini-navbar .fb-toolbar-extensions-btn,
+.fb-mini-navbar .fb-mini-extensions-btn,
+.fb-mini-navbar .fb-account-btn {
+  display: none !important;
+}
+
+.fb-mini-navbar .fb-omnibox-star {
+  box-sizing: border-box;
+  width: 24px;
+  min-width: 24px;
+  height: 28px;
+  flex: 0 0 24px;
+  padding: 3px;
 }
 
 .fb-mini-navbar .fb-mode-text {
@@ -5256,8 +5281,11 @@ button.fb-site-passkey-indicator {
 }
 
 .fb-mini-navbar .fb-omnibox-input {
+  box-sizing: border-box;
+  flex: 1 1 0;
+  width: 0;
   min-width: 0;
-  font-size: 0.8rem;
+  font-size: 0.78rem;
 }
 
 /* Developer Sponsor shortcuts: intentionally compact so they sit at the

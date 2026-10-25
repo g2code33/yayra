@@ -19,8 +19,11 @@ for (const file of files) {
   // reasons - we never reformat them, so the whitespace rule does not apply.
   // The security patterns below still apply to them.
   const isVendored = file.split(path.sep).includes('vendor');
-  // Preserve the upstream OEWN license wording and embedded tab characters.
-  const isUpstreamDictionaryLicense = file === 'public/dictionary-packs/OPEN-ENGLISH-WORDNET-LICENSE-2025.md';
+  // Preserve upstream dictionary license wording and embedded tab characters.
+  const isUpstreamDictionaryLicense = [
+    'public/dictionary-packs/OPEN-ENGLISH-WORDNET-LICENSE-2025.md',
+    'public/dictionary-packs/GCIDE-LICENSE-0.54.md'
+  ].includes(file);
   if (text.includes('\t') && !isVendored && !isUpstreamDictionaryLicense) problems.push(`${file}: tab character found`);
   for (const [pattern, message] of forbidden) {
     if (pattern.test(text) && !file.endsWith('lint.mjs') && !file.endsWith('RELEASE-PIPELINE.md')) problems.push(`${file}: ${message}`);

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { runInNewContext } from 'node:vm';
 import { createOverlayBridge } from '../electron/overlayWindow.cjs';
 import { createOverlayStore } from '../electron/overlayStore.cjs';
 
@@ -225,6 +226,7 @@ function makeRicherBrowserWindowClass() {
       this.visibleOnAllWorkspaces = null;
       this.loadedUrl = null;
       this._listeners = {};
+      this.webContents = { sent: [], isLoading: () => false, send: (...args) => this.webContents.sent.push(args) };
       this._position = [opts.x, opts.y];
       instances.push(this);
     }
@@ -281,6 +283,64 @@ test('overlayWindow: single bubble click opens the floating mini browser window 
   assert.equal(mini.opts.frame, false, 'frameless floating panel');
   assert.equal(mini.opts.webPreferences.preload, '/fake/preload.cjs', 'full window.yayra API preload (native tabs work inside the mini)');
   assert.equal(mini.alwaysOnTop.level, 'screen-saver', 'floats above other apps like the bubble');
+});
+
+test('overlayWindow: a selected tab opens in mini through the validated IPC handoff and reuses its tabs', () => {
+  const { bridge, ipcMain, instances } = makeMiniHarness();
+  const handoff = ipcMain.handlers.get('yayra:overlay-open-mini-page');
+  assert.equal(typeof handoff, 'function', 'the preload-facing mini handoff IPC is registered');
+  assert.equal(handoff(null, { url: 'javascript:alert(1)' }), false, 'script URLs are rejected');
+  assert.equal(handoff(null, { url: 'https://user:password@example.test/' }), false, 'credential-bearing URLs are rejected');
+  assert.equal(handoff(null, { url: 'file:///etc/passwd' }), false, 'local file URLs are rejected');
+
+  const firstUrl = 'https://example.test/first';
+  assert.equal(handoff(null, { url: firstUrl }), true, 'a valid web page creates the mini browser');
+  let mini = bridge.getMiniWindow();
+  assert.equal(instances.length, 1, 'only the mini browser is opened');
+  assert.ok(mini.loadedUrl.includes(`page=${encodeURIComponent(firstUrl)}`), 'first page is loaded at mini startup');
+
+  const secondUrl = 'yayra://downloads';
+  assert.equal(bridge.openPageInMini(secondUrl), true, 'a later handoff is accepted');
+  assert.equal(bridge.getMiniWindow(), mini, 'the existing mini window is reused');
+  assert.deepEqual(mini.webContents.sent, [['yayra:overlay-mini-open-page', { url: secondUrl }]],
+    'the mini renderer receives a safe open-page event instead of replacing its session');
+  assert.equal(instances.length, 1, 'handoffs do not create duplicate mini windows');
+});
+
+test('preload: mini page events are queued until the mini shell subscribes, then delivered and unsubscribed safely', async () => {
+  const source = fs.readFileSync(new URL('../electron/preload.cjs', import.meta.url), 'utf8');
+  const listeners = new Map();
+  let exposed = null;
+  const calls = [];
+  const ipcRenderer = {
+    on: (channel, callback) => listeners.set(channel, callback),
+    removeListener: (channel, callback) => { if (listeners.get(channel) === callback) listeners.delete(channel); },
+    invoke: async (channel, payload) => { calls.push({ channel, payload }); return true; },
+    send: () => {}
+  };
+  runInNewContext(source, {
+    require: (name) => { assert.equal(name, 'electron'); return { ipcRenderer, contextBridge: { exposeInMainWorld: (_name, api) => { exposed = api; } } }; },
+    console,
+    setTimeout,
+    clearTimeout,
+    setInterval: () => 1,
+    clearInterval: () => {}
+  });
+  assert.ok(exposed?.overlay?.onOpenPage, 'the main preload exposes the mini handoff subscription');
+  const first = { url: 'https://example.test/queued' };
+  listeners.get('yayra:overlay-mini-open-page')({}, first);
+  const received = [];
+  const unsubscribe = exposed.overlay.onOpenPage((payload) => received.push(payload));
+  assert.deepEqual(received, [first], 'a page handoff sent during app startup is replayed once the shell is ready');
+  const second = { url: 'yayra://downloads' };
+  listeners.get('yayra:overlay-mini-open-page')({}, second);
+  assert.deepEqual(received, [first, second], 'later handoffs arrive immediately');
+  unsubscribe();
+  listeners.get('yayra:overlay-mini-open-page')({}, { url: 'https://example.test/ignored' });
+  assert.equal(received.length, 2, 'unsubscribe stops renderer callbacks');
+  assert.equal(await exposed.overlay.openPageInMini('https://example.test/first'), true);
+  assert.equal(calls.at(-1).channel, 'yayra:overlay-open-mini-page');
+  assert.equal(calls.at(-1).payload.url, 'https://example.test/first');
 });
 
 test('overlayWindow: clicking the bubble again hides the mini panel; clicking once more brings the SAME window back', () => {

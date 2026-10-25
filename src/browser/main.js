@@ -144,9 +144,9 @@ if (root) {
     isMobile: isMiniShell
       ? resolveMiniLayoutPref() === 'mobile'
       : ['android', 'ios', 'pwa', 'pwa-installed'].includes(target),
-    // The mini panel shares the profile's storage with the main window -
-    // it must NEVER write the rolling last-session snapshot, or every
-    // bubble use wipes the "Continue with these tabs?" offer.
+    // Session recovery is isolated by shell kind inside the shared profile:
+    // mini tabs use their own snapshot and close-choice keys, never the
+    // main browser's "Continue with these tabs?" state.
     isMiniShell,
     updateService: service,
     initialUrl: bootPage || 'yayra://newtab',
@@ -172,6 +172,8 @@ if (root) {
         browserShell.render(root);
       }
     });
+    const overlayApi = (window.yayra && window.yayra.overlay) || (window.ibrowse && window.ibrowse.overlay) || null;
+    overlayApi?.onOpenPage?.(({ url } = {}) => browserShell.openUrlHandoff?.(url));
   }
   if (!isMiniShell) {
     const overlayApi = (window.yayra && window.yayra.overlay) || (window.ibrowse && window.ibrowse.overlay) || null;

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { setupDomShim, MockElement } from './dom-shim.mjs';
 setupDomShim();
 if (!document.createTextNode) document.createTextNode = (text) => { const node = new MockElement('#text'); node.textContent = String(text); return node; };
@@ -42,6 +43,25 @@ test('dictionary page renders local results and untrusted definitions as text, n
     assert.equal(viewport.querySelector('script'), null);
   } finally { shell.destroy(); container.remove(); }
 });
+
+test('Dictionary is a working side-drawer destination and pack source links have independent spacing', () => {
+  const { shell, container } = makeShell();
+  try {
+    shell.state.isSideDrawerOpen = true;
+    shell.render(container);
+    const dictionaryButton = container.querySelector('.fb-dr-dictionary');
+    assert.ok(dictionaryButton, 'the side drawer includes the Dictionary entry');
+    dictionaryButton.click();
+    assert.equal(shell.getActiveTab().url, 'yayra://dictionary', 'the menu opens the offline dictionary page');
+    const source = requireBrowserShellSource();
+    assert.match(source, /\.fb-dict-link\{display:block[^}]*margin-top:7px/,
+      'license and verification links stack with visible spacing in pack cards');
+  } finally { shell.destroy(); container.remove(); }
+});
+
+function requireBrowserShellSource() {
+  return readFileSync(new URL('../packages/shared-ui/src/components/BrowserShell.js', import.meta.url), 'utf8');
+}
 
 test('Dictionary entry point and selection shortcut are visible in Settings', () => {
   const { shell, container } = makeShell();

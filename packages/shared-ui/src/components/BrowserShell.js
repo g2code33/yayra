@@ -279,7 +279,13 @@ export class BrowserShell {
       if (!this.storageAdapter) this.storageAdapter = scoped;
       this.wheelRepo = options.wheelRepo || createWheelRepo(scoped);
       this.shortcutsRepo = options.shortcutsRepo || createShortcutsRepo(scoped);
-      this.sessionRepo = options.sessionRepo || createSessionRepo(scoped);
+      const sessionStorage = options.isMiniShell
+        ? {
+          get: (key) => scoped.get(`mini:${key}`),
+          set: (key, value) => scoped.set(`mini:${key}`, value)
+        }
+        : scoped;
+      this.sessionRepo = options.sessionRepo || createSessionRepo(sessionStorage);
       this.tabGroupsRepo = options.tabGroupsRepo || createTabGroupsRepo(scoped);
     } else {
       this.profileStorage = null;
@@ -3413,9 +3419,9 @@ export class BrowserShell {
 
     // 2. Browser Navigation Toolbar (Back, Forward, Reload/Stop, Brand, Lock + Search Engine, Omnibox, Star, Downloads, Extensions, Menu)
     const navbar = document.createElement('nav');
-    navbar.className = 'fb-chrome-navbar';
+    navbar.className = `fb-chrome-navbar${this.options?.isMiniShell ? ' fb-mini-navbar' : ''}`;
     navbar.setAttribute('role', 'toolbar');
-    navbar.setAttribute('aria-label', 'Navigation and address bar');
+    navbar.setAttribute('aria-label', this.options?.isMiniShell ? 'Mini navigation and address bar' : 'Navigation and address bar');
 
     // Navigation Controls
     const navControls = document.createElement('div');
@@ -8554,7 +8560,7 @@ export class BrowserShell {
         .fb-dict-definition{border-top:1px solid rgba(148,163,184,.18);padding-top:8px;margin-top:8px}.fb-dict-example{margin:6px 0 0 16px;color:var(--fb-text-muted,#cbd5e1)}
         .fb-dict-list{display:grid;gap:10px;margin-top:14px}.fb-dict-split{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.fb-dict-checkbox{display:flex;align-items:center;gap:8px}
         .fb-dict-empty{padding:22px 16px;border:1px dashed rgba(148,163,184,.4);border-radius:12px;text-align:center;color:var(--fb-text-muted,#9ca3af)}
-        .fb-dict-link{color:#93c5fd;text-decoration:underline}.fb-dict-pack-meta{font-size:.9rem;line-height:1.5;overflow-wrap:anywhere}.fb-dict-license{max-height:240px;overflow:auto;white-space:pre-wrap;font:inherit;font-size:.8rem;line-height:1.45;color:var(--fb-text-muted,#cbd5e1)}
+        .fb-dict-link{display:block;width:max-content;max-width:100%;margin-top:7px;color:#93c5fd;text-decoration:underline;overflow-wrap:anywhere}.fb-dict-pack-meta{font-size:.9rem;line-height:1.5;overflow-wrap:anywhere}.fb-dict-license{max-height:240px;overflow:auto;white-space:pre-wrap;font:inherit;font-size:.8rem;line-height:1.45;color:var(--fb-text-muted,#cbd5e1)}
         .fb-dict-status{min-height:1.3em;margin:8px 0;color:var(--fb-text-muted,#9ca3af)}
         .fb-dictionary-brand-action{display:inline-flex;align-items:center;gap:8px}.fb-dictionary-brand-action svg{width:20px;height:20px}
         .fb-toolbar-dictionary-btn svg{filter:drop-shadow(0 0 5px rgba(56,189,248,.3))}
@@ -8652,7 +8658,7 @@ export class BrowserShell {
       });
       const integrityNote = document.createElement('div'); integrityNote.className = 'fb-dict-notice';
       integrityNote.textContent = durableDictionaryStorage
-        ? 'General English is available as a verified 6.6 MB WordNet 3.0 download. Medical, Pharmacy and Business packs are not included until their sources and redistribution licences are confirmed.'
+        ? 'Verified offline packs include WordNet 3.0, Open English WordNet 2025, GCIDE 0.54, and FIBO Q2 2026. Medical and Pharmacy are historical GCIDE subject-tagged subsets; Pharmacy is small and is not a drug database or prescribing guide.'
         : 'Persistent IndexedDB storage is unavailable in this build. Downloads and imports are disabled so dictionary data cannot be lost when the session closes.';
       section.appendChild(integrityNote);
       const list = document.createElement('div'); list.className = 'fb-dict-list'; section.appendChild(list);
@@ -15302,21 +15308,14 @@ export class BrowserShell {
    * untouched (pooled frames / native views).
    * ----------------------------------------------------------- */
   /**
-   * Rolling "tabs that are still open" snapshot (profile-scoped). A tab
-   * the user closes by hand leaves state.tabs and therefore the
-   * snapshot - so whatever the snapshot holds when the app dies (quit,
-   * crash, tray exit) is exactly "the tabs that were NOT closed
-   * manually", which the next launch offers as "Continue with these
-   * tabs". Debounced + JSON-compared so render() can call it freely.
+   * Rolling "tabs that are still open" snapshot, isolated by profile and
+   * by shell kind. The mini shell uses its own `mini:last-session-tabs`
+   * storage key, so its recovery offer cannot read or overwrite the main
+   * browser's session. Debounced + JSON-compared so render() can call it freely.
    */
   queueSessionSnapshot() {
     if (!this.sessionRepo || typeof this.sessionRepo.saveSession !== 'function') return;
     if (typeof setTimeout !== 'function') return;
-    // The bubble's mini panel runs its OWN shell over the SAME profile
-    // storage: letting it snapshot its (empty) tab list silently wiped
-    // the main window's last session every time the bubble was used -
-    // the "recover recent tabs never comes" bug.
-    if (this.options?.isMiniShell) return;
     const tabs = (this.state.tabs || [])
       .map((tab) => this.sessionEntryForTab(tab))
       .filter(Boolean);
@@ -15706,6 +15705,7 @@ export class BrowserShell {
         <div class="fb-toolbar-actions">
           <button class="fb-action-btn fb-toolbar-action-btn fb-mini-download-btn" title="Downloads" aria-label="Downloads">${Icons.download}</button>
           <button class="fb-action-btn fb-toolbar-action-btn fb-mini-documents-btn" title="Documents" aria-label="Documents">${Icons.document}</button>
+          <button class="fb-action-btn fb-toolbar-action-btn fb-mini-dictionary-btn" title="Dictionary" aria-label="Dictionary">${Icons.dictionary}</button>
           <button class="fb-action-btn fb-toolbar-action-btn fb-mini-extensions-btn" title="Extensions and Shields" aria-label="Extensions and Shields">${Icons.shield}</button>
           ${this.authBridge ? `<button class="fb-action-btn fb-toolbar-action-btn fb-account-btn fb-mini-account-btn" title="Yayra account" aria-label="Account">${this.renderAccountAvatarHtml(this.state.googleAccount?.signedIn ? this.state.googleAccount.profile : null, 22)}</button>` : ''}
           <button class="fb-action-btn fb-menu-btn fb-toolbar-action-btn fb-mini-drawer-btn" title="Customize and control Yayra" aria-label="Main menu">${Icons.moreVertical}</button>
@@ -15765,6 +15765,10 @@ export class BrowserShell {
 
     win.querySelector('.fb-mini-documents-btn')?.addEventListener('click', () => {
       this.openInternalPage('yayra://documents');
+    });
+
+    win.querySelector('.fb-mini-dictionary-btn')?.addEventListener('click', () => {
+      this.openInternalPage('yayra://dictionary');
     });
 
     win.querySelector('.fb-mini-extensions-btn')?.addEventListener('click', () => {
@@ -16747,7 +16751,8 @@ export class BrowserShell {
   }
 
   closeSessionStorageKey() {
-    return `yayra:close-session:${encodeURIComponent(this.currentProfileId())}`;
+    const shellScope = this.options?.isMiniShell ? 'mini:' : '';
+    return `yayra:${shellScope}close-session:${encodeURIComponent(this.currentProfileId())}`;
   }
 
   closeWithSessionMode(mode) {
@@ -16802,8 +16807,10 @@ export class BrowserShell {
     let raw = null;
     try {
       raw = localStorage.getItem(scopedKey);
-      // One-time migration for sessions saved before profile-scoped keys.
-      if (raw === null) {
+      // One-time migration for main-browser sessions saved before
+      // profile-scoped keys. A mini shell must never adopt the main browser's
+      // older close choice.
+      if (raw === null && !this.options?.isMiniShell) {
         storageKey = 'yayra:close-session';
         raw = localStorage.getItem(storageKey);
       }
@@ -17934,6 +17941,7 @@ export class BrowserShell {
         <!-- 4. Downloads and local Documents -->
         <button class="fb-drawer-item fb-dr-downloads">${Icons.download} <span>Downloads</span> <kbd>Ctrl+J</kbd></button>
         <button class="fb-drawer-item fb-dr-documents">${Icons.document} <span>Documents</span></button>
+        <button class="fb-drawer-item fb-dr-dictionary">${Icons.dictionary} <span>Dictionary</span></button>
 
         <!-- 5. Bookmarks & Lists with Submenu -->
         <div class="fb-drawer-item-has-submenu">
@@ -18347,6 +18355,11 @@ export class BrowserShell {
     drawer.querySelector('.fb-dr-documents')?.addEventListener('click', () => {
       this.state.isSideDrawerOpen = false;
       this.openInternalPage('yayra://documents');
+    });
+
+    drawer.querySelector('.fb-dr-dictionary')?.addEventListener('click', () => {
+      this.state.isSideDrawerOpen = false;
+      this.openInternalPage('yayra://dictionary');
     });
 
     drawer.querySelector('.fb-dr-bookmarks')?.addEventListener('click', () => {
@@ -20295,6 +20308,17 @@ export class BrowserShell {
       { label: 'New Tab', action: () => this.createNewTab() },
       { label: 'Reload', action: () => this.reloadTabById(tab.id) },
       { label: 'Duplicate Tab', action: () => this.duplicateTabById(tab.id) },
+      ...(!tab.isPrivate && typeof this.overlayBridge?.openPageInMini === 'function'
+        && /^(?:https?:\/\/|yayra:\/\/)/i.test(String(tab.url || '')) ? [{
+        label: 'Open in mini yayra',
+        action: () => {
+          try {
+            Promise.resolve(this.overlayBridge.openPageInMini(tab.url))
+              .then((opened) => { if (opened === false) this.showTransientNotice('Could not open this tab in yayra mini.'); })
+              .catch(() => this.showTransientNotice('Could not open this tab in yayra mini.'));
+          } catch { this.showTransientNotice('Could not open this tab in yayra mini.'); }
+        }
+      }] : []),
       ...(/^https?:\/\//i.test(String(tab.url || '')) ? [{
         label: 'Move Tab to New Window',
         action: () => { void this.detachTabToWindow(tab.id); }

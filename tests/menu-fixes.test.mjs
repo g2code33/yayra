@@ -613,6 +613,37 @@ test('TAB RIGHT-CLICK: group, move, open, and remove actions work for the tab un
   }
 });
 
+test('TAB RIGHT-CLICK: opens an eligible non-private tab in mini and hides the action for private tabs', async () => {
+  const previousBridge = window.yayra;
+  const handoffs = [];
+  window.yayra = { overlay: {
+    getSettings: async () => ({}),
+    openPageInMini: async (url) => { handoffs.push(url); return true; }
+  } };
+  const { shell } = await makeShell();
+  try {
+    const target = shell.getActiveTab();
+    target.url = 'https://selected.example.test/path';
+    shell.renderTabContextMenu(40, 40, target);
+    let buttons = [...document.body.querySelectorAll('.fb-tab-context-menu-item')];
+    const openInMini = buttons.find((button) => button.textContent === 'Open in mini yayra');
+    assert.ok(openInMini, 'right-click menu offers the mini browser handoff for ordinary tabs');
+    openInMini.click();
+    await flush();
+    assert.deepEqual(handoffs, ['https://selected.example.test/path'], 'the selected tab URL is sent over the bridge');
+
+    target.isPrivate = true;
+    shell.renderTabContextMenu(40, 40, target);
+    buttons = [...document.body.querySelectorAll('.fb-tab-context-menu-item')];
+    assert.equal(buttons.some((button) => button.textContent === 'Open in mini yayra'), false,
+      'private tabs are never handed off to the persistent mini session');
+  } finally {
+    shell.destroy();
+    if (previousBridge === undefined) delete window.yayra;
+    else window.yayra = previousBridge;
+  }
+});
+
 test('LINKS: a tab opened by a page is inserted beside its source and keeps its privacy/group context', async () => {
   const { shell } = await makeShell();
   try {
