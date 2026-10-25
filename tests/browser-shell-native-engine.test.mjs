@@ -507,8 +507,13 @@ test('Native engine: connected Google continuation keeps the full destination in
     assert.equal(tab.url, destination, 'path, query, and fragment from the initiating Google destination are restored');
     assert.equal(externalProductCalls, 0, 'continuation is not abandoned to Chrome');
     assert.ok(calls.ensure.some((call) => call.url === destination), 'the exact destination resumes in Yayra’s site engine');
-    assert.match(shell.rootElement.querySelector('.fb-google-connected-banner')?.textContent || '', /selected@example\.com/,
+    const connectedBanner = shell.rootElement.querySelector('.fb-google-connected-banner');
+    assert.match(connectedBanner?.textContent || '', /selected@example\.com/,
       'the Google page receives a persistent Yayra account reflection instead of a generic Sign in state');
+    assert.ok(connectedBanner.querySelector('.fb-google-connected-banner-identity'), 'identity stays grouped on the left');
+    assert.equal(connectedBanner.querySelector('.fb-google-connected-banner-actions')?.querySelectorAll('button').length, 2,
+      'Gmail and services actions are grouped together');
+    assert.ok(connectedBanner.querySelector('.fb-google-connected-banner-note'), 'verification is shown as its own status pill');
     shell.destroy();
   } finally {
     uninstall();

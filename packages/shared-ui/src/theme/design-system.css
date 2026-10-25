@@ -1455,29 +1455,43 @@ button.fb-site-passkey-indicator {
 
 .fb-google-connected-banner {
   box-sizing: border-box;
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  min-height: 42px;
-  padding: 5px 12px;
-  border-bottom: 1px solid color-mix(in srgb, var(--fb-border-subtle, #3c4043) 76%, transparent);
-  background: var(--fb-bg-elevated, #202124);
-  color: var(--fb-text-primary, #e8eaed);
-  font-size: 12px;
+  position: relative;
   z-index: 2;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 16px;
+  width: 100%;
+  min-height: 58px;
+  padding: 8px clamp(14px, 2vw, 24px);
+  border-bottom: 1px solid rgba(148, 163, 184, .16);
+  background: linear-gradient(105deg, #202936 0%, #1a202a 58%, #171c25 100%);
+  color: #f1f5f9;
+  font-size: 13px;
+}
+
+.fb-google-connected-banner-identity {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 11px;
+  min-width: 0;
 }
 
 .fb-google-connected-banner-badge {
   display: grid;
   place-items: center;
-  flex: 0 0 29px;
-  width: 29px;
-  height: 29px;
+  flex: 0 0 36px;
+  width: 36px;
+  height: 36px;
   overflow: hidden;
+  border: 2px solid rgba(255, 255, 255, .2);
   border-radius: 50%;
   background: #1a73e8;
   color: #fff;
-  font-weight: 700;
+  font-size: 14px;
+  font-weight: 750;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .25);
 }
 
 .fb-google-connected-banner-badge img {
@@ -1486,38 +1500,92 @@ button.fb-site-passkey-indicator {
   object-fit: cover;
 }
 
-.fb-google-connected-banner > span:nth-child(2) {
+.fb-google-connected-banner-copy {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
+  gap: 2px;
   min-width: 0;
 }
 
-.fb-google-connected-banner b,
-.fb-google-connected-banner small {
-  max-width: min(42vw, 340px);
+.fb-google-connected-banner-copy b {
   overflow: hidden;
+  color: #f8fafc;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.25;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.fb-google-connected-banner small {
-  color: var(--fb-text-secondary, #9aa0a6);
-  font-size: 10px;
+.fb-google-connected-banner-copy small {
+  overflow: hidden;
+  color: #aab7c8;
+  font-size: 11px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.fb-google-connected-banner button {
-  margin-left: auto;
-  padding: 5px 12px;
-  border: 1px solid var(--fb-border-subtle, #5f6368);
-  border-radius: 16px;
-  background: transparent;
-  color: inherit;
+.fb-google-connected-banner-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.fb-google-connected-banner .fb-google-connected-banner-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 34px;
+  margin: 0;
+  padding: 0 13px;
+  border: 1px solid rgba(164, 184, 210, .3);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, .055);
+  color: #e8eef7;
   cursor: pointer;
+  font: 600 12px/1 system-ui, sans-serif;
+  white-space: nowrap;
+  transition: background .15s ease, border-color .15s ease, transform .15s ease;
+}
+
+.fb-google-connected-banner .fb-google-connected-banner-action:hover {
+  transform: translateY(-1px);
+  border-color: rgba(138, 180, 248, .65);
+  background: rgba(96, 165, 250, .16);
+}
+
+.fb-google-connected-banner .fb-google-services-hub-btn {
+  border-color: rgba(138, 180, 248, .48);
+  background: rgba(96, 165, 250, .13);
+  color: #cfe1ff;
 }
 
 .fb-google-connected-banner-note {
-  color: #8ab4f8;
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid rgba(52, 211, 153, .28);
+  border-radius: 999px;
+  background: rgba(16, 185, 129, .1);
+  color: #9ce8cb;
+  font-size: 11px;
+  font-weight: 600;
   white-space: nowrap;
+}
+
+.fb-google-connected-banner-note::before {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #34d399;
+  box-shadow: 0 0 8px rgba(52, 211, 153, .55);
+  content: '';
 }
 
 .fb-gmail-auth-holder {
@@ -1804,6 +1872,24 @@ button.fb-site-passkey-indicator {
     display: none;
   }
 
+  .fb-google-connected-banner {
+    gap: 10px;
+    min-height: 54px;
+    padding: 7px 12px;
+  }
+
+  .fb-google-connected-banner-badge {
+    flex-basis: 32px;
+    width: 32px;
+    height: 32px;
+  }
+
+  .fb-google-connected-banner .fb-google-connected-banner-action {
+    min-height: 32px;
+    padding: 0 10px;
+    font-size: 11px;
+  }
+
   .fb-gmail-header {
     min-height: 54px;
     padding: 6px 10px;
@@ -1829,6 +1915,22 @@ button.fb-site-passkey-indicator {
 
   .fb-gmail-message {
     padding: 16px 14px 36px;
+  }
+}
+
+@media (max-width: 480px) {
+  .fb-google-connected-banner {
+    flex-wrap: wrap;
+    gap: 7px 10px;
+    padding: 8px 10px;
+  }
+
+  .fb-google-connected-banner-identity {
+    flex-basis: 100%;
+  }
+
+  .fb-google-connected-banner-actions {
+    margin-left: auto;
   }
 }
 
@@ -10981,14 +11083,3 @@ button.fb-site-passkey-indicator {
   .fb-google-services-actions { justify-content: flex-start; }
   .fb-google-services-grid { grid-template-columns: repeat(auto-fill, minmax(135px, 1fr)); }
 }
-
-.fb-google-connected-banner .fb-google-services-hub-btn {
-  padding: 4px 9px;
-  border: 1px solid rgba(138,180,248,.45);
-  border-radius: 14px;
-  background: rgba(96,165,250,.12);
-  color: inherit;
-  cursor: pointer;
-  font-size: .76rem;
-}
-.fb-google-connected-banner .fb-google-services-hub-btn:hover { background: rgba(96,165,250,.22); }

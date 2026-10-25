@@ -4462,30 +4462,38 @@ export class BrowserShell {
       badge.textContent = String(profile.name || profile.email || 'G').trim().slice(0, 1).toUpperCase() || 'G';
     }
     const copy = document.createElement('span');
+    copy.className = 'fb-google-connected-banner-copy';
     const label = document.createElement('b');
     label.textContent = this.state.googleServices?.profile?.email || profile.email || profile.name || 'Google account';
     const detail = document.createElement('small');
     detail.textContent = this.state.googleServices?.signedIn ? 'Google services connected in Yayra' : 'Connected to Yayra';
     copy.appendChild(label);
     copy.appendChild(detail);
-    banner.appendChild(badge);
-    banner.appendChild(copy);
+    const identity = document.createElement('div');
+    identity.className = 'fb-google-connected-banner-identity';
+    identity.appendChild(badge);
+    identity.appendChild(copy);
+    banner.appendChild(identity);
 
+    const actions = document.createElement('div');
+    actions.className = 'fb-google-connected-banner-actions';
     const gmail = document.createElement('button');
     gmail.type = 'button';
-    gmail.textContent = 'Gmail';
+    gmail.className = 'fb-google-connected-banner-action';
+    gmail.textContent = 'Open Gmail';
     gmail.addEventListener('click', () => {
       this._inAppOnlyGoogleTabs.add(activeTab.id);
       this.navigateActiveTab('https://mail.google.com/mail/u/0/#inbox');
     });
-    banner.appendChild(gmail);
+    actions.appendChild(gmail);
 
     const hub = document.createElement('button');
     hub.type = 'button';
-    hub.className = 'fb-google-services-hub-btn';
+    hub.className = 'fb-google-connected-banner-action fb-google-services-hub-btn';
     hub.textContent = 'Google services';
     hub.addEventListener('click', () => this.openInternalPage('yayra://google-services'));
-    banner.appendChild(hub);
+    actions.appendChild(hub);
+    banner.appendChild(actions);
 
     const explanation = document.createElement('span');
     explanation.className = 'fb-google-connected-banner-note';
