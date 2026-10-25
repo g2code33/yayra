@@ -8689,9 +8689,9 @@ export class BrowserShell {
                 const result = await this.getDictionaryLibrary().manager.install(pack.id, { onProgress: (event) => {
                   if (event.state === 'downloading') progress.textContent = `Downloading ${formatDictionaryBytes(event.loaded)} of ${formatDictionaryBytes(event.total)} (${Math.round(event.progress * 100)}%). You can retry if the connection drops.`;
                   else if (event.state === 'verifying') progress.textContent = 'Checking the pack checksum…';
-                  else if (event.state === 'installing') progress.textContent = 'Verified. Installing and indexing 147,806 terms for offline search…';
+                  else if (event.state === 'installing') progress.textContent = `Verified. Installing ${pack.title} for offline search…`;
                 } });
-                progress.textContent = result.duplicate ? 'This pack is already installed.' : 'General English is installed and ready for offline search.';
+                progress.textContent = result.duplicate ? 'This pack is already installed.' : `${pack.title} is installed and ready for offline search.`;
                 this.render();
               } catch (error) {
                 progress.textContent = this.dictionaryErrorMessage(error);
@@ -8700,7 +8700,7 @@ export class BrowserShell {
             }, 'primary');
             installButton.disabled = !durableDictionaryStorage;
             const actions = document.createElement('div'); actions.className = 'fb-dict-card-actions'; actions.appendChild(installButton); card.appendChild(actions); card.appendChild(progress);
-            if (pack.licenseUrl) { const licenseLink = document.createElement('a'); licenseLink.className = 'fb-dict-link'; licenseLink.href = pack.licenseUrl; licenseLink.target = '_blank'; licenseLink.rel = 'noopener noreferrer'; licenseLink.textContent = 'Read Princeton WordNet 3.0 licence'; card.appendChild(licenseLink); }
+            if (pack.licenseUrl) { const licenseLink = document.createElement('a'); licenseLink.className = 'fb-dict-link'; licenseLink.href = pack.licenseUrl; licenseLink.target = '_blank'; licenseLink.rel = 'noopener noreferrer'; licenseLink.textContent = 'Read full source licence notices'; card.appendChild(licenseLink); }
             if (pack.sourceUrl) { const link = document.createElement('a'); link.className = 'fb-dict-link'; link.href = pack.sourceUrl; link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = 'Verify source archive'; card.appendChild(link); }
           } else {
             const note = document.createElement('p'); note.className = 'fb-dict-muted'; note.textContent = 'No verified source dataset is available for this category yet.'; card.appendChild(note);

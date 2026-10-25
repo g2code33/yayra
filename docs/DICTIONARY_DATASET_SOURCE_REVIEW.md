@@ -1,11 +1,24 @@
 # Dictionary dataset source review
 
-Reviewed 25 October 2026. This is a practical redistribution screen, not legal advice. No new corpus was imported or advertised as downloadable from this review. A source may be added only after pinning its edition, checking the exact files and notices shipped, documenting attribution and update cadence, and producing a reproducible Yayra pack.
+Reviewed 25 October 2026. This is a practical redistribution screen, not legal advice. Open English WordNet 2025 has now been pinned, checked against its source notices, and built as a separately downloadable Yayra pack. Other sources remain unavailable until their exact data and redistribution obligations are verified.
+
+## Verified downloadable pack
+
+### Open English WordNet 2025 (core edition)
+
+- Upstream edition: Open English WordNet 2025, released 31 December 2025; source commit `dc343f2683279ecbb13fab4e2fd778d7b162d287`.
+- The official source README reports 107,519 synsets. The deterministic Yayra transform indexes 127,311 unique terms and preserves the included usage examples. This is the 2025 core edition, not 2025+; proper names are excluded.
+- Licensing: the upstream `LICENSE.md` applies CC BY 4.0 to Open English WordNet and states the resource derives from Princeton WordNet. The distribution's `WNDB_License.txt` preserves the underlying WordNet 3.1 notice. Both complete source notices are carried in the pack metadata and `public/dictionary-packs/OPEN-ENGLISH-WORDNET-LICENSE-2025.md`.
+- Pinned source archive: `https://codeload.github.com/globalwordnet/english-wordnet/zip/dc343f2683279ecbb13fab4e2fd778d7b162d287`; SHA-256 `c5068434cf585e8d7899ca0908db2c00cb51edf015e9d0846484d0f5680495d2`.
+- Yayra asset: `public/dictionary-packs/oewn-2025-v1.yayrapack`; SHA-512 `HO0KHKrsw6faeu4HiAW9jYoXppL0ouYxfY9gGeZtqpWxvSyMJ/7joZQSR4W7AIpeHDNi+GHmjHXVfzORu2v7SA==`.
+- Rebuild from the extracted pinned source with `node scripts/build-oewn-pack.mjs <source-directory>`. The build script verifies the pinned directory and a SHA-256 digest of the README, license notices, and YAML source tree (`3da494282ea713ae27f29bcb1dde3ede9e2359aadfd13122009fb98776a776d4`), then checks the edition counts and notices. The pack remains an explicit user download (not precached) and stays below the app's compressed and decompressed import limits.
 
 ## General English suggestions
 
 | Source | Review | Decision |
 | --- | --- | --- |
+| Open English WordNet 2025 | The pinned core release is CC BY 4.0 and derived from Princeton WordNet; the release also includes the underlying WordNet 3.1 notice. Both notices and attribution are preserved. | Added as `oewn-2025`, a verified General English download with 127,311 indexed terms. |
+| GCIDE 0.54 | The official project describes the corpus as derived from Webster's 1913 dictionary, supplemented in part with WordNet; its official license page states GPL-3.0-or-later. | A promising free source, but not yet packaged: exact 0.54 source archive integrity, complete corresponding source for any transformed data, and the pack-size/import limits still need verification. |
 | Wiktionary | Entry text is dual-licensed under CC BY-SA 4.0 and GFDL, with imported pages and contributor attribution requiring care. Redistributed/adapted text must preserve the applicable licensing notices, attribution and share-alike obligations, including access to the transparent source copy. | Eligible in principle, but no dump parser, edition pin, attribution index or compliant pack is prepared. Do not call it a ready-to-install Yayra pack yet. |
 | ConceptNet 5 | The graph is CC BY-SA 4.0 and requires attribution/share-alike. It contains relations and some lexical information, but is primarily a commonsense knowledge graph rather than a definitions dictionary. Its combined graph also aggregates sources with their own terms. | Eligible for a separately described related-concepts pack after source audit; not represented as a definitions dictionary and not included in the current pack catalog. |
 | BabelNet | Its current license restricts the resource to research institutions/non-commercial use and controls distribution of indexes and processed adaptations. | Not suitable for a generally downloadable Yayra pack. |
@@ -25,6 +38,8 @@ Reviewed 25 October 2026. This is a practical redistribution screen, not legal a
 
 ## Primary references checked
 
+- Open English WordNet 2025 source, release and license: https://github.com/globalwordnet/english-wordnet/tree/2025-edition, https://github.com/globalwordnet/english-wordnet/releases/tag/2025-edition, https://github.com/globalwordnet/english-wordnet/blob/2025-edition/LICENSE.md, and https://github.com/globalwordnet/english-wordnet/blob/2025-edition/WNDB_License.txt
+- GCIDE project description and license: https://gcide.gnu.org.ua/ and https://gcide.gnu.org.ua/license; GNU 0.54 release announcement: https://lists.gnu.org/archive/html/info-gnu/2024-12/msg00009.html
 - Wiktionary copyright and reuse: https://en.wiktionary.org/wiki/Wiktionary:Copyrights and https://dumps.wikimedia.org/legal.html
 - ConceptNet data license and attribution: https://conceptnet.io/ and https://github.com/commonsense/conceptnet5/wiki/Copying-and-sharing-ConceptNet
 - BabelNet license: https://babelnet.org/license and https://babelnet.org/full-license

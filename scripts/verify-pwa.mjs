@@ -14,10 +14,14 @@ const expected = (await listFiles(dist))
 if (JSON.stringify(precache) !== JSON.stringify(expected)) {
   fail(`precache mismatch\nexpected=${JSON.stringify(expected, null, 2)}\nactual=${JSON.stringify(precache, null, 2)}`);
 }
-const dictionaryPack = './dictionary-packs/wordnet-3.0-v1.yayrapack';
-if (!existsSync(path.join(dist, dictionaryPack.slice(2)))) fail('bundled WordNet 3.0 download asset is missing');
-if (precache.includes(dictionaryPack)) fail('large dictionary pack must be downloaded only on explicit user request, not precached');
-if (!precache.includes('./dictionary-packs/WORDNET-LICENSE-3.0.txt')) fail('WordNet 3.0 licence must remain available to the PWA');
+for (const [dictionaryPack, licenseFile] of [
+  ['./dictionary-packs/wordnet-3.0-v1.yayrapack', './dictionary-packs/WORDNET-LICENSE-3.0.txt'],
+  ['./dictionary-packs/oewn-2025-v1.yayrapack', './dictionary-packs/OPEN-ENGLISH-WORDNET-LICENSE-2025.md']
+]) {
+  if (!existsSync(path.join(dist, dictionaryPack.slice(2)))) fail(`bundled dictionary download asset is missing: ${dictionaryPack}`);
+  if (precache.includes(dictionaryPack)) fail(`large dictionary pack must be downloaded only on explicit user request, not precached: ${dictionaryPack}`);
+  if (!precache.includes(licenseFile)) fail(`dictionary license notices must remain available to the PWA: ${licenseFile}`);
+}
 // The integrated document readers are a lazy ESM graph. Pin every offline
 // engine explicitly so a copy/filter change cannot ship a shell whose Open
 // document action lands on a startup error only after installation.

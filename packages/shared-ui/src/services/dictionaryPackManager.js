@@ -1,9 +1,7 @@
 import { validateDictionaryEntry } from './dictionaryEngine.js';
 
-// The General English pack is generated from the source archive listed in its
-// manifest. WordNet's own 3.0 licence is embedded in the original data files
-// and copied verbatim into every generated pack; the remaining catalog slots
-// stay unavailable until equally clear, redistributable sources are verified.
+// Only editions with a verified source, fixed data version, package integrity,
+// and all required redistribution notices are listed as downloadable.
 export const DICTIONARY_PACK_CATALOG = Object.freeze([
   Object.freeze({
     id: 'wordnet-30', title: 'General English — Princeton WordNet 3.0', category: 'general', available: true,
@@ -18,6 +16,20 @@ export const DICTIONARY_PACK_CATALOG = Object.freeze([
     licenseUrl: './dictionary-packs/WORDNET-LICENSE-3.0.txt',
     attribution: 'WordNet 3.0 Copyright 2006 by Princeton University. All rights reserved.',
     description: '147,806 English terms with WordNet senses and definitions. One-time download; after installation, lookups work offline.'
+  }),
+  Object.freeze({
+    id: 'oewn-2025', title: 'General English — Open English WordNet 2025', category: 'general', available: true,
+    version: '2025.0.0', datasetVersion: '2025', packVersion: '1.0.0',
+    source: 'Open English WordNet 2025 core source at the pinned Global Wordnet Association commit.',
+    sourceUrl: 'https://codeload.github.com/globalwordnet/english-wordnet/zip/dc343f2683279ecbb13fab4e2fd778d7b162d287',
+    sourceIntegrity: 'sha256-xQaENM9YXo14mcoJCNssAMtR7fAV6dCEZITQ9WgEldI=',
+    downloadUrl: './dictionary-packs/oewn-2025-v1.yayrapack',
+    integrity: 'sha512-HO0KHKrsw6faeu4HiAW9jYoXppL0ouYxfY9gGeZtqpWxvSyMJ/7joZQSR4W7AIpeHDNi+GHmjHXVfzORu2v7SA==',
+    downloadSize: 6_290_950,
+    license: 'Open English WordNet: CC BY 4.0; derived Princeton WordNet 3.1 data: retain the included WordNet license notice.',
+    licenseUrl: './dictionary-packs/OPEN-ENGLISH-WORDNET-LICENSE-2025.md',
+    attribution: 'Open English WordNet Team, Open English WordNet 2025; underlying WordNet 3.1 Copyright 2011 by Princeton University.',
+    description: 'Updated community-maintained English word senses. Download once to search offline; the 2025 core edition excludes proper names.'
   }),
   Object.freeze({
     id: 'medical-open', title: 'Medical', category: 'medical', available: false,
@@ -50,6 +62,7 @@ export async function verifyPackIntegrity(bytes, integrity, subtle = globalThis.
 
 const MAX_IMPORT_BYTES = 50 * 1024 * 1024;
 const MAX_IMPORT_ENTRIES = 200_000;
+const MAX_LICENSE_TEXT_LENGTH = 30_000;
 const MAX_COMPRESSED_DOWNLOAD_BYTES = 20 * 1024 * 1024;
 const PARTIAL_SAVE_INTERVAL = 1024 * 1024;
 
@@ -119,7 +132,7 @@ export class DictionaryPackManager {
       if (typeof meta[key] !== 'string' || !meta[key].trim() || meta[key].length > 2000) throw new Error(`dictionary-import-metadata-${key}-required`);
     }
     if (!validDate(meta.buildDate) || !validDate(meta.updatedAt)) throw new Error('dictionary-import-metadata-date-invalid');
-    if (meta.licenseText !== undefined && (typeof meta.licenseText !== 'string' || meta.licenseText.length > 5000)) throw new Error('dictionary-import-license-text-invalid');
+    if (meta.licenseText !== undefined && (typeof meta.licenseText !== 'string' || meta.licenseText.length > MAX_LICENSE_TEXT_LENGTH)) throw new Error('dictionary-import-license-text-invalid');
     const entriesByTerm = new Map();
     for (const raw of data.entries) {
       const entry = validateDictionaryEntry(raw, { packId: id, category });
@@ -150,7 +163,7 @@ export class DictionaryPackManager {
       source: meta.source.trim().slice(0, 2000),
       sourceUrl: safeHttps(meta.sourceUrl),
       license: meta.license.trim().slice(0, 2000),
-      licenseText: typeof meta.licenseText === 'string' ? meta.licenseText.trim().slice(0, 5000) : '',
+      licenseText: typeof meta.licenseText === 'string' ? meta.licenseText.trim().slice(0, MAX_LICENSE_TEXT_LENGTH) : '',
       attribution: meta.attribution.trim().slice(0, 2000),
       sourceIntegrity: typeof meta.sourceIntegrity === 'string' ? meta.sourceIntegrity.trim().slice(0, 200) : '',
       datasetVersion: String(meta.datasetVersion || version).slice(0, 120),

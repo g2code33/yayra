@@ -63,7 +63,17 @@ test('pack import requires provenance and stores an integrity checksum', async (
   delete bad.metadata.license;
   await assert.rejects(manager.importPack(JSON.stringify(bad)), /dictionary-import-metadata-license-required/);
   assert.equal(DICTIONARY_PACK_CATALOG.find((pack) => pack.id === 'wordnet-30')?.available, true);
-  assert.equal(DICTIONARY_PACK_CATALOG.filter((pack) => pack.available).length, 1, 'only the verified General English dataset is downloadable');
+  assert.equal(DICTIONARY_PACK_CATALOG.find((pack) => pack.id === 'oewn-2025')?.available, true);
+  assert.equal(DICTIONARY_PACK_CATALOG.filter((pack) => pack.available).length, 2, 'only verified, attributed English datasets are downloadable');
+});
+
+test('pack import preserves complete license notices longer than the legacy 5 KB limit', async () => {
+  const store = new MemoryDictionaryStore();
+  const manager = new DictionaryPackManager({ store });
+  const fixture = JSON.parse(createFixturePack());
+  fixture.metadata.licenseText = 'LICENSE'.repeat(1_000);
+  const result = await manager.importPack(JSON.stringify(fixture));
+  assert.equal(result.pack.licenseText.length, fixture.metadata.licenseText.length);
 });
 
 test('dictionary checksum verification uses declared SHA-256 / SHA-512 algorithms', async () => {
@@ -85,6 +95,31 @@ test('bundled WordNet 3.0 pack is checksum-pinned, correctly licensed, and conta
   assert.match(pack.metadata.licenseText, /WordNet 3\.0 Copyright 2006 by Princeton University/);
   assert.equal(pack.entries.length, 147806);
   assert.ok(pack.entries.find((entry) => entry.term === 'bank')?.definitions.some((definition) => /financial institution/.test(definition.text)));
+});
+
+test('Open English WordNet 2025 pack is pinned, attributed, and safely sized for installation', async () => {
+  const descriptor = DICTIONARY_PACK_CATALOG.find((pack) => pack.id === 'oewn-2025');
+  const bytes = new Uint8Array(await readFile(new URL('../public/dictionary-packs/oewn-2025-v1.yayrapack', import.meta.url)));
+  assert.equal(bytes.length, descriptor.downloadSize);
+  assert.ok(bytes.length < 20 * 1024 * 1024);
+  assert.equal(await verifyPackIntegrity(bytes, descriptor.integrity), true);
+  const source = gunzipSync(bytes);
+  assert.ok(source.length < 50 * 1024 * 1024, 'decompressed pack remains under the app import limit');
+  const pack = JSON.parse(source.toString('utf8'));
+  assert.equal(pack.format, 'yayra-dictionary-pack');
+  assert.equal(pack.metadata.id, 'oewn-2025');
+  assert.equal(pack.metadata.datasetVersion, '2025');
+  assert.equal(pack.metadata.sourceIntegrity, descriptor.sourceIntegrity);
+  assert.ok(pack.metadata.licenseText.length > 5_000);
+  assert.match(pack.metadata.licenseText, /Creative Commons Attribution 4\.0/);
+  assert.match(pack.metadata.licenseText, /WordNet 3\.1 Copyright 2011 by Princeton University/);
+  assert.match(pack.metadata.description, /107,519 synsets/);
+  assert.match(pack.metadata.description, /excludes proper names/);
+  assert.equal(pack.entries.length, 127311);
+  assert.ok(pack.entries.find((entry) => entry.term === 'bank')?.definitions.some((definition) => /financial institution/i.test(definition.text)));
+  const license = await readFile(new URL('../public/dictionary-packs/OPEN-ENGLISH-WORDNET-LICENSE-2025.md', import.meta.url), 'utf8');
+  assert.match(license, /Open English WordNet WNDB distribution notice/);
+  assert.match(license, /WordNet 3\.1 Copyright 2011 by Princeton University/);
 });
 
 test('resumable dictionary download requests only the missing byte range and persists completion', async () => {
