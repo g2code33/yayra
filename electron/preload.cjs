@@ -5,9 +5,23 @@ const AUTH_EVENT_CHANNEL = 'yayra:auth-event';
 const DOWNLOADS_EVENT_CHANNEL = 'yayra:downloads-event';
 const UPDATES_EVENT_CHANNEL = 'yayra:updates-event';
 const CHROME_INPUT_RECOVERY_CHANNEL = 'yayra:chrome-input-recover';
+const CONTEXT_MENU_ACTION_CHANNEL = 'yayra:context-menu-action';
+const CONTEXT_MENU_NAV_STATE_CHANNEL = 'yayra:context-menu-navigation-state';
 
 const api = {
   getLaunchInfo: () => ipcRenderer.invoke('yayra:get-launch-info'),
+  contextMenu: {
+    updateNavigationState: (state = {}) => ipcRenderer.send(CONTEXT_MENU_NAV_STATE_CHANNEL, {
+      canGoBack: state.canGoBack === true,
+      canGoForward: state.canGoForward === true
+    }),
+    onAction: (callback) => {
+      if (typeof callback !== 'function') return () => {};
+      const listener = (_event, payload) => callback(payload || {});
+      ipcRenderer.on(CONTEXT_MENU_ACTION_CHANNEL, listener);
+      return () => ipcRenderer.removeListener(CONTEXT_MENU_ACTION_CHANNEL, listener);
+    }
+  },
   // Frameless-window controls: the OS title bar + menu block are removed
   // (electron/main.cjs createWindow), so the renderer's tab strip renders
   // real minimize/maximize/close buttons through these.

@@ -8301,6 +8301,34 @@ button.fb-site-passkey-indicator {
   transform: translateY(0) scale(0.98);
 }
 
+.fb-local-image-page {
+  min-height: 100%;
+  background: var(--fb-bg, #111827);
+}
+.fb-local-image-container {
+  display: grid;
+  min-height: 100%;
+  place-items: center;
+  box-sizing: border-box;
+  padding: 28px;
+  overflow: auto;
+}
+.fb-local-image {
+  display: block;
+  max-width: min(100%, 1600px);
+  max-height: calc(100vh - 210px);
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  box-shadow: 0 14px 44px rgba(0, 0, 0, .32);
+}
+.fb-local-image-notice {
+  max-width: 560px;
+  color: var(--fb-text-secondary, #aab2c0);
+  text-align: center;
+  line-height: 1.6;
+}
+
 .fb-ai-container {
   display: flex;
   flex-direction: column;

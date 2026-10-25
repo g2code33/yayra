@@ -964,6 +964,30 @@ test('buildContextMenuTemplate: plain page click offers Back/Forward/Reload/Insp
   assert.ok(findItem(template, 'Inspect'));
 });
 
+test('buildContextMenuTemplate: Yayra shell history controls are enabled from active-tab state and route through the shell', () => {
+  const sent = [];
+  const wc = { canGoBack: () => false, canGoForward: () => false, inspectElement: () => {}, reload: () => assert.fail('shell must reload the active tab, not the shell window') };
+  const template = buildContextMenuTemplate({
+    params: {},
+    wc,
+    tabId: null,
+    send: (_tabId, type, payload) => sent.push({ type, payload }),
+    clipboard: { writeText: () => {} },
+    navigationState: { canGoBack: true, canGoForward: false },
+    useTabNavigation: true
+  });
+  const back = findItem(template, 'Back');
+  const forward = findItem(template, 'Forward');
+  assert.equal(back.enabled, true);
+  assert.equal(forward.enabled, false);
+  back.click();
+  findItem(template, 'Reload').click();
+  assert.deepEqual(sent, [
+    { type: 'context-menu-navigation', payload: { direction: 'back' } },
+    { type: 'context-menu-navigation', payload: { direction: 'reload' } }
+  ]);
+});
+
 test('buildContextMenuTemplate: prefers webContents.navigationHistory over the deprecated legacy methods (Electron 32+)', () => {
   const calls = [];
   const wc = {

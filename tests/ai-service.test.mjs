@@ -167,9 +167,9 @@ test('AI: normalizeChatCompletionsUrl accepts base URLs and complete URLs', () =
 
 /* ------------------------- shell integration ------------------------- */
 
-function makeShell({ aiService } = {}) {
+function makeShell({ aiService, contextMenuBridge } = {}) {
   const container = document.createElement('div');
-  const shell = new BrowserShell({ container, isMobile: false, aiService });
+  const shell = new BrowserShell({ container, isMobile: false, aiService, contextMenuBridge });
   shell.render(container);
   return { shell, container };
 }
@@ -196,6 +196,41 @@ test('Shell: yayra://ai renders the AI page with input + empty state', () => {
   assert.ok(container.querySelector('.fb-ai-input'), 'prompt input present');
   assert.ok(container.querySelector('.fb-ai-empty'), 'empty state before any question');
   assert.equal(shell.getTabTitle(shell.state.tabs[0]), 'Yayra AI');
+});
+
+test('Shell context-menu actions open Yayra AI in a real tab instead of sending to a no-op shell handler', () => {
+  let onAction;
+  const { shell, container } = makeShell({
+    contextMenuBridge: { onAction(callback) { onAction = callback; return () => {}; } }
+  });
+  onAction({ type: 'new-window-request', url: 'yayra://ai' });
+  assert.equal(shell.getActiveTab().url, 'yayra://ai');
+  assert.ok(container.querySelector('.fb-ai-page'), 'AI page appears after the native menu action');
+});
+
+test('Shell context-menu Back/Forward/Reload actions target the active tab history', () => {
+  let onAction;
+  const { shell } = makeShell({
+    contextMenuBridge: { onAction(callback) { onAction = callback; return () => {}; } }
+  });
+  shell.navigateActiveTab('yayra://settings');
+  assert.equal(shell.getActiveTab().url, 'yayra://settings');
+  onAction({ type: 'context-menu-navigation', direction: 'back' });
+  assert.equal(shell.getActiveTab().url, 'yayra://newtab');
+  onAction({ type: 'context-menu-navigation', direction: 'forward' });
+  assert.equal(shell.getActiveTab().url, 'yayra://settings');
+  onAction({ type: 'context-menu-navigation', direction: 'reload' });
+  assert.equal(shell.getActiveTab().url, 'yayra://settings');
+});
+
+test('Shell: local blob image addresses open in Yayra instead of becoming a Google search', () => {
+  const { shell, container } = makeShell();
+  const blobUrl = 'blob:yayra://app/app/41b60cd1-3f5b-4d7c-bc41-0dc879b888aa';
+  const target = shell.interpretUrl(blobUrl);
+  assert.match(target, /^yayra:\/\/image\?src=/);
+  shell.navigateActiveTab(blobUrl);
+  assert.equal(shell.getActiveTab().url, target);
+  assert.ok(container.querySelector('.fb-local-image-page'), 'image viewer renders in the new tab');
 });
 
 test('Shell: asking appends user + assistant messages from the provider', async () => {

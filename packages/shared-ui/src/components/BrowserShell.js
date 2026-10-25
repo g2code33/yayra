@@ -731,6 +731,12 @@ export class BrowserShell {
     if (this.nativeWebview) {
       this._unsubscribeNativeWebview = this.nativeWebview.onEvent((evt) => this.handleNativeWebviewEvent(evt));
     }
+    const contextMenuBridge = options.contextMenuBridge
+      || (typeof window !== 'undefined' ? window.yayra?.contextMenu : null);
+    this.contextMenuBridge = contextMenuBridge;
+    this._unsubscribeContextMenu = typeof contextMenuBridge?.onAction === 'function'
+      ? contextMenuBridge.onAction((evt) => this.handleShellContextMenuAction(evt))
+      : null;
 
     // Live desktop update progress (electron/desktopUpdater.cjs events).
     this._unsubscribeUpdatesBridge = null;
@@ -2203,6 +2209,15 @@ export class BrowserShell {
     try { this.applyPointerTheme(); } catch { /* headless */ }
     const target = container || this.container || (this.rootElement && this.rootElement.parentElement);
     if (!target) return null;
+    const activeForContextMenu = this.getActiveTab();
+    if (typeof this.contextMenuBridge?.updateNavigationState === 'function') {
+      try {
+        this.contextMenuBridge.updateNavigationState({
+          canGoBack: Boolean(activeForContextMenu?.canGoBack),
+          canGoForward: Boolean(activeForContextMenu?.canGoForward)
+        });
+      } catch { /* native menu state is a convenience; rendering must continue */ }
+    }
 
     this.lastRenderTarget = target;
 
@@ -4064,6 +4079,8 @@ export class BrowserShell {
       this.renderDocumentViewer(viewport, activeTab);
     } else if (url.startsWith('yayra://recover-document/')) {
       this.renderDocumentRecoveryPage(viewport, activeTab);
+    } else if (url === 'yayra://image' || url.startsWith('yayra://image?')) {
+      this.renderInternalImagePage(viewport, activeTab);
     } else if (!url || url === 'yayra://newtab' || url === 'about:blank') {
       this.renderNewTabPage(viewport, activeTab);
     } else if (url === 'yayra://settings') {
@@ -4962,9 +4979,9 @@ export class BrowserShell {
         const name = document.createElement('strong');
         name.textContent = service.title;
         const label = document.createElement('small');
-        label.textContent = service.scope
-          ? 'Connected data available'
-          : (chromeAvailable && this.state.settings.googleOpenInChromeProfile !== false ? 'Opens in dedicated Chrome' : 'Opens in Yayra');
+        label.textContent = service.api
+          ? (connected ? 'Read-only data preview' : 'Connect for a read-only preview')
+          : (chromeAvailable && this.state.settings.googleOpenInChromeProfile !== false ? 'Opens signed in with dedicated Chrome' : 'Opens in Yayra');
         const open = document.createElement('button');
         open.type = 'button';
         open.className = 'fb-btn fb-btn-primary fb-google-services-open';
@@ -6002,6 +6019,22 @@ export class BrowserShell {
     }
     if (tab.sitePasskeyRequest?.requestId === request.requestId
         && tab.id === this.state.activeTabId) this.requestRender();
+  }
+
+  handleShellContextMenuAction(evt) {
+    if (evt?.type === 'context-menu-navigation') {
+      if (evt.direction === 'back') this.goBack();
+      else if (evt.direction === 'forward') this.goForward();
+      else if (evt.direction === 'reload') this.reload();
+      return;
+    }
+    if (evt?.type !== 'new-window-request' || typeof evt.url !== 'string' || !evt.url) return;
+    const source = this.getActiveTab();
+    this.createNewTab(Boolean(source?.isPrivate), {
+      afterTabId: source?.id || null,
+      group: source?.group || null
+    });
+    this.navigateActiveTab(evt.url);
   }
 
   handleNativeWebviewEvent(evt) {
@@ -10455,6 +10488,51 @@ export class BrowserShell {
   /* -------------------------------------------------------------
    * 9. ABOUT IN-TAB PAGE (PHASE 16)
    * ----------------------------------------------------------- */
+  renderInternalImagePage(viewport, activeTab) {
+    const page = document.createElement('div');
+    page.className = 'fb-internal-page fb-local-image-page';
+    let source = '';
+    try {
+      source = new URLSearchParams(String(activeTab?.url || '').split('?')[1] || '').get('src') || '';
+    } catch { /* malformed copied URL */ }
+    const allowed = source.length <= 2_000_000 && (
+      /^blob:/i.test(source)
+      || /^data:image\/(?:png|jpe?g|gif|webp|bmp|avif|svg\+xml)(?:;[^,]*)?,/i.test(source)
+      || (() => {
+        try {
+          const local = new URL(source);
+          return local.protocol === 'file:' && !local.username && !local.password
+            && /\.(?:png|jpe?g|gif|webp|bmp|avif|svg)$/i.test(local.pathname);
+        } catch { return false; }
+      })()
+    );
+    const container = document.createElement('main');
+    container.className = 'fb-local-image-container';
+    if (!allowed) {
+      const notice = document.createElement('p');
+      notice.className = 'fb-local-image-notice';
+      notice.textContent = 'This image address is invalid or is no longer available. Blob image addresses only last for the current Yayra session.';
+      container.appendChild(notice);
+    } else {
+      const image = document.createElement('img');
+      image.className = 'fb-local-image';
+      image.alt = 'Image opened from a local document';
+      image.draggable = false;
+      image.referrerPolicy = 'no-referrer';
+      image.addEventListener('error', () => {
+        image.remove();
+        const notice = document.createElement('p');
+        notice.className = 'fb-local-image-notice';
+        notice.textContent = 'Yayra could not reopen this image. The original image address may only be available in the tab or document where it was created.';
+        container.appendChild(notice);
+      }, { once: true });
+      image.src = source;
+      container.appendChild(image);
+    }
+    page.appendChild(container);
+    viewport.appendChild(page);
+  }
+
   /* -------------------------------------------------------------
    * YAYRA AI - yayra://ai (Chrome-style "AI options on every search")
    * -----------------------------------------------------------
@@ -10899,7 +10977,15 @@ export class BrowserShell {
       if (!this._aiAutoAsked) this._aiAutoAsked = new Set();
       if (!this._aiAutoAsked.has(guard)) {
         this._aiAutoAsked.add(guard);
-        this.askYayraAi(query, { newChat: true });
+        // Start only after this page has finished its current render. Asking
+        // synchronously here caused a nested shell render while the AI tab was
+        // still being constructed; the native tab surface could then cover the
+        // chat page and leave a blank-looking AI tab on desktop.
+        Promise.resolve().then(() => {
+          const stillCurrent = this.getActiveTab()?.id === activeTab.id
+            && this.getActiveTab()?.url === activeTab.url;
+          if (stillCurrent) this.askYayraAi(query, { newChat: true });
+        });
       }
     }
   }
@@ -19779,6 +19865,26 @@ export class BrowserShell {
     const trimmed = input.trim();
     if (trimmed.startsWith('yayra://') || trimmed.startsWith('about:') || trimmed.startsWith('app://')) {
       return trimmed;
+    }
+    // Images copied from a local document often use a renderer-owned blob:
+    // URL. Treat those addresses as images, not search text or top-level web
+    // navigations (a blob URL cannot be opened in a separate WebContents).
+    // Only image data URLs and file URLs with a known image extension enter
+    // this viewer; arbitrary data:/file: documents remain blocked.
+    if (trimmed.length <= 2_000_000) {
+      let imageSource = false;
+      if (/^blob:/i.test(trimmed)) {
+        try { imageSource = new URL(trimmed).protocol === 'blob:'; } catch { imageSource = false; }
+      } else if (/^data:image\/(?:png|jpe?g|gif|webp|bmp|avif|svg\+xml)(?:;[^,]*)?,/i.test(trimmed)) {
+        imageSource = true;
+      } else if (/^file:/i.test(trimmed)) {
+        try {
+          const local = new URL(trimmed);
+          imageSource = local.protocol === 'file:' && !local.username && !local.password
+            && /\.(?:png|jpe?g|gif|webp|bmp|avif|svg)$/i.test(local.pathname);
+        } catch { imageSource = false; }
+      }
+      if (imageSource) return `yayra://image?src=${encodeURIComponent(trimmed)}`;
     }
     if (trimmed === 'settings') return 'yayra://settings';
     if (trimmed === 'google' || trimmed === 'google services' || trimmed === 'google-services') return 'yayra://google-services';

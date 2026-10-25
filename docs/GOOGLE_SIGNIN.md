@@ -162,7 +162,10 @@ On return:
 - on desktop, Google product tiles open in that same real Chrome profile by
   default; Web/PWA/mobile keep their existing in-Yayra/API or external-browser
   behavior. Gmail's explicit **Open Gmail in Yayra** action uses the bounded
-  read-only mailbox;
+  read-only mailbox. The hub includes the app-launcher products visible in the
+  Google apps menu (including Blogger, Saved, Arts & Culture and Merchant
+  Center) so they share this same signed-in Chrome profile; only products with
+  an explicitly supported read-only Google API expose an in-Yayra data preview;
 - API-backed services expose real, normalized account data through the
   privileged main process or Worker. No Google page cookie is copied and no
   Google token is exposed to page JavaScript;

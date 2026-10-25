@@ -1,4 +1,5 @@
 const { app, BrowserWindow, WebContentsView, ipcMain, protocol, net, shell, safeStorage, Menu, clipboard, session, dialog, screen, Tray, nativeImage, systemPreferences, desktopCapturer, webContents, globalShortcut } = require('electron');
+const CONTEXT_MENU_ACTION_CHANNEL = 'yayra:context-menu-action';
 const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -43,12 +44,14 @@ const CUSTOM_SCHEME = 'yayra';
 // the legacy partition so upgrades can remove its old cookies/storage.
 const LEGACY_GOOGLE_AUTH_PARTITION = 'persist:yayra-google-auth';
 const CHROME_INPUT_RECOVERY_CHANNEL = 'yayra:chrome-input-recover';
+const CONTEXT_MENU_NAV_STATE_CHANNEL = 'yayra:context-menu-navigation-state';
 // Keep local-document IPC bounded before any file is read into memory. This
 // mirrors MAX_DOCUMENT_BYTES in the browser workspace (CommonJS cannot import
 // that browser ESM module during Electron startup).
 const MAX_DOCUMENT_BYTES = 300 * 1024 * 1024;
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 let mainWindow;
+const contextMenuNavigationStates = new WeakMap();
 let downloadsBridge = null;
 // Yayra-owned real Chrome profile for genuinely signed-in Google websites.
 // Created lazily so app.getPath('userData') is always available.
@@ -1021,6 +1024,13 @@ function registerGoogleChromeProfileIpc() {
 }
 
 function registerIpcBridges() {
+  ipcMain.on(CONTEXT_MENU_NAV_STATE_CHANNEL, (event, payload = {}) => {
+    if (!event?.sender || !payload || typeof payload !== 'object') return;
+    contextMenuNavigationStates.set(event.sender, {
+      canGoBack: payload.canGoBack === true,
+      canGoForward: payload.canGoForward === true
+    });
+  });
   registerDesktopUpdateHandlers({ getWindow: () => mainWindow });
 
   ensureDocumentLibrary();
@@ -1893,7 +1903,21 @@ async function createProfileWindow(profileId, initialUrl = null, { isPrivate = f
   const clearShellRecovery = installShellFreezeRecovery(win, 'profile shell');
   win.webContents.on('context-menu', (_event, params) => {
     if (win.isDestroyed()) return;
-    const template = buildContextMenuTemplate({ params, wc: win.webContents, tabId: null, send: () => {}, clipboard });
+    const template = buildContextMenuTemplate({
+      params,
+      wc: win.webContents,
+      tabId: null,
+      send: (_tabId, type, payload) => {
+        if (type === 'new-window-request' && payload?.url) {
+          win.webContents.send(CONTEXT_MENU_ACTION_CHANNEL, { type, url: payload.url });
+        } else if (type === 'context-menu-navigation') {
+          win.webContents.send(CONTEXT_MENU_ACTION_CHANNEL, { type, direction: payload?.direction });
+        }
+      },
+      navigationState: contextMenuNavigationStates.get(win.webContents),
+      useTabNavigation: true,
+      clipboard
+    });
     popupMenuWithRecovery({ menu: Menu.buildFromTemplate(template), window: win });
   });
   const winContents = win.webContents;
@@ -1974,7 +1998,15 @@ function createWindow() {
       params,
       wc: win.webContents,
       tabId: null,
-      send: () => {},
+      send: (_tabId, type, payload) => {
+        if (type === 'new-window-request' && payload?.url) {
+          win.webContents.send(CONTEXT_MENU_ACTION_CHANNEL, { type, url: payload.url });
+        } else if (type === 'context-menu-navigation') {
+          win.webContents.send(CONTEXT_MENU_ACTION_CHANNEL, { type, direction: payload?.direction });
+        }
+      },
+      navigationState: contextMenuNavigationStates.get(win.webContents),
+      useTabNavigation: true,
       clipboard
     });
     popupMenuWithRecovery({ menu: Menu.buildFromTemplate(template), window: win });

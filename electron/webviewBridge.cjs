@@ -1281,7 +1281,7 @@ function historyGoForward(wc) {
  * user clicks an item) and `clipboard`/`send` - so it is fully unit-testable
  * without a real Electron `Menu`. See tests/electron-webview-bridge.test.mjs.
  */
-function buildContextMenuTemplate({ params, wc, tabId, send, clipboard }) {
+function buildContextMenuTemplate({ params, wc, tabId, send, clipboard, navigationState = null, useTabNavigation = false }) {
   const template = [];
   const isLink = !!(params && params.linkURL);
   const isImage = !!(params && params.mediaType === 'image' && params.srcURL);
@@ -1342,9 +1342,17 @@ function buildContextMenuTemplate({ params, wc, tabId, send, clipboard }) {
     // Always available, Chrome-style: open the in-browser AI chat.
     { label: 'Ask Yayra AI', click: () => send(tabId, 'new-window-request', { url: 'yayra://ai' }) },
     { type: 'separator' },
-    { label: 'Back', enabled: historyCanGoBack(wc), click: () => historyGoBack(wc) },
-    { label: 'Forward', enabled: historyCanGoForward(wc), click: () => historyGoForward(wc) },
-    { label: 'Reload', click: () => wc.reload() },
+    {
+      label: 'Back',
+      enabled: useTabNavigation ? navigationState?.canGoBack === true : historyCanGoBack(wc),
+      click: () => useTabNavigation ? send(tabId, 'context-menu-navigation', { direction: 'back' }) : historyGoBack(wc)
+    },
+    {
+      label: 'Forward',
+      enabled: useTabNavigation ? navigationState?.canGoForward === true : historyCanGoForward(wc),
+      click: () => useTabNavigation ? send(tabId, 'context-menu-navigation', { direction: 'forward' }) : historyGoForward(wc)
+    },
+    { label: 'Reload', click: () => useTabNavigation ? send(tabId, 'context-menu-navigation', { direction: 'reload' }) : wc.reload() },
     { type: 'separator' },
     { label: 'Inspect', click: () => wc.inspectElement((params && params.x) || 0, (params && params.y) || 0) }
   );
