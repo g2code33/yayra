@@ -13,6 +13,7 @@ const { parseAppModeUrl, buildInstallPlan, appWindowClass } = require('./appMode
 const { parsePdfFileArg } = require('./pdfLaunch.cjs');
 const { extractManifestLink, parseManifest, pickInstallIdentity, siteIconCandidates, isPngBuffer, isIcoBuffer, extractPngFromIco, generateSiteIdentityPng, pngToIco } = require('./pwaManifest.cjs');
 const { startGlobalHotkeys } = require('./globalHotkeys.cjs');
+const { createDictionaryLookupShortcut } = require('./dictionaryLookupShortcut.cjs');
 const { createAuthBridge, normalizeAuthProfileId } = require('./authBridge.cjs');
 const { createAuthStore } = require('./authStore.cjs');
 const { signInWithGoogle } = require('./googleAuth.cjs');
@@ -107,6 +108,24 @@ function windowsForProfile(profileId) {
 let overlayBridge = null;
 let webviewBridge = null;
 let globalHotkeys = null;
+const dictionaryLookupShortcut = createDictionaryLookupShortcut({
+  globalShortcut,
+  clipboard,
+  openLookup: (url) => {
+    if (!/^yayra:\/\/dictionary(?:\?|$)/i.test(String(url || ''))) return false;
+    try { if (overlayBridge?.openDictionaryLookupInMini?.(url)) return true; } catch { /* use the full browser below */ }
+    let win = null;
+    try { win = overlayBridge?.restoreMainWindow?.() || null; } catch { /* shell may be closed */ }
+    win = win || mainWindow || createWindow();
+    if (!win || win.isDestroyed?.()) return false;
+    const deliver = () => { try { if (!win.isDestroyed?.()) win.webContents.send('yayra:open-url', { url }); } catch { /* window closed */ } };
+    try {
+      if (typeof win.webContents?.isLoading === 'function' && win.webContents.isLoading()) win.webContents.once('did-finish-load', deliver);
+      else deliver();
+      return true;
+    } catch { return false; }
+  }
+});
 let trayController = null;
 let windowDragController = null;
 let lastLoadError = null;
@@ -931,6 +950,7 @@ app.whenReady().then(async () => {
 }).catch((err) => reportStartupFailure('startup-sequence', err));
 
 app.on('will-quit', () => {
+  try { dictionaryLookupShortcut.dispose(); } catch { /* exiting */ }
   try { globalHotkeys?.detach(); } catch { /* exiting */ }
   try { windowDragController?.destroy(); } catch { /* exiting */ }
   windowDragController = null;
@@ -1124,6 +1144,11 @@ function registerIpcBridges() {
 
   // Menu > More tools > Performance / Task manager: REAL process metrics
   // (no invented numbers). Summarized here so the renderer gets plain data.
+  ipcMain.handle('yayra:dictionary-set-global-shortcut', (event, payload = {}) => {
+    if (!senderWindow(event)) return { ok: false, reason: 'untrusted-sender' };
+    return dictionaryLookupShortcut.configure(payload.enabled === true, payload.accelerator);
+  });
+
   ipcMain.handle('yayra:app-metrics', () => {
     try {
       const metrics = app.getAppMetrics() || [];

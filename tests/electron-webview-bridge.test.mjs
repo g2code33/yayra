@@ -136,7 +136,7 @@ test('native selection actions are page-local, bounded, editable-aware, and non-
   const script = buildTextSelectionActionsScript();
   assert.doesNotThrow(() => runInNewContext(`new Function(${JSON.stringify(script)})`), 'the injected source parses as JavaScript');
   assert.match(script, /Text selection actions/);
-  for (const action of ["'Copy'", "'Cut'", "'Paste'", "'Search'", "'Ask Yayra AI'"]) {
+  for (const action of ["'Copy'", "'Cut'", "'Paste'", "'Search'", "'Ask Yayra AI'", "'Ask Yayra Dictionary'", "'Save selection'"]) {
     assert.ok(script.includes(action), `${action} is offered from highlighted text`);
   }
   assert.match(script, /pointerdown[\s\S]*hide\(true\)/, 'an outside press closes the toolbar without a modal scrim');
@@ -1079,6 +1079,25 @@ test('buildContextMenuTemplate: selected text also offers Ask Yayra AI about "..
   aiItem.click();
   assert.equal(sent[0].type, 'new-window-request');
   assert.equal(sent[0].payload.url, 'yayra://ai?q=hello%20world', 'selection handed to the AI page, which auto-asks it');
+});
+
+test('buildContextMenuTemplate: selected text offers local dictionary lookup and an explicit vocabulary save', () => {
+  const sent = [];
+  const wc = { canGoBack: () => false, canGoForward: () => false, inspectElement: () => {}, copy: () => {} };
+  const template = buildContextMenuTemplate({
+    params: { selectionText: 'hello world', pageURL: 'https://example.test/article?token=private' },
+    wc,
+    tabId: 'tab-1',
+    send: (tabId, type, payload) => sent.push({ type, payload }),
+    clipboard: { writeText: () => {} }
+  });
+  findItem(template, 'Ask Yayra Dictionary about "hello world"').click();
+  assert.equal(sent[0].payload.url, 'yayra://dictionary?q=hello%20world');
+  findItem(template, 'Save selection to vocabulary').click();
+  assert.match(sent[1].payload.url, /^yayra:\/\/dictionary\?/);
+  assert.match(sent[1].payload.url, /save=hello\+world/);
+  assert.match(sent[1].payload.url, /source=https%3A%2F%2Fexample\.test%2Farticle/);
+  assert.doesNotMatch(sent[1].payload.url, /token%3Dprivate/, 'source page query credentials are excluded from the saved provenance URL');
 });
 
 test('buildContextMenuTemplate: every right-click offers a general Ask Yayra AI entry', () => {

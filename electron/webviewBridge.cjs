@@ -660,6 +660,16 @@ function buildTextSelectionActionsScript() {
         if (snapshot.text.length <= MAX_QUERY) {
           addButton(bar, 'Search', function () { openAction('https://www.google.com/search?q=' + encodeURIComponent(snapshot.text.trim())); });
           addButton(bar, 'Ask Yayra AI', function () { openAction('yayra://ai?q=' + encodeURIComponent(snapshot.text.trim())); });
+          addButton(bar, 'Ask Yayra Dictionary', function () { openAction('yayra://dictionary?q=' + encodeURIComponent(snapshot.text.trim())); });
+          addButton(bar, 'Save selection', function () {
+            var safeSource = '';
+            try {
+              var sourceUrl = new URL(location.href);
+              if ((sourceUrl.protocol === 'https:' || sourceUrl.protocol === 'http:') && !sourceUrl.username && !sourceUrl.password) safeSource = sourceUrl.origin + sourceUrl.pathname;
+            } catch (_sourceError) {}
+            var params = new URLSearchParams({ view: 'saved', save: snapshot.text.trim(), source: safeSource.slice(0, 2000), title: document.title.slice(0, 300) });
+            openAction('yayra://dictionary?' + params.toString());
+          });
         }
         (document.body || document.documentElement).appendChild(bar);
         var rect = snapshot.rect || {};
@@ -1281,6 +1291,14 @@ function historyGoForward(wc) {
  * user clicks an item) and `clipboard`/`send` - so it is fully unit-testable
  * without a real Electron `Menu`. See tests/electron-webview-bridge.test.mjs.
  */
+function safeSelectionSourceUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) return '';
+    return `${url.origin}${url.pathname}`.slice(0, 2000);
+  } catch { return ''; }
+}
+
 function buildContextMenuTemplate({ params, wc, tabId, send, clipboard, navigationState = null, useTabNavigation = false }) {
   const template = [];
   const isLink = !!(params && params.linkURL);
@@ -1319,7 +1337,7 @@ function buildContextMenuTemplate({ params, wc, tabId, send, clipboard, navigati
     );
   } else if (hasSelection) {
     if (template.length) template.push({ type: 'separator' });
-    const trimmed = params.selectionText.trim();
+    const trimmed = params.selectionText.trim().slice(0, 2000);
     const shortText = trimmed.length > 32 ? `${trimmed.slice(0, 32)}\u2026` : trimmed;
     template.push(
       { label: 'Copy', click: () => wc.copy() },
@@ -1333,6 +1351,19 @@ function buildContextMenuTemplate({ params, wc, tabId, send, clipboard, navigati
         // renderInternalAiPage + services/aiService.js).
         label: `Ask Yayra AI about "${shortText}"`,
         click: () => send(tabId, 'new-window-request', { url: `yayra://ai?q=${encodeURIComponent(trimmed)}` })
+      },
+      {
+        label: `Ask Yayra Dictionary about "${shortText}"`,
+        click: () => send(tabId, 'new-window-request', { url: `yayra://dictionary?q=${encodeURIComponent(trimmed)}` })
+      },
+      {
+        label: 'Save selection to vocabulary',
+        click: () => {
+          const query = new URLSearchParams({ view: 'saved', save: trimmed });
+          const sourceUrl = safeSelectionSourceUrl(params.pageURL);
+          if (sourceUrl) query.set('source', sourceUrl);
+          send(tabId, 'new-window-request', { url: `yayra://dictionary?${query.toString()}` });
+        }
       }
     );
   }

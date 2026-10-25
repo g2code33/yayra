@@ -7,6 +7,15 @@ const UPDATES_EVENT_CHANNEL = 'yayra:updates-event';
 const CHROME_INPUT_RECOVERY_CHANNEL = 'yayra:chrome-input-recover';
 const CONTEXT_MENU_ACTION_CHANNEL = 'yayra:context-menu-action';
 const CONTEXT_MENU_NAV_STATE_CHANNEL = 'yayra:context-menu-navigation-state';
+const dictionaryLookupListeners = new Set();
+let pendingDictionaryLookup = null;
+ipcRenderer.on('yayra:overlay-dictionary-lookup', (_event, payload) => {
+  const safePayload = payload && typeof payload === 'object' ? payload : {};
+  if (!dictionaryLookupListeners.size) pendingDictionaryLookup = safePayload;
+  for (const callback of dictionaryLookupListeners) {
+    try { callback(safePayload); } catch { /* isolated renderer listener */ }
+  }
+});
 
 const api = {
   getLaunchInfo: () => ipcRenderer.invoke('yayra:get-launch-info'),
@@ -237,6 +246,11 @@ const api = {
       isPrivate: Boolean(options && options.isPrivate)
     })
   },
+  // User-opt-in clipboard dictionary shortcut. The main process reads
+  // clipboard text only when this explicit global shortcut is pressed.
+  dictionary: {
+    setGlobalLookupShortcut: (enabled, accelerator) => ipcRenderer.invoke('yayra:dictionary-set-global-shortcut', { enabled: Boolean(enabled), accelerator })
+  },
   // System-wide floating overlay bubble settings (see
   // electron/overlayWindow.cjs). The overlay window itself is a completely
   // separate native window/renderer - this is just the Settings-facing
@@ -258,6 +272,18 @@ const api = {
     closeMini: () => ipcRenderer.send('yayra:overlay-mini-close'),
     // Carries the mini's current site so the full browser continues it.
     openFullFromMini: (url = null) => ipcRenderer.send('yayra:overlay-mini-open-full', { url }),
+    // Explicit dictionary lookup handoff: preserves an existing mini window and its tabs.
+    openDictionaryLookup: (url) => ipcRenderer.invoke('yayra:overlay-open-dictionary-lookup', { url }),
+    onDictionaryLookup: (callback) => {
+      if (typeof callback !== 'function') return () => {};
+      dictionaryLookupListeners.add(callback);
+      if (pendingDictionaryLookup) {
+        const payload = pendingDictionaryLookup;
+        pendingDictionaryLookup = null;
+        queueMicrotask(() => { try { callback(payload); } catch { /* isolated listener */ } });
+      }
+      return () => dictionaryLookupListeners.delete(callback);
+    },
     // Main window: receive "open this url" handoffs (e.g. from mini).
     onOpenUrl: (callback) => {
       const listener = (_event, payload) => callback(payload || {});

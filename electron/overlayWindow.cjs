@@ -812,6 +812,22 @@ function createOverlayBridge({
     return ensureMiniWindow(`${miniUrl}${sep}page=${encodeURIComponent(String(page || ''))}`);
   }
 
+  function openDictionaryLookupInMini(page) {
+    const url = typeof page === 'string' && /^yayra:\/\/dictionary(?:\?|$)/i.test(page) ? page.slice(0, 4000) : '';
+    if (!url || !mainPreloadPath) return false;
+    if (!miniWin || miniWin.isDestroyed()) return Boolean(openMiniPanelAt(url));
+    const deliver = () => {
+      try { if (miniWin && !miniWin.isDestroyed()) miniWin.webContents.send('yayra:overlay-dictionary-lookup', { url }); } catch { /* mini closed */ }
+    };
+    try {
+      miniWin.show?.();
+      miniWin.focus?.();
+      if (typeof miniWin.webContents?.isLoading === 'function' && miniWin.webContents.isLoading()) miniWin.webContents.once('did-finish-load', deliver);
+      else deliver();
+      return true;
+    } catch { return false; }
+  }
+
   function destroyMiniWindow() {
     miniTopmostTimer = stopTopmostGuard(miniTopmostTimer);
     if (miniWin && !miniWin.isDestroyed()) miniWin.close();
@@ -1547,6 +1563,7 @@ function createOverlayBridge({
     }
   }
 
+  ipcMain.handle('yayra:overlay-open-dictionary-lookup', (_event, payload = {}) => openDictionaryLookupInMini(payload.url));
   ipcMain.handle('yayra:overlay-get-settings', () => overlayStore.load());
   ipcMain.handle('yayra:overlay-set-enabled', (_e, enabled) => setEnabled(enabled));
   ipcMain.handle('yayra:overlay-set-launch-at-startup', (_e, enabled) => setLaunchAtStartup(enabled));
@@ -1666,6 +1683,7 @@ function createOverlayBridge({
     isRadialOpen,
     handleRadialAction,
     openMiniPanelAt,
+    openDictionaryLookupInMini,
     setWheelItems,
     initializeOnStartup,
     applyLoginItemSettings
