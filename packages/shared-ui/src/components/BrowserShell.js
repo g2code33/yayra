@@ -6079,14 +6079,17 @@ export class BrowserShell {
     let route;
     try { route = new URL(url); } catch { return false; }
     const selectedTextToSave = route.searchParams.get('save');
+    const selectedTextToHighlight = route.searchParams.get('highlight');
+    const textToSave = selectedTextToSave || selectedTextToHighlight;
     // Never leave explicitly saved selected text in a tab/session URL. Save it
     // to the profile-owned vocabulary store, then open a clean vocabulary URL.
-    if (selectedTextToSave) {
+    if (textToSave) {
       const sourceUrl = safeSelectionSourceUrl(route.searchParams.get('source'));
       const sourceTitle = String(route.searchParams.get('title') || '').slice(0, 300);
+      const isHighlight = Boolean(selectedTextToHighlight);
       const destination = sourceTab?.isPrivate ? 'new-tab' : (this.state.settings.dictionaryLookupDestination || 'new-tab');
+      const cleanUrl = isHighlight ? 'yayra://vocabulary?filter=highlight' : 'yayra://vocabulary';
       const openSavedItems = () => {
-        const cleanUrl = 'yayra://vocabulary';
         if (destination === 'current-tab' && sourceTab?.id) {
           this.selectTab(sourceTab.id);
           this.navigateActiveTab(cleanUrl);
@@ -6109,12 +6112,11 @@ export class BrowserShell {
         this.createNewTab(Boolean(sourceTab?.isPrivate), { afterTabId: sourceTab?.id || null, group: sourceTab?.group || null });
         this.navigateActiveTab(cleanUrl);
       };
-      void this.getDictionaryLibrary().saveSelection(selectedTextToSave, {
-        sourceTitle,
-        sourceUrl,
-        isPrivate: Boolean(sourceTab?.isPrivate)
-      }).then(() => {
-        this.showTransientNotice?.('Selected text saved to your vocabulary.');
+      const savePromise = isHighlight
+        ? this.getDictionaryLibrary().saveHighlight(textToSave, { sourceTitle, sourceUrl, isPrivate: Boolean(sourceTab?.isPrivate) })
+        : this.getDictionaryLibrary().saveSelection(textToSave, { sourceTitle, sourceUrl, isPrivate: Boolean(sourceTab?.isPrivate) });
+      void savePromise.then(() => {
+        this.showTransientNotice?.(isHighlight ? 'Highlight saved to your vocabulary.' : 'Selected text saved to your vocabulary.');
         openSavedItems();
       }).catch((error) => this.showTransientNotice?.(`Could not save selection: ${this.dictionaryErrorMessage(error)}`));
       return true;
@@ -8431,7 +8433,7 @@ export class BrowserShell {
     if (/browser_open_failed|no system browser/i.test(code)) return 'Yayra could not open your secure system browser. Check your browser settings and try again.';
     if (code === 'oauth_timeout') return 'Google did not return before the secure sign-in attempt expired. Please try again.';
     if (code === 'oauth_state_mismatch') return 'The sign-in response could not be verified, so Yayra rejected it for your security.';
-    if (code.includes('access_denied')) return 'Google sign-in was cancelled or declined.';
+    if (code.includes('access_denied')) return 'Google denied this sign-in. If the page says the app is being tested, add this account in Google Cloud Console → Google Auth Platform → Audience → Test users, or publish and verify the OAuth app. This restriction cannot be bypassed in Yayra.';
     if (code.startsWith('token_exchange_failed')) return 'Google returned to Yayra, but the secure sign-in exchange failed. Please try again.';
     if (code.startsWith('userinfo_failed')) return 'Yayra signed in but could not read your basic Google profile. Please try again.';
     if (code.includes('gmail_scope_not_granted')) return 'Google did not grant read-only Gmail access. Reconnect and allow Gmail to open it inside Yayra.';
@@ -8542,7 +8544,7 @@ export class BrowserShell {
         .fb-dict-btn{border:1px solid rgba(148,163,184,.3);border-radius:9px;padding:9px 12px;background:rgba(148,163,184,.08);color:inherit;cursor:pointer;font:inherit;line-height:1.2}
         .fb-dict-btn:hover{background:rgba(148,163,184,.18)}.fb-dict-btn:focus-visible,.fb-dict-input:focus-visible{outline:2px solid #60a5fa;outline-offset:2px}
         .fb-dict-nav .fb-dict-btn{border-color:transparent;background:transparent;color:var(--fb-text-muted,#aab2c0);white-space:nowrap}.fb-dict-nav .fb-dict-btn[aria-current=page]{background:linear-gradient(120deg,rgba(37,99,235,.3),rgba(124,58,237,.23));border-color:rgba(96,165,250,.3);color:#fff}
-        .fb-dict-btn.primary{background:#2563eb;color:#fff;border-color:#2563eb}.fb-dict-btn.danger{color:#fecaca}.fb-dict-btn:disabled{opacity:.6;cursor:wait}
+        .fb-dict-btn.primary{background:#2563eb;color:#fff;border-color:#2563eb}.fb-dict-state-btn.is-active{background:linear-gradient(120deg,rgba(16,185,129,.28),rgba(20,184,166,.2));border-color:rgba(52,211,153,.62);color:#d1fae5;box-shadow:0 0 0 1px rgba(52,211,153,.12) inset}.fb-dict-star-btn.is-active{background:linear-gradient(120deg,rgba(245,158,11,.28),rgba(234,179,8,.2));border-color:rgba(251,191,36,.68);color:#fef3c7}.fb-dict-btn.danger{color:#fecaca}.fb-dict-btn:disabled{opacity:.6;cursor:wait}
         .fb-dict-input{box-sizing:border-box;min-width:0;width:100%;max-width:100%;border:1px solid rgba(148,163,184,.35);border-radius:9px;padding:10px;background:rgba(15,23,42,.8);color:inherit;font:inherit}
         .fb-dict-search{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:9px;align-items:center}.fb-dict-search .fb-dict-input[type=search]{min-width:0}.fb-dict-filters{grid-column:1/-1;border:1px solid rgba(148,163,184,.2);border-radius:10px;padding:0 12px;background:rgba(30,41,59,.22)}.fb-dict-filters summary{cursor:pointer;padding:10px 0;color:var(--fb-text-muted,#aab2c0)}.fb-dict-filter-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;padding:2px 0 12px}
         .fb-dict-notice{margin:12px 0;padding:10px 13px;border:1px solid rgba(96,165,250,.25);border-radius:10px;background:rgba(37,99,235,.07);line-height:1.45}
@@ -8586,18 +8588,28 @@ export class BrowserShell {
       button.addEventListener('click', () => routeSearch(button.dataset.dictView === 'search' ? {} : { view: button.dataset.dictView }));
     });
     const selectedToSave = route.searchParams.get('save');
-    const saveToken = `${activeTab?.id || ''}:${activeTab?.url || ''}`;
-    if (selectedToSave && this._dictionarySavedSelectionToken !== saveToken) {
-      this._dictionarySavedSelectionToken = saveToken;
-      void this.getDictionaryLibrary().saveSelection(selectedToSave, {
-        sourceTitle: route.searchParams.get('title') || '',
-        sourceUrl: route.searchParams.get('source') || '',
-        isPrivate: Boolean(activeTab?.isPrivate)
-      }).then(() => {
-        this.showTransientNotice?.('Selected text saved to your vocabulary.');
+    const selectedToHighlight = route.searchParams.get('highlight');
+    const selectedText = selectedToSave || selectedToHighlight;
+    const selectionToken = `${activeTab?.id || ''}:${activeTab?.url || ''}`;
+    if (selectedText && this._dictionarySavedSelectionToken !== selectionToken) {
+      this._dictionarySavedSelectionToken = selectionToken;
+      const isHighlight = Boolean(selectedToHighlight);
+      const savePromise = isHighlight
+        ? this.getDictionaryLibrary().saveHighlight(selectedText, {
+          sourceTitle: route.searchParams.get('title') || '',
+          sourceUrl: route.searchParams.get('source') || '',
+          isPrivate: Boolean(activeTab?.isPrivate)
+        })
+        : this.getDictionaryLibrary().saveSelection(selectedText, {
+          sourceTitle: route.searchParams.get('title') || '',
+          sourceUrl: route.searchParams.get('source') || '',
+          isPrivate: Boolean(activeTab?.isPrivate)
+        });
+      void savePromise.then(() => {
+        this.showTransientNotice?.(isHighlight ? 'Highlight saved to your vocabulary.' : 'Selected text saved to your vocabulary.');
         const current = this.state.tabs.find((tab) => tab.id === activeTab?.id);
         if (current?.url === activeTab?.url) {
-          this.navigateActiveTab('yayra://vocabulary');
+          this.navigateActiveTab(isHighlight ? 'yayra://vocabulary?filter=highlight' : 'yayra://vocabulary');
           this.render();
         }
       }).catch(() => this.showTransientNotice?.('Could not save selected text.'));
@@ -8787,19 +8799,21 @@ export class BrowserShell {
         ? 'Persistent local storage is unavailable; this session cannot retain packs or vocabulary after closing.'
         : 'Search is limited to enabled local packs. Download General English under Packs to start searching offline.');
       const compareBar = document.createElement('div'); compareBar.className = 'fb-dict-tools';
-      const compareButton = makeButton('Compare selected (2)', async () => {
+      const compareButton = makeButton('Compare two words or sources', async () => {
         if (this._dictionaryCompareSelection?.length !== 2) { status.textContent = 'Select exactly two definitions to compare.'; return; }
         const comparison = document.createElement('section'); comparison.className = 'fb-dict-card'; comparison.setAttribute('aria-label', 'Dictionary comparison');
-        const h = document.createElement('h2'); h.textContent = 'Compare definitions'; comparison.appendChild(h);
+        const h = document.createElement('h2'); h.textContent = 'Compare words or dictionary sources'; comparison.appendChild(h);
         const split = document.createElement('div'); split.className = 'fb-dict-split';
         for (const entry of this._dictionaryCompareSelection) {
-          const col = document.createElement('div'); col.className = 'fb-dict-card'; const title = document.createElement('h3'); title.textContent = `${entry.term} — ${entry.sourcePack.title}`; col.appendChild(title);
+          const col = document.createElement('div'); col.className = 'fb-dict-card'; const title = document.createElement('h3'); title.textContent = `${entry.term} — ${entry.sourcePack?.title || entry.source || 'Local dictionary'}`; col.appendChild(title);
           for (const definition of entry.definitions.slice(0, 12)) { const p = document.createElement('p'); p.className = 'fb-dict-def'; p.textContent = `${definition.partOfSpeech ? `${definition.partOfSpeech}: ` : ''}${definition.text}`; col.appendChild(p); }
           split.appendChild(col);
         }
         comparison.appendChild(split); output.prepend(comparison); comparison.scrollIntoView?.({ block: 'nearest' });
       });
-      compareBar.appendChild(compareButton); section.appendChild(compareBar);
+      compareButton.classList.add('fb-dict-compare-button'); compareButton.disabled = true;
+      const compareHint = document.createElement('p'); compareHint.className = 'fb-dict-muted'; compareHint.textContent = 'Choose any two results: compare the same word across dictionaries, or search a phrase such as “bank money” and select two different words.';
+      compareBar.appendChild(compareHint); compareBar.appendChild(compareButton); section.appendChild(compareBar);
       const output = document.createElement('div'); output.className = 'fb-dict-list'; output.setAttribute('aria-live', 'polite'); section.appendChild(output); content.appendChild(section);
       form.addEventListener('submit', (event) => {
         event.preventDefault();
@@ -8838,6 +8852,58 @@ export class BrowserShell {
     viewport.appendChild(page);
   }
 
+  async hydrateDictionaryResultStates(output) {
+    try {
+      const personalItems = await this.getDictionaryLibrary().getPersonalData({ includeHistory: false });
+      const savedByTerm = new Map(personalItems.filter((item) => item.kind === 'saved')
+        .map((item) => [item.normalizedTerm || normalizeDictionaryTerm(item.term), item]));
+      output.querySelectorAll('[data-dictionary-state]').forEach((button) => {
+        if (button.getAttribute('aria-pressed') === 'true') return;
+        const saved = savedByTerm.get(normalizeDictionaryTerm(button.dataset.term));
+        if (!saved) return;
+        if (button.dataset.dictionaryState === 'saved') {
+          button.textContent = 'Saved ✓';
+          button.classList.add('is-active');
+          button.setAttribute('aria-pressed', 'true');
+        } else if (button.dataset.dictionaryState === 'starred' && saved.starred) {
+          button.textContent = 'Starred ★';
+          button.classList.add('is-active');
+          button.setAttribute('aria-pressed', 'true');
+        }
+      });
+    } catch { /* result cards remain usable if personal storage is temporarily unavailable */ }
+  }
+
+  async runDictionaryCardAction(container, action) {
+    const buttons = [...(container?.querySelectorAll?.('button') || [])];
+    for (const button of buttons) button.disabled = true;
+    try { return await action(); }
+    finally { for (const button of buttons) button.disabled = false; }
+  }
+
+  updateDictionaryCompareSelection(entry, checkbox, status, output) {
+    const selected = this._dictionaryCompareSelection || [];
+    const key = `${entry.packId}@${entry.sourcePack?.version || ''}:${normalizeDictionaryTerm(entry.term)}`;
+    const alreadySelected = selected.some((item) => item._compareKey === key);
+    if (checkbox.checked && !alreadySelected && selected.length >= 2) {
+      checkbox.checked = false;
+      status.textContent = 'Comparison includes up to two definitions.';
+      return;
+    }
+    const next = checkbox.checked
+      ? [...selected.filter((item) => item._compareKey !== key), { ...entry, _compareKey: key }]
+      : selected.filter((item) => item._compareKey !== key);
+    this._dictionaryCompareSelection = next.slice(0, 2);
+    const compareControl = output.parentElement?.querySelector('.fb-dict-compare-button');
+    if (compareControl) {
+      compareControl.disabled = this._dictionaryCompareSelection.length !== 2;
+      compareControl.textContent = this._dictionaryCompareSelection.length === 2
+        ? 'Compare selected (2)'
+        : `Compare (${this._dictionaryCompareSelection.length}/2)`;
+    }
+    status.textContent = `${this._dictionaryCompareSelection.length} of 2 comparison entries selected.`;
+  }
+
   renderDictionaryResults(output, result, status, makeButton, appendStatus, { combined = false } = {}) {
     output.textContent = '';
     this._dictionaryCompareSelection = [];
@@ -8852,30 +8918,26 @@ export class BrowserShell {
             const combinedPack = combinedEntry.sourcePack || {};
             const sourceBlock = document.createElement('section'); sourceBlock.className = 'fb-dict-definition';
             const source = document.createElement('p'); source.className = 'fb-dict-source';
-            source.textContent = `${combinedPack.title || combinedEntry.source || 'Local pack'} · ${combinedPack.category || combinedEntry.category || 'general'} · ${combinedPack.datasetVersion || combinedPack.version || 'version not stated'} · ${combinedPack.license || 'Licence not stated'}`;
+            source.textContent = combinedPack.title || combinedEntry.source || 'Local dictionary';
             sourceBlock.appendChild(source);
             for (const definition of (combinedEntry.definitions || []).slice(0, 20)) {
               const line = document.createElement('p'); line.className = 'fb-dict-def'; line.textContent = `${definition.partOfSpeech ? `${definition.partOfSpeech}: ` : ''}${definition.text}`; sourceBlock.appendChild(line);
               for (const example of (definition.examples || []).slice(0, 4)) { const exampleLine = document.createElement('p'); exampleLine.className = 'fb-dict-example'; exampleLine.textContent = `“${example}”`; sourceBlock.appendChild(exampleLine); }
             }
-            const attribution = document.createElement('p'); attribution.className = 'fb-dict-source'; attribution.textContent = `Attribution: ${combinedPack.attribution || combinedEntry.attribution || 'Not supplied by the dataset.'}`; sourceBlock.appendChild(attribution);
             const sourceActions = document.createElement('div'); sourceActions.className = 'fb-dict-card-actions';
-            sourceActions.appendChild(makeButton(`Save from ${combinedPack.title || 'this source'}`, async () => {
-              try { await this.getDictionaryLibrary().saveEntry(combinedEntry); status.textContent = `Saved “${combinedEntry.term}” to your profile vocabulary.`; }
+            const combinedSaveButton = makeButton(`Save from ${combinedPack.title || 'this source'}`, async () => {
+              try { await this.runDictionaryCardAction(sourceActions, () => this.getDictionaryLibrary().saveEntry(combinedEntry)); combinedSaveButton.textContent = 'Saved ✓'; combinedSaveButton.classList.add('is-active'); combinedSaveButton.setAttribute('aria-pressed', 'true'); status.textContent = `Saved “${combinedEntry.term}” to your profile vocabulary.`; }
               catch (error) { status.textContent = this.dictionaryErrorMessage(error); }
-            }));
+            }, 'fb-dict-state-btn');
+            combinedSaveButton.setAttribute('data-dictionary-state', 'saved'); combinedSaveButton.setAttribute('data-term', combinedEntry.term); combinedSaveButton.setAttribute('aria-pressed', 'false'); sourceActions.appendChild(combinedSaveButton);
+            const combinedStarButton = makeButton('Star', async () => {
+              try { const saved = await this.runDictionaryCardAction(sourceActions, () => this.getDictionaryLibrary().toggleStar(combinedEntry)); combinedStarButton.textContent = saved.starred ? 'Starred ★' : 'Star'; combinedStarButton.classList.toggle('is-active', saved.starred); combinedStarButton.setAttribute('aria-pressed', String(saved.starred)); status.textContent = saved.starred ? `Starred “${combinedEntry.term}”.` : `Removed star from “${combinedEntry.term}”.`; }
+              catch (error) { status.textContent = this.dictionaryErrorMessage(error); }
+            }, 'fb-dict-state-btn fb-dict-star-btn');
+            combinedStarButton.setAttribute('data-dictionary-state', 'starred'); combinedStarButton.setAttribute('data-term', combinedEntry.term); combinedStarButton.setAttribute('aria-pressed', 'false'); sourceActions.appendChild(combinedStarButton);
             const compareLabel = document.createElement('label'); compareLabel.className = 'fb-dict-checkbox';
             const compareInput = document.createElement('input'); compareInput.type = 'checkbox'; compareInput.setAttribute('aria-label', `Compare ${combinedEntry.term} from ${combinedPack.title || 'local pack'}`);
-            compareInput.addEventListener('change', () => {
-              const selected = this._dictionaryCompareSelection || [];
-              const key = `${combinedEntry.packId}@${combinedPack.version}:${normalizeDictionaryTerm(combinedEntry.term)}`;
-              if (compareInput.checked) {
-                if (selected.length >= 2) { compareInput.checked = false; status.textContent = 'Comparison includes up to two definitions.'; return; }
-                selected.push({ ...combinedEntry, _compareKey: key });
-              } else this._dictionaryCompareSelection = selected.filter((item) => item._compareKey !== key);
-              this._dictionaryCompareSelection = selected.slice(0, 2);
-              status.textContent = `${this._dictionaryCompareSelection.length} of 2 comparison entries selected.`;
-            });
+            compareInput.addEventListener('change', () => this.updateDictionaryCompareSelection(combinedEntry, compareInput, status, output));
             compareLabel.appendChild(compareInput); compareLabel.appendChild(document.createTextNode('Compare')); sourceActions.appendChild(compareLabel);
             sourceBlock.appendChild(sourceActions);
             combinedCard.appendChild(sourceBlock);
@@ -8888,7 +8950,7 @@ export class BrowserShell {
           const title = document.createElement('h2'); title.textContent = entry.term; card.appendChild(title);
           const pack = entry.sourcePack || {};
           const source = document.createElement('p'); source.className = 'fb-dict-source';
-          source.textContent = `${pack.title || entry.source || 'Local pack'} · ${pack.category || entry.category || 'general'} · ${pack.datasetVersion || pack.version || 'version not stated'} · ${pack.license || 'Licence not stated'}`;
+          source.textContent = pack.title || entry.source || 'Local dictionary';
           card.appendChild(source);
           for (const definition of (entry.definitions || []).slice(0, 20)) {
             const row = document.createElement('div'); row.className = 'fb-dict-definition';
@@ -8898,34 +8960,24 @@ export class BrowserShell {
             if (synonyms.length) { const p = document.createElement('p'); p.className = 'fb-dict-source'; p.textContent = `Related: ${synonyms.slice(0, 20).join(', ')}`; row.appendChild(p); }
             card.appendChild(row);
           }
-          const attribution = document.createElement('p'); attribution.className = 'fb-dict-source'; attribution.textContent = `Attribution: ${pack.attribution || entry.attribution || 'Not supplied by the dataset.'}`; card.appendChild(attribution);
-          if (pack.sourceUrl) { const link = document.createElement('a'); link.className = 'fb-dict-link'; link.href = pack.sourceUrl; link.target = '_blank'; link.rel = 'noopener noreferrer'; link.textContent = 'Source information'; card.appendChild(link); }
           const actions = document.createElement('div'); actions.className = 'fb-dict-card-actions';
-          actions.appendChild(makeButton('Save to vocabulary', async () => { try { await this.getDictionaryLibrary().saveEntry(entry); status.textContent = `Saved “${entry.term}” to your profile vocabulary.`; } catch (error) { status.textContent = this.dictionaryErrorMessage(error); } }));
-          actions.appendChild(makeButton('Star', async () => { try { await this.getDictionaryLibrary().toggleStar(entry); status.textContent = `Updated favourite for “${entry.term}”.`; } catch (error) { status.textContent = this.dictionaryErrorMessage(error); } }));
-          const compare = document.createElement('label'); compare.className = 'fb-dict-checkbox'; const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.setAttribute('aria-label', `Select ${entry.term} from ${pack.title || 'local pack'} for comparison`);
-          checkbox.addEventListener('change', () => {
-            const key = `${entry.packId}@${pack.version}:${normalizeDictionaryTerm(entry.term)}`;
-            const selected = this._dictionaryCompareSelection || [];
-            if (checkbox.checked) {
-              if (selected.length >= 2) { checkbox.checked = false; status.textContent = 'Comparison includes up to two definitions.'; return; }
-              selected.push({ ...entry, _compareKey: key });
-            } else this._dictionaryCompareSelection = selected.filter((item) => item._compareKey !== key);
-            this._dictionaryCompareSelection = selected.slice(0, 2);
-            status.textContent = `${this._dictionaryCompareSelection.length} of 2 comparison entries selected.`;
-          });
-          compare.appendChild(checkbox); compare.appendChild(document.createTextNode('Compare')); actions.appendChild(compare);
-          const highlightButton = makeButton('Highlight selected text', async () => {
-            const selectedText = typeof window !== 'undefined' ? String(window.getSelection?.() || '').trim() : '';
-            if (!selectedText) { status.textContent = 'Select text in this definition first, then choose Highlight selected text.'; return; }
-            try { await this.getDictionaryLibrary().saveHighlight(entry, { selectedText, sourceTitle: pack.title || '', sourceUrl: pack.sourceUrl || '' }); status.textContent = 'Highlight saved to your profile vocabulary.'; }
+          const saveButton = makeButton('Save to vocabulary', async () => {
+            try { await this.runDictionaryCardAction(actions, () => this.getDictionaryLibrary().saveEntry(entry)); saveButton.textContent = 'Saved ✓'; saveButton.classList.add('is-active'); saveButton.setAttribute('aria-pressed', 'true'); status.textContent = `Saved “${entry.term}” to your profile vocabulary.`; }
             catch (error) { status.textContent = this.dictionaryErrorMessage(error); }
-          });
-          highlightButton.addEventListener('pointerdown', (event) => event.preventDefault());
-          actions.appendChild(highlightButton);
+          }, 'fb-dict-state-btn');
+          saveButton.setAttribute('data-dictionary-state', 'saved'); saveButton.setAttribute('data-term', entry.term); saveButton.setAttribute('aria-pressed', 'false'); actions.appendChild(saveButton);
+          const starButton = makeButton('Star', async () => {
+            try { const saved = await this.runDictionaryCardAction(actions, () => this.getDictionaryLibrary().toggleStar(entry)); starButton.textContent = saved.starred ? 'Starred ★' : 'Star'; starButton.classList.toggle('is-active', saved.starred); starButton.setAttribute('aria-pressed', String(saved.starred)); status.textContent = saved.starred ? `Starred “${entry.term}”.` : `Removed star from “${entry.term}”.`; }
+            catch (error) { status.textContent = this.dictionaryErrorMessage(error); }
+          }, 'fb-dict-state-btn fb-dict-star-btn');
+          starButton.setAttribute('data-dictionary-state', 'starred'); starButton.setAttribute('data-term', entry.term); starButton.setAttribute('aria-pressed', 'false'); actions.appendChild(starButton);
+          const compare = document.createElement('label'); compare.className = 'fb-dict-checkbox'; const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.setAttribute('aria-label', `Select ${entry.term} from ${pack.title || 'local pack'} for comparison`);
+          checkbox.addEventListener('change', () => this.updateDictionaryCompareSelection(entry, checkbox, status, output));
+          compare.appendChild(checkbox); compare.appendChild(document.createTextNode('Compare')); actions.appendChild(compare);
           card.appendChild(actions); output.appendChild(card);
         }
       }
+      void this.hydrateDictionaryResultStates(output);
     } else if (result.suggestions?.length) {
       const suggestionTitle = document.createElement('p'); suggestionTitle.className = 'fb-dict-muted'; suggestionTitle.textContent = 'No exact match. Local suggestions:'; output.appendChild(suggestionTitle);
       for (const suggestion of result.suggestions) output.appendChild(makeButton(suggestion.term, () => {
@@ -14899,6 +14951,7 @@ export class BrowserShell {
       addAction('Ask Yayra AI', () => this.openSelectionInYayraAi(snapshot.text), 'fb-selection-ai');
       addAction('Ask Yayra Dictionary', () => this.openSelectionInDictionary(snapshot.text), 'fb-selection-dictionary');
       addAction('Save selection', () => this.openSelectionSave(snapshot.text), 'fb-selection-save');
+      addAction('Highlight', () => this.openSelectionHighlight(snapshot.text), 'fb-selection-highlight');
     }
     toolbar.addEventListener('pointerdown', (event) => {
       event.preventDefault?.();
@@ -15040,6 +15093,23 @@ export class BrowserShell {
     if (!query) return false;
     const source = this.getActiveTab();
     const url = `yayra://dictionary?q=${encodeURIComponent(query)}`;
+    if (this.handleDictionaryLookupRequest(url, source)) return true;
+    this.createNewTab(Boolean(source?.isPrivate), { render: false, afterTabId: source?.id || null, group: source?.group || null });
+    this.navigateActiveTab(url);
+    return true;
+  }
+
+  openSelectionHighlight(text) {
+    const selection = String(text || '').trim().slice(0, MAX_SELECTION_SEARCH_TEXT);
+    if (!selection) return false;
+    const source = this.getActiveTab();
+    const params = new URLSearchParams({
+      view: 'saved',
+      highlight: selection,
+      source: safeSelectionSourceUrl(source?.url),
+      title: String(source?.title || '').slice(0, 300)
+    });
+    const url = `yayra://dictionary?${params.toString()}`;
     if (this.handleDictionaryLookupRequest(url, source)) return true;
     this.createNewTab(Boolean(source?.isPrivate), { render: false, afterTabId: source?.id || null, group: source?.group || null });
     this.navigateActiveTab(url);
@@ -18810,6 +18880,7 @@ export class BrowserShell {
         <button class="fb-menu-item fb-btn-history" data-action="history">${Icons.history} <span>History</span></button>
         <button class="fb-menu-item fb-btn-bookmarks" data-action="bookmarks">${Icons.bookmark} <span>Bookmarks</span></button>
         <button class="fb-menu-item fb-btn-downloads" data-action="downloads">${Icons.download} <span>Downloads</span></button>
+        <button class="fb-menu-item" data-action="dictionary">${Icons.dictionary} <span>Dictionary</span></button>
         <button class="fb-menu-item" data-action="clear-data">${Icons.trash} <span>Clear Data</span></button>
         <button class="fb-menu-item" data-action="extensions">${Icons.puzzle} <span>Extensions</span></button>
         <button class="fb-menu-item" data-action="permissions">${Icons.shield} <span>Permissions</span></button>
@@ -18833,6 +18904,7 @@ export class BrowserShell {
           case 'history': this.openInternalPage('yayra://history'); break;
           case 'bookmarks': this.openInternalPage('yayra://bookmarks'); break;
           case 'downloads': this.openInternalPage('yayra://downloads'); break;
+          case 'dictionary': this.openInternalPage('yayra://dictionary'); break;
           case 'clear-data': this.openModal('clear-data'); break;
           case 'extensions': this.openInternalPage('yayra://extensions'); break;
           case 'permissions': this.openInternalPage('yayra://permissions'); break;

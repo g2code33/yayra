@@ -212,12 +212,17 @@ test('Chrome-Style 3-Dot Menu: Full architectural structure with all operational
   assert.ok(actions.includes('passwords'));
   assert.ok(actions.includes('history'));
   assert.ok(actions.includes('downloads'));
+  assert.ok(actions.includes('dictionary'));
   assert.ok(actions.includes('bookmarks'));
   assert.ok(actions.includes('clear-data'));
   assert.ok(actions.includes('extensions'));
   assert.ok(actions.includes('permissions'));
   assert.ok(actions.includes('settings'));
   assert.ok(actions.includes('about'));
+  let dictionaryRoute = '';
+  shell.openInternalPage = (url) => { dictionaryRoute = url; };
+  menuCard.querySelector('[data-action="dictionary"]').click();
+  assert.equal(dictionaryRoute, 'yayra://dictionary', 'the new menu item opens the dictionary page');
 });
 
 test('Password Manager: Secure origin-scoped encryption, autofill matching, and lifecycle', async () => {

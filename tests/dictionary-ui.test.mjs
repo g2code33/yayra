@@ -67,3 +67,94 @@ test('dictionary pages route imported packs and personal vocabulary in both inte
     assert.match(secondViewport.textContent, /My vocabulary/);
   } finally { shell.destroy(); container.remove(); }
 });
+
+
+test('dictionary result cards keep only a concise source label and visibly activate Save and Star', async () => {
+  const { shell, container } = makeShell();
+  const viewport = document.createElement('div');
+  const store = new MemoryDictionaryStore();
+  const sourcePack = {
+    id: 'compact-fixture', title: 'Local word list', category: 'general', version: '1.0',
+    datasetVersion: '1.0', source: 'Fixture', license: 'CC BY 4.0', attribution: 'Fixture author',
+    sourceUrl: 'https://example.test/source', enabled: true
+  };
+  await store.savePack(sourcePack, [validateDictionaryEntry({
+    term: 'compact', packId: sourcePack.id, category: sourcePack.category, source: sourcePack.source,
+    definitions: [{ text: 'A concise test definition.' }]
+  }, { packId: sourcePack.id, category: sourcePack.category })]);
+  shell.dictionaryLibrary = new DictionaryLibrary({ profileId: 'default', store });
+  try {
+    shell.renderInternalDictionaryPage(viewport, { id: 'tab-compact', url: 'yayra://dictionary?q=compact', isPrivate: false });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const card = viewport.querySelector('.fb-dict-card');
+    assert.ok(card);
+    assert.match(card.textContent, /Local word list/);
+    assert.match(card.textContent, /A concise test definition/);
+    assert.doesNotMatch(card.textContent, /CC BY 4\.0|Attribution:|integrity|checksum/i);
+    assert.equal(card.querySelector('.fb-dict-link'), null, 'the verbose source link is not repeated on result cards');
+    assert.equal(card.querySelectorAll('button').length, 2, 'result controls are Save and Star; highlighting appears only for a selection');
+    const [saveButton, starButton] = card.querySelectorAll('button');
+    saveButton.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    starButton.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(saveButton.textContent, 'Saved ✓');
+    assert.equal(saveButton.getAttribute('aria-pressed'), 'true');
+    assert.equal(starButton.textContent, 'Starred ★');
+    assert.equal(starButton.getAttribute('aria-pressed'), 'true');
+    assert.ok(saveButton.classList.contains('is-active'));
+    assert.ok(starButton.classList.contains('is-active'));
+    const [saved] = (await shell.getDictionaryLibrary().getPersonalData()).filter((item) => item.kind === 'saved');
+    assert.equal(saved.term, 'compact');
+    assert.equal(saved.starred, true);
+    const reloadedViewport = document.createElement('div');
+    shell.renderInternalDictionaryPage(reloadedViewport, { id: 'tab-compact-reload', url: 'yayra://dictionary?q=compact', isPrivate: false });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const reloadedCard = reloadedViewport.querySelector('.fb-dict-card');
+    assert.ok(reloadedCard, 'the reopened search renders its result card');
+    const [reloadedSave, reloadedStar] = reloadedCard.querySelectorAll('button');
+    assert.equal(reloadedSave.textContent, 'Saved ✓', 'saved state remains active after reopening the result');
+    assert.equal(reloadedStar.textContent, 'Starred ★', 'star state remains active after reopening the result');
+  } finally { shell.destroy(); container.remove(); }
+});
+
+test('comparison selection supports different dictionaries and different words, and clears correctly', () => {
+  const { shell, container } = makeShell();
+  const wrapper = document.createElement('div');
+  const output = document.createElement('div');
+  const compareButton = document.createElement('button'); compareButton.className = 'fb-dict-compare-button'; compareButton.disabled = true; wrapper.appendChild(compareButton); wrapper.appendChild(output);
+  const status = document.createElement('p');
+  const makeEntry = (term, packId, title) => ({ term, packId, source: title, sourcePack: { version: '1.0', title }, definitions: [{ text: `${term} from ${title}` }] });
+  const first = makeEntry('bank', 'one', 'WordNet');
+  const sameWordOtherDictionary = makeEntry('bank', 'two', 'Other dictionary');
+  const differentWord = makeEntry('money', 'one', 'WordNet');
+  try {
+    const firstBox = document.createElement('input'); firstBox.checked = true;
+    shell.updateDictionaryCompareSelection(first, firstBox, status, output);
+    const secondBox = document.createElement('input'); secondBox.checked = true;
+    shell.updateDictionaryCompareSelection(sameWordOtherDictionary, secondBox, status, output);
+    assert.equal(shell._dictionaryCompareSelection.length, 2);
+    assert.equal(compareButton.disabled, false);
+    assert.equal(status.textContent, '2 of 2 comparison entries selected.');
+    firstBox.checked = false;
+    shell.updateDictionaryCompareSelection(first, firstBox, status, output);
+    assert.equal(shell._dictionaryCompareSelection.length, 1, 'unchecking removes rather than re-adding the selected definition');
+    assert.equal(compareButton.disabled, true);
+    secondBox.checked = false;
+    shell.updateDictionaryCompareSelection(sameWordOtherDictionary, secondBox, status, output);
+    const bankBox = document.createElement('input'); bankBox.checked = true;
+    const moneyBox = document.createElement('input'); moneyBox.checked = true;
+    shell.updateDictionaryCompareSelection(first, bankBox, status, output);
+    shell.updateDictionaryCompareSelection(differentWord, moneyBox, status, output);
+    assert.deepEqual(shell._dictionaryCompareSelection.map((item) => item.term), ['bank', 'money']);
+  } finally { shell.destroy(); container.remove(); }
+});
+
+test('Google OAuth test-user errors explain the required consent-screen fix', () => {
+  const { shell, container } = makeShell();
+  try {
+    const message = shell.formatGoogleSignInError('oauth_error:access_denied');
+    assert.match(message, /Google Auth Platform → Audience → Test users/);
+    assert.match(message, /cannot be bypassed in Yayra/);
+  } finally { shell.destroy(); container.remove(); }
+});

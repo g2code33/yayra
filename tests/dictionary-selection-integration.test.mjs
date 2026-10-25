@@ -75,3 +75,40 @@ test('selection save strips source query strings and does not leave selected tex
     assert.equal(saved[0].sourcePage, 'https://example.test/article');
   } finally { shell.destroy(); container.remove(); }
 });
+
+
+test('selected-text Highlight saves a personal highlight and opens a clean highlights view', async () => {
+  const { shell, container } = makeShell();
+  try {
+    shell.getActiveTab().url = 'https://example.test/article?token=private#section';
+    let navigated = '';
+    shell.createNewTab = () => {};
+    shell.navigateActiveTab = (url) => { navigated = url; };
+    assert.equal(shell.openSelectionHighlight('Highlighted phrase'), true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(navigated, 'yayra://vocabulary?filter=highlight');
+    assert.doesNotMatch(navigated, /Highlighted|token|section/);
+    const [highlight] = await shell.getDictionaryLibrary().getPersonalData({ includeHistory: false });
+    assert.equal(highlight.kind, 'highlight');
+    assert.equal(highlight.selectedText, 'Highlighted phrase');
+    assert.equal(highlight.sourcePage, 'https://example.test/article');
+  } finally { shell.destroy(); container.remove(); }
+});
+
+
+test('Highlight is offered only in the visible actions for selected text', () => {
+  const { shell, container } = makeShell();
+  try {
+    let highlighted = '';
+    shell.openSelectionHighlight = (text) => { highlighted = text; return true; };
+    const toolbar = shell.showSelectionToolbar({
+      kind: 'range', text: 'selected definition text', editable: false,
+      rect: { left: 20, right: 180, top: 100, bottom: 120 },
+      anchorNode: {}, anchorOffset: 0, focusNode: {}, focusOffset: 23
+    });
+    const highlightButton = toolbar.querySelector('.fb-selection-highlight');
+    assert.ok(highlightButton);
+    highlightButton.click();
+    assert.equal(highlighted, 'selected definition text');
+  } finally { shell.destroy(); container.remove(); }
+});

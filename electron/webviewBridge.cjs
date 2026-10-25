@@ -661,6 +661,15 @@ function buildTextSelectionActionsScript() {
           addButton(bar, 'Search', function () { openAction('https://www.google.com/search?q=' + encodeURIComponent(snapshot.text.trim())); });
           addButton(bar, 'Ask Yayra AI', function () { openAction('yayra://ai?q=' + encodeURIComponent(snapshot.text.trim())); });
           addButton(bar, 'Ask Yayra Dictionary', function () { openAction('yayra://dictionary?q=' + encodeURIComponent(snapshot.text.trim())); });
+          addButton(bar, 'Highlight selection', function () {
+            var safeSource = '';
+            try {
+              var sourceUrl = new URL(location.href);
+              if ((sourceUrl.protocol === 'https:' || sourceUrl.protocol === 'http:') && !sourceUrl.username && !sourceUrl.password) safeSource = sourceUrl.origin + sourceUrl.pathname;
+            } catch (_sourceError) {}
+            var params = new URLSearchParams({ view: 'saved', highlight: snapshot.text.trim(), source: safeSource.slice(0, 2000), title: document.title.slice(0, 300) });
+            openAction('yayra://dictionary?' + params.toString());
+          });
           addButton(bar, 'Save selection', function () {
             var safeSource = '';
             try {
@@ -1365,6 +1374,15 @@ function buildContextMenuTemplate({ params, wc, tabId, send, clipboard, navigati
       {
         label: `Ask Yayra Dictionary about "${shortText}"`,
         click: () => send(tabId, 'new-window-request', { url: `yayra://dictionary?q=${encodeURIComponent(trimmed)}` })
+      },
+      {
+        label: 'Highlight selected text',
+        click: () => {
+          const query = new URLSearchParams({ view: 'saved', highlight: trimmed });
+          const sourceUrl = safeSelectionSourceUrl(params.pageURL);
+          if (sourceUrl) query.set('source', sourceUrl);
+          send(tabId, 'new-window-request', { url: `yayra://dictionary?${query.toString()}` });
+        }
       },
       {
         label: 'Save selection to vocabulary',
