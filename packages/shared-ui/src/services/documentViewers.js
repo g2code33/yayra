@@ -243,6 +243,13 @@ export function resolvePptxSlideshowShortcut(event, { digitBuffer = '' } = {}) {
 
 export const resolveDocumentSlideshowShortcut = resolvePptxSlideshowShortcut;
 
+export function resolveDocumentSlideshowClick(clientX, bounds = {}) {
+  const x = Number(clientX);
+  const left = Number(bounds.left) || 0;
+  const width = Math.max(0, Number(bounds.width) || 0);
+  return Number.isFinite(x) && x < left + width / 2 ? 'previous' : 'next';
+}
+
 function handleCommonKeys(event, controller, state, { canRotate = false, canNight = false } = {}) {
   if (!event || isTypingTarget(event)) return null;
   const key = String(event.key || '');

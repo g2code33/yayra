@@ -9,6 +9,7 @@ import { setupDomShim } from './dom-shim.mjs';
 import { BrowserShell } from '../packages/shared-ui/src/components/BrowserShell.js';
 import {
   resolveDocumentSlideshowShortcut,
+  resolveDocumentSlideshowClick,
   resolvePptxSlideshowShortcut
 } from '../packages/shared-ui/src/services/documentViewers.js';
 
@@ -199,6 +200,13 @@ test('DOCUMENT SLIDESHOW SHORTCUTS: PDF and PowerPoint navigation, jumping, blan
     'Space still activates a focused accessible button instead of advancing');
 });
 
+test('DOCUMENT SLIDESHOW CLICKS: left half navigates backward and right half forward', () => {
+  const bounds = { left: 100, width: 800 };
+  assert.equal(resolveDocumentSlideshowClick(250, bounds), 'previous');
+  assert.equal(resolveDocumentSlideshowClick(650, bounds), 'next');
+  assert.equal(resolveDocumentSlideshowClick(500, bounds), 'next', 'the center split favors advancing');
+});
+
 test('DOCUMENT HUB UI: safe rows, filters, unavailable state and direct reopen work together', async () => {
   const previousYayra = window.yayra;
   const calls = [];
@@ -336,6 +344,15 @@ test('DOCUMENT HUB + SLIDESHOW SOURCE CONTRACT: toolbar placement, IPC privacy, 
   assert.match(shell, /startPdfSlideshow/);
   assert.match(shell, /startDocumentSlideshow/);
   assert.match(shell, /requestFullscreen\(\{ navigationUI: 'hide' \}\)/);
+  assert.match(shell, /fb-in-pptx-projector-display/);
+  assert.match(shell, /resolveDocumentSlideshowClick\(event\.clientX, bounds\) === 'previous'\) void viewer\.prevPage/);
+  assert.match(shell, /else void viewer\.nextPage/,
+    'left-side clicks go backward and right-side clicks go forward');
+  assert.match(preload, /projector-list-displays/);
+  assert.match(preload, /projector-move-to-display/);
+  assert.match(preload, /projector-restore-display/);
+  assert.match(main, /screen\.getAllDisplays\(\)/);
+  assert.match(main, /projector-restore-display/);
   assert.match(shell, /exitPptxSlideshow/);
   assert.match(shell, /exitDocumentSlideshow/);
   assert.match(shell, /fb-pptx-slideshow-ink/);

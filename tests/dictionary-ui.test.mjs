@@ -44,6 +44,25 @@ test('dictionary page renders local results and untrusted definitions as text, n
   } finally { shell.destroy(); container.remove(); }
 });
 
+test('dictionary category, source and layout changes immediately rerun the active query', async () => {
+  const { shell, container } = makeShell();
+  const viewport = document.createElement('div');
+  const tab = shell.getActiveTab();
+  tab.url = 'yayra://dictionary?q=aspirin';
+  let navigated = '';
+  shell.navigateActiveTab = (url) => { navigated = url; };
+  try {
+    shell.renderInternalDictionaryPage(viewport, tab);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const category = viewport.querySelector('[aria-label="Filter by dictionary category"]');
+    assert.ok(category);
+    category.value = 'pharmacy';
+    category.dispatchEvent(new Event('change', { bubbles: true }));
+    assert.match(navigated, /category=pharmacy/);
+    assert.match(navigated, /q=aspirin/);
+  } finally { shell.destroy(); container.remove(); }
+});
+
 test('Dictionary is a working side-drawer destination and pack source links have independent spacing', () => {
   const { shell, container } = makeShell();
   try {

@@ -77,21 +77,57 @@ test('selection save strips source query strings and does not leave selected tex
 });
 
 
-test('selected-text Highlight saves a personal highlight and opens a clean highlights view', async () => {
+test('selected-text Highlight applies color and saves a personal highlight without navigating', async () => {
   const { shell, container } = makeShell();
+  const previousCss = globalThis.CSS;
+  const previousHighlight = globalThis.Highlight;
   try {
     shell.getActiveTab().url = 'https://example.test/article?token=private#section';
     let navigated = '';
+    class TestHighlight { constructor() { this.ranges = []; } add(range) { this.ranges.push(range); } }
+    globalThis.CSS = { highlights: new Map() };
+    globalThis.Highlight = TestHighlight;
     shell.createNewTab = () => {};
     shell.navigateActiveTab = (url) => { navigated = url; };
-    assert.equal(shell.openSelectionHighlight('Highlighted phrase'), true);
+    const range = { cloneRange: () => ({ selected: true }) };
+    assert.equal(shell.openSelectionHighlight('Highlighted phrase', { kind: 'range', range }), true);
     await new Promise((resolve) => setTimeout(resolve, 0));
-    assert.equal(navigated, 'yayra://vocabulary?filter=highlight');
-    assert.doesNotMatch(navigated, /Highlighted|token|section/);
+    assert.equal(globalThis.CSS.highlights.get('yayra-selection-highlight').ranges.length, 1,
+      'the selected live range receives a visible CSS highlight');
+    assert.equal(navigated, '', 'Highlight stays on the current tab');
     const [highlight] = await shell.getDictionaryLibrary().getPersonalData({ includeHistory: false });
     assert.equal(highlight.kind, 'highlight');
     assert.equal(highlight.selectedText, 'Highlighted phrase');
     assert.equal(highlight.sourcePage, 'https://example.test/article');
+    assert.equal(highlight.highlightColor, '#ffe08a', 'the persisted item carries the applied highlight color');
+  } finally {
+    shell.destroy();
+    container.remove();
+    if (previousCss === undefined) delete globalThis.CSS; else globalThis.CSS = previousCss;
+    if (previousHighlight === undefined) delete globalThis.Highlight; else globalThis.Highlight = previousHighlight;
+  }
+});
+
+
+test('website selection highlight is stored locally from the WebContents event without opening a route', async () => {
+  const { shell, container } = makeShell();
+  try {
+    const tab = shell.getActiveTab();
+    tab.url = 'https://example.test/read?secret=hidden#chapter';
+    tab.title = 'Article';
+    let navigated = false;
+    shell.navigateActiveTab = () => { navigated = true; };
+    await shell.saveWebviewSelectionHighlight({
+      text: 'A highlighted passage',
+      sourceUrl: 'https://example.test/read?secret=hidden#chapter',
+      sourceTitle: 'Article',
+      highlightColor: '#ffe08a'
+    }, tab);
+    const [highlight] = await shell.getDictionaryLibrary().getPersonalData({ includeHistory: false });
+    assert.equal(highlight.kind, 'highlight');
+    assert.equal(highlight.sourcePage, 'https://example.test/read');
+    assert.equal(highlight.highlightColor, '#ffe08a');
+    assert.equal(navigated, false);
   } finally { shell.destroy(); container.remove(); }
 });
 

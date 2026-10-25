@@ -35,6 +35,7 @@ import { PasswordManager } from '../../../persistence/src/PasswordManager.js';
 import { PasskeyService } from '../services/passkeyService.js';
 import { DictionaryLibrary } from '../services/dictionaryLibrary.js';
 import { normalizeDictionaryTerm } from '../services/dictionaryEngine.js';
+import { resolveDocumentSlideshowClick } from '../services/documentViewers.js';
 import { ProfileService } from '../services/profileService.js';
 import {
   createProfileScopedStorage,
@@ -521,6 +522,7 @@ export class BrowserShell {
         // these fields control only how this profile presents/manages it.
         pptxNotesColor: DEFAULT_PPTX_NOTES_COLOR,
         pptxSlideshowFullscreen: true,
+        pptxProjectorDisplayId: 'current',
         pptxSlideshowAutoHideControls: true,
         documentsDefaultSort: 'opened',
         documentsDefaultSortDirection: 'desc',
@@ -6502,6 +6504,9 @@ export class BrowserShell {
       case 'popup-blocked':
         this.showTransientNotice('Yayra blocked a website pop-up. Allow pop-ups in Privacy & Security > Site settings if you trust this site.');
         break;
+      case 'selection-highlight':
+        void this.saveWebviewSelectionHighlight(evt, tab);
+        break;
       case 'new-window-request':
         if (evt.url) {
           if (this.handleDictionaryLookupRequest(evt.url, tab)) break;
@@ -8761,7 +8766,7 @@ export class BrowserShell {
           const card = document.createElement('article'); card.className = 'fb-dict-card';
           const title = document.createElement('h3'); title.textContent = `${item.starred ? '★ ' : ''}${item.term}`; card.appendChild(title);
           const detail = document.createElement('p'); detail.className = 'fb-dict-source'; detail.textContent = `${item.kind}${item.category ? ` · ${item.category}` : ''}${item.collectionId ? ` · ${item.collectionId}` : ''}`; card.appendChild(detail);
-          if (item.selectedText) { const quote = document.createElement('blockquote'); quote.className = 'fb-dict-def'; quote.textContent = item.selectedText; card.appendChild(quote); }
+          if (item.selectedText) { const quote = document.createElement('blockquote'); quote.className = 'fb-dict-def'; quote.textContent = item.selectedText; if (item.kind === 'highlight') { quote.classList.add('fb-dict-highlight-quote'); quote.style.backgroundColor = /^#[0-9a-f]{6}$/i.test(item.highlightColor || '') ? item.highlightColor : '#ffe08a'; quote.style.color = '#312000'; quote.style.padding = '10px 12px'; quote.style.borderRadius = '8px'; } card.appendChild(quote); }
           for (const definition of (item.definitions || []).slice(0, 4)) { const line = document.createElement('p'); line.className = 'fb-dict-def'; line.textContent = definition.text || ''; card.appendChild(line); }
           if (item.note) { const note = document.createElement('p'); note.className = 'fb-dict-muted'; note.textContent = `Note: ${item.note}`; card.appendChild(note); }
           if (item.tags?.length) { const tags = document.createElement('p'); tags.className = 'fb-dict-source'; tags.textContent = `Tags: ${item.tags.join(', ')}`; card.appendChild(tags); }
@@ -8793,7 +8798,10 @@ export class BrowserShell {
       mode.value = route.searchParams.get('mode') === 'combined' ? 'combined' : 'separate';
       void this.getDictionaryLibrary().store.getActivePacks().then((packs) => {
         for (const pack of packs) { const option = document.createElement('option'); option.value = pack.id; option.textContent = pack.title; sourcePack.appendChild(option); }
-        sourcePack.value = packs.some((pack) => pack.id === route.searchParams.get('pack')) ? route.searchParams.get('pack') : 'all';
+        const requestedPack = route.searchParams.get('pack');
+        const requestedPackInstalled = packs.some((pack) => pack.id === requestedPack);
+        sourcePack.value = requestedPack && requestedPackInstalled ? requestedPack : 'all';
+        if (requestedPack && !requestedPackInstalled && input.value.trim()) searchWithCurrentFilters();
       }).catch(() => {});
       const searchButton = document.createElement('button'); searchButton.type = 'submit'; searchButton.className = 'fb-dict-btn primary'; searchButton.textContent = 'Search';
       const filterDetails = document.createElement('details'); filterDetails.className = 'fb-dict-filters';
@@ -8821,15 +8829,21 @@ export class BrowserShell {
       const compareHint = document.createElement('p'); compareHint.className = 'fb-dict-muted'; compareHint.textContent = 'Choose any two results: compare the same word across dictionaries, or search a phrase such as “bank money” and select two different words.';
       compareBar.appendChild(compareHint); compareBar.appendChild(compareButton); section.appendChild(compareBar);
       const output = document.createElement('div'); output.className = 'fb-dict-list'; output.setAttribute('aria-live', 'polite'); section.appendChild(output); content.appendChild(section);
+      const searchWithCurrentFilters = () => routeSearch({
+        q: input.value.trim(),
+        ...(category.value !== 'all' ? { category: category.value } : {}),
+        ...(sourcePack.value !== 'all' ? { pack: sourcePack.value } : {}),
+        ...(mode.value === 'combined' ? { mode: 'combined' } : {})
+      });
       form.addEventListener('submit', (event) => {
         event.preventDefault();
-        routeSearch({
-          q: input.value.trim(),
-          ...(category.value !== 'all' ? { category: category.value } : {}),
-          ...(sourcePack.value !== 'all' ? { pack: sourcePack.value } : {}),
-          ...(mode.value === 'combined' ? { mode: 'combined' } : {})
-        });
+        searchWithCurrentFilters();
       });
+      for (const filter of [category, sourcePack, mode]) {
+        filter.addEventListener('change', () => {
+          if (input.value.trim()) searchWithCurrentFilters();
+        });
+      }
       const initialQuery = input.value.trim();
       if (initialQuery) {
         void (async () => {
@@ -9619,6 +9633,16 @@ export class BrowserShell {
               <div><strong>Start slideshows in true fullscreen</strong><p>Use the entire display for a projector when browser fullscreen permission is available.</p></div>
               <input type="checkbox" id="fb-in-pptx-fullscreen" ${this.state.settings.pptxSlideshowFullscreen !== false ? 'checked' : ''} />
             </div>
+            <div class="fb-setting-row">
+              <label for="fb-in-pptx-projector-display">Projector display</label>
+              <div style="display:flex; gap:8px; flex:1; min-width:0;">
+                <select id="fb-in-pptx-projector-display" class="fb-select" aria-describedby="fb-pptx-projector-help">
+                  <option value="current">Current display (automatic)</option>
+                </select>
+                <button type="button" class="fb-btn" id="fb-in-pptx-refresh-displays">Detect displays</button>
+              </div>
+            </div>
+            <p id="fb-pptx-projector-help">Choose an external monitor for the next slideshow. Yayra restores this window to its previous display and size when the presentation ends.</p>
             <div class="fb-setting-toggle-row">
               <div><strong>Auto-hide slideshow controls</strong><p>Hide projector controls after a short idle period; move the pointer to bring them back.</p></div>
               <input type="checkbox" id="fb-in-pptx-autohide" ${this.state.settings.pptxSlideshowAutoHideControls !== false ? 'checked' : ''} />
@@ -9935,7 +9959,53 @@ export class BrowserShell {
     bindToggle('#fb-in-set-restore-session', (on) => { this.state.settings.restoreSessionOnLaunch = on; });
     bindToggle('#fb-in-documents-show-missing', (on) => { this.state.settings.documentsShowMissing = on; });
     bindToggle('#fb-in-pptx-fullscreen', (on) => { this.state.settings.pptxSlideshowFullscreen = on; });
+    bindSelect('#fb-in-pptx-projector-display', (value) => { this.state.settings.pptxProjectorDisplayId = value || 'current'; });
     bindToggle('#fb-in-pptx-autohide', (on) => { this.state.settings.pptxSlideshowAutoHideControls = on; });
+    const projectorDisplaySelect = page.querySelector('#fb-in-pptx-projector-display');
+    const projectorRefreshButton = page.querySelector('#fb-in-pptx-refresh-displays');
+    const projectorHelp = page.querySelector('#fb-pptx-projector-help');
+    const refreshProjectorDisplays = async () => {
+      if (!projectorDisplaySelect) return;
+      const bridge = this.windowControls;
+      if (typeof bridge?.listDisplays !== 'function') {
+        projectorDisplaySelect.disabled = true;
+        if (projectorRefreshButton) projectorRefreshButton.disabled = true;
+        if (projectorHelp) projectorHelp.textContent = 'External display selection is available in the Yayra desktop app.';
+        return;
+      }
+      if (projectorRefreshButton) projectorRefreshButton.disabled = true;
+      try {
+        const displays = await bridge.listDisplays();
+        const selected = String(this.state.settings.pptxProjectorDisplayId || 'current');
+        projectorDisplaySelect.textContent = '';
+        const automatic = document.createElement('option');
+        automatic.value = 'current';
+        automatic.textContent = 'Current display (automatic)';
+        projectorDisplaySelect.appendChild(automatic);
+        for (const display of Array.isArray(displays) ? displays : []) {
+          const option = document.createElement('option');
+          option.value = String(display.id);
+          option.textContent = String(display.label || `Display ${display.id}`);
+          projectorDisplaySelect.appendChild(option);
+        }
+        const selectedAvailable = Array.isArray(displays) && displays.some((display) => String(display.id) === selected);
+        projectorDisplaySelect.value = selectedAvailable ? selected : 'current';
+        if (selected !== 'current' && !selectedAvailable) {
+          this.state.settings.pptxProjectorDisplayId = 'current';
+          this.persistSettings();
+        }
+        projectorDisplaySelect.disabled = false;
+        if (projectorHelp) projectorHelp.textContent = displays?.length > 1
+          ? 'Choose an external monitor for the next slideshow. Yayra restores this window to its previous display and size when the presentation ends.'
+          : 'Only one display is connected. Connect a projector or monitor, then choose Detect displays.';
+      } catch {
+        if (projectorHelp) projectorHelp.textContent = 'Could not detect displays. Reconnect the projector and try Detect displays.';
+      } finally {
+        if (projectorRefreshButton) projectorRefreshButton.disabled = false;
+      }
+    };
+    projectorRefreshButton?.addEventListener('click', () => { void refreshProjectorDisplays(); });
+    void refreshProjectorDisplays();
     // (Chrome-style keep-alive: loaded pages are never auto-refreshed -
     // see mountPooledWebFrame(). The old auto-refresh toggle is gone.)
     bindToggle('#fb-in-set-floating-default', (on) => { this.state.settings.floatingEnabledByDefault = on; });
@@ -14957,7 +15027,7 @@ export class BrowserShell {
       addAction('Ask Yayra AI', () => this.openSelectionInYayraAi(snapshot.text), 'fb-selection-ai');
       addAction('Ask Yayra Dictionary', () => this.openSelectionInDictionary(snapshot.text), 'fb-selection-dictionary');
       addAction('Save selection', () => this.openSelectionSave(snapshot.text), 'fb-selection-save');
-      addAction('Highlight', () => this.openSelectionHighlight(snapshot.text), 'fb-selection-highlight');
+      addAction('Highlight', () => this.openSelectionHighlight(snapshot.text, snapshot), 'fb-selection-highlight');
     }
     toolbar.addEventListener('pointerdown', (event) => {
       event.preventDefault?.();
@@ -15105,21 +15175,69 @@ export class BrowserShell {
     return true;
   }
 
-  openSelectionHighlight(text) {
+  applySelectionHighlight(snapshot, color = '#ffe08a') {
+    const range = snapshot?.kind === 'range' ? snapshot.range : null;
+    const highlights = typeof CSS !== 'undefined' ? CSS.highlights : null;
+    const HighlightApi = typeof Highlight !== 'undefined' ? Highlight : null;
+    if (!range || !highlights || !HighlightApi || typeof highlights.set !== 'function') return false;
+    try {
+      const name = 'yayra-selection-highlight';
+      let highlight = highlights.get(name);
+      if (!highlight) {
+        highlight = new HighlightApi();
+        highlights.set(name, highlight);
+      }
+      highlight.add(range.cloneRange?.() || range);
+      if (!document.getElementById('yayra-selection-highlight-style')) {
+        const style = document.createElement('style');
+        style.id = 'yayra-selection-highlight-style';
+        style.textContent = `::highlight(${name}) { background-color: ${color}; color: inherit; }`;
+        (document.head || document.documentElement).appendChild(style);
+      }
+      return true;
+    } catch { return false; }
+  }
+
+  openSelectionHighlight(text, snapshot = this._selectionToolbarSnapshot) {
     const selection = String(text || '').trim().slice(0, MAX_SELECTION_SEARCH_TEXT);
     if (!selection) return false;
     const source = this.getActiveTab();
-    const params = new URLSearchParams({
-      view: 'saved',
-      highlight: selection,
-      source: safeSelectionSourceUrl(source?.url),
-      title: String(source?.title || '').slice(0, 300)
-    });
-    const url = `yayra://dictionary?${params.toString()}`;
-    if (this.handleDictionaryLookupRequest(url, source)) return true;
-    this.createNewTab(Boolean(source?.isPrivate), { render: false, afterTabId: source?.id || null, group: source?.group || null });
-    this.navigateActiveTab(url);
+    const color = '#ffe08a';
+    this.applySelectionHighlight(snapshot, color);
+    if (source?.isPrivate) {
+      this.showTransientNotice('Highlighted on this page. Private-session highlights are not saved.');
+      return true;
+    }
+    void this.getDictionaryLibrary().saveHighlight(selection, {
+      selectedText: selection,
+      sourceUrl: source?.url,
+      sourceTitle: source?.title,
+      highlightColor: color
+    }).then(() => this.showTransientNotice('Highlight saved to your vocabulary.'))
+      .catch((error) => this.showTransientNotice(this.dictionaryErrorMessage(error)));
     return true;
+  }
+
+  async saveWebviewSelectionHighlight(payload, tab) {
+    const text = String(payload?.text || '').trim().slice(0, MAX_SELECTION_SEARCH_TEXT);
+    if (!text || !tab) return false;
+    if (tab.isPrivate) {
+      this.showTransientNotice('Highlighted on this page. Private-session highlights are not saved.');
+      return true;
+    }
+    try {
+      await this.getDictionaryLibrary().saveHighlight(text, {
+        selectedText: text,
+        sourceUrl: payload?.sourceUrl || tab.url,
+        sourceTitle: payload?.sourceTitle || tab.title,
+        highlightColor: payload?.highlightColor || '#ffe08a'
+      });
+      this.showTransientNotice('Highlight saved to your vocabulary.');
+      return true;
+    } catch (error) {
+      this.showTransientNotice(this.dictionaryErrorMessage(error));
+      return false;
+    }
   }
 
   openSelectionSave(text) {
@@ -24579,6 +24697,7 @@ export class BrowserShell {
         <span>Previous ${pageNoun}</span><kbd>P</kbd><kbd>Backspace</kbd><kbd>\u2190</kbd><kbd>\u2191</kbd><kbd>PgUp</kbd>
         <span>First / last ${pageNoun}</span><kbd>Home</kbd><kbd>End</kbd>
         <span>Jump to ${pageNoun}</span><kbd>number</kbd><kbd>Enter</kbd>
+        <span>Click slide sides</span><kbd>Left: previous</kbd><kbd>Right: next</kbd>
         <span>Black / white screen</span><kbd>B</kbd><kbd>.</kbd><kbd>W</kbd><kbd>,</kbd>
         ${isPowerPoint ? '<span>Speaker notes</span><kbd>S</kbd><kbd>Alt+F5</kbd><kbd>Ctrl+Shift+N</kbd>' : ''}
         <span>Laser / pen / arrow</span><kbd>Ctrl+L</kbd><kbd>Ctrl+P</kbd><kbd>Ctrl+A</kbd>
@@ -24659,6 +24778,7 @@ export class BrowserShell {
       jumpTimer: null,
       wheelAt: 0,
       enteredFullscreen: false,
+      projectorWindowMoved: false,
       suppressFullscreenExit: false,
       drawing: false,
       lastPoint: null,
@@ -24668,6 +24788,11 @@ export class BrowserShell {
     this._pptxSlideshow = show; // compatibility alias for earlier integrations
     tab.docState.slideshowMode = true;
 
+    const projectorDisplayId = String(this.state.settings.pptxProjectorDisplayId || 'current');
+    if (projectorDisplayId !== 'current' && typeof this.windowControls?.moveToDisplay === 'function') {
+      try { show.projectorWindowMoved = Boolean(await this.windowControls.moveToDisplay(projectorDisplayId)); }
+      catch { show.projectorWindowMoved = false; }
+    }
     const fullscreenWanted = this.state.settings.pptxSlideshowFullscreen !== false;
     let fullscreenPromise = null;
     if (fullscreenWanted && typeof overlay.requestFullscreen === 'function') {
@@ -24878,7 +25003,9 @@ export class BrowserShell {
       if (event.target?.closest?.('video,audio,button,a,input,textarea,select,[contenteditable="true"]')) return;
       const selection = typeof window.getSelection === 'function' ? window.getSelection() : null;
       if (selection && selection.isCollapsed === false && String(selection).trim()) return;
-      void viewer.nextPage?.();
+      const bounds = surface.getBoundingClientRect?.() || { left: 0, width: Number(window.innerWidth) || 0 };
+      if (resolveDocumentSlideshowClick(event.clientX, bounds) === 'previous') void viewer.prevPage?.();
+      else void viewer.nextPage?.();
     });
     surface.addEventListener('wheel', (event) => {
       if (Math.abs(event.deltaY) < 16 || Date.now() - show.wheelAt < 350) return;
@@ -25016,6 +25143,9 @@ export class BrowserShell {
         await document.exitFullscreen?.();
       }
     } catch { /* fullscreen may already be leaving */ }
+    if (show.projectorWindowMoved && typeof this.windowControls?.restoreDisplay === 'function') {
+      try { await this.windowControls.restoreDisplay(); } catch { /* best-effort restore after projector removal */ }
+    }
     const tab = this.state.tabs.find((item) => item.id === show.tabId);
     if (tab?.docState) tab.docState.slideshowMode = false;
     try {

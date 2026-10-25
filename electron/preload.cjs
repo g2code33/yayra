@@ -50,6 +50,9 @@ const api = {
     minimize: () => ipcRenderer.invoke('yayra:window-minimize'),
     toggleMaximize: () => ipcRenderer.invoke('yayra:window-maximize-toggle'),
     isMaximized: () => ipcRenderer.invoke('yayra:window-is-maximized'),
+    listDisplays: () => ipcRenderer.invoke('yayra:projector-list-displays'),
+    moveToDisplay: (displayId) => ipcRenderer.invoke('yayra:projector-move-to-display', { displayId }),
+    restoreDisplay: () => ipcRenderer.invoke('yayra:projector-restore-display'),
     close: () => ipcRenderer.invoke('yayra:window-close'),
     // Manual dragging keeps the complete tab strip out of Electron's native
     // app-region path, which can swallow input and leave Linux chrome stuck.

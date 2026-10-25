@@ -613,6 +613,25 @@ function buildTextSelectionActionsScript() {
       var openAction = function (url) {
         try { window.open(url, '_blank', 'noopener,noreferrer'); } catch (_err) {}
       };
+      var applySelectionHighlight = function (snapshot, color) {
+        try {
+          if (snapshot.kind !== 'range' || !window.CSS?.highlights || !window.Highlight) return false;
+          var name = 'yayra-selection-highlight';
+          var highlight = window.CSS.highlights.get(name);
+          if (!highlight) {
+            highlight = new window.Highlight();
+            window.CSS.highlights.set(name, highlight);
+          }
+          highlight.add(snapshot.range.cloneRange());
+          if (!document.getElementById('yayra-selection-highlight-style')) {
+            var style = document.createElement('style');
+            style.id = 'yayra-selection-highlight-style';
+            style.textContent = '::highlight(' + name + ') { background-color: ' + color + '; color: inherit; }';
+            (document.head || document.documentElement).appendChild(style);
+          }
+          return true;
+        } catch (_err) { return false; }
+      };
       var addButton = function (parent, label, action) {
         var button = document.createElement('button');
         button.type = 'button';
@@ -667,8 +686,15 @@ function buildTextSelectionActionsScript() {
               var sourceUrl = new URL(location.href);
               if ((sourceUrl.protocol === 'https:' || sourceUrl.protocol === 'http:') && !sourceUrl.username && !sourceUrl.password) safeSource = sourceUrl.origin + sourceUrl.pathname;
             } catch (_sourceError) {}
-            var params = new URLSearchParams({ view: 'saved', highlight: snapshot.text.trim(), source: safeSource.slice(0, 2000), title: document.title.slice(0, 300) });
-            openAction('yayra://dictionary?' + params.toString());
+            var color = '#ffe08a';
+            applySelectionHighlight(snapshot, color);
+            var params = new URLSearchParams({
+              text: snapshot.text.trim(),
+              sourceUrl: safeSource.slice(0, 2000),
+              sourceTitle: document.title.slice(0, 300),
+              highlightColor: color
+            });
+            openAction('yayra://selection-highlight?' + params.toString());
           });
           addButton(bar, 'Save selection', function () {
             var safeSource = '';
@@ -2768,6 +2794,21 @@ function createWebviewBridge({
     });
     wc.setWindowOpenHandler((openDetails = {}) => {
       const { url } = openDetails;
+      // Selection highlighting is handled locally: the injected page script
+      // paints the live range, then sends bounded text/source metadata to the
+      // browser shell for profile-owned persistence. It must never navigate.
+      try {
+        const requested = new URL(String(url || ''));
+        if (requested.protocol === 'yayra:' && requested.hostname === 'selection-highlight') {
+          sendTo(entry, 'selection-highlight', {
+            text: (requested.searchParams.get('text') || '').slice(0, 2000),
+            sourceUrl: String(wc.getURL?.() || entry.lastUrl || '').slice(0, 4000),
+            sourceTitle: String(wc.getTitle?.() || '').slice(0, 300),
+            highlightColor: '#ffe08a'
+          });
+          return { action: 'deny' };
+        }
+      } catch { /* continue through normal popup handling */ }
       // In-page WebAuthn helper asking to reopen this page in the user's
       // real browser (where phone/synced passkeys actually work).
       const externalTarget = decodeOpenExternalRequest(url);

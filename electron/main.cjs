@@ -52,6 +52,7 @@ const CONTEXT_MENU_NAV_STATE_CHANNEL = 'yayra:context-menu-navigation-state';
 const MAX_DOCUMENT_BYTES = 300 * 1024 * 1024;
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 let mainWindow;
+const projectorWindowRestoreStates = new Map();
 const contextMenuNavigationStates = new WeakMap();
 let downloadsBridge = null;
 // Yayra-owned real Chrome profile for genuinely signed-in Google websites.
@@ -1082,6 +1083,59 @@ function registerIpcBridges() {
     return win.isMaximized();
   });
   ipcMain.handle('yayra:window-is-maximized', (event) => Boolean(senderWindow(event)?.isMaximized()));
+  ipcMain.handle('yayra:projector-list-displays', () => {
+    try {
+      const primaryId = String(screen.getPrimaryDisplay()?.id ?? '');
+      return screen.getAllDisplays().map((display, index) => {
+        const bounds = display.bounds || display.workArea || {};
+        return {
+          id: String(display.id),
+          label: `Display ${index + 1}${String(display.id) === primaryId ? ' (primary)' : ''} · ${Number(bounds.width) || 0} × ${Number(bounds.height) || 0}`,
+          primary: String(display.id) === primaryId
+        };
+      });
+    } catch { return []; }
+  });
+  ipcMain.handle('yayra:projector-move-to-display', (event, { displayId } = {}) => {
+    const win = senderWindow(event);
+    if (!win || displayId == null || String(displayId) === 'current') return false;
+    let display;
+    try { display = screen.getAllDisplays().find((item) => String(item.id) === String(displayId)); } catch { return false; }
+    if (!display) return false;
+    const target = display.workArea || display.bounds;
+    if (!target) return false;
+    const savedHere = !projectorWindowRestoreStates.has(win.id);
+    try {
+      if (savedHere) {
+        projectorWindowRestoreStates.set(win.id, {
+          bounds: win.getBounds(),
+          maximized: win.isMaximized(),
+          fullscreen: win.isFullScreen()
+        });
+      }
+      if (win.isFullScreen()) win.setFullScreen(false);
+      if (win.isMaximized()) win.unmaximize();
+      win.setBounds({ x: target.x, y: target.y, width: target.width, height: target.height }, false);
+      return true;
+    } catch {
+      if (savedHere) projectorWindowRestoreStates.delete(win.id);
+      return false;
+    }
+  });
+  ipcMain.handle('yayra:projector-restore-display', (event) => {
+    const win = senderWindow(event);
+    const saved = win && projectorWindowRestoreStates.get(win.id);
+    if (!win || !saved) return false;
+    try {
+      if (win.isFullScreen()) win.setFullScreen(false);
+      if (win.isMaximized()) win.unmaximize();
+      win.setBounds(saved.bounds, false);
+      if (saved.maximized) win.maximize();
+      else if (saved.fullscreen) win.setFullScreen(true);
+      projectorWindowRestoreStates.delete(win.id);
+      return true;
+    } catch { return false; }
+  });
   ipcMain.handle('yayra:window-close', (event) => {
     senderWindow(event)?.close();
   });

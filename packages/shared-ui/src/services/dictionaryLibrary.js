@@ -75,13 +75,14 @@ export class DictionaryLibrary {
     return item;
   }
 
-  async saveHighlight(entryOrText, { selectedText = '', note = '', tags = [], sourceTitle = '', sourceUrl = '', isPrivate = false } = {}) {
+  async saveHighlight(entryOrText, { selectedText = '', note = '', tags = [], sourceTitle = '', sourceUrl = '', isPrivate = false, highlightColor = '#ffe08a' } = {}) {
     const text = String(selectedText || (typeof entryOrText === 'string' ? entryOrText : '') || entryOrText?.term || '').normalize('NFKC').replace(/\s+/g, ' ').trim().slice(0, 3000);
     if (!text) throw new Error('highlight-empty');
     const item = {
       id: makeId(), ownerProfile: this.profileId, kind: 'highlight',
       term: String(entryOrText?.term || text).slice(0, 240), normalizedTerm: normalizeDictionaryTerm(entryOrText?.term || text),
       selectedText: text, note: String(note || '').slice(0, 10_000), tags: normalizeTags(tags),
+      highlightColor: /^#[0-9a-f]{6}$/i.test(String(highlightColor)) ? String(highlightColor).toLowerCase() : '#ffe08a',
       sourceTitle: String(sourceTitle || '').slice(0, 500), sourcePage: sanitizePageUrl(sourceUrl), isPrivateSource: Boolean(isPrivate),
       packId: String(entryOrText?.packId || '').slice(0, 120), category: entryOrText?.category || 'general',
       createdAt: Date.now(), updatedAt: Date.now()

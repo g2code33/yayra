@@ -49,6 +49,19 @@ test('offline search supports prefix results, source/category filters, and compa
   assert.equal(compareDictionaryEntries(result.results.slice(0, 2)).length, 2);
 });
 
+test('dictionary category filters match entry categories inside mixed-category packs', async () => {
+  const store = new MemoryDictionaryStore();
+  await store.savePack({ ...META, category: 'general', enabled: true }, [
+    validateDictionaryEntry({ term: 'aspirin', category: 'pharmacy', definitions: ['A medicine.'] }, { packId: META.id }),
+    validateDictionaryEntry({ term: 'clinical', category: 'medical', definitions: ['Relating to treatment.'] }, { packId: META.id })
+  ]);
+  assert.deepEqual((await searchDictionary(store, 'aspirin', { categories: ['pharmacy'] })).results.map((entry) => entry.term), ['aspirin']);
+  assert.equal((await searchDictionary(store, 'aspirin', { categories: ['medical'] })).results.length, 0,
+    'an entry with the wrong category is not leaked through its pack metadata');
+  assert.equal((await searchDictionary(store, 'clinical', { categories: ['general'] })).results.length, 0,
+    'an entry category takes precedence over the containing pack category');
+});
+
 test('pack import requires provenance and stores an integrity checksum', async () => {
   const store = new MemoryDictionaryStore();
   const manager = new DictionaryPackManager({ store });

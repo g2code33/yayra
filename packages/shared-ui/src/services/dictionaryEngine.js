@@ -91,7 +91,10 @@ export async function searchDictionary(store, query, { packIds = null, categorie
   const activePacks = await store.getActivePacks();
   const allowedPacks = new Set((packIds || activePacks.map((pack) => pack.id)).filter((id) => activePacks.some((pack) => pack.id === id)));
   const allowedCategories = categories ? new Set(categories) : null;
-  const eligible = activePacks.filter((pack) => allowedPacks.has(pack.id) && (!allowedCategories || allowedCategories.has(pack.category)));
+  // Categories are entry-level when supplied by a pack. Filtering only on
+  // pack.category hid correctly tagged entries from mixed-category packs and
+  // could show entries whose own category did not match the selected filter.
+  const eligible = activePacks.filter((pack) => allowedPacks.has(pack.id));
   const resultMap = new Map();
   const queryTerms = [term, ...inflectionCandidates(term)];
   for (let rank = 0; rank < queryTerms.length; rank += 1) {
@@ -99,6 +102,8 @@ export async function searchDictionary(store, query, { packIds = null, categorie
     for (const pack of eligible) {
       const entries = await store.findEntries(pack.id, pack.version, candidate, safeLimit);
       for (const entry of entries) {
+        const entryCategory = entry.category || pack.category || 'general';
+        if (allowedCategories && !allowedCategories.has(entryCategory)) continue;
         const normalized = normalizeDictionaryTerm(entry.normalizedTerm || entry.term);
         const matchRank = normalized === term ? 0 : normalized === candidate ? rank + 1 : 10 + rank;
         const key = `${pack.id}:${pack.version}:${normalized}`;
@@ -113,6 +118,8 @@ export async function searchDictionary(store, query, { packIds = null, categorie
     for (const token of term.split(' ').filter((part) => part.length > 1).slice(0, 8)) {
       for (const pack of eligible) {
         for (const entry of await store.findEntries(pack.id, pack.version, token, Math.min(6, safeLimit))) {
+          const entryCategory = entry.category || pack.category || 'general';
+          if (allowedCategories && !allowedCategories.has(entryCategory)) continue;
           const normalized = normalizeDictionaryTerm(entry.normalizedTerm || entry.term);
           const key = `${pack.id}:${pack.version}:${normalized}`;
           if (!resultMap.has(key)) resultMap.set(key, { ...entry, sourcePack: pack, matchRank: 20 });
@@ -124,7 +131,7 @@ export async function searchDictionary(store, query, { packIds = null, categorie
     || a.sourcePack.title.localeCompare(b.sourcePack.title)
     || a.term.localeCompare(b.term)).slice(0, safeLimit);
   const grouped = groupRelatedDefinitions(results);
-  const suggestions = results.length ? [] : await collectSuggestions(store, term, eligible, 8);
+  const suggestions = results.length ? [] : await collectSuggestions(store, term, eligible, 8, allowedCategories);
   return { query: String(query).slice(0, MAX_TERM), normalizedQuery: term, results, groups: grouped, suggestions };
 }
 
@@ -138,11 +145,13 @@ function groupRelatedDefinitions(results) {
   return [...groups.values()];
 }
 
-async function collectSuggestions(store, term, packs, limit) {
+async function collectSuggestions(store, term, packs, limit, categories = null) {
   const matches = [];
   const prefix = term.split(' ').at(-1) || term;
   for (const pack of packs) {
     for (const entry of await store.findEntries(pack.id, pack.version, prefix.slice(0, Math.max(2, Math.min(5, prefix.length))), limit)) {
+      const category = entry.category || pack.category || 'general';
+      if (categories && !categories.has(category)) continue;
       const normalizedTerm = normalizeDictionaryTerm(entry.term);
       if (normalizedTerm !== term && !matches.some((item) => item.normalizedTerm === normalizedTerm)) matches.push({ term: entry.term, normalizedTerm, packId: pack.id, category: pack.category });
     }
