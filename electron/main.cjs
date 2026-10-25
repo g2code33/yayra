@@ -33,6 +33,9 @@ const { applyVaapiPolicy } = require('./vaapiProbe.cjs');
 const { createWindowDragController } = require('./windowDrag.cjs');
 const { popupMenuWithRecovery, closeNativeMenuForWindow } = require('./nativeMenuGuard.cjs');
 const { buildMediaCompatibilityScript, installMediaCompatibility } = require('./mediaCompatibility.cjs');
+const { createGoogleChromeProfileManager } = require('./googleChromeProfile.cjs');
+const { safeGoogleDestination } = require('./googleAuthParity.cjs');
+const { applyGoogleAuthUserAgentMetadata } = require('./googleAuthUserAgentMetadata.cjs');
 
 const CUSTOM_SCHEME = 'yayra';
 // v1.0.70 briefly used this app-controlled Google auth partition. The
@@ -47,6 +50,9 @@ const MAX_DOCUMENT_BYTES = 300 * 1024 * 1024;
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 let mainWindow;
 let downloadsBridge = null;
+// Yayra-owned real Chrome profile for genuinely signed-in Google websites.
+// Created lazily so app.getPath('userData') is always available.
+let googleChromeProfileManager = null;
 // Trusted local-file catalog. It alone owns source paths; renderer code only
 // ever receives opaque ids plus display metadata or bytes for one chosen id.
 let documentLibrary = null;
@@ -958,6 +964,62 @@ function resolveTrayIconPath() {
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 
+/**
+ * IPC for the dedicated REAL Chrome profile and the Google auth parity
+ * switch. Every profile id is resolved from the pinned shell window, so an
+ * untrusted renderer cannot open another profile's Chrome cookie jar. Only
+ * exact HTTPS Google-owned destinations can be launched.
+ */
+function registerGoogleChromeProfileIpc() {
+  const manager = () => googleChromeProfileManager;
+  const profileFor = (event) => resolveWebContentsProfile(event?.sender) || 'default';
+
+  ipcMain.handle('yayra:chrome-profile-status', (event) => {
+    const instance = manager();
+    if (!instance) return { available: false, reason: 'chrome_profile_unavailable' };
+    const status = instance.status(profileFor(event));
+    // Never return the absolute binary path or profile directory to a
+    // renderer: those are main-process-only filesystem details.
+    return {
+      ok: true,
+      available: status.available,
+      exists: status.exists,
+      launched: status.launched,
+      profileId: status.profileId
+    };
+  });
+
+  ipcMain.handle('yayra:chrome-profile-open', (event, payload = {}) => {
+    const instance = manager();
+    if (!instance) return { ok: false, error: 'chrome_profile_unavailable' };
+    const target = safeGoogleDestination(payload?.url);
+    if (!target) return { ok: false, error: 'invalid_google_destination' };
+    const result = instance.open(profileFor(event), target);
+    return result?.ok
+      ? { ok: true, profileId: result.profileId }
+      : { ok: false, error: result?.error || 'chrome_profile_open_failed' };
+  });
+
+  ipcMain.handle('yayra:chrome-profile-sign-in', (event) => {
+    const instance = manager();
+    if (!instance) return { ok: false, error: 'chrome_profile_unavailable' };
+    // Sign in to Google's own account page in real Chrome. The user then
+    // opens Gmail/Drive/Account from Yayra's Google services hub in the same
+    // profile, genuinely signed in. Yayra's verified OAuth identity flow is
+    // separate and untouched.
+    const result = instance.open(profileFor(event), 'https://myaccount.google.com/');
+    return result?.ok
+      ? { ok: true, profileId: result.profileId }
+      : { ok: false, error: result?.error || 'chrome_profile_open_failed' };
+  });
+
+  ipcMain.handle('yayra:chrome-profile-close', (event) => {
+    const instance = manager();
+    if (!instance) return { ok: false, error: 'chrome_profile_unavailable' };
+    return instance.close(profileFor(event));
+  });
+}
+
 function registerIpcBridges() {
   registerDesktopUpdateHandlers({ getWindow: () => mainWindow });
 
@@ -1076,11 +1138,39 @@ function registerIpcBridges() {
     }
   });
 
+  // Settings > Security > Secure DNS. Electron exposes Chromium's built-in
+  // resolver app-wide (not per page); accept only audited providers/templates
+  // and never a renderer-supplied resolver URL.
+  ipcMain.handle('yayra:configure-secure-dns', async (event, { enabled = true, provider = 'automatic' } = {}) => {
+    if (!senderWindow(event)) return { ok: false, reason: 'untrusted-sender' };
+    if (typeof app.configureHostResolver !== 'function') return { ok: false, reason: 'unsupported' };
+    const providers = {
+      cloudflare: 'https://cloudflare-dns.com/dns-query',
+      google: 'https://dns.google/dns-query',
+      quad9: 'https://dns.quad9.net/dns-query'
+    };
+    const selected = ['automatic', ...Object.keys(providers)].includes(provider) ? provider : 'automatic';
+    const options = enabled
+      ? {
+        enableBuiltInResolver: true,
+        secureDnsMode: selected === 'automatic' ? 'automatic' : 'secure',
+        ...(providers[selected] ? { secureDnsServers: [providers[selected]] } : {})
+      }
+      : { enableBuiltInResolver: true, secureDnsMode: 'off' };
+    try {
+      await app.configureHostResolver(options);
+      return { ok: true, enabled: Boolean(enabled), provider: enabled ? selected : 'off' };
+    } catch (error) {
+      console.error('[yayra] secure DNS configuration failed', error);
+      return { ok: false, reason: 'configuration-failed' };
+    }
+  });
+
   // Settings/menu > Clear browsing data: REALLY clears Chromium's disk
   // caches (and optionally cookies/site data) across every session Yayra
   // uses - the default session, the default profile partition, and every
   // live profile/incognito partition. Returns the real byte count freed.
-  ipcMain.handle('yayra:clear-browsing-data', async (_event, { cache = true, cookies = false } = {}) => {
+  ipcMain.handle('yayra:clear-browsing-data', async (_event, { cache = true, cookies = false, since = null, form = false } = {}) => {
     try {
       const sessions = new Set([
         session.defaultSession,
@@ -1091,9 +1181,38 @@ function registerIpcBridges() {
         try { if (wc.session) sessions.add(wc.session); } catch { /* destroyed */ }
       }
       let clearedBytes = 0;
+      let removedCookies = 0;
+      let removedFormData = 0;
+      const cutoff = Number.isFinite(Number(since)) && Number(since) > 0 ? Number(since) : 0;
       for (const ses of sessions) {
         if (!ses) continue;
         try {
+          if (cutoff && ses.cookies?.get && ses.cookies?.remove) {
+            let jars = [];
+            try { jars = await ses.cookies.get({}); } catch { jars = []; }
+            for (const cookie of jars.slice(0, 20_000)) {
+              const creation = Number(cookie?.creationDate || 0) * 1000;
+              // Chromium may omit a creation date. Absence is not evidence
+              // that the cookie is newer than the selected time range.
+              if (creation > 0 && creation < cutoff) continue;
+              const domain = String(cookie?.domain || '').replace(/^\./, '');
+              const name = String(cookie?.name || '');
+              if (!domain || !name) continue;
+              const scheme = cookie?.secure ? 'https' : 'http';
+              const path = String(cookie?.path || '/').startsWith('/') ? String(cookie.path || '/') : '/';
+              try { await ses.cookies.remove(`${scheme}://${domain}${path}`, name); removedCookies += 1; }
+              catch { /* cookie expired concurrently */ }
+            }
+          }
+          if (form && typeof ses.clearData === 'function') {
+            try {
+              const options = typeof ses.clearData === 'function'
+                ? { dataTypes: ['passwords', 'autofill'], ...(cutoff ? { since: cutoff / 1000 } : {}) }
+                : {};
+              await ses.clearData(options);
+              removedFormData += 1;
+            } catch { /* older Electron hosts clear no form data */ }
+          }
           if (cache) {
             if (typeof ses.getCacheSize === 'function') {
               try { clearedBytes += await ses.getCacheSize(); } catch { /* size is best-effort */ }
@@ -1115,13 +1234,20 @@ function registerIpcBridges() {
             const storages = ses === session.defaultSession
               ? ['cookies']
               : ['cookies', 'localstorage', 'indexdb', 'serviceworkers', 'websql'];
-            await ses.clearStorageData({ storages });
+            if (cutoff) {
+              // Electron cannot selectively erase IndexedDB by age. Only
+              // cookies are time-filtered here; full site storage is cleared
+              // by the explicit "All time" action. Do not silently over-delete.
+              await ses.clearStorageData({ storages: ['cookies'] });
+            } else {
+              await ses.clearStorageData({ storages });
+            }
           }
         } catch (err) {
           console.error('[yayra] clear-browsing-data failed for a session', err);
         }
       }
-      return { ok: true, clearedBytes, sessions: sessions.size };
+      return { ok: true, clearedBytes, sessions: sessions.size, removedCookies, clearedFormDataSessions: removedFormData, since: cutoff || null };
     } catch (err) {
       return { ok: false, reason: String(err?.message || err) };
     }
@@ -1437,6 +1563,22 @@ function registerIpcBridges() {
     logger: console
   });
 
+  // Dedicated REAL Chrome, launched with its own --user-data-dir per Yayra
+  // browsing profile. This is the guaranteed path: Google sees a genuine
+  // external Chrome (correct TLS/UA/client hints, native WebAuthn, real
+  // device-bound cookies), while the OAuth loopback callback still returns
+  // the verified identity to Yayra's main process. No cookies are copied.
+  googleChromeProfileManager = createGoogleChromeProfileManager({
+    fs,
+    spawn,
+    platform: process.platform,
+    env: process.env,
+    homedir: os.homedir(),
+    userDataDir: app.getPath('userData'),
+    logger: console
+  });
+  registerGoogleChromeProfileIpc();
+
   // Native website-rendering engine bridge (replaces <iframe>-based rendering
   // so real sites with X-Frame-Options/frame-ancestors - Google, GitHub,
   // etc. - actually load). See electron/webviewBridge.cjs for the full
@@ -1459,7 +1601,29 @@ function registerIpcBridges() {
     consumeWebsitePasskeyGrant: devicePasskeyBridge.consumeWebsiteGrant,
     // Per-profile and private page sessions are created lazily by the native
     // view bridge; attach each one to the same real download tracker.
-    attachDownloadSession: (pageSession) => downloadsBridge?.attachSession?.(pageSession)
+    attachDownloadSession: (pageSession) => downloadsBridge?.attachSession?.(pageSession),
+    // Privacy/site-data IPC derives profile scope from the trusted shell
+    // window. Renderer-supplied profile ids cannot reach another partition.
+    getProfileIdForWebContents: (wc) => resolveWebContentsProfile(wc),
+    sessionModule: session,
+    // Best-effort "behave like a standalone browser" mode for first-party
+    // Google sign-in inside Yayra. Default OFF; enabled per profile from the
+    // Security Center. See electron/googleAuthParity.cjs.
+    googleAuthParityEnabled: () => false,
+    // Guaranteed fallback: a real Chrome window with a Yayra-owned profile.
+    openGoogleChromeProfile: ({ url, profileId, reason }) => {
+      const result = googleChromeProfileManager?.open(profileId, url) || { ok: false, error: 'chrome_profile_unavailable' };
+      if (!result.ok) {
+        // Last resort: the OS external user-agent still satisfies RFC 8252.
+        const fallback = safeGoogleDestination(url);
+        if (fallback) shell.openExternal(fallback).catch(() => {});
+        console.log(`[yayra:chrome-profile] ${reason || 'open'} system-browser-fallback`);
+        return { ...result, systemFallback: Boolean(fallback) };
+      }
+      console.log(`[yayra:chrome-profile] ${reason || 'open'} opened`);
+      return result;
+    },
+    applyGoogleAuthUserAgentMetadata
   });
 
   // "Sign in with Google" for Yayra's own app-level identity. The system
@@ -1502,7 +1666,15 @@ function registerIpcBridges() {
     // worked fine. net.fetch is proxy- and OS-cert-aware the same way the
     // browser is, so it succeeds in those environments too.
     fetchImpl: typeof net.fetch === 'function' ? net.fetch : undefined,
-    signInImpl: signInWithGoogle
+    signInImpl: signInWithGoogle,
+    // Dedicated real Chrome as the external user-agent for the Google
+    // services consent. The loopback callback still lands in
+    // googleAuth.cjs's one-shot main-process HTTP server, so PKCE, state and
+    // the encrypted token store are completely unchanged.
+    openGoogleAuthorization: (url, profileId) => googleChromeProfileManager?.openAuthorization(profileId, url)
+      || { ok: false, error: 'chrome_profile_unavailable' },
+    openGoogleProductInChromeProfile: (url, profileId) => googleChromeProfileManager?.open(profileId, url)
+      || { ok: false, error: 'chrome_profile_unavailable' }
   });
 
   // Real file-download tracking (replaces the old hardcoded fake "Downloads"

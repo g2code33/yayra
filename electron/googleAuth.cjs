@@ -79,6 +79,7 @@ function buildAuthorizationUrl({ clientId, redirectUri, state, codeChallenge, sc
   url.searchParams.set('code_challenge', codeChallenge);
   url.searchParams.set('code_challenge_method', 'S256');
   url.searchParams.set('access_type', 'offline');
+  url.searchParams.set('include_granted_scopes', 'true');
   url.searchParams.set('prompt', 'consent select_account');
   return url.toString();
 }

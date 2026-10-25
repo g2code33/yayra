@@ -1,3 +1,10 @@
+import {
+  GOOGLE_SERVICE_IDS,
+  googleServiceById,
+  googleServiceApiUrl,
+  normalizeGoogleServiceItems
+} from '../src/services/googleServiceCatalog.js';
+
 const DEFAULT_MANIFEST = {
   schema: 1,
   channel: 'stable',
@@ -17,9 +24,23 @@ const AUTH_LIMIT = 20;
 const AUTH_MAX_BODY_BYTES = 16 * 1024;
 const authBuckets = new Map();
 const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
+const GMAIL_SCOPE = 'https://www.googleapis.com/auth/gmail.readonly';
 const DRIVE_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DRIVE_MAX_FILE_BYTES = 300 * 1024 * 1024;
+const GMAIL_BODY_MAX_CHARS = 2 * 1024 * 1024;
 const DRIVE_SESSION_PREFIX = 'drive-session:';
+const GMAIL_SESSION_PREFIX = 'gmail-session:';
+const GOOGLE_SERVICES_SESSION_PREFIX = 'google-services-session:';
+const GOOGLE_SERVICE_SCOPES = Object.freeze([
+  'https://www.googleapis.com/auth/gmail.readonly',
+  'https://www.googleapis.com/auth/drive.readonly',
+  'https://www.googleapis.com/auth/calendar.readonly',
+  'https://www.googleapis.com/auth/youtube.readonly',
+  'https://www.googleapis.com/auth/contacts.readonly',
+  'https://www.googleapis.com/auth/photoslibrary.readonly',
+  'https://www.googleapis.com/auth/tasks.readonly',
+  'https://www.googleapis.com/auth/classroom.courses.readonly'
+]);
 
 
 // --- /api/ai : Yayra's managed AI, backed by a POOL of NVIDIA keys -------
@@ -42,14 +63,20 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.protocol !== 'https:' && url.hostname !== 'localhost') return new Response('HTTPS required', { status: 400 });
-    if (!['/updates/manifest.json', '/api/suggestions', '/api/latest-release', '/api/ai', '/api/drive/download', '/api/drive/session/revoke', '/auth/google/exchange'].includes(url.pathname)) {
+    if (!['/updates/manifest.json', '/api/suggestions', '/api/latest-release', '/api/ai', '/api/drive/download', '/api/drive/session/revoke', '/api/gmail/messages', '/api/gmail/message', '/api/gmail/session/revoke', '/api/google/services', '/api/google/services/session/revoke', '/auth/google/exchange'].includes(url.pathname)) {
       return new Response('not found', { status: 404 });
     }
 
     const isGoogleExchange = url.pathname === '/auth/google/exchange';
     const isDriveDownload = url.pathname === '/api/drive/download';
     const isDriveRevoke = url.pathname === '/api/drive/session/revoke';
-    const isDelegatedGoogleRoute = isGoogleExchange || isDriveDownload || isDriveRevoke;
+    const isGmailList = url.pathname === '/api/gmail/messages';
+    const isGmailMessage = url.pathname === '/api/gmail/message';
+    const isGmailRevoke = url.pathname === '/api/gmail/session/revoke';
+    const isGoogleServiceList = url.pathname === '/api/google/services';
+    const isGoogleServicesRevoke = url.pathname === '/api/google/services/session/revoke';
+    const isDelegatedGoogleRoute = isGoogleExchange || isDriveDownload || isDriveRevoke
+      || isGmailList || isGmailMessage || isGmailRevoke || isGoogleServiceList || isGoogleServicesRevoke;
     const authOrigin = isDelegatedGoogleRoute ? authorizeGoogleExchangeOrigin(request, env) : null;
     const headers = isDelegatedGoogleRoute ? googleAuthHeaders(authOrigin) : baseHeaders();
     if (isDelegatedGoogleRoute && authOrigin === false) {
@@ -68,6 +95,11 @@ export default {
     if (url.pathname === '/api/ai') return answerWithNvidiaPool(request, headers, env, ip);
     if (isDriveDownload) return downloadDelegatedDriveFile(request, url, headers, env, authOrigin);
     if (isDriveRevoke) return revokeDelegatedDriveSession(request, headers, env, authOrigin);
+    if (isGmailList) return listDelegatedGmailMessages(request, url, headers, env, authOrigin);
+    if (isGmailMessage) return getDelegatedGmailMessage(request, url, headers, env, authOrigin);
+    if (isGmailRevoke) return revokeDelegatedGmailSession(request, headers, env, authOrigin);
+    if (isGoogleServiceList) return getDelegatedGoogleServiceItems(request, url, headers, env, authOrigin);
+    if (isGoogleServicesRevoke) return revokeDelegatedGoogleServicesSession(request, headers, env, authOrigin);
     if (isGoogleExchange) return exchangeGoogleAuthCode(request, headers, env, authOrigin);
     return serveManifest(request, env, headers);
   }
@@ -505,7 +537,7 @@ async function exchangeGoogleAuthCode(request, headers, env, authorizedOrigin = 
   const redirectUri = typeof body.redirectUri === 'string' ? body.redirectUri : '';
   const platform = typeof body.platform === 'string' ? body.platform : 'web';
   const capability = body.capability === undefined ? 'profile' : body.capability;
-  if (!['profile', 'drive-readonly'].includes(capability)) {
+  if (!['profile', 'drive-readonly', 'gmail-readonly', 'google-services'].includes(capability)) {
     return new Response(JSON.stringify({ error: 'invalid_capability' }), { status: 400, headers });
   }
   if (!['web', 'android', 'ios'].includes(platform)) {
@@ -517,6 +549,12 @@ async function exchangeGoogleAuthCode(request, headers, env, authorizedOrigin = 
   }
   if (capability === 'drive-readonly' && !delegatedDriveConfigured(env)) {
     return new Response(JSON.stringify({ error: 'drive_session_not_configured' }), { status: 501, headers });
+  }
+  if (capability === 'gmail-readonly' && !delegatedDriveConfigured(env)) {
+    return new Response(JSON.stringify({ error: 'gmail_session_not_configured' }), { status: 501, headers });
+  }
+  if (capability === 'google-services' && !delegatedDriveConfigured(env)) {
+    return new Response(JSON.stringify({ error: 'google_services_session_not_configured' }), { status: 501, headers });
   }
   if (!code || !codeVerifier || !redirectUri) {
     return new Response(JSON.stringify({ error: 'missing_fields' }), { status: 400, headers });
@@ -610,27 +648,43 @@ async function exchangeGoogleAuthCode(request, headers, env, authorizedOrigin = 
   // Explicitly reconstruct every client-facing object so no Google token can
   // ride along. The ordinary identity flow still drops tokens immediately.
   const profile = { sub, name, email, picture };
-  if (capability !== 'drive-readonly') {
+  if (capability === 'profile') {
     return new Response(JSON.stringify({ profile }), { status: 200, headers });
   }
 
+  const delegated = capability === 'drive-readonly'
+    ? { requiredScope: DRIVE_SCOPE, errorPrefix: 'drive', sessionScope: 'drive.readonly', prefix: DRIVE_SESSION_PREFIX }
+    : (capability === 'gmail-readonly'
+      ? { requiredScope: GMAIL_SCOPE, errorPrefix: 'gmail', sessionScope: 'gmail.readonly', prefix: GMAIL_SESSION_PREFIX }
+      : { requiredScope: null, errorPrefix: 'google_services', sessionScope: 'google.services', prefix: GOOGLE_SERVICES_SESSION_PREFIX });
   const grantedScopes = new Set(String(tokens.scope || '').split(/\s+/).filter(Boolean));
-  if (!grantedScopes.has(DRIVE_SCOPE)) {
-    return new Response(JSON.stringify({ error: 'drive_scope_not_granted' }), { status: 403, headers });
+  const serviceScopes = GOOGLE_SERVICE_SCOPES.filter((scope) => grantedScopes.has(scope));
+  if (delegated.requiredScope && !grantedScopes.has(delegated.requiredScope)) {
+    return new Response(JSON.stringify({ error: `${delegated.errorPrefix}_scope_not_granted` }), { status: 403, headers });
+  }
+  if (capability === 'google-services' && serviceScopes.length === 0) {
+    return new Response(JSON.stringify({ error: 'google_services_scope_not_granted' }), { status: 403, headers });
   }
   try {
-    const driveSession = await createDelegatedDriveSession(env, {
+    const delegatedSession = await createDelegatedGoogleSession(env, {
       accessToken,
       refreshToken: typeof tokens.refresh_token === 'string' ? tokens.refresh_token : '',
       expiresIn: Number(tokens.expires_in),
       platform,
       sub,
-      origin: typeof authorizedOrigin === 'string' ? authorizedOrigin : null
+      origin: typeof authorizedOrigin === 'string' ? authorizedOrigin : null,
+      scope: delegated.sessionScope,
+      prefix: delegated.prefix,
+      grantedScopes: serviceScopes
     });
-    return new Response(JSON.stringify({ profile, driveSession }), { status: 200, headers });
+    return new Response(JSON.stringify(capability === 'drive-readonly'
+      ? { profile, driveSession: delegatedSession }
+      : (capability === 'gmail-readonly'
+        ? { profile, gmailSession: delegatedSession }
+        : { profile, googleServicesSession: delegatedSession, grantedScopes: serviceScopes })), { status: 200, headers });
   } catch (error) {
-    console.log(`[auth] delegated Drive session creation failed: ${error?.message || error}`);
-    return new Response(JSON.stringify({ error: 'drive_session_unavailable' }), { status: 503, headers });
+    console.log(`[auth] delegated ${delegated.errorPrefix} session creation failed: ${error?.message || error}`);
+    return new Response(JSON.stringify({ error: `${delegated.errorPrefix}_session_unavailable` }), { status: 503, headers });
   }
 }
 
@@ -687,15 +741,20 @@ async function openDelegatedSession(env, value) {
   return parsed;
 }
 
-async function createDelegatedDriveSession(env, {
+async function createDelegatedGoogleSession(env, {
   accessToken,
   refreshToken,
   expiresIn,
   platform,
   sub,
-  origin
+  origin,
+  scope,
+  prefix,
+  grantedScopes = []
 }) {
-  if (!delegatedDriveConfigured(env)) throw new Error('drive_session_not_configured');
+  if (!delegatedDriveConfigured(env)) throw new Error('delegated_session_not_configured');
+  if (!['drive.readonly', 'gmail.readonly', 'google.services'].includes(scope)
+    || ![DRIVE_SESSION_PREFIX, GMAIL_SESSION_PREFIX, GOOGLE_SERVICES_SESSION_PREFIX].includes(prefix)) throw new Error('invalid_delegated_capability');
   const id = base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)));
   const now = Date.now();
   const sessionExpiresAt = now + DRIVE_SESSION_TTL_SECONDS * 1000;
@@ -706,21 +765,23 @@ async function createDelegatedDriveSession(env, {
     sessionExpiresAt,
     platform,
     sub,
-    origin
+    origin,
+    scope,
+    grantedScopes: Array.isArray(grantedScopes) ? grantedScopes.filter((item) => GOOGLE_SERVICE_SCOPES.includes(item)) : []
   };
   await env.GOOGLE_DRIVE_SESSIONS.put(
-    `${DRIVE_SESSION_PREFIX}${id}`,
+    `${prefix}${id}`,
     await sealDelegatedSession(env, session),
     { expirationTtl: DRIVE_SESSION_TTL_SECONDS }
   );
-  return { id, expiresAt: new Date(sessionExpiresAt).toISOString(), scope: 'drive.readonly' };
+  return { id, expiresAt: new Date(sessionExpiresAt).toISOString(), scope };
 }
 
-async function refreshDelegatedDriveSession(env, id, session) {
+async function refreshDelegatedGoogleSession(env, id, session, prefix, reconnectError) {
   if (session.expiresAt > Date.now() + 60_000) return session;
-  if (!session.refreshToken || session.sessionExpiresAt <= Date.now()) throw new Error('drive_reconnect_required');
+  if (!session.refreshToken || session.sessionExpiresAt <= Date.now()) throw new Error(reconnectError);
   const client = resolveGoogleClient(env, session.platform);
-  if (!client) throw new Error('drive_reconnect_required');
+  if (!client) throw new Error(reconnectError);
   const params = new URLSearchParams({
     client_id: client.clientId,
     refresh_token: session.refreshToken,
@@ -732,11 +793,11 @@ async function refreshDelegatedDriveSession(env, id, session) {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: params.toString()
   });
-  if (!response.ok) throw new Error('drive_reconnect_required');
+  if (!response.ok) throw new Error(reconnectError);
   const tokens = await response.json();
   if (typeof tokens?.access_token !== 'string' || !tokens.access_token
     || tokens.access_token.length > 8192 || /[\u0000-\u0020\u007f]/.test(tokens.access_token)) {
-    throw new Error('drive_reconnect_required');
+    throw new Error(reconnectError);
   }
   const next = {
     ...session,
@@ -748,16 +809,17 @@ async function refreshDelegatedDriveSession(env, id, session) {
   };
   const remainingSeconds = Math.max(60, Math.ceil((next.sessionExpiresAt - Date.now()) / 1000));
   await env.GOOGLE_DRIVE_SESSIONS.put(
-    `${DRIVE_SESSION_PREFIX}${id}`,
+    `${prefix}${id}`,
     await sealDelegatedSession(env, next),
     { expirationTtl: remainingSeconds }
   );
   return next;
 }
 
-function delegatedSessionId(request) {
+function delegatedSessionId(request, scheme = 'YayraDrive') {
   const authorization = request.headers.get('authorization') || '';
-  const match = /^YayraDrive ([A-Za-z0-9_-]{43})$/.exec(authorization);
+  const escapedScheme = ['YayraGmail', 'YayraServices'].includes(scheme) ? scheme : 'YayraDrive';
+  const match = new RegExp(`^${escapedScheme} ([A-Za-z0-9_-]{43})$`).exec(authorization);
   return match ? match[1] : null;
 }
 
@@ -808,6 +870,339 @@ async function revokeDelegatedDriveSession(request, headers, env, authorizedOrig
     finally { if (timer) clearTimeout(timer); }
   }
   return new Response(JSON.stringify({ ok: true, providerRevoked }), { status: 200, headers });
+}
+
+async function loadDelegatedGmailSession(request, headers, env, authorizedOrigin) {
+  if (!delegatedDriveConfigured(env)) {
+    return { response: new Response(JSON.stringify({ error: 'gmail_session_not_configured' }), { status: 501, headers }) };
+  }
+  const id = delegatedSessionId(request, 'YayraGmail');
+  if (!id) return { response: new Response(JSON.stringify({ error: 'gmail_session_required' }), { status: 401, headers }) };
+  const key = `${GMAIL_SESSION_PREFIX}${id}`;
+  try {
+    const sealed = await env.GOOGLE_DRIVE_SESSIONS.get(key);
+    if (!sealed) return { response: new Response(JSON.stringify({ error: 'gmail_reconnect_required' }), { status: 401, headers }) };
+    let session = await openDelegatedSession(env, sealed);
+    if (session.scope !== 'gmail.readonly' || session.sessionExpiresAt <= Date.now()) throw new Error('gmail_reconnect_required');
+    if ((session.origin || null) !== (typeof authorizedOrigin === 'string' ? authorizedOrigin : null)) {
+      return { response: new Response(JSON.stringify({ error: 'gmail_session_origin_mismatch' }), { status: 403, headers }) };
+    }
+    session = await refreshDelegatedGoogleSession(env, id, session, GMAIL_SESSION_PREFIX, 'gmail_reconnect_required');
+    return { id, key, session };
+  } catch (error) {
+    try { await env.GOOGLE_DRIVE_SESSIONS.delete?.(key); } catch { /* optional KV delete */ }
+    return { response: new Response(JSON.stringify({ error: error?.message === 'gmail_reconnect_required'
+      ? 'gmail_reconnect_required'
+      : 'gmail_session_invalid' }), { status: 401, headers }) };
+  }
+}
+
+async function revokeDelegatedGmailSession(request, headers, env, authorizedOrigin) {
+  if (request.method !== 'POST') {
+    return new Response(JSON.stringify({ error: 'method not allowed' }), { status: 405, headers });
+  }
+  const loaded = await loadDelegatedGmailSession(request, headers, env, authorizedOrigin);
+  if (loaded.response) return loaded.response;
+  try { await env.GOOGLE_DRIVE_SESSIONS.delete(loaded.key); }
+  catch { return new Response(JSON.stringify({ error: 'gmail_session_unavailable' }), { status: 503, headers }); }
+  const token = loaded.session.refreshToken || loaded.session.accessToken;
+  let providerRevoked = false;
+  if (typeof token === 'string' && token) {
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), 5_000) : null;
+    try {
+      const response = await fetch('https://oauth2.googleapis.com/revoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ token }).toString(),
+        ...(controller ? { signal: controller.signal } : {})
+      });
+      providerRevoked = response.ok;
+    } catch { /* local capability is already gone */ }
+    finally { if (timer) clearTimeout(timer); }
+  }
+  return new Response(JSON.stringify({ ok: true, providerRevoked }), { status: 200, headers });
+}
+
+async function loadDelegatedGoogleServicesSession(request, headers, env, authorizedOrigin) {
+  if (!delegatedDriveConfigured(env)) {
+    return { response: new Response(JSON.stringify({ error: 'google_services_session_not_configured' }), { status: 501, headers }) };
+  }
+  const id = delegatedSessionId(request, 'YayraServices');
+  if (!id) return { response: new Response(JSON.stringify({ error: 'google_services_session_required' }), { status: 401, headers }) };
+  const key = `${GOOGLE_SERVICES_SESSION_PREFIX}${id}`;
+  try {
+    const sealed = await env.GOOGLE_DRIVE_SESSIONS.get(key);
+    if (!sealed) return { response: new Response(JSON.stringify({ error: 'google_services_reconnect_required' }), { status: 401, headers }) };
+    let session = await openDelegatedSession(env, sealed);
+    if (session.scope !== 'google.services' || session.sessionExpiresAt <= Date.now()) throw new Error('google_services_reconnect_required');
+    if ((session.origin || null) !== (typeof authorizedOrigin === 'string' ? authorizedOrigin : null)) {
+      return { response: new Response(JSON.stringify({ error: 'google_services_session_origin_mismatch' }), { status: 403, headers }) };
+    }
+    session = await refreshDelegatedGoogleSession(env, id, session, GOOGLE_SERVICES_SESSION_PREFIX, 'google_services_reconnect_required');
+    return { id, key, session };
+  } catch (error) {
+    try { await env.GOOGLE_DRIVE_SESSIONS.delete?.(key); } catch { /* optional KV delete */ }
+    return { response: new Response(JSON.stringify({ error: error?.message === 'google_services_reconnect_required'
+      ? 'google_services_reconnect_required'
+      : 'google_services_session_invalid' }), { status: 401, headers }) };
+  }
+}
+
+async function revokeDelegatedGoogleServicesSession(request, headers, env, authorizedOrigin) {
+  if (request.method !== 'POST') {
+    return new Response(JSON.stringify({ error: 'method not allowed' }), { status: 405, headers });
+  }
+  const loaded = await loadDelegatedGoogleServicesSession(request, headers, env, authorizedOrigin);
+  if (loaded.response) return loaded.response;
+  try { await env.GOOGLE_DRIVE_SESSIONS.delete(loaded.key); }
+  catch { return new Response(JSON.stringify({ error: 'google_services_session_unavailable' }), { status: 503, headers }); }
+  const token = loaded.session.refreshToken || loaded.session.accessToken;
+  let providerRevoked = false;
+  if (typeof token === 'string' && token) {
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), 5_000) : null;
+    try {
+      const response = await fetch('https://oauth2.googleapis.com/revoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ token }).toString(),
+        ...(controller ? { signal: controller.signal } : {})
+      });
+      providerRevoked = response.ok;
+    } catch { /* local capability is already gone */ }
+    finally { if (timer) clearTimeout(timer); }
+  }
+  return new Response(JSON.stringify({ ok: true, providerRevoked }), { status: 200, headers });
+}
+
+async function getDelegatedGoogleServiceItems(request, url, headers, env, authorizedOrigin) {
+  if (request.method !== 'GET') {
+    return new Response(JSON.stringify({ error: 'method not allowed' }), { status: 405, headers });
+  }
+  const serviceId = String(url.searchParams.get('service') || '');
+  if (!GOOGLE_SERVICE_IDS.has(serviceId)) {
+    return new Response(JSON.stringify({ error: 'invalid_google_service' }), { status: 400, headers });
+  }
+  const service = googleServiceById(serviceId);
+  if (!service?.api) {
+    return new Response(JSON.stringify({ ok: true, service: serviceId, items: [], count: 0, truncated: false }), { status: 200, headers });
+  }
+  const loaded = await loadDelegatedGoogleServicesSession(request, headers, env, authorizedOrigin);
+  if (loaded.response) return loaded.response;
+  const grantedScopes = Array.isArray(loaded.session.grantedScopes) ? loaded.session.grantedScopes : [];
+  if (service.scope && !grantedScopes.includes(service.scope)) {
+    return new Response(JSON.stringify({ error: 'service_scope_required', scope: service.scope }), { status: 403, headers });
+  }
+  const apiUrl = googleServiceApiUrl(serviceId, Date.now());
+  if (!apiUrl) return new Response(JSON.stringify({ error: 'invalid_google_service' }), { status: 400, headers });
+  let response;
+  try {
+    response = await fetch(apiUrl, {
+      headers: { Authorization: `Bearer ${loaded.session.accessToken}`, Accept: 'application/json' }
+    });
+  } catch {
+    return new Response(JSON.stringify({ error: 'google_service_upstream_unavailable' }), { status: 502, headers });
+  }
+  if (!response.ok) {
+    return new Response(JSON.stringify({ error: response.status === 401 ? 'google_services_reconnect_required' : 'google_service_upstream_failed' }), {
+      status: response.status === 401 ? 401 : 502,
+      headers
+    });
+  }
+  let payload;
+  try { payload = await readBoundedUpstreamJson(response, 1024 * 1024, 'google_service_response_too_large'); }
+  catch { return new Response(JSON.stringify({ error: 'google_service_response_invalid' }), { status: 502, headers }); }
+  const normalized = normalizeGoogleServiceItems(serviceId, payload);
+  return new Response(JSON.stringify({ ok: true, service: serviceId, ...normalized }), { status: 200, headers });
+}
+
+async function readBoundedUpstreamJson(response, maxBytes, errorCode = 'upstream_response_too_large') {
+  const declared = Number(response?.headers?.get?.('content-length'));
+  if (Number.isFinite(declared) && (declared < 0 || declared > maxBytes)) throw new Error(errorCode);
+  const reader = response?.body?.getReader?.();
+  if (!reader) {
+    const text = await response.text();
+    if (new TextEncoder().encode(text).byteLength > maxBytes) throw new Error(errorCode);
+    try { return JSON.parse(text); } catch { throw new Error(errorCode); }
+  }
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = value instanceof Uint8Array ? value : new Uint8Array(value || []);
+    total += chunk.byteLength;
+    if (total > maxBytes) {
+      try { await reader.cancel(errorCode); } catch { /* best effort */ }
+      throw new Error(errorCode);
+    }
+    chunks.push(chunk);
+  }
+  const combined = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try { return JSON.parse(new TextDecoder().decode(combined)); }
+  catch { throw new Error(errorCode); }
+}
+
+function cleanGmailText(value, maxLength = 1000) {
+  return String(value || '')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+    .slice(0, maxLength);
+}
+
+function gmailHeaders(payload) {
+  const values = new Map();
+  for (const header of Array.isArray(payload?.headers) ? payload.headers : []) {
+    const name = typeof header?.name === 'string' ? header.name.toLowerCase() : '';
+    if (['subject', 'from', 'to', 'date'].includes(name) && !values.has(name)) {
+      values.set(name, cleanGmailText(header.value, name === 'subject' ? 998 : 2000));
+    }
+  }
+  return {
+    subject: values.get('subject') || '(no subject)',
+    from: values.get('from') || '',
+    to: values.get('to') || '',
+    date: values.get('date') || ''
+  };
+}
+
+function normalizeGmailMetadata(value) {
+  if (!value || typeof value !== 'object' || typeof value.id !== 'string'
+    || !/^[A-Za-z0-9_-]{1,200}$/.test(value.id)) return null;
+  return {
+    id: value.id,
+    threadId: typeof value.threadId === 'string' && /^[A-Za-z0-9_-]{1,200}$/.test(value.threadId)
+      ? value.threadId
+      : value.id,
+    labelIds: (Array.isArray(value.labelIds) ? value.labelIds : [])
+      .filter((label) => typeof label === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(label))
+      .slice(0, 50),
+    snippet: cleanGmailText(value.snippet, 1000),
+    internalDate: typeof value.internalDate === 'string' && /^\d{1,20}$/.test(value.internalDate) ? value.internalDate : null,
+    headers: gmailHeaders(value.payload)
+  };
+}
+
+function decodeGmailPart(value) {
+  if (typeof value !== 'string' || !value || value.length > GMAIL_BODY_MAX_CHARS * 2
+    || !/^[A-Za-z0-9_-]+$/.test(value)) return '';
+  try {
+    return new TextDecoder().decode(base64UrlDecode(value)).replace(/\u0000/g, '').slice(0, GMAIL_BODY_MAX_CHARS);
+  } catch {
+    return '';
+  }
+}
+
+function gmailBodyText(payload) {
+  let plain = '';
+  let html = '';
+  const visit = (part, depth = 0) => {
+    if (!part || depth > 20 || plain) return;
+    const decoded = decodeGmailPart(part?.body?.data);
+    const mime = String(part?.mimeType || '').toLowerCase();
+    if (decoded && mime === 'text/plain') plain = decoded;
+    else if (decoded && mime === 'text/html' && !html) html = decoded;
+    for (const child of Array.isArray(part?.parts) ? part.parts.slice(0, 200) : []) visit(child, depth + 1);
+  };
+  visit(payload);
+  if (plain) return cleanGmailText(plain, GMAIL_BODY_MAX_CHARS);
+  return cleanGmailText(html
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p\s*>/gi, '\n\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'"), GMAIL_BODY_MAX_CHARS);
+}
+
+async function listDelegatedGmailMessages(request, url, headers, env, authorizedOrigin) {
+  if (request.method !== 'GET') return new Response(JSON.stringify({ error: 'method not allowed' }), { status: 405, headers });
+  const maxResults = Number(url.searchParams.get('maxResults') || 25);
+  const query = url.searchParams.get('q') || '';
+  const pageToken = url.searchParams.get('pageToken') || '';
+  if (!Number.isInteger(maxResults) || maxResults < 1 || maxResults > 30
+    || query.length > 500 || /[\u0000-\u001f\u007f]/.test(query)
+    || (pageToken && !/^[A-Za-z0-9._~+/=-]{1,1024}$/.test(pageToken))) {
+    return new Response(JSON.stringify({ error: 'invalid_gmail_list_request' }), { status: 400, headers });
+  }
+  const loaded = await loadDelegatedGmailSession(request, headers, env, authorizedOrigin);
+  if (loaded.response) return loaded.response;
+  const authHeaders = { Authorization: `Bearer ${loaded.session.accessToken}`, Accept: 'application/json' };
+  const params = new URLSearchParams({ maxResults: String(maxResults) });
+  if (query) params.set('q', query);
+  if (pageToken) params.set('pageToken', pageToken);
+  let response;
+  try { response = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?${params}`, { headers: authHeaders }); }
+  catch { return new Response(JSON.stringify({ error: 'gmail_upstream_unavailable' }), { status: 502, headers }); }
+  if (!response.ok) {
+    return new Response(JSON.stringify({ error: response.status === 401 || response.status === 403
+      ? 'gmail_reconnect_required'
+      : 'gmail_list_failed' }), { status: response.status === 401 || response.status === 403 ? 401 : 502, headers });
+  }
+  let list;
+  try { list = await readBoundedUpstreamJson(response, 256 * 1024, 'gmail_response_too_large'); } catch { list = null; }
+  if (!list || typeof list !== 'object') return new Response(JSON.stringify({ error: 'gmail_response_malformed' }), { status: 502, headers });
+  const ids = (Array.isArray(list.messages) ? list.messages : [])
+    .map((message) => message?.id)
+    .filter((id) => typeof id === 'string' && /^[A-Za-z0-9_-]{1,200}$/.test(id))
+    .slice(0, maxResults);
+  const messages = (await Promise.all(ids.map(async (id) => {
+    const detailParams = new URLSearchParams({ format: 'metadata' });
+    for (const name of ['Subject', 'From', 'To', 'Date']) detailParams.append('metadataHeaders', name);
+    try {
+      const detail = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(id)}?${detailParams}`, { headers: authHeaders });
+      return detail.ok
+        ? normalizeGmailMetadata(await readBoundedUpstreamJson(detail, 256 * 1024, 'gmail_response_too_large'))
+        : null;
+    } catch { return null; }
+  }))).filter(Boolean);
+  const nextPageToken = typeof list.nextPageToken === 'string' && /^[A-Za-z0-9._~+/=-]{1,1024}$/.test(list.nextPageToken)
+    ? list.nextPageToken
+    : null;
+  const resultSizeEstimate = Number.isSafeInteger(Number(list.resultSizeEstimate))
+    ? Math.max(0, Number(list.resultSizeEstimate))
+    : null;
+  return new Response(JSON.stringify({ messages, nextPageToken, resultSizeEstimate }), { status: 200, headers });
+}
+
+async function getDelegatedGmailMessage(request, url, headers, env, authorizedOrigin) {
+  if (request.method !== 'GET') return new Response(JSON.stringify({ error: 'method not allowed' }), { status: 405, headers });
+  const id = url.searchParams.get('id') || '';
+  if (!/^[A-Za-z0-9_-]{1,200}$/.test(id)) {
+    return new Response(JSON.stringify({ error: 'invalid_gmail_message_id' }), { status: 400, headers });
+  }
+  const loaded = await loadDelegatedGmailSession(request, headers, env, authorizedOrigin);
+  if (loaded.response) return loaded.response;
+  let response;
+  try {
+    response = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodeURIComponent(id)}?format=full`, {
+      headers: { Authorization: `Bearer ${loaded.session.accessToken}`, Accept: 'application/json' }
+    });
+  } catch {
+    return new Response(JSON.stringify({ error: 'gmail_upstream_unavailable' }), { status: 502, headers });
+  }
+  if (!response.ok) {
+    const status = response.status === 404 ? 404 : response.status === 401 || response.status === 403 ? 401 : 502;
+    return new Response(JSON.stringify({ error: status === 404
+      ? 'gmail_message_not_found'
+      : (status === 401 ? 'gmail_reconnect_required' : 'gmail_message_failed') }), { status, headers });
+  }
+  let value;
+  try { value = await readBoundedUpstreamJson(response, 6 * 1024 * 1024, 'gmail_response_too_large'); } catch { value = null; }
+  const metadata = normalizeGmailMetadata(value);
+  if (!metadata) return new Response(JSON.stringify({ error: 'gmail_response_malformed' }), { status: 502, headers });
+  const message = { ...metadata, bodyText: gmailBodyText(value.payload), bodyTruncated: false };
+  return new Response(JSON.stringify({ message }), { status: 200, headers });
 }
 
 function safeDownloadFilename(value, fallback = 'Google Drive download') {
@@ -886,7 +1281,7 @@ async function downloadDelegatedDriveFile(request, url, headers, env, authorized
     if ((session.origin || null) !== (typeof authorizedOrigin === 'string' ? authorizedOrigin : null)) {
       return new Response(JSON.stringify({ error: 'drive_session_origin_mismatch' }), { status: 403, headers });
     }
-    session = await refreshDelegatedDriveSession(env, id, session);
+    session = await refreshDelegatedGoogleSession(env, id, session, DRIVE_SESSION_PREFIX, 'drive_reconnect_required');
   } catch (error) {
     try { await env.GOOGLE_DRIVE_SESSIONS.delete?.(key); } catch { /* optional KV delete */ }
     return new Response(JSON.stringify({ error: error?.message === 'drive_reconnect_required'

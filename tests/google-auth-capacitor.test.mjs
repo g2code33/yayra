@@ -6,7 +6,7 @@ import {
   createCapacitorAuthBridge,
   signInWithGoogleCapacitor
 } from '../src/services/googleAuthCapacitor.js';
-import { DRIVE_SESSION_KEY, PROFILE_KEY } from '../src/services/googleAuthWeb.js';
+import { DRIVE_SESSION_KEY, GMAIL_SESSION_KEY, PROFILE_KEY } from '../src/services/googleAuthWeb.js';
 import { resolveCapacitorGoogleAuthConfig } from '../src/config/googleAuthCapacitor.js';
 
 const CLIENT_ID = 'android-client-id.apps.googleusercontent.com';
@@ -388,6 +388,55 @@ test('capacitor Drive consent persists only an opaque capability, downloads inte
   assert.deepEqual(events, ['drive-connecting', 'signed-in', 'drive-connected', 'signed-out']);
   assert.equal(local.getItem(DRIVE_SESSION_KEY), null);
   assert.equal(calls.some(({ url }) => String(url).includes('/api/drive/session/revoke')), true);
+});
+
+test('capacitor Gmail consent returns to the initiating app and reads mail through the opaque Worker capability', async () => {
+  const cap = fakeCapacitor();
+  const local = fakeStorage();
+  const sessionId = 'N'.repeat(43);
+  const events = [];
+  const bridge = createCapacitorAuthBridge({
+    clientId: CLIENT_ID, platform: 'android', exchangeUrl: EXCHANGE_URL,
+    localStorage: local,
+    openBrowser: cap.openBrowser, closeBrowser: cap.closeBrowser,
+    onUrlOpen: cap.onUrlOpen, onBrowserFinished: cap.onBrowserFinished,
+    fetchImpl: async (url, options) => {
+      if (url === EXCHANGE_URL) {
+        assert.equal(JSON.parse(options.body).capability, 'gmail-readonly');
+        return new Response(JSON.stringify({
+          profile: { sub: 'mobile-gmail', name: 'Ama', email: 'mobile@example.com' },
+          gmailSession: { id: sessionId, expiresAt: '2099-01-01T00:00:00.000Z', scope: 'gmail.readonly' }
+        }), { status: 200 });
+      }
+      if (String(url).includes('/api/gmail/messages')) {
+        assert.equal(options.headers.Authorization, `YayraGmail ${sessionId}`);
+        return new Response(JSON.stringify({
+          messages: [{
+            id: 'mobile_msg', threadId: 'mobile_thread', labelIds: ['INBOX'], snippet: 'Hi', internalDate: '1700000000000',
+            headers: { subject: 'Mobile mail', from: 'sender@example.com', to: 'mobile@example.com', date: 'Tue' }
+          }]
+        }), { status: 200 });
+      }
+      if (String(url).includes('/api/gmail/session/revoke')) return new Response('{}', { status: 200 });
+      throw new Error(`unexpected fetch ${url}`);
+    }
+  });
+  bridge.onEvent((event) => events.push(event.type));
+  const connecting = bridge.connectGmail('profile-mobile');
+  await waitFor(() => cap.opened.length === 1);
+  const authorization = new URL(cap.opened[0]);
+  assert.equal(authorization.searchParams.get('scope'), 'openid email profile https://www.googleapis.com/auth/gmail.readonly');
+  assert.equal(authorization.searchParams.get('access_type'), 'offline');
+  cap.deliverUrl(`${DEFAULT_MOBILE_REDIRECT_URI}?code=gmail-code&state=${authorization.searchParams.get('state')}`);
+  const connected = await connecting;
+  assert.equal(connected.profile.email, 'mobile@example.com');
+  assert.deepEqual(events, ['gmail-connecting', 'signed-in', 'gmail-connected']);
+  assert.ok(local.getItem(`${GMAIL_SESSION_KEY}:profile:profile-mobile`));
+  assert.equal(JSON.stringify(local.dump()).includes('access_token'), false);
+
+  const listed = await bridge.listGmailMessages({ query: 'in:inbox' }, 'profile-mobile');
+  assert.equal(listed.ok, true);
+  assert.equal(listed.messages[0].headers.subject, 'Mobile mail');
 });
 
 test('capacitor auth bridge reports sign-in errors through the event channel without throwing', async () => {

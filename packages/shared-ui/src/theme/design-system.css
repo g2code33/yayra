@@ -1441,6 +1441,397 @@ button.fb-site-passkey-indicator {
   display: flex;
 }
 
+.fb-google-connected-product {
+  flex-direction: column;
+}
+
+.fb-google-connected-product-content {
+  position: relative;
+  display: flex;
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+}
+
+.fb-google-connected-banner {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 42px;
+  padding: 5px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--fb-border-subtle, #3c4043) 76%, transparent);
+  background: var(--fb-bg-elevated, #202124);
+  color: var(--fb-text-primary, #e8eaed);
+  font-size: 12px;
+  z-index: 2;
+}
+
+.fb-google-connected-banner-badge {
+  display: grid;
+  place-items: center;
+  flex: 0 0 29px;
+  width: 29px;
+  height: 29px;
+  overflow: hidden;
+  border-radius: 50%;
+  background: #1a73e8;
+  color: #fff;
+  font-weight: 700;
+}
+
+.fb-google-connected-banner-badge img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.fb-google-connected-banner > span:nth-child(2) {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.fb-google-connected-banner b,
+.fb-google-connected-banner small {
+  max-width: min(42vw, 340px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fb-google-connected-banner small {
+  color: var(--fb-text-secondary, #9aa0a6);
+  font-size: 10px;
+}
+
+.fb-google-connected-banner button {
+  margin-left: auto;
+  padding: 5px 12px;
+  border: 1px solid var(--fb-border-subtle, #5f6368);
+  border-radius: 16px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.fb-google-connected-banner-note {
+  color: #8ab4f8;
+  white-space: nowrap;
+}
+
+.fb-gmail-auth-holder {
+  position: relative;
+  display: flex;
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+}
+
+.fb-gmail-page {
+  box-sizing: border-box;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  width: 100%;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--fb-bg-app, #f6f8fc);
+  color: var(--fb-text-primary, #1f1f1f);
+}
+
+.fb-gmail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 64px;
+  padding: 8px 18px;
+  border-bottom: 1px solid var(--fb-border-subtle, #e0e3e7);
+  background: var(--fb-bg-elevated, #fff);
+}
+
+.fb-gmail-brand,
+.fb-gmail-account {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.fb-gmail-brand {
+  font-size: 20px;
+}
+
+.fb-gmail-mark {
+  display: grid;
+  place-items: center;
+  width: 35px;
+  height: 28px;
+  border: 3px solid #ea4335;
+  border-radius: 5px;
+  color: #ea4335;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.fb-gmail-account {
+  min-width: 0;
+  padding: 5px 10px 5px 5px;
+  border: 1px solid var(--fb-border-subtle, #dadce0);
+  border-radius: 24px;
+}
+
+.fb-gmail-account img,
+.fb-gmail-avatar-fallback {
+  display: grid;
+  place-items: center;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: #1a73e8;
+  color: #fff;
+  font-weight: 700;
+}
+
+.fb-gmail-account > span:last-child {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.fb-gmail-account small {
+  color: var(--fb-text-secondary, #5f6368);
+  font-size: 10px;
+}
+
+.fb-gmail-account b {
+  max-width: min(42vw, 320px);
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fb-gmail-search {
+  display: flex;
+  gap: 8px;
+  padding: 10px 18px;
+  background: var(--fb-bg-elevated, #fff);
+}
+
+.fb-gmail-search input {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 14px;
+  border: 1px solid transparent;
+  border-radius: 22px;
+  outline: none;
+  background: var(--fb-bg-glass-input, #eaf1fb);
+  color: inherit;
+}
+
+.fb-gmail-search input:focus {
+  border-color: #1a73e8;
+}
+
+.fb-gmail-search button,
+.fb-gmail-more,
+.fb-gmail-back {
+  padding: 8px 14px;
+  border: 1px solid var(--fb-border-subtle, #dadce0);
+  border-radius: 18px;
+  background: var(--fb-bg-elevated, #fff);
+  color: inherit;
+  cursor: pointer;
+}
+
+.fb-gmail-layout {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.fb-gmail-sidebar {
+  box-sizing: border-box;
+  display: flex;
+  flex: 0 0 190px;
+  flex-direction: column;
+  gap: 3px;
+  padding: 14px 10px;
+  border-right: 1px solid var(--fb-border-subtle, #e0e3e7);
+}
+
+.fb-gmail-sidebar button {
+  padding: 9px 14px;
+  border: 0;
+  border-radius: 0 18px 18px 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.fb-gmail-sidebar button:hover,
+.fb-gmail-sidebar button.is-active {
+  background: color-mix(in srgb, #ea4335 16%, transparent);
+  font-weight: 650;
+}
+
+.fb-gmail-sidebar p {
+  margin: auto 8px 4px;
+  color: var(--fb-text-secondary, #5f6368);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.fb-gmail-main {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  background: var(--fb-bg-elevated, #fff);
+}
+
+.fb-gmail-list {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+.fb-gmail-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 24%) minmax(0, 1fr) max-content;
+  gap: 14px;
+  align-items: center;
+  width: 100%;
+  padding: 11px 16px;
+  border: 0;
+  border-bottom: 1px solid var(--fb-border-subtle, #e0e3e7);
+  background: color-mix(in srgb, var(--fb-bg-elevated, #fff) 88%, #eef1f5);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.fb-gmail-row:hover {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, #1a73e8 35%, transparent);
+}
+
+.fb-gmail-row.is-unread {
+  background: var(--fb-bg-elevated, #fff);
+  font-weight: 650;
+}
+
+.fb-gmail-row-sender,
+.fb-gmail-row-content {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fb-gmail-row-content span,
+.fb-gmail-row time {
+  color: var(--fb-text-secondary, #5f6368);
+  font-weight: 400;
+}
+
+.fb-gmail-more {
+  align-self: center;
+  margin: 18px;
+}
+
+.fb-gmail-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  min-height: 260px;
+  padding: 30px;
+  text-align: center;
+}
+
+.fb-gmail-empty h2,
+.fb-gmail-empty p {
+  margin: 0;
+  max-width: 560px;
+}
+
+.fb-gmail-message {
+  box-sizing: border-box;
+  max-width: 980px;
+  min-height: 100%;
+  padding: 22px 28px 48px;
+}
+
+.fb-gmail-message h1 {
+  margin: 22px 0 18px;
+  font-size: clamp(20px, 3vw, 30px);
+}
+
+.fb-gmail-message-meta {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  margin-bottom: 24px;
+}
+
+.fb-gmail-message-meta > span {
+  grid-column: 1;
+  color: var(--fb-text-secondary, #5f6368);
+}
+
+.fb-gmail-message-meta time {
+  grid-column: 2;
+  grid-row: 1;
+  color: var(--fb-text-secondary, #5f6368);
+}
+
+.fb-gmail-message-body {
+  margin: 0;
+  overflow: visible;
+  color: inherit;
+  font: inherit;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 720px) {
+  .fb-google-connected-banner-note,
+  .fb-gmail-sidebar {
+    display: none;
+  }
+
+  .fb-gmail-header {
+    min-height: 54px;
+    padding: 6px 10px;
+  }
+
+  .fb-gmail-account small {
+    display: none;
+  }
+
+  .fb-gmail-search {
+    padding: 8px 10px;
+  }
+
+  .fb-gmail-row {
+    grid-template-columns: minmax(90px, 30%) minmax(0, 1fr);
+    gap: 8px;
+    padding: 10px;
+  }
+
+  .fb-gmail-row time {
+    display: none;
+  }
+
+  .fb-gmail-message {
+    padding: 16px 14px 36px;
+  }
+}
+
 /* Browser-grade network recovery surface. It lives in Yayra's renderer while
    the failed native/iframe surface is hidden, so a site can never strand the
    viewport as an unexplained blank rectangle. */
@@ -10409,3 +10800,139 @@ button.fb-site-passkey-indicator {
     width: 100%;
   }
 }
+
+/* Security center: Chrome-like subpages with fully wired settings rows. */
+.fb-privacy-hub { display: flex; flex-direction: column; padding: 0 !important; overflow: hidden; }
+.fb-privacy-page-header { display: flex; align-items: center; gap: 12px; padding: 18px 20px 6px; }
+.fb-privacy-back { min-width: 36px; min-height: 36px; border-radius: 50%; border: 1px solid var(--fb-border-glass, rgba(255,255,255,.12)); background: transparent; color: var(--fb-text-primary, #f3f4f6); cursor: pointer; font-size: 1.25rem; line-height: 1; }
+.fb-privacy-back:hover { background: rgba(255,255,255,.08); }
+.fb-privacy-page-header h3 { margin: 0; font-size: 1.16rem; }
+.fb-privacy-page-header p { margin: 2px 0 0; font-size: .82rem; color: var(--fb-text-muted, #9ca3af); }
+.fb-privacy-body { display: flex; flex-direction: column; gap: 12px; padding: 12px 20px 22px; max-height: min(62vh, 680px); overflow-y: auto; }
+.fb-privacy-safety-card, .fb-privacy-row-card, .fb-privacy-guide-card { border: 1px solid var(--fb-border-glass, rgba(255,255,255,.12)); border-radius: 14px; background: rgba(255,255,255,.025); padding: 15px 16px; }
+.fb-privacy-safety-card { display: flex; align-items: center; justify-content: space-between; gap: 16px; background: linear-gradient(100deg, rgba(59,130,246,.11), rgba(16,185,129,.07)); }
+.fb-privacy-safety-card strong { display: block; font-size: .98rem; }
+.fb-privacy-safety-card p { margin: 4px 0 0; font-size: .82rem; color: var(--fb-text-secondary, #cbd5e1); }
+.fb-privacy-link-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.fb-privacy-nav-card { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 64px; padding: 11px 13px; border-radius: 13px; border: 1px solid var(--fb-border-glass, rgba(255,255,255,.12)); background: rgba(255,255,255,.025); color: var(--fb-text-primary, #f3f4f6); text-align: left; cursor: pointer; transition: background .15s, border-color .15s, transform .15s; }
+.fb-privacy-nav-card:hover, .fb-privacy-nav-card:focus-visible { background: rgba(96,165,250,.11); border-color: rgba(96,165,250,.38); transform: translateY(-1px); }
+.fb-privacy-nav-icon { width: 30px; height: 30px; flex: 0 0 30px; color: #8ab4f8; }
+.fb-privacy-nav-icon svg { width: 100%; height: 100%; }
+.fb-privacy-nav-text { flex: 1; min-width: 0; }
+.fb-privacy-nav-text strong { display: block; font-size: .91rem; }
+.fb-privacy-nav-text small { display: block; margin-top: 3px; color: var(--fb-text-muted, #9ca3af); line-height: 1.35; }
+.fb-privacy-nav-chevron { color: var(--fb-text-muted, #9ca3af); font-size: 1.2rem; }
+.fb-privacy-section-label { margin: 6px 0 3px; font-size: .74rem; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: var(--fb-text-muted, #9ca3af); }
+.fb-privacy-row-list { display: flex; flex-direction: column; gap: 8px; }
+.fb-privacy-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 14px; border: 1px solid var(--fb-border-glass, rgba(255,255,255,.10)); border-radius: 12px; background: rgba(255,255,255,.018); }
+.fb-privacy-row strong { display: block; font-size: .89rem; }
+.fb-privacy-row p { margin: 4px 0 0; font-size: .79rem; line-height: 1.45; color: var(--fb-text-muted, #9ca3af); }
+.fb-privacy-row > .fb-btn, .fb-privacy-row > .fb-select, .fb-privacy-row > input[type="checkbox"] { flex: 0 0 auto; }
+.fb-privacy-row > .fb-select { min-width: 170px; max-width: 240px; }
+.fb-privacy-status { padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(16,185,129,.3); background: rgba(16,185,129,.08); color: #a7f3d0; font-size: .83rem; line-height: 1.45; }
+.fb-privacy-status.is-warning { border-color: rgba(245,158,11,.35); background: rgba(245,158,11,.08); color: #fcd34d; }
+.fb-privacy-guide-steps { display: flex; justify-content: center; gap: 7px; margin: 8px 0 4px; }
+.fb-privacy-guide-steps span { width: 8px; height: 8px; border-radius: 50%; background: rgba(255,255,255,.18); }
+.fb-privacy-guide-steps span.active { width: 22px; border-radius: 5px; background: #8ab4f8; }
+.fb-privacy-guide-illustration { display: flex; align-items: center; justify-content: center; min-height: 155px; padding: 20px; border-radius: 16px; background: radial-gradient(circle at 50% 25%, rgba(96,165,250,.16), transparent 62%), rgba(255,255,255,.02); color: #8ab4f8; }
+.fb-privacy-guide-illustration svg { width: 100px; height: 100px; }
+.fb-privacy-guide-card h4 { margin: 0; text-align: center; font-size: 1.06rem; }
+.fb-privacy-guide-card > p { margin: 8px auto 0; max-width: 620px; text-align: center; font-size: .85rem; line-height: 1.55; color: var(--fb-text-secondary, #cbd5e1); }
+.fb-privacy-guide-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 18px; }
+.fb-privacy-guide-columns { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; margin-top: 14px; }
+.fb-privacy-guide-columns h5 { margin: 0 0 6px; font-size: .78rem; color: #8ab4f8; }
+.fb-privacy-guide-columns p { margin: 0; font-size: .78rem; line-height: 1.5; color: var(--fb-text-muted, #9ca3af); }
+.fb-privacy-delete-ranges { display: flex; flex-wrap: wrap; gap: 8px; }
+.fb-privacy-delete-ranges button { border: 1px solid var(--fb-border-glass, rgba(255,255,255,.14)); border-radius: 18px; padding: 7px 12px; background: transparent; color: var(--fb-text-primary, #f3f4f6); cursor: pointer; font-size: .8rem; }
+.fb-privacy-delete-ranges button.active { border-color: #8ab4f8; background: rgba(96,165,250,.18); }
+.fb-privacy-checklist { display: flex; flex-direction: column; gap: 9px; }
+.fb-privacy-checklist label { display: flex; gap: 10px; align-items: flex-start; font-size: .85rem; line-height: 1.45; }
+.fb-privacy-checklist input { margin-top: 3px; }
+.fb-privacy-modal-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+.fb-privacy-site-list { display: flex; flex-direction: column; gap: 8px; max-height: 410px; overflow-y: auto; }
+.fb-privacy-site-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--fb-border-glass, rgba(255,255,255,.10)); border-radius: 11px; }
+.fb-privacy-site-row strong { font-size: .85rem; word-break: break-word; }
+.fb-privacy-site-row small { display: block; margin-top: 2px; color: var(--fb-text-muted, #9ca3af); }
+.fb-privacy-site-row button { flex: 0 0 auto; }
+.fb-privacy-exception-row { display: flex; gap: 8px; align-items: center; }
+.fb-privacy-exception-row input { flex: 1; min-width: 0; }
+.fb-privacy-permission-table { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 9px; }
+.fb-privacy-permission-table label { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 9px 11px; border: 1px solid var(--fb-border-glass, rgba(255,255,255,.10)); border-radius: 10px; font-size: .82rem; }
+.fb-privacy-permission-table select { max-width: 110px; }
+@media (max-width: 700px) {
+  .fb-privacy-body { padding: 10px 12px 20px; max-height: 68vh; }
+  .fb-privacy-page-header { padding: 14px 12px 4px; }
+  .fb-privacy-safety-card { flex-direction: column; align-items: flex-start; }
+  .fb-privacy-row { flex-direction: column; align-items: flex-start; }
+  .fb-privacy-row > .fb-select { max-width: 100%; width: 100%; }
+  .fb-privacy-guide-columns { grid-template-columns: 1fr; }
+}
+
+/* In-Yayra Google services hub and connected-account identity. */
+.fb-google-services-page { display: flex; flex-direction: column; gap: 18px; padding: 24px; overflow-y: auto; color: var(--fb-text-primary, #eef2f7); }
+.fb-google-services-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 18px; border: 1px solid var(--fb-border-glass, rgba(255,255,255,.12)); border-radius: 18px; background: linear-gradient(110deg, rgba(66,133,244,.16), rgba(52,168,83,.08)); }
+.fb-google-services-identity { display: flex; align-items: center; gap: 14px; min-width: 0; }
+.fb-google-services-mark { display: flex; align-items: center; justify-content: center; width: 48px; height: 48px; flex: 0 0 48px; border-radius: 50%; background: #fff; color: #4285f4; font: 800 1.55rem/1 system-ui, sans-serif; box-shadow: 0 4px 20px rgba(0,0,0,.18); }
+.fb-google-services-identity h1 { margin: 0; font-size: 1.2rem; }
+.fb-google-services-identity p { margin: 5px 0 0; max-width: 720px; font-size: .84rem; line-height: 1.5; color: var(--fb-text-secondary, #cbd5e1); }
+.fb-google-services-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+/* Dedicated real Chrome profile: the guaranteed path to a genuinely
+   signed-in Google website. Kept visually distinct from Yayra's own
+   OAuth-verified app identity so the two are never confused. */
+.fb-google-services-chrome-panel { margin: 0 0 20px; padding: 16px 18px; border: 1px solid rgba(96,165,250,.36); border-radius: 16px; background: linear-gradient(135deg, rgba(59,130,246,.12), rgba(59,130,246,.04)); }
+.fb-google-services-chrome-panel h2 { margin: 0 0 8px; font-size: 1rem; font-weight: 700; }
+.fb-google-services-chrome-panel p { margin: 0 0 14px; font-size: .84rem; line-height: 1.55; opacity: .85; }
+.fb-google-services-chrome-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.fb-google-services-chrome-actions .fb-btn:disabled { opacity: .45; cursor: not-allowed; }
+.fb-google-services-chrome-open { font-size: .76rem !important; padding: 5px 10px !important; }
+
+/* Main-process-verified origin badge. Lives inside the omnibox, which is
+   rendered by the shell renderer (never by page content), so a fake login
+   page cannot paint or influence it. */
+.fb-auth-surface-verified { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; max-width: 260px; margin-right: 6px; padding: 3px 9px; border: 1px solid rgba(52,211,153,.42); border-radius: 999px; background: rgba(52,211,153,.1); font-size: .7rem; white-space: nowrap; overflow: hidden; }
+.fb-auth-surface-verified-lock { display: inline-flex; color: #6ee7b7; }
+.fb-auth-surface-verified-lock svg { width: 12px; height: 12px; }
+.fb-auth-surface-verified-host { font-weight: 700; color: #a7f3d0; overflow: hidden; text-overflow: ellipsis; }
+.fb-auth-surface-verified-label { opacity: .7; }
+
+.fb-google-services-status { display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; border: 1px solid rgba(52,211,153,.32); border-radius: 14px; background: rgba(52,211,153,.08); }
+.fb-google-services-status > span { flex: 0 0 22px; color: #6ee7b7; }
+.fb-google-services-status > span svg { width: 22px; height: 22px; }
+.fb-google-services-status p { margin: 0; font-size: .83rem; line-height: 1.5; }
+.fb-google-services-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; min-height: 340px; padding: 30px; border: 1px dashed var(--fb-border-glass, rgba(255,255,255,.18)); border-radius: 18px; text-align: center; }
+.fb-google-services-empty h2 { margin: 0; font-size: 1.25rem; }
+.fb-google-services-empty p { max-width: 680px; margin: 0; font-size: .88rem; line-height: 1.6; color: var(--fb-text-secondary, #cbd5e1); }
+.fb-google-services-group h2 { margin: 0 0 10px; font-size: .78rem; letter-spacing: .08em; text-transform: uppercase; color: var(--fb-text-muted, #9ca3af); }
+.fb-google-services-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; }
+.fb-google-services-card { display: flex; flex-direction: column; gap: 8px; min-height: 150px; padding: 14px; border: 1px solid var(--fb-border-glass, rgba(255,255,255,.11)); border-radius: 15px; background: rgba(255,255,255,.025); transition: background .15s, border-color .15s, transform .15s; }
+.fb-google-services-card:hover { border-color: rgba(138,180,248,.45); background: rgba(96,165,250,.08); transform: translateY(-1px); }
+.fb-google-services-card-icon { display: flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 11px; background: rgba(255,255,255,.08); font-size: 1.2rem; }
+.fb-google-services-card strong { font-size: .92rem; }
+.fb-google-services-card small { margin-top: -4px; color: var(--fb-text-muted, #9ca3af); }
+.fb-google-services-card .fb-btn { width: 100%; padding: 7px 8px; font-size: .78rem; }
+.fb-google-services-preview { padding: 16px; border: 1px solid var(--fb-border-glass, rgba(255,255,255,.12)); border-radius: 16px; background: rgba(255,255,255,.025); }
+.fb-google-services-preview-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.fb-google-services-preview-header h2 { margin: 0; font-size: 1rem; }
+.fb-google-services-items { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+.fb-google-services-item { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid var(--fb-border-glass, rgba(255,255,255,.10)); border-radius: 11px; background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.fb-google-services-item:hover { background: rgba(255,255,255,.05); }
+.fb-google-services-item:disabled { opacity: .65; cursor: default; }
+.fb-google-services-item strong { font-size: .84rem; }
+.fb-google-services-item small { color: var(--fb-text-muted, #9ca3af); }
+@media (max-width: 700px) {
+  .fb-google-services-page { padding: 14px; }
+  .fb-google-services-header { flex-direction: column; }
+  .fb-google-services-actions { justify-content: flex-start; }
+  .fb-google-services-grid { grid-template-columns: repeat(auto-fill, minmax(135px, 1fr)); }
+}
+
+.fb-google-connected-banner .fb-google-services-hub-btn {
+  padding: 4px 9px;
+  border: 1px solid rgba(138,180,248,.45);
+  border-radius: 14px;
+  background: rgba(96,165,250,.12);
+  color: inherit;
+  cursor: pointer;
+  font-size: .76rem;
+}
+.fb-google-connected-banner .fb-google-services-hub-btn:hover { background: rgba(96,165,250,.22); }

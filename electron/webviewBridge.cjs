@@ -2,6 +2,29 @@
 
 const { popupMenuWithRecovery } = require('./nativeMenuGuard.cjs');
 const { buildMediaCompatibilityScript, installMediaCompatibility } = require('./mediaCompatibility.cjs');
+const {
+  DEFAULT_PRIVACY_POLICY,
+  sanitizePrivacyPolicy,
+  hostnameFromUrl,
+  upgradedHttpsUrl,
+  isTrackerRequest,
+  isUnsafeRequest,
+  isThirdPartyRequest,
+  applyPrivacyRequestHeaders,
+  applyPrivacyResponseHeaders,
+  permissionKey,
+  policyDecisionForPermission
+} = require('./privacyShield.cjs');
+const {
+  isGoogleAuthSurface,
+  isGoogleSignInRejectedUrl,
+  googleSignInFallbackUrl,
+  isFirstPartyGoogleSignInUrl,
+  isThirdPartyGoogleOAuthUrl,
+  isGoogleAccountPortalUrl,
+  applyGoogleAuthClientHints,
+  safeGoogleDestination
+} = require('./googleAuthParity.cjs');
 
 /**
  * Yayra Floating Browser - Native Web Content Engine Bridge (Electron main process)
@@ -152,6 +175,84 @@ function decodeOpenExternalRequest(url) {
   } catch (_err) {
     return null;
   }
+}
+
+const YAYRA_GOOGLE_ACCOUNT_ELEMENT_ID = 'yayra-google-service-account';
+const YAYRA_GOOGLE_ACCOUNT_STATE = '__yayraGoogleServicesAccountV1';
+
+function isGoogleProductHost(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  return host === 'google.com' || host.endsWith('.google.com')
+    || host === 'youtube.com' || host.endsWith('.youtube.com')
+    || host === 'blogger.com' || host.endsWith('.blogger.com');
+}
+
+function sanitizeGoogleServiceAccount(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const email = String(value.email || '').trim().toLowerCase();
+  const name = String(value.name || '').trim().replace(/[\u0000-\u001f\u007f]/g, '');
+  if (!email || email.length > 254 || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return null;
+  return { email, name: name.slice(0, 100) };
+}
+
+function buildGoogleServiceAccountScript(profile) {
+  const account = sanitizeGoogleServiceAccount(profile);
+  if (!account) {
+    return `(function(){try{document.getElementById(${JSON.stringify(YAYRA_GOOGLE_ACCOUNT_ELEMENT_ID)})?.remove();delete window[${JSON.stringify(YAYRA_GOOGLE_ACCOUNT_STATE)}];}catch(_err){}})();`;
+  }
+  const email = JSON.stringify(account.email);
+  const name = JSON.stringify(account.name || account.email);
+  const elementId = JSON.stringify(YAYRA_GOOGLE_ACCOUNT_ELEMENT_ID);
+  const stateKey = JSON.stringify(YAYRA_GOOGLE_ACCOUNT_STATE);
+  return `(function(){
+  try {
+    var host = String(location.hostname || '').toLowerCase();
+    var googleHost = host === 'google.com' || /\\.google\\.com$/.test(host) || host === 'youtube.com' || /\\.youtube\\.com$/.test(host) || /\\.blogger\\.com$/.test(host);
+    if (!googleHost) return;
+    var email = ${email};
+    var name = ${name};
+    var id = ${elementId};
+    var stateKey = ${stateKey};
+    window[stateKey] = { connected: true, email: email, name: name, source: 'yayra-oauth' };
+    var apply = function () {
+      var root = document.getElementById(id);
+      if (!root) {
+        root = document.createElement('div');
+        root.id = id;
+        root.setAttribute('role', 'status');
+        root.setAttribute('aria-label', 'Yayra Google account ' + email);
+        root.style.cssText = 'position:fixed;top:10px;right:14px;z-index:2147483646;display:flex;align-items:center;gap:8px;max-width:min(420px,calc(100vw - 28px));padding:8px 12px;border-radius:999px;border:1px solid rgba(138,180,248,.55);background:rgba(20,28,42,.94);color:#f7f9fc;font:600 12px/1.3 system-ui,sans-serif;box-shadow:0 6px 22px rgba(0,0,0,.28);pointer-events:auto;';
+        var shield = document.createElement('span');
+        shield.textContent = '◆';
+        shield.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;background:#1a73e8;color:white;font-size:12px;';
+        var text = document.createElement('span');
+        text.style.cssText = 'min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+        text.textContent = email;
+        var label = document.createElement('small');
+        label.textContent = 'Yayra connected';
+        label.style.cssText = 'color:#a8c7fa;font-weight:700;white-space:nowrap;';
+        root.appendChild(shield);
+        root.appendChild(text);
+        root.appendChild(label);
+        (document.body || document.documentElement).appendChild(root);
+      }
+      // Deliberately do NOT rewrite Google's own Sign in button, avatar,
+      // account menu, or DOM state. This strip reports only Yayra's verified
+      // OAuth identity; the genuine Google website cookie session is owned by
+      // the dedicated Chrome profile and may still be signed out in this tab.
+    };
+    apply();
+    if (!window.__yayraGoogleAccountObserver) {
+      var previous = window.__yayraGoogleAccountObserver;
+      try { previous && previous.disconnect && previous.disconnect(); } catch (_err) {}
+      if (typeof MutationObserver === 'function') {
+        var observer = new MutationObserver(function () { apply(); });
+        observer.observe(document.documentElement || document.body, { childList: true, subtree: true, characterData: true });
+        window.__yayraGoogleAccountObserver = observer;
+      }
+    }
+  } catch (_err) {}
+})();`;
 }
 
 const POINTER_STYLE_ID = 'yayra-custom-pointer-theme';
@@ -1325,6 +1426,23 @@ function createWebviewBridge({
   // Main wires every per-profile/private Session into downloadsBridge. This
   // callback is optional in tests and non-Electron hosts.
   attachDownloadSession = null,
+  // Trusted profile/session resolvers power privacy controls before the first
+  // native page exists. Renderer-provided profile ids are never trusted.
+  getProfileIdForWebContents = null,
+  sessionModule = null,
+  // Google auth-surface parity (see electron/googleAuthParity.cjs). Injected
+  // so hosts/tests can opt in without changing the default behavior of every
+  // other WebContentsView user. `googleAuthParityEnabled` is a function so a
+  // live Security Center setting takes effect without recreating views.
+  googleAuthParityEnabled = null,
+  // Main-owned callback: open a Google destination in Yayra's dedicated,
+  // Yayra-owned real Chrome profile. Used only as a fallback when Google
+  // rejects the in-Yayra attempt, and for explicit "open in Chrome" actions.
+  openGoogleChromeProfile = null,
+  // Main-owned callback: apply honest UA client-hint metadata to a view via
+  // CDP `Emulation.setUserAgentOverride`. Best effort; never an automation
+  // flag. See googleAuthParity.cjs for the header-level half.
+  applyGoogleAuthUserAgentMetadata = null,
   sitePasskeyCompletionTimeoutMs = SITE_PASSKEY_COMPLETION_TIMEOUT_MS,
   logger = console,
   pageUnresponsiveReloadDelayMs = PAGE_UNRESPONSIVE_RELOAD_DELAY_MS,
@@ -1342,9 +1460,388 @@ function createWebviewBridge({
   // Without this Electron cancels navigator.credentials.get() whenever an
   // authenticator returns accounts, making valid site passkeys look broken.
   const webAuthnSessionListeners = new WeakMap();
-  // Per-shell-window policy. WeakMap keeps the preference scoped to the
-  // renderer that owns the native views without retaining destroyed windows.
+  // Per-shell-window policy. WeakMaps keep preferences scoped to the renderer
+  // that owns native views without retaining closed shell windows.
   const backgroundThrottlingByHost = new WeakMap();
+  const privacyPolicyByHost = new WeakMap();
+  // Per-host + per-profile Google auth parity. Default OFF: nothing changes
+  // for hosts that do not opt in. Enabling it removes the embedded signals
+  // Google rejects (script injection, header rewriting, mismatched client
+  // hints) on accounts.google.com / consent.google.com / myaccount.google.com.
+  const googleAuthParityByHost = new WeakMap();
+  const googleAuthParityByProfile = new Map();
+  const rejectedSignInByEntry = new WeakSet();
+  const authSurfaceActiveByEntry = new WeakSet();
+
+  function parityEnabled(profileId = 'default') {
+    // Explicit per-profile override wins over the host-wide default. Both are
+    // set by trusted main-process IPC, never by renderer page content.
+    const key = String(profileId || 'default');
+    if (googleAuthParityByProfile.has(key)) return googleAuthParityByProfile.get(key);
+    if (typeof googleAuthParityEnabled === 'function') {
+      try { return Boolean(googleAuthParityEnabled(profileId)); } catch { return false; }
+    }
+    return Boolean(googleAuthParityEnabled);
+  }
+
+  function currentUrlForEntry(entry) {
+    try {
+      return entry?.view?.webContents?.getURL?.() || entry?.lastUrl || entry?.requestedUrl || '';
+    } catch { return entry?.lastUrl || entry?.requestedUrl || ''; }
+  }
+
+  /** True when this view is actually showing a Google authentication page. */
+  function isAuthSurfaceEntry(entry) {
+    return isGoogleAuthSurface(currentUrlForEntry(entry));
+  }
+
+  /**
+   * Whether Yayra should try to complete a first-party Google sign-in inside
+   * its own persistent per-profile session. Third-party OAuth is NEVER allowed
+   * here: that request carries another site's client_id and callback.
+   */
+  function allowNativeGoogleSignIn(rawUrl, profileId = 'default', isPrivate = false) {
+    // A private tab must never be given access to the persistent Chrome
+    // profile/cookie jar. It keeps the historical external-browser handoff.
+    if (isPrivate || !parityEnabled(profileId)) return false;
+    if (isThirdPartyGoogleOAuthUrl(rawUrl)) return false;
+    return isFirstPartyGoogleSignInUrl(rawUrl) || isGoogleAccountPortalUrl(rawUrl);
+  }
+
+  function safeOriginForUrl(rawUrl) {
+    try {
+      const parsed = new URL(String(rawUrl || ''));
+      return parsed.protocol === 'https:' ? parsed.origin : '';
+    } catch { return ''; }
+  }
+
+  /**
+   * Emit a verified-origin indicator only when the auth-surface state
+   * CHANGES. Sending it on every navigation would add a spurious event to
+   * every ordinary page load and break event-count contracts in the shell.
+   */
+  function emitAuthSurfaceState(entry, rawUrl) {
+    const active = parityEnabled(entry?.profileId) && isGoogleAuthSurface(rawUrl);
+    const wasActive = authSurfaceActiveByEntry.has(entry);
+    if (active === wasActive) return;
+    if (active) authSurfaceActiveByEntry.add(entry);
+    else authSurfaceActiveByEntry.delete(entry);
+    sendTo(entry, 'google-auth-surface', {
+      active,
+      origin: active ? safeOriginForUrl(rawUrl) : ''
+    });
+  }
+
+  function openChromeProfileFallback(entry, rawUrl, reason = 'rejected') {
+    const target = reason === 'google-rejected-embedded-browser'
+      ? googleSignInFallbackUrl(rawUrl)
+      : (safeGoogleDestination(rawUrl) || 'https://accounts.google.com/ServiceLogin');
+    if (entry?.isPrivate) {
+      // Do not launch the persistent per-profile Chrome jar from a private
+      // tab. A normal system-browser handoff is the explicit user-visible
+      // escape hatch, and no private-tab cookies/URLs enter Yayra storage.
+      try {
+        Promise.resolve(shell.openExternal(target)).catch(() => {});
+        return { opened: true, chromeProfileOpened: false };
+      } catch { return { opened: false, chromeProfileOpened: false }; }
+    }
+    if (typeof openGoogleChromeProfile !== 'function') return { opened: false, chromeProfileOpened: false };
+    try {
+      const result = openGoogleChromeProfile({
+        url: target,
+        profileId: String(entry?.profileId || 'default'),
+        tabId: entry?.tabId || null,
+        reason
+      });
+      if (result && typeof result.catch === 'function') {
+        result.catch(() => {});
+        return { opened: true, chromeProfileOpened: true };
+      }
+      return {
+        opened: Boolean(result?.ok || result?.systemFallback),
+        chromeProfileOpened: Boolean(result?.ok)
+      };
+    } catch { return { opened: false, chromeProfileOpened: false }; }
+  }
+
+  /**
+   * Parity item 6: Google explicitly says "This browser or app may not be
+   * secure" by navigating to /signin/rejected (or returning
+   * disallowed_useragent). Detect it in the trusted main process and hand the
+   * SAME destination to Yayra's dedicated real Chrome profile instead of
+   * stranding the user on a dead page or looping the OAuth flow forever.
+   */
+  function handleRejectedSignIn(entry, rawUrl) {
+    if (!parityEnabled(entry?.profileId) || !isGoogleSignInRejectedUrl(rawUrl)) return false;
+    if (rejectedSignInByEntry.has(entry)) return true;
+    rejectedSignInByEntry.add(entry);
+    const fallback = openChromeProfileFallback(entry, rawUrl, 'google-rejected-embedded-browser');
+    emitAuthSurfaceState(entry, '');
+    sendTo(entry, 'google-sign-in-rejected', {
+      provider: 'google',
+      origin: safeOriginForUrl(rawUrl),
+      fallbackOpened: fallback.opened,
+      chromeProfileOpened: fallback.chromeProfileOpened
+    });
+    return true;
+  }
+  const privacyPolicyByProfile = new Map();
+  const privacyStatsByProfile = new Map();
+  const runtimeSitePermissionsByProfile = new Map();
+  const entriesByWebContentsId = new Map();
+  const permissionConfiguredSessions = new WeakSet();
+  const googleServiceAccountByHost = new WeakMap();
+
+  function googleServiceAccountForEntry(entry) {
+    return entry?.hostWc ? googleServiceAccountByHost.get(entry.hostWc) || null : null;
+  }
+
+  function injectGoogleServiceAccount(entry) {
+    const wc = entry?.view?.webContents;
+    if (!wc || wc.isDestroyed?.() || typeof wc.executeJavaScript !== 'function') return;
+    // Parity item 2: Yayra's connected-account marker is an injected page
+    // script. It must NEVER run on accounts.google.com / consent.google.com /
+    // myaccount.google.com - that is precisely the "insert arbitrary scripts"
+    // capability Google's secure-browser policy calls out. The verified
+    // account is shown in Yayra's own browser chrome instead.
+    if (isAuthSurfaceEntry(entry)) return;
+    try {
+      const currentUrl = wc.getURL?.() || entry.lastUrl || entry.requestedUrl || '';
+      let host = '';
+      try { host = new URL(currentUrl).hostname; } catch { /* no committed page yet */ }
+      if (!isGoogleProductHost(host)) return;
+      const result = wc.executeJavaScript(buildGoogleServiceAccountScript(googleServiceAccountForEntry(entry)), true);
+      if (result && typeof result.catch === 'function') result.catch(() => {});
+    } catch { /* page navigated away */ }
+  }
+
+  function privacyPolicyForEntry(entry) {
+    return (entry?.hostWc && privacyPolicyByHost.get(entry.hostWc))
+      || privacyPolicyByProfile.get(String(entry?.profileId || 'default'))
+      || DEFAULT_PRIVACY_POLICY;
+  }
+
+  function entryForRequestDetails(details = {}) {
+    const id = Number(details.webContentsId);
+    return Number.isInteger(id) ? entriesByWebContentsId.get(id) || null : null;
+  }
+
+  function privacyPolicyForRequest(details, fallbackProfileId = 'default') {
+    const entry = entryForRequestDetails(details);
+    return entry ? privacyPolicyForEntry(entry) : (privacyPolicyByProfile.get(String(fallbackProfileId)) || DEFAULT_PRIVACY_POLICY);
+  }
+
+  function topLevelUrlForRequest(details = {}) {
+    const entry = entryForRequestDetails(details);
+    if (!entry) return '';
+    try { return entry.view?.webContents?.getURL?.() || entry.lastUrl || entry.requestedUrl || ''; }
+    catch { return entry.lastUrl || entry.requestedUrl || ''; }
+  }
+
+  function notePrivacyBlock(details, kind, fallbackProfileId = 'default') {
+    const entry = entryForRequestDetails(details);
+    const profileId = String(entry?.profileId || fallbackProfileId || 'default');
+    const current = privacyStatsByProfile.get(profileId) || { blockedTrackers: 0, blockedCookies: 0, blockedUnsafe: 0, blockedImages: 0 };
+    const key = kind === 'tracker' ? 'blockedTrackers'
+      : kind === 'cookie' ? 'blockedCookies'
+        : kind === 'image' ? 'blockedImages'
+          : 'blockedUnsafe';
+    current[key] += 1;
+    privacyStatsByProfile.set(profileId, current);
+  }
+
+  function buildPrivacyRequestPolicy(profileId) {
+    function authSurfaceRequest(details = {}) {
+      if (!parityEnabled(profileId)) return false;
+      const topLevel = topLevelUrlForRequest(details);
+      return isGoogleAuthSurface(details.url) || isGoogleAuthSurface(topLevel);
+    }
+
+    return {
+      // Advertised to mediaCompatibility.cjs so it can bypass its own
+      // Cache-Control / Cloudinary rewriting on Google auth traffic.
+      authSurfaceParity: true,
+      isAuthSurfaceRequest: (details = {}) => authSurfaceRequest(details),
+      isGoogleAuthRequest: (details = {}) => parityEnabled(profileId) && isGoogleAuthSurface(details.url),
+      beforeRequest(details = {}) {
+        // Parity item 3: do not rewrite, upgrade, block or redirect ANY
+        // request belonging to a Google authentication surface. Tracker
+        // rules, HTTPS-first redirects and third-party cookie stripping can
+        // break Google's own sign-in and are themselves "embedded proxy"
+        // signals. Client hints are added separately in beforeSendHeaders.
+        if (authSurfaceRequest(details)) return {};
+        const policy = privacyPolicyForRequest(details, profileId);
+        if (policy.httpsFirst && details.resourceType === 'mainFrame') {
+          const redirectURL = upgradedHttpsUrl(details.url);
+          if (redirectURL && redirectURL !== details.url) return { redirectURL };
+        }
+        if (isUnsafeRequest(details, policy)) {
+          notePrivacyBlock(details, 'unsafe', profileId);
+          return { cancel: true };
+        }
+        if (!policy.imagesEnabled && details.resourceType === 'image') {
+          notePrivacyBlock(details, 'image', profileId);
+          return { cancel: true };
+        }
+        if (isTrackerRequest(details, policy)) {
+          notePrivacyBlock(details, 'tracker', profileId);
+          return { cancel: true };
+        }
+        return {};
+      },
+      beforeSendHeaders(details = {}, headers = {}) {
+        // Parity items 1 + 3: on the Google auth request itself, add honest,
+        // internally consistent UA client hints and nothing else. For other
+        // resources on an auth page, preserve the headers untouched (the
+        // top-level auth page still exempts them from Yayra's privacy rules).
+        // No DNT/GPC injection, topic/attribution stripping, cookie removal,
+        // or cache-control overrides.
+        if (authSurfaceRequest(details)) {
+          return isGoogleAuthSurface(details.url)
+            ? applyGoogleAuthClientHints(headers)
+            : headers;
+        }
+        const policy = privacyPolicyForRequest(details, profileId);
+        const topLevelUrl = topLevelUrlForRequest(details);
+        const blockedCookie = policy.thirdPartyCookies === 'block'
+          && isThirdPartyRequest({ ...details, requestHeaders: headers }, topLevelUrl);
+        const next = applyPrivacyRequestHeaders(details, headers, policy, topLevelUrl);
+        if (blockedCookie && Object.keys(headers).some((name) => /^cookie$/i.test(name))
+          && !Object.keys(next).some((name) => /^cookie$/i.test(name))) {
+          notePrivacyBlock(details, 'cookie', profileId);
+        }
+        return next;
+      },
+      headersReceived(details = {}, headers = {}) {
+        // Parity item 3: never strip Google's Set-Cookie / ad-privacy response
+        // headers on an auth surface. Those cookies ARE the sign-in session.
+        if (authSurfaceRequest(details)) return headers;
+        const policy = privacyPolicyForRequest(details, profileId);
+        const topLevelUrl = topLevelUrlForRequest(details);
+        const hadCookie = Object.keys(headers).some((name) => /^set-cookie\d*$/i.test(name));
+        const next = applyPrivacyResponseHeaders(details, headers, policy, topLevelUrl);
+        if (hadCookie && !Object.keys(next).some((name) => /^set-cookie\d*$/i.test(name))) {
+          notePrivacyBlock(details, 'cookie', profileId);
+        }
+        return next;
+      }
+    };
+  }
+
+  function requestOriginForPermission(webContents, details = {}) {
+    const candidates = [details.requestingUrl, details.securityOrigin, details.embeddingOrigin];
+    try { candidates.push(webContents?.getURL?.()); } catch { /* destroyed */ }
+    for (const value of candidates) {
+      try {
+        const parsed = new URL(String(value || ''));
+        if (parsed.protocol === 'https:' || (parsed.protocol === 'http:' && /^(?:localhost|127(?:\.\d{1,3}){3}|\[?::1\]?)$/i.test(parsed.hostname))) {
+          return parsed.origin;
+        }
+      } catch { /* continue */ }
+    }
+    return '';
+  }
+
+  function permissionLabel(key) {
+    return ({
+      location: 'your location', camera: 'your camera', microphone: 'your microphone',
+      notifications: 'notifications', clipboard: 'your clipboard', midi: 'MIDI devices',
+      usb: 'USB devices', serial: 'serial devices', bluetooth: 'Bluetooth devices',
+      hid: 'human-interface devices', pointerLock: 'pointer lock', idleDetection: 'idle activity'
+    })[key] || 'this capability';
+  }
+
+  function installWebsitePermissionPolicy(ses) {
+    if (!ses || permissionConfiguredSessions.has(ses)) return;
+    const canRequest = typeof ses.setPermissionRequestHandler === 'function';
+    const canCheck = typeof ses.setPermissionCheckHandler === 'function';
+    if (!canRequest && !canCheck) return;
+    const resolve = (webContents, permission, details = {}) => {
+      const entry = webContents ? entriesByWebContents.get(webContents) : null;
+      const policy = privacyPolicyForEntry(entry);
+      const origin = requestOriginForPermission(webContents, details);
+      const runtime = runtimeSitePermissionsByProfile.get(String(entry?.profileId || 'default')) || {};
+      const result = policyDecisionForPermission(policy, origin, { permission, details }, runtime);
+      return { entry, policy, origin, ...result };
+    };
+    if (canCheck) {
+      ses.setPermissionCheckHandler((webContents, permission, _requestingOrigin, details = {}) => {
+        // Chromium-owned capabilities needed for ordinary rendering are safe
+        // without a persistent website grant. Sensitive APIs flow through the
+        // explicit policy below.
+        if (permission === 'fullscreen' || permission === 'clipboard-sanitized-write') return true;
+        const result = resolve(webContents, permission, details);
+        return Boolean(result.origin && result.key && result.decision === 'allow');
+      });
+    }
+    if (canRequest) {
+      ses.setPermissionRequestHandler((webContents, permission, callback, details = {}) => {
+        let settled = false;
+        const finish = (allowed) => {
+          if (settled) return;
+          settled = true;
+          try { callback(Boolean(allowed)); } catch { /* request navigated away */ }
+        };
+        if (permission === 'fullscreen' || permission === 'clipboard-sanitized-write') {
+          finish(true);
+          return;
+        }
+        const result = resolve(webContents, permission, details);
+        if (!result.origin || !result.key || result.decision === 'block') {
+          finish(false);
+          return;
+        }
+        if (result.decision === 'allow') {
+          finish(true);
+          return;
+        }
+        const owner = result.entry?.hostWin && !result.entry.hostWin.isDestroyed?.()
+          ? result.entry.hostWin
+          : getMainWindow();
+        if (!dialog || typeof dialog.showMessageBox !== 'function') {
+          finish(false);
+          return;
+        }
+        const hostname = hostnameFromUrl(result.origin) || 'This site';
+        const options = {
+          type: 'question',
+          title: 'Website permission',
+          message: `${hostname} wants to use ${permissionLabel(result.key)}`,
+          detail: 'Allow only when you trust this site. You can review or remove saved decisions in Settings > Privacy & Security > Site settings.',
+          buttons: ['Allow once', 'Always allow', 'Block'],
+          defaultId: 2,
+          cancelId: 2,
+          noLink: true
+        };
+        let prompt;
+        try {
+          prompt = owner && !owner.isDestroyed?.()
+            ? dialog.showMessageBox(owner, options)
+            : dialog.showMessageBox(options);
+        } catch {
+          finish(false);
+          return;
+        }
+        Promise.resolve(prompt).then(({ response } = {}) => {
+          if (response === 1 || response === 2) {
+            const profileId = String(result.entry?.profileId || 'default');
+            const runtime = runtimeSitePermissionsByProfile.get(profileId) || {};
+            runtime[result.origin] = { ...(runtime[result.origin] || {}), [result.key]: response === 1 ? 'allow' : 'block' };
+            runtimeSitePermissionsByProfile.set(profileId, runtime);
+            if (result.entry) {
+              sendTo(result.entry, 'site-permission-decision', {
+                origin: result.origin,
+                permission: result.key,
+                decision: response === 1 ? 'allow' : 'block'
+              });
+            }
+          }
+          finish(response === 0 || response === 1);
+        }, () => finish(false));
+      });
+    }
+    permissionConfiguredSessions.add(ses);
+  }
 
   function cancelPageUnresponsiveReload(entry) {
     if (!entry) return;
@@ -1578,6 +2075,20 @@ function createWebviewBridge({
   }
 
   async function routeAuthentication(entry, rawUrl, reason = 'navigation') {
+    if (entry?.isPrivate && requiresYayraGoogleAccountConnection(rawUrl)) {
+      // OAuth/API capabilities are durable and profile-scoped, so a private
+      // tab must not create them. Hand the Google destination to the normal
+      // system browser without opening the persistent Yayra Chrome profile.
+      const target = safeGoogleDestination(rawUrl) || 'https://accounts.google.com/ServiceLogin';
+      try {
+        await shell.openExternal(target);
+        sendTo(entry, 'system-browser-handoff', { provider: 'google', reason });
+        return 'external';
+      } catch {
+        sendTo(entry, 'system-browser-handoff-failed', { provider: 'google', reason });
+        return 'failed';
+      }
+    }
     if (requiresYayraGoogleAccountConnection(rawUrl)) {
       requestYayraGoogleAccountConnection(entry, reason);
       return 'yayra-google-account';
@@ -1613,6 +2124,26 @@ function createWebviewBridge({
   function installWebAuthnAccountChooser(ses) {
     if (!ses || typeof ses.on !== 'function' || webAuthnSessionListeners.has(ses)) return;
     const listener = (_event, details = {}, callback) => {
+      // Parity item 4: on Google auth surfaces let Chromium's own WebAuthn
+      // account chooser run. Yayra's virtual passkey provider / account sheet
+      // is an app-controlled intermediary that Google can detect, and it can
+      // break Google's own passkey and 2FA challenges.
+      const authFrameEntry = entryForWebAuthnFrame(ses, details?.frame);
+      if (authFrameEntry && isAuthSurfaceEntry(authFrameEntry)) {
+        // Electron's select-webauthn-account callback is app-mediated. Do not
+        // show Yayra's own account chooser on Google sign-in; cancel this
+        // embedded attempt and move the current Google page to real Chrome,
+        // whose native passkey/password-manager UI is the supported path.
+        const currentUrl = currentUrlForEntry(authFrameEntry);
+        const fallback = openChromeProfileFallback(authFrameEntry, currentUrl, 'google-webauthn-native-fallback');
+        sendTo(authFrameEntry, 'google-webauthn-fallback', {
+          origin: safeOriginForUrl(currentUrl),
+          fallbackOpened: fallback.opened,
+          chromeProfileOpened: fallback.chromeProfileOpened
+        });
+        try { callback(undefined); } catch { /* request expired */ }
+        return;
+      }
       let completed = false;
       let entry = null;
       let requestId = '';
@@ -1808,7 +2339,8 @@ function createWebviewBridge({
 
   function installTextSelectionActions(entry) {
     const wc = entry?.view?.webContents;
-    if (!wc) return;
+    // Parity item 2: no arbitrary page scripts on Google auth surfaces.
+    if (!wc || isAuthSurfaceEntry(entry)) return;
     const script = buildTextSelectionActionsScript();
     for (const frame of pageFrames(wc)) {
       if (!frame || typeof frame.executeJavaScript !== 'function') continue;
@@ -1821,7 +2353,8 @@ function createWebviewBridge({
 
   function installMediaCompatibilityInFrames(entry) {
     const wc = entry?.view?.webContents;
-    if (!wc) return;
+    // Parity item 2: no arbitrary page scripts on Google auth surfaces.
+    if (!wc || isAuthSurfaceEntry(entry)) return;
     const script = buildMediaCompatibilityScript();
     for (const frame of pageFrames(wc)) {
       if (!frame || typeof frame.executeJavaScript !== 'function') continue;
@@ -1856,7 +2389,9 @@ function createWebviewBridge({
 
   function applyPointerThemeToPage(entry) {
     const wc = entry && entry.view && entry.view.webContents;
-    if (!wc) return;
+    // Google auth parity keeps the page completely untouched, including
+    // Yayra's user stylesheet and cursor scripts.
+    if (!wc || isAuthSurfaceEntry(entry)) return;
 
     const frames = pageFrames(wc);
 
@@ -1943,8 +2478,29 @@ function createWebviewBridge({
     // the full rationale). Guarded: test fakes may not implement
     // executeJavaScript.
     wc.on('dom-ready', () => {
+      // Parity items 2 + 4: on Google auth surfaces Yayra injects NOTHING
+      // into the page - no text-selection shim, no account marker, no WebAuthn
+      // watchdog, no Google-Search thinking watchdog, no media shim, and no
+      // pointer-theme CSS. Google's native WebAuthn/passkey flow runs
+      // untouched. Only the main-process CDP metadata override (which is not
+      // a page script) is applied, and only when the host opted in.
+      if (isAuthSurfaceEntry(entry)) {
+        // Remove Yayra's Linux software platform authenticator first: it uses
+        // the same CDP debugger the UA-metadata override needs, and a virtual
+        // authenticator is itself a detectable non-native WebAuthn signal.
+        try { websitePasskeyProvider?.detach?.(wc); } catch { /* optional host */ }
+        if (typeof applyGoogleAuthUserAgentMetadata === 'function') {
+          Promise.resolve(applyGoogleAuthUserAgentMetadata(wc, {
+            userAgent: buildBrowserUserAgent()
+          })).catch(() => {});
+        }
+        emitAuthSurfaceState(entry, currentUrlForEntry(entry));
+        return;
+      }
+      emitAuthSurfaceState(entry, currentUrlForEntry(entry));
       if (entry.pointerTheme !== 'system') applyPointerThemeToPage(entry);
       installTextSelectionActions(entry);
+      injectGoogleServiceAccount(entry);
       if (typeof wc.executeJavaScript === 'function') {
         const watchdogs = [
           buildWebAuthnWatchdogScript(),
@@ -2042,6 +2598,7 @@ function createWebviewBridge({
     wc.on('did-finish-load', () => {
       if (entry.mainFrameFailed) return;
       const url = wc.getURL?.() || entry.lastUrl || entry.requestedUrl || '';
+      injectGoogleServiceAccount(entry);
       sendTo(entry, 'load-succeeded', { url });
     });
     const handoffAuthNavigation = (...args) => {
@@ -2054,8 +2611,30 @@ function createWebviewBridge({
       const isMainFrame = typeof details?.isMainFrame === 'boolean'
         ? details.isMainFrame
         : (typeof args[3] === 'boolean' ? args[3] : true);
-      if (!isMainFrame || (!requiresSystemBrowserAuth(url, authHosts)
-        && !requiresYayraGoogleAccountConnection(url))) return;
+      if (!isMainFrame) return;
+      // Parity: allow first-party Google sign-in to load natively in Yayra's
+      // persistent per-profile session when the user opted in. Third-party
+      // OAuth (a different site's client_id/callback) is NEVER allowed here.
+      if (allowNativeGoogleSignIn(url, entry?.profileId, entry?.isPrivate)) {
+        if (isGoogleAuthSurface(url)) {
+          // This is a page-initiated navigation (not ensureView). Retire the
+          // virtual authenticator before the auth document commits, and
+          // preconfigure the honest UAData metadata. Chromium's own native
+          // passkey behavior is then used for the Google challenge.
+          try { websitePasskeyProvider?.detach?.(wc); } catch { /* optional host */ }
+          entry.websitePasskeyReady = null;
+          if (typeof applyGoogleAuthUserAgentMetadata === 'function') {
+            try {
+              Promise.resolve(applyGoogleAuthUserAgentMetadata(wc, {
+                userAgent: buildBrowserUserAgent()
+              })).catch(() => {});
+            } catch { /* header-level hints remain active */ }
+          }
+        }
+        return;
+      }
+      if (!requiresSystemBrowserAuth(url, authHosts)
+        && !requiresYayraGoogleAccountConnection(url)) return;
 
       event?.preventDefault?.();
       // Prevent the canceled navigation from leaving a stale loading spinner
@@ -2070,10 +2649,20 @@ function createWebviewBridge({
     wc.on('will-redirect', handoffAuthNavigation);
     wc.on('did-navigate', (_event, url) => {
       entry.lastUrl = url;
+      // Parity item 6: Google rejected the in-Yayra attempt -> open a fresh
+      // ServiceLogin entry point in the dedicated real Chrome profile.
+      if (handleRejectedSignIn(entry, url)) return;
+      rejectedSignInByEntry.delete(entry);
+      // Parity item 5: surface a main-process-verified origin to Yayra's
+      // browser chrome so the user can see exactly who they are signing into.
+      // Only the origin crosses IPC - never the full URL, query, or tokens.
+      // Emitted only on state change (see emitAuthSurfaceState).
+      emitAuthSurfaceState(entry, url);
       sendTo(entry, 'navigated', { url, ...navState(wc) });
     });
     wc.on('did-navigate-in-page', (_event, url) => {
       entry.lastUrl = url;
+      injectGoogleServiceAccount(entry);
       sendTo(entry, 'navigated', { url, ...navState(wc) });
     });
     wc.on('page-title-updated', (_event, title) => sendTo(entry, 'title-updated', { title }));
@@ -2110,7 +2699,8 @@ function createWebviewBridge({
       if (!win || win.isDestroyed()) return;
       popupMenuWithRecovery({ menu: Menu.buildFromTemplate(template), window: win });
     });
-    wc.setWindowOpenHandler(({ url }) => {
+    wc.setWindowOpenHandler((openDetails = {}) => {
+      const { url } = openDetails;
       // In-page WebAuthn helper asking to reopen this page in the user's
       // real browser (where phone/synced passkeys actually work).
       const externalTarget = decodeOpenExternalRequest(url);
@@ -2119,8 +2709,16 @@ function createWebviewBridge({
         sendTo(entry, 'system-browser-handoff', { url: externalTarget });
         return { action: 'deny' };
       }
-      if (requiresSystemBrowserAuth(url, authHosts) || requiresYayraGoogleAccountConnection(url)) {
+      if (!allowNativeGoogleSignIn(url, entry?.profileId, entry?.isPrivate)
+        && (requiresSystemBrowserAuth(url, authHosts) || requiresYayraGoogleAccountConnection(url))) {
         void routeAuthentication(entry, url, 'popup');
+        return { action: 'deny' };
+      }
+      const policy = privacyPolicyForEntry(entry);
+      const disposition = String(openDetails.disposition || '');
+      if (!policy.allowWebsitePopups && disposition
+        && !['foreground-tab', 'background-tab', 'new-window'].includes(disposition)) {
+        sendTo(entry, 'popup-blocked', { url: '' });
         return { action: 'deny' };
       }
       // Let the renderer decide (usually: open as a new Yayra tab).
@@ -2140,7 +2738,7 @@ function createWebviewBridge({
     return `persist:yayra-profile-${id.replace(/[^a-zA-Z0-9_-]/g, '')}`;
   }
 
-  function createView(key, tabId, isPrivate, hostWc, hostWin, profileId = 'default') {
+  function createView(key, tabId, isPrivate, hostWc, hostWin, profileId = 'default', initialUrl = '') {
     const view = new WebContentsView({
       webPreferences: {
         contextIsolation: true,
@@ -2153,11 +2751,17 @@ function createWebviewBridge({
     if (typeof view.webContents.setUserAgent === 'function') {
       view.webContents.setUserAgent(buildBrowserUserAgent());
     }
-    // Install before loadURL/cache lookup. Cloudinary f_auto/raw HEIC images
-    // are served as WebP when this machine's embedded Chromium codec set
-    // differs from Firefox's, rather than leaving a white backdrop and the
-    // browser's broken-image glyph in the corner.
-    installMediaCompatibility(view.webContents.session, logger);
+    // Install before loadURL/cache lookup. Privacy enforcement and Cloudinary
+    // media compatibility share one composed WebRequest listener per Session;
+    // Electron would otherwise let the later registration replace the first.
+    const normalizedProfileId = String(profileId || 'default');
+    const hostPolicy = hostWc ? privacyPolicyByHost.get(hostWc) : null;
+    if (hostPolicy) privacyPolicyByProfile.set(normalizedProfileId, hostPolicy);
+    installMediaCompatibility(
+      view.webContents.session,
+      logger,
+      buildPrivacyRequestPolicy(normalizedProfileId)
+    );
     try { attachDownloadSession?.(view.webContents.session); } catch { /* download tracking remains optional */ }
     // Pre-paint background: Chromium's default surface is WHITE, which
     // flashes whenever a view is created/hidden/resized inside Yayra's
@@ -2174,7 +2778,7 @@ function createWebviewBridge({
       hostWc,
       hostWin,
       isPrivate: Boolean(isPrivate),
-      profileId: String(profileId || 'default'),
+      profileId: normalizedProfileId,
       requestedUrl: null,
       mainFrameFailed: false,
       loadGeneration: 0,
@@ -2189,7 +2793,30 @@ function createWebviewBridge({
     };
     views.set(key, entry);
     entriesByWebContents.set(view.webContents, entry);
-    if (websitePasskeyProvider && typeof websitePasskeyProvider.attach === 'function') {
+    try {
+      const webContentsId = Number(view.webContents.id);
+      if (Number.isInteger(webContentsId)) entriesByWebContentsId.set(webContentsId, entry);
+    } catch { /* test fakes may not expose an id */ }
+    installWebsitePermissionPolicy(view.webContents.session);
+    const privacyPolicy = privacyPolicyForEntry(entry);
+    if (typeof view.webContents.setJavaScriptEnabled === 'function') {
+      try { view.webContents.setJavaScriptEnabled(privacyPolicy.javascriptEnabled !== false); } catch { /* unsupported host */ }
+    }
+    const initialGoogleAuthSurface = parityEnabled(entry.profileId) && isGoogleAuthSurface(initialUrl);
+    if (initialGoogleAuthSurface && typeof applyGoogleAuthUserAgentMetadata === 'function') {
+      // Set navigator.userAgentData metadata before the first Google page
+      // script runs. The header-level client hints are installed in the
+      // Session listener and do not need CDP.
+      try {
+        entry.googleAuthMetadataReady = Promise.resolve(applyGoogleAuthUserAgentMetadata(view.webContents, {
+          userAgent: buildBrowserUserAgent()
+        })).catch(() => false);
+      } catch { entry.googleAuthMetadataReady = Promise.resolve(false); }
+    }
+    // Never attach Yayra's virtual authenticator to the initial Google
+    // sign-in document. The native Chromium WebAuthn implementation must be
+    // present from the first document script onward.
+    if (!initialGoogleAuthSurface && websitePasskeyProvider && typeof websitePasskeyProvider.attach === 'function') {
       try {
         entry.websitePasskeyReady = Promise.resolve(websitePasskeyProvider.attach({
           webContents: view.webContents,
@@ -2219,7 +2846,17 @@ function createWebviewBridge({
     const win = (hostWin && !hostWin.isDestroyed?.()) ? hostWin : getMainWindow();
     if (!win || win.isDestroyed() || !tabId || !url) return { handedOffToSystemBrowser: false };
 
-    if (requiresYayraGoogleAccountConnection(url)) {
+    // Parity: when the user opted in, load first-party Google sign-in and
+    // Google Account pages in this view's persistent per-profile session so
+    // Google can accept them as a standalone browser. If Google rejects, the
+    // did-navigate handler opens the dedicated Chrome profile instead.
+    const nativeGoogleAllowed = allowNativeGoogleSignIn(url, profileId, isPrivate);
+
+    if (!nativeGoogleAllowed && requiresYayraGoogleAccountConnection(url)) {
+      if (isPrivate) {
+        const mode = await routeAuthentication({ tabId, hostWc, isPrivate: true }, url, 'direct-navigation');
+        return { handedOffToSystemBrowser: mode === 'external' };
+      }
       // Root/Manage Account/first-party login cannot establish a Google
       // website cookie in this isolated partition. Request Yayra's callback-
       // returning OAuth flow instead; unlike the old raw ServiceLogin handoff,
@@ -2228,7 +2865,7 @@ function createWebviewBridge({
       return { handedOffToSystemBrowser: false, googleAccountConnectionRequired: true };
     }
 
-    if (requiresSystemBrowserAuth(url, authHosts)) {
+    if (!nativeGoogleAllowed && requiresSystemBrowserAuth(url, authHosts)) {
       // No native website view is needed merely to launch the provider. Use a
       // minimal entry-shaped target so the completion event returns only to
       // the shell window that requested this tab.
@@ -2244,7 +2881,7 @@ function createWebviewBridge({
       entry = undefined;
     }
     if (!entry) {
-      entry = createView(key, tabId, isPrivate, hostWc, win, profileId);
+      entry = createView(key, tabId, isPrivate, hostWc, win, profileId, url);
       const configuredBackgroundThrottling = hostWc ? backgroundThrottlingByHost.get(hostWc) : undefined;
       // Live-sites is fail-open: even if the renderer's startup preference
       // IPC raced or an older preload never sent it, background pages keep
@@ -2272,7 +2909,24 @@ function createWebviewBridge({
     // provider finishes attaching a few milliseconds later. Keep only the
     // newest URL when rapid navigation arrives while initialization waits.
     entry.requestedUrl = url;
-    if (entry.websitePasskeyReady) await entry.websitePasskeyReady;
+    if (nativeGoogleAllowed && isGoogleAuthSurface(url)) {
+      // A reused page view may already have Yayra's Linux virtual
+      // authenticator attached. Detach it before starting a Google auth
+      // document, then install honest UA metadata before loadURL.
+      try { websitePasskeyProvider?.detach?.(entry.view.webContents); } catch { /* optional host */ }
+      entry.websitePasskeyReady = null;
+      if (!entry.googleAuthMetadataReady && typeof applyGoogleAuthUserAgentMetadata === 'function') {
+        try {
+          entry.googleAuthMetadataReady = Promise.resolve(applyGoogleAuthUserAgentMetadata(entry.view.webContents, {
+            userAgent: buildBrowserUserAgent()
+          })).catch(() => false);
+        } catch { entry.googleAuthMetadataReady = Promise.resolve(false); }
+      }
+    }
+    if (entry.websitePasskeyReady && !nativeGoogleAllowed) await entry.websitePasskeyReady;
+    if (nativeGoogleAllowed && isGoogleAuthSurface(url) && entry.googleAuthMetadataReady) {
+      await entry.googleAuthMetadataReady;
+    }
     if (entry.requestedUrl !== url) return { handedOffToSystemBrowser: false };
 
     if (entry.lastUrl !== url) {
@@ -2494,6 +3148,10 @@ function createWebviewBridge({
       }
     }
     try { websitePasskeyProvider?.detach?.(entry.view.webContents); } catch { /* view is closing */ }
+    try {
+      const webContentsId = Number(entry.view?.webContents?.id);
+      if (Number.isInteger(webContentsId)) entriesByWebContentsId.delete(webContentsId);
+    } catch { /* view is closing */ }
     if (!entry.view.webContents.isDestroyed()) entry.view.webContents.close();
     views.delete(key);
   }
@@ -2516,9 +3174,188 @@ function createWebviewBridge({
     }
   }
 
+  function trustedProfileIdForSender(sender) {
+    try {
+      const id = typeof getProfileIdForWebContents === 'function'
+        ? getProfileIdForWebContents(sender)
+        : null;
+      if (typeof id === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(id)) return id;
+    } catch { /* use default */ }
+    return 'default';
+  }
+
+  function sessionsForSender(sender) {
+    const sessions = new Set();
+    for (const entry of views.values()) {
+      if (entry.hostWc === sender && entry.view?.webContents?.session) sessions.add(entry.view.webContents.session);
+    }
+    if (sessionModule && typeof sessionModule.fromPartition === 'function') {
+      try { sessions.add(sessionModule.fromPartition(partitionForProfile(trustedProfileIdForSender(sender)))); }
+      catch { /* unavailable in stripped-down test hosts */ }
+    }
+    return sessions;
+  }
+
+  function cookieRemovalUrl(cookie) {
+    const domain = String(cookie?.domain || '').replace(/^\./, '');
+    if (!domain) return null;
+    const scheme = cookie?.secure ? 'https' : 'http';
+    const path = String(cookie?.path || '/').startsWith('/') ? String(cookie.path || '/') : '/';
+    return `${scheme}://${domain}${path}`;
+  }
+
+  // Trusted, per-profile Google auth-surface parity switch. The renderer can
+  // opt in/out (Security Center), but the profile scope is resolved from the
+  // pinned shell window - a renderer cannot enable parity for another
+  // profile or inject arbitrary policy values.
+  ipcMain.handle('yayra:webview-google-auth-parity-set', (event, payload = {}) => {
+    const sender = event?.sender;
+    if (!sender) return { ok: false, reason: 'untrusted-sender' };
+    const enabled = payload?.enabled === true;
+    const profileId = trustedProfileIdForSender(sender);
+    googleAuthParityByHost.set(sender, enabled);
+    googleAuthParityByProfile.set(profileId, enabled);
+    return { ok: true, enabled, profileId };
+  });
+
+  ipcMain.handle('yayra:webview-privacy-set', (event, payload = {}) => {
+    const sender = event?.sender;
+    if (!sender) return { ok: false, reason: 'untrusted-sender' };
+    const policy = sanitizePrivacyPolicy(payload);
+    const profileId = trustedProfileIdForSender(sender);
+    const previous = privacyPolicyByHost.get(sender);
+    if (policy.autoRemoveUnusedPermissions && previous?.autoRemoveUnusedPermissions === false) {
+      runtimeSitePermissionsByProfile.delete(profileId);
+    }
+    privacyPolicyByHost.set(sender, policy);
+    privacyPolicyByProfile.set(profileId, policy);
+    let updated = 0;
+    let reloadRecommended = false;
+    for (const entry of views.values()) {
+      if (entry.hostWc !== sender) continue;
+      entry.profileId = profileId;
+      const wc = entry.view?.webContents;
+      if (!wc || wc.isDestroyed?.()) continue;
+      if (typeof wc.setJavaScriptEnabled === 'function') {
+        try {
+          const previous = typeof wc.isJavaScriptEnabled === 'function' ? wc.isJavaScriptEnabled() : null;
+          wc.setJavaScriptEnabled(policy.javascriptEnabled !== false);
+          reloadRecommended ||= previous !== null && previous !== (policy.javascriptEnabled !== false);
+        } catch { /* setting applies to newly created views */ }
+      }
+      updated += 1;
+    }
+    return {
+      ok: true,
+      updated,
+      reloadRecommended,
+      policy: {
+        httpsFirst: policy.httpsFirst,
+        safeBrowsingLevel: policy.safeBrowsingLevel,
+        adBlockEnabled: policy.adBlockEnabled,
+        doNotTrack: policy.doNotTrack,
+        globalPrivacyControl: policy.globalPrivacyControl,
+        thirdPartyCookies: policy.thirdPartyCookies,
+        secureDnsEnabled: policy.secureDnsEnabled
+      }
+    };
+  });
+
+  ipcMain.handle('yayra:webview-set-google-service-account', (event, payload = null) => {
+    const sender = event?.sender;
+    if (!sender) return { ok: false, reason: 'untrusted-sender' };
+    const account = payload ? sanitizeGoogleServiceAccount(payload) : null;
+    if (account) googleServiceAccountByHost.set(sender, account);
+    else googleServiceAccountByHost.delete(sender);
+    let updated = 0;
+    for (const entry of views.values()) {
+      if (entry.hostWc !== sender) continue;
+      injectGoogleServiceAccount(entry);
+      updated += 1;
+    }
+    return { ok: true, connected: Boolean(account), updated };
+  });
+
+  ipcMain.handle('yayra:webview-privacy-status', (event) => {
+    const sender = event?.sender;
+    if (!sender) return { ok: false, reason: 'untrusted-sender' };
+    const profileId = trustedProfileIdForSender(sender);
+    const policy = privacyPolicyByHost.get(sender) || privacyPolicyByProfile.get(profileId) || DEFAULT_PRIVACY_POLICY;
+    const stats = privacyStatsByProfile.get(profileId) || { blockedTrackers: 0, blockedCookies: 0, blockedUnsafe: 0, blockedImages: 0 };
+    const recommendations = [];
+    if (!policy.httpsFirst) recommendations.push('https-first');
+    if (policy.safeBrowsingLevel !== 'enhanced') recommendations.push('safe-browsing');
+    if (!policy.adBlockEnabled) recommendations.push('tracker-protection');
+    if (policy.thirdPartyCookies !== 'block') recommendations.push('third-party-cookies');
+    if (!policy.doNotTrack || !policy.globalPrivacyControl) recommendations.push('privacy-signals');
+    if (!policy.secureDnsEnabled) recommendations.push('secure-dns');
+    if (policy.preloadPages) recommendations.push('disable-preload');
+    if (policy.allowWebsitePopups) recommendations.push('website-popups');
+    if (policy.javascriptEnabled === false) recommendations.push('javascript-disabled');
+    return { ok: true, profileId, recommendations, stats: { ...stats } };
+  });
+
+  ipcMain.handle('yayra:webview-site-data-list', async (event) => {
+    const sender = event?.sender;
+    if (!sender) return { ok: false, reason: 'untrusted-sender', sites: [] };
+    const byHost = new Map();
+    for (const ses of sessionsForSender(sender)) {
+      if (!ses?.cookies?.get) continue;
+      let cookies = [];
+      try { cookies = await ses.cookies.get({}); } catch { continue; }
+      for (const cookie of cookies.slice(0, 20_000)) {
+        const host = String(cookie?.domain || '').replace(/^\./, '').toLowerCase();
+        if (!host || !/^[a-z0-9.-]{1,253}$/i.test(host)) continue;
+        const current = byHost.get(host) || { host, cookies: 0, secureCookies: 0 };
+        current.cookies += 1;
+        if (cookie.secure) current.secureCookies += 1;
+        byHost.set(host, current);
+      }
+    }
+    const sites = Array.from(byHost.values())
+      .sort((a, b) => b.cookies - a.cookies || a.host.localeCompare(b.host))
+      .slice(0, 1_000);
+    return { ok: true, sites, totalSites: byHost.size, truncated: byHost.size > sites.length };
+  });
+
+  ipcMain.handle('yayra:webview-site-data-remove', async (event, { host } = {}) => {
+    const sender = event?.sender;
+    const cleanHost = String(host || '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+    if (!sender || !cleanHost || cleanHost.length > 253 || !/^[a-z0-9.-]+$/i.test(cleanHost)) {
+      return { ok: false, reason: 'invalid-host' };
+    }
+    let removed = 0;
+    for (const ses of sessionsForSender(sender)) {
+      if (!ses) continue;
+      if (ses.cookies?.get && ses.cookies?.remove) {
+        let cookies = [];
+        try { cookies = await ses.cookies.get({}); } catch { cookies = []; }
+        for (const cookie of cookies) {
+          const domain = String(cookie?.domain || '').replace(/^\./, '').toLowerCase();
+          if (domain !== cleanHost && !domain.endsWith(`.${cleanHost}`) && !cleanHost.endsWith(`.${domain}`)) continue;
+          const url = cookieRemovalUrl(cookie);
+          if (!url) continue;
+          try { await ses.cookies.remove(url, cookie.name); removed += 1; } catch { /* continue */ }
+        }
+      }
+      if (typeof ses.clearStorageData === 'function') {
+        const storages = ['localstorage', 'indexdb', 'serviceworkers', 'cachestorage', 'websql'];
+        for (const scheme of ['https', 'http']) {
+          try { await ses.clearStorageData({ origin: `${scheme}://${cleanHost}`, storages }); } catch { /* best effort */ }
+        }
+      }
+    }
+    return { ok: true, removed };
+  });
+
   ipcMain.handle('yayra:webview-ensure', (event, { tabId, url, isPrivate, profileId, pointerTheme, pointerSize } = {}) => {
     const { hostWc, hostWin } = resolveHost(event);
-    return ensureView(viewKey(event, tabId), tabId, url, { isPrivate, hostWc, hostWin, profileId, pointerTheme, pointerSize });
+    const trustedProfileId = typeof getProfileIdForWebContents === 'function'
+      ? trustedProfileIdForSender(hostWc)
+      : profileId;
+    return ensureView(viewKey(event, tabId), tabId, url, {
+      isPrivate, hostWc, hostWin, profileId: trustedProfileId, pointerTheme, pointerSize
+    });
   });
   ipcMain.handle('yayra:webview-continue-passkey', async (event, {
     tabId,
@@ -2835,6 +3672,7 @@ function createWebviewBridge({
     const entry = views.get(viewKey(event, tabId));
     const wc = entry && entry.view && entry.view.webContents;
     if (!wc || typeof wc.executeJavaScript !== 'function') return { ok: false, reason: 'no-native-page' };
+    if (isAuthSurfaceEntry(entry)) return { ok: false, reason: 'protected-auth-surface' };
     const script = `(() => {
       const title = String(document.title || '').trim();
       const url = String(location.href || '');
@@ -3123,6 +3961,17 @@ function createWebviewBridge({
   };
 }
 
+// Hoisted (not an inline nested literal) so Node's CJS -> ESM static export
+// scanner keeps detecting every named export for the .mjs test suites.
+const GOOGLE_AUTH_PARITY_HELPERS = Object.freeze({
+  isGoogleAuthSurface,
+  isGoogleSignInRejectedUrl,
+  googleSignInFallbackUrl,
+  isFirstPartyGoogleSignInUrl,
+  isThirdPartyGoogleOAuthUrl,
+  isGoogleAccountPortalUrl
+});
+
 module.exports = {
   WEBVIEW_EVENT_CHANNEL,
   SITE_PASSKEY_REQUEST_CHANNEL,
@@ -3141,11 +3990,14 @@ module.exports = {
   buildPointerThemeScript,
   buildPointerTextCursorScript,
   buildTextSelectionActionsScript,
+  buildGoogleServiceAccountScript,
+  sanitizeGoogleServiceAccount,
   sanitizeBounds,
   sanitizePageBounds,
   MIN_NATIVE_PAGE_Y,
   buildBrowserUserAgent,
   buildContextMenuTemplate,
   reloadActionForInput,
+  googleAuthParity: GOOGLE_AUTH_PARITY_HELPERS,
   createWebviewBridge
 };

@@ -33,8 +33,9 @@
  *   `/auth/google/exchange` endpoint (worker/update-worker.mjs), which
  *   holds the secret as a Worker binding and performs token exchange and
  *   userinfo server-side. Basic identity returns ONLY the sanitized profile.
- *   A separate, explicit Drive-readonly consent encrypts scoped credentials
- *   in Worker KV and returns only an opaque origin-bound Yayra capability.
+ *   Separate, explicit Gmail-readonly and Drive-readonly consents encrypt
+ *   scoped credentials in Worker KV and return only capability-specific,
+ *   opaque, origin-bound Yayra sessions.
  *
  * SECURITY TRADE-OFF versus Electron's OS keychain - be explicit:
  *   Electron encrypts raw OAuth tokens at rest with safeStorage (OS
@@ -43,9 +44,10 @@
  *   IndexedDB, even a non-HttpOnly cookie) is readable by any same-origin
  *   script. Instead of storing Google credentials weakly, RAW GOOGLE TOKENS
  *   NEVER REACH THE BROWSER. Profile tokens are discarded after userinfo;
- *   delegated Drive credentials stay AES-GCM-encrypted in Worker KV and are
- *   refreshed/revoked only there. localStorage contains display profile data
- *   and, when granted, a random scoped capability—not a bearer/refresh token.
+ *   delegated Gmail/Drive credentials stay AES-GCM-encrypted in Worker KV and
+ *   are refreshed/revoked only there. localStorage contains display profile
+ *   data and, when granted, random scoped capabilities—not bearer/refresh
+ *   tokens.
  *
  * Every external effect (storage, navigation, fetch, randomness, hashing)
  * is dependency-injected so the URL construction, state round trip, and
@@ -60,9 +62,25 @@ export const GOOGLE_AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/aut
 export const DEFAULT_SCOPES = ['openid', 'email', 'profile'];
 export const DRIVE_READONLY_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
 export const DRIVE_SCOPES = [...DEFAULT_SCOPES, DRIVE_READONLY_SCOPE];
+export const GMAIL_READONLY_SCOPE = 'https://www.googleapis.com/auth/gmail.readonly';
+export const GMAIL_SCOPES = [...DEFAULT_SCOPES, GMAIL_READONLY_SCOPE];
 export const CALLBACK_PATH = '/auth/callback';
 export const PENDING_KEY = 'yayra:google-auth:pending';
 export const DRIVE_SESSION_KEY = 'yayra:google-drive:delegated-session';
+export const GMAIL_SESSION_KEY = 'yayra:google-gmail:delegated-session';
+export const GOOGLE_SERVICES_SESSION_KEY = 'yayra:google-services:delegated-session';
+export const GOOGLE_SERVICES_CAPABILITY = 'google-services';
+export const GOOGLE_SERVICES_SCOPES = [
+  'openid', 'email', 'profile',
+  'https://www.googleapis.com/auth/gmail.readonly',
+  'https://www.googleapis.com/auth/drive.readonly',
+  'https://www.googleapis.com/auth/calendar.readonly',
+  'https://www.googleapis.com/auth/youtube.readonly',
+  'https://www.googleapis.com/auth/contacts.readonly',
+  'https://www.googleapis.com/auth/photoslibrary.readonly',
+  'https://www.googleapis.com/auth/tasks.readonly',
+  'https://www.googleapis.com/auth/classroom.courses.readonly'
+];
 
 export function normalizeGoogleProductOrigin(value) {
   if (typeof value !== 'string' || value.length === 0 || value.length > 512) return null;
@@ -172,6 +190,40 @@ export function driveRevokeUrlForExchange(exchangeUrl) {
   return driveApiUrlForExchange(exchangeUrl, '/api/drive/session/revoke').toString();
 }
 
+export function gmailListUrlForExchange(exchangeUrl, { query = '', pageToken = '', maxResults = 25 } = {}) {
+  const url = driveApiUrlForExchange(exchangeUrl, '/api/gmail/messages');
+  if (typeof query !== 'string' || query.length > 500 || /[\u0000-\u001f\u007f]/.test(query)) throw new Error('invalid_gmail_list_request');
+  if (pageToken && (typeof pageToken !== 'string' || !/^[A-Za-z0-9._~+/=-]{1,1024}$/.test(pageToken))) throw new Error('invalid_gmail_list_request');
+  const count = Number(maxResults);
+  if (!Number.isInteger(count) || count < 1 || count > 30) throw new Error('invalid_gmail_list_request');
+  url.searchParams.set('maxResults', String(count));
+  if (query.trim()) url.searchParams.set('q', query.trim());
+  if (pageToken) url.searchParams.set('pageToken', pageToken);
+  return url.toString();
+}
+
+export function gmailMessageUrlForExchange(exchangeUrl, messageId) {
+  const url = driveApiUrlForExchange(exchangeUrl, '/api/gmail/message');
+  if (typeof messageId !== 'string' || !/^[A-Za-z0-9_-]{1,200}$/.test(messageId)) throw new Error('invalid_gmail_message_id');
+  url.searchParams.set('id', messageId);
+  return url.toString();
+}
+
+export function gmailRevokeUrlForExchange(exchangeUrl) {
+  return driveApiUrlForExchange(exchangeUrl, '/api/gmail/session/revoke').toString();
+}
+
+export function googleServicesUrlForExchange(exchangeUrl, serviceId) {
+  const url = driveApiUrlForExchange(exchangeUrl, '/api/google/services');
+  if (typeof serviceId !== 'string' || !/^[a-z0-9-]{1,40}$/.test(serviceId)) throw new Error('invalid_google_service');
+  url.searchParams.set('service', serviceId);
+  return url.toString();
+}
+
+export function googleServicesRevokeUrlForExchange(exchangeUrl) {
+  return driveApiUrlForExchange(exchangeUrl, '/api/google/services/session/revoke').toString();
+}
+
 function driveFilenameFromResponse(response) {
   const disposition = response?.headers?.get?.('content-disposition') || '';
   const encoded = /filename\*=UTF-8''([^;]+)/i.exec(disposition)?.[1];
@@ -253,6 +305,141 @@ export async function revokeDelegatedDriveSession({
     const response = await fetchImpl(driveRevokeUrlForExchange(exchangeUrl), {
       method: 'POST',
       headers: { Authorization: `YayraDrive ${session.id}`, Accept: 'application/json' },
+      ...(controller ? { signal: controller.signal } : {})
+    });
+    return { ok: response.ok, revoked: response.ok };
+  } catch {
+    return { ok: false, revoked: false };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function cleanGmailValue(value, maxLength) {
+  return String(value || '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').slice(0, maxLength);
+}
+
+export function sanitizeGmailMessage(value, { includeBody = false } = {}) {
+  if (!value || typeof value !== 'object' || typeof value.id !== 'string'
+    || !/^[A-Za-z0-9_-]{1,200}$/.test(value.id)) return null;
+  const headers = value.headers && typeof value.headers === 'object' ? value.headers : {};
+  const message = {
+    id: value.id,
+    threadId: typeof value.threadId === 'string' && /^[A-Za-z0-9_-]{1,200}$/.test(value.threadId)
+      ? value.threadId
+      : value.id,
+    labelIds: (Array.isArray(value.labelIds) ? value.labelIds : [])
+      .filter((label) => typeof label === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(label))
+      .slice(0, 50),
+    snippet: cleanGmailValue(value.snippet, 1000),
+    internalDate: typeof value.internalDate === 'string' && /^\d{1,20}$/.test(value.internalDate)
+      ? value.internalDate
+      : null,
+    headers: {
+      subject: cleanGmailValue(headers.subject || '(no subject)', 998),
+      from: cleanGmailValue(headers.from, 2000),
+      to: cleanGmailValue(headers.to, 2000),
+      date: cleanGmailValue(headers.date, 2000)
+    }
+  };
+  if (includeBody) {
+    message.bodyText = cleanGmailValue(value.bodyText, 2 * 1024 * 1024);
+    message.bodyTruncated = value.bodyTruncated === true;
+  }
+  return message;
+}
+
+async function delegatedGmailJson({
+  url,
+  sessionStorage,
+  profileId = DEFAULT_AUTH_PROFILE_ID,
+  fetchImpl = globalThis.fetch,
+  includeBody = false
+}) {
+  const session = loadGmailSession(sessionStorage, () => Date.now(), profileId);
+  if (!session) throw new Error('gmail_reconnect_required');
+  const response = await fetchImpl(url, {
+    method: 'GET',
+    headers: { Authorization: `YayraGmail ${session.id}`, Accept: 'application/json' }
+  });
+  const text = await readBoundedExchangeResponse(response, includeBody ? 3 * 1024 * 1024 : 512 * 1024);
+  if (!response.ok) {
+    const code = safeExchangeErrorCode(text);
+    if (response.status === 401) sessionStorage.removeItem(authStorageKey(GMAIL_SESSION_KEY, profileId));
+    throw new Error(`${includeBody ? 'gmail_message_failed' : 'gmail_list_failed'}:${response.status}:${code}`);
+  }
+  let body;
+  try { body = JSON.parse(text); } catch { throw new Error('gmail_response_malformed'); }
+  return body;
+}
+
+export async function listDelegatedGmailMessages({
+  options = {},
+  exchangeUrl,
+  sessionStorage,
+  profileId = DEFAULT_AUTH_PROFILE_ID,
+  fetchImpl = globalThis.fetch
+}) {
+  const body = await delegatedGmailJson({
+    url: gmailListUrlForExchange(exchangeUrl, options),
+    sessionStorage,
+    profileId,
+    fetchImpl
+  });
+  const messages = (Array.isArray(body?.messages) ? body.messages : [])
+    .map((message) => sanitizeGmailMessage(message))
+    .filter(Boolean)
+    .slice(0, 30);
+  const nextPageToken = typeof body?.nextPageToken === 'string'
+    && /^[A-Za-z0-9._~+/=-]{1,1024}$/.test(body.nextPageToken)
+    ? body.nextPageToken
+    : null;
+  return {
+    messages,
+    nextPageToken,
+    resultSizeEstimate: Number.isSafeInteger(Number(body?.resultSizeEstimate))
+      ? Math.max(0, Number(body.resultSizeEstimate))
+      : null
+  };
+}
+
+export async function getDelegatedGmailMessage({
+  messageId,
+  exchangeUrl,
+  sessionStorage,
+  profileId = DEFAULT_AUTH_PROFILE_ID,
+  fetchImpl = globalThis.fetch
+}) {
+  const body = await delegatedGmailJson({
+    url: gmailMessageUrlForExchange(exchangeUrl, messageId),
+    sessionStorage,
+    profileId,
+    fetchImpl,
+    includeBody: true
+  });
+  const message = sanitizeGmailMessage(body?.message, { includeBody: true });
+  if (!message) throw new Error('gmail_response_malformed');
+  return message;
+}
+
+export async function revokeDelegatedGmailSession({
+  exchangeUrl,
+  sessionStorage,
+  profileId = DEFAULT_AUTH_PROFILE_ID,
+  fetchImpl = globalThis.fetch,
+  timeoutMs = 5000
+}) {
+  const session = loadGmailSession(sessionStorage, () => Date.now(), profileId);
+  sessionStorage?.removeItem?.(authStorageKey(GMAIL_SESSION_KEY, profileId));
+  if (!session) return { ok: true, revoked: false };
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = controller && Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? setTimeout(() => controller.abort(), Math.min(timeoutMs, 30_000))
+    : null;
+  try {
+    const response = await fetchImpl(gmailRevokeUrlForExchange(exchangeUrl), {
+      method: 'POST',
+      headers: { Authorization: `YayraGmail ${session.id}`, Accept: 'application/json' },
       ...(controller ? { signal: controller.signal } : {})
     });
     return { ok: response.ok, revoked: response.ok };
@@ -362,6 +549,118 @@ export function loadDriveSession(sessionStorage, now = () => Date.now(), profile
   }
 }
 
+export function sanitizeGmailSession(value) {
+  if (!value || typeof value !== 'object') return null;
+  const id = typeof value.id === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value.id) ? value.id : null;
+  const expiresAt = typeof value.expiresAt === 'string' && Number.isFinite(Date.parse(value.expiresAt))
+    ? value.expiresAt
+    : null;
+  if (!id || !expiresAt || value.scope !== 'gmail.readonly') return null;
+  return { id, expiresAt, scope: 'gmail.readonly' };
+}
+
+export function saveGmailSession(sessionStorage, value, profileId = DEFAULT_AUTH_PROFILE_ID) {
+  const session = sanitizeGmailSession(value);
+  if (!session) throw new Error('invalid_gmail_session');
+  sessionStorage.setItem(authStorageKey(GMAIL_SESSION_KEY, profileId), JSON.stringify(session));
+  return session;
+}
+
+export function loadGmailSession(sessionStorage, now = () => Date.now(), profileId = DEFAULT_AUTH_PROFILE_ID) {
+  const key = authStorageKey(GMAIL_SESSION_KEY, profileId);
+  const raw = sessionStorage?.getItem?.(key);
+  if (!raw || raw.length > 4096) return null;
+  try {
+    const session = sanitizeGmailSession(JSON.parse(raw));
+    if (!session || Date.parse(session.expiresAt) <= Number(now())) {
+      sessionStorage?.removeItem?.(key);
+      return null;
+    }
+    return session;
+  } catch {
+    sessionStorage?.removeItem?.(key);
+    return null;
+  }
+}
+
+export function sanitizeGoogleServicesSession(value) {
+  if (!value || typeof value !== 'object') return null;
+  const id = typeof value.id === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value.id) ? value.id : null;
+  const expiresAt = typeof value.expiresAt === 'string' && Number.isFinite(Date.parse(value.expiresAt))
+    ? value.expiresAt
+    : null;
+  if (!id || !expiresAt || value.scope !== 'google.services') return null;
+  return { id, expiresAt, scope: 'google.services' };
+}
+
+export function saveGoogleServicesSession(sessionStorage, value, profileId = DEFAULT_AUTH_PROFILE_ID) {
+  const session = sanitizeGoogleServicesSession(value);
+  if (!session) throw new Error('invalid_google_services_session');
+  sessionStorage.setItem(authStorageKey(GOOGLE_SERVICES_SESSION_KEY, profileId), JSON.stringify(session));
+  return session;
+}
+
+export function loadGoogleServicesSession(sessionStorage, now = () => Date.now(), profileId = DEFAULT_AUTH_PROFILE_ID) {
+  const key = authStorageKey(GOOGLE_SERVICES_SESSION_KEY, profileId);
+  const raw = sessionStorage?.getItem?.(key);
+  if (!raw || raw.length > 4096) return null;
+  try {
+    const session = sanitizeGoogleServicesSession(JSON.parse(raw));
+    if (!session || Date.parse(session.expiresAt) <= Number(now())) {
+      sessionStorage?.removeItem?.(key);
+      return null;
+    }
+    return session;
+  } catch {
+    sessionStorage?.removeItem?.(key);
+    return null;
+  }
+}
+
+export async function getDelegatedGoogleServiceItems({
+  serviceId,
+  exchangeUrl,
+  sessionStorage,
+  profileId = DEFAULT_AUTH_PROFILE_ID,
+  fetchImpl = globalThis.fetch
+}) {
+  const session = loadGoogleServicesSession(sessionStorage, () => Date.now(), profileId);
+  if (!session) throw new Error('google_services_reconnect_required');
+  const response = await fetchImpl(googleServicesUrlForExchange(exchangeUrl, serviceId), {
+    headers: { Authorization: `YayraServices ${session.id}`, Accept: 'application/json' }
+  });
+  const text = await readBoundedExchangeResponse(response);
+  if (!response.ok) {
+    if (response.status === 401) sessionStorage.removeItem(authStorageKey(GOOGLE_SERVICES_SESSION_KEY, profileId));
+    throw new Error(`google_service_failed:${response.status}:${safeExchangeErrorCode(text)}`);
+  }
+  let body;
+  try { body = JSON.parse(text); } catch { throw new Error('google_service_malformed_response'); }
+  if (!body?.ok || !Array.isArray(body.items)) throw new Error('google_service_malformed_response');
+  return { items: body.items.slice(0, 10), count: Number(body.count) || body.items.length };
+}
+
+export async function revokeDelegatedGoogleServicesSession({
+  exchangeUrl,
+  sessionStorage,
+  profileId = DEFAULT_AUTH_PROFILE_ID,
+  fetchImpl = globalThis.fetch
+}) {
+  const session = loadGoogleServicesSession(sessionStorage, () => Date.now(), profileId);
+  const key = authStorageKey(GOOGLE_SERVICES_SESSION_KEY, profileId);
+  sessionStorage?.removeItem?.(key);
+  if (!session) return { ok: true, providerRevoked: false };
+  try {
+    const response = await fetchImpl(googleServicesRevokeUrlForExchange(exchangeUrl), {
+      method: 'POST',
+      headers: { Authorization: `YayraServices ${session.id}`, Accept: 'application/json' }
+    });
+    return response.ok ? await response.json() : { ok: false };
+  } catch {
+    return { ok: false, error: 'revoke_unavailable' };
+  }
+}
+
 /**
  * Same parameter set as the Electron flow (including `prompt=consent
  * select_account` so "Switch account" shows Google's account chooser).
@@ -382,7 +681,13 @@ export function buildAuthorizationUrl({ clientId, redirectUri, state, codeChalle
   const validDriveScopes = Array.isArray(scopes)
     && scopes.length === DRIVE_SCOPES.length
     && scopes.every((scope, index) => scope === DRIVE_SCOPES[index]);
-  if (!validProfileScopes && !validDriveScopes) throw new Error('invalid_scopes');
+  const validGmailScopes = Array.isArray(scopes)
+    && scopes.length === GMAIL_SCOPES.length
+    && scopes.every((scope, index) => scope === GMAIL_SCOPES[index]);
+  const validServicesScopes = Array.isArray(scopes)
+    && scopes.length === GOOGLE_SERVICES_SCOPES.length
+    && scopes.every((scope, index) => scope === GOOGLE_SERVICES_SCOPES[index]);
+  if (!validProfileScopes && !validDriveScopes && !validGmailScopes && !validServicesScopes) throw new Error('invalid_scopes');
   const url = new URL(GOOGLE_AUTH_ENDPOINT);
   url.searchParams.set('client_id', clientId);
   url.searchParams.set('redirect_uri', redirectUri);
@@ -392,7 +697,8 @@ export function buildAuthorizationUrl({ clientId, redirectUri, state, codeChalle
   url.searchParams.set('code_challenge', codeChallenge);
   url.searchParams.set('code_challenge_method', 'S256');
   url.searchParams.set('prompt', 'consent select_account');
-  if (validDriveScopes) url.searchParams.set('access_type', 'offline');
+  url.searchParams.set('include_granted_scopes', 'true');
+  if (validDriveScopes || validGmailScopes || validServicesScopes) url.searchParams.set('access_type', 'offline');
   return url.toString();
 }
 
@@ -412,7 +718,7 @@ export async function beginSignIn({
   navigate
 }) {
   if (!clientId) throw new Error('not_configured');
-  if (!['profile', 'drive-readonly'].includes(capability)) throw new Error('invalid_capability');
+  if (!['profile', 'drive-readonly', 'gmail-readonly', GOOGLE_SERVICES_CAPABILITY].includes(capability)) throw new Error('invalid_capability');
   const safeOrigin = validatedWebOrigin(origin);
   const { codeVerifier, codeChallenge } = await generatePkcePair(cryptoImpl);
   const state = generateState(cryptoImpl);
@@ -425,7 +731,10 @@ export async function beginSignIn({
     returnTo: safeReturnToPath(returnTo, safeOrigin),
     startedAt: new Date().toISOString()
   }));
-  const scopes = capability === 'drive-readonly' ? DRIVE_SCOPES : DEFAULT_SCOPES;
+  const scopes = capability === 'drive-readonly'
+    ? DRIVE_SCOPES
+    : (capability === 'gmail-readonly' ? GMAIL_SCOPES
+      : (capability === GOOGLE_SERVICES_CAPABILITY ? GOOGLE_SERVICES_SCOPES : DEFAULT_SCOPES));
   const url = buildAuthorizationUrl({ clientId, redirectUri, state, codeChallenge, scopes });
   navigate(url);
   return url;
@@ -486,7 +795,7 @@ export async function completeSignIn({
     || !/^[A-Za-z0-9_-]{8,256}$/.test(pending.state)
     || typeof pending.codeVerifier !== 'string'
     || !/^[A-Za-z0-9._~-]{43,128}$/.test(pending.codeVerifier)
-    || (pending.capability !== undefined && !['profile', 'drive-readonly'].includes(pending.capability))
+    || (pending.capability !== undefined && !['profile', 'drive-readonly', 'gmail-readonly', GOOGLE_SERVICES_CAPABILITY].includes(pending.capability))
     || (pending.profileId !== undefined && normalizeAuthProfileId(pending.profileId) !== pending.profileId)
     || typeof pending.startedAt !== 'string') {
     throw new Error('corrupt_pending_sign_in');
@@ -504,7 +813,9 @@ export async function completeSignIn({
   if (parsed.state !== pending.state) throw new Error('state_mismatch');
   if (!parsed.ok) throw new Error(parsed.error);
 
-  const capability = pending.capability === 'drive-readonly' ? 'drive-readonly' : 'profile';
+  const capability = ['drive-readonly', 'gmail-readonly', GOOGLE_SERVICES_CAPABILITY].includes(pending.capability)
+    ? pending.capability
+    : 'profile';
   const response = await fetchImpl(safeExchangeUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
@@ -530,11 +841,21 @@ export async function completeSignIn({
   const driveSession = capability === 'drive-readonly'
     ? sanitizeDriveSession(body?.driveSession)
     : null;
+  const gmailSession = capability === 'gmail-readonly'
+    ? sanitizeGmailSession(body?.gmailSession)
+    : null;
+  const googleServicesSession = capability === GOOGLE_SERVICES_CAPABILITY
+    ? sanitizeGoogleServicesSession(body?.googleServicesSession)
+    : null;
   if (capability === 'drive-readonly' && !driveSession) throw new Error('exchange_malformed_drive_session');
+  if (capability === 'gmail-readonly' && !gmailSession) throw new Error('exchange_malformed_gmail_session');
+  if (capability === GOOGLE_SERVICES_CAPABILITY && !googleServicesSession) throw new Error('exchange_malformed_google_services_session');
   return {
     profile,
     ...(pending.profileId !== undefined ? { profileId: normalizeAuthProfileId(pending.profileId) } : {}),
     ...(driveSession ? { driveSession } : {}),
+    ...(gmailSession ? { gmailSession } : {}),
+    ...(googleServicesSession ? { googleServicesSession } : {}),
     returnTo: safeReturnToPath(pending.returnTo, safeOrigin)
   };
 }
@@ -631,6 +952,64 @@ export function createWebAuthBridge({
         return { ok: false, error: message };
       }
     },
+    async connectGmail(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
+      if (!clientId) return { ok: false, error: 'not_configured' };
+      emit({ type: 'gmail-connecting', profileId });
+      try {
+        await beginSignIn({
+          clientId,
+          origin,
+          returnTo: getPath(),
+          capability: 'gmail-readonly',
+          profileId,
+          sessionStorage,
+          cryptoImpl,
+          navigate
+        });
+        return { ok: true, pending: true };
+      } catch (err) {
+        const message = err && err.message ? err.message : String(err);
+        emit({ type: 'gmail-error', profileId, message });
+        return { ok: false, error: message };
+      }
+    },
+    async connectGoogleServices(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
+      if (!clientId) return { ok: false, error: 'not_configured' };
+      emit({ type: 'google-services-connecting', profileId });
+      try {
+        await beginSignIn({
+          clientId,
+          origin,
+          returnTo: getPath(),
+          capability: GOOGLE_SERVICES_CAPABILITY,
+          profileId,
+          sessionStorage,
+          cryptoImpl,
+          navigate
+        });
+        return { ok: true, pending: true };
+      } catch (err) {
+        const message = err && err.message ? err.message : String(err);
+        emit({ type: 'google-services-error', profileId, message });
+        return { ok: false, error: message };
+      }
+    },
+    async getGoogleServiceItems(serviceId, claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
+      try {
+        const result = await getDelegatedGoogleServiceItems({ serviceId, exchangeUrl, sessionStorage: localStorage, profileId, fetchImpl });
+        return { ok: true, ...result };
+      } catch (err) {
+        return { ok: false, error: err?.message || String(err) };
+      }
+    },
+    async getGoogleServicesSession(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
+      const session = loadGoogleServicesSession(localStorage, () => Date.now(), profileId);
+      return session ? { connected: true, expiresAt: session.expiresAt, scopes: GOOGLE_SERVICES_SCOPES } : { connected: false };
+    },
     async downloadDriveFile(fileId, claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
       const profileId = normalizeAuthProfileId(claimedProfileId);
       try {
@@ -645,18 +1024,47 @@ export function createWebAuthBridge({
       const session = loadDriveSession(localStorage, () => Date.now(), profileId);
       return session ? { connected: true, expiresAt: session.expiresAt } : { connected: false };
     },
+    async listGmailMessages(options = {}, claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
+      try {
+        const result = await listDelegatedGmailMessages({ options, exchangeUrl, sessionStorage: localStorage, profileId, fetchImpl });
+        return { ok: true, ...result };
+      } catch (err) {
+        return { ok: false, error: err?.message || String(err) };
+      }
+    },
+    async getGmailMessage(messageId, claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
+      try {
+        const message = await getDelegatedGmailMessage({ messageId, exchangeUrl, sessionStorage: localStorage, profileId, fetchImpl });
+        return { ok: true, message };
+      } catch (err) {
+        return { ok: false, error: err?.message || String(err) };
+      }
+    },
+    async getGmailSession(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
+      const session = loadGmailSession(localStorage, () => Date.now(), profileId);
+      return session ? { connected: true, expiresAt: session.expiresAt } : { connected: false };
+    },
     async signOut(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
       const profileId = normalizeAuthProfileId(claimedProfileId);
       clearProfile(localStorage, profileId);
       emit({ type: 'signed-out', profileId });
-      await revokeDelegatedDriveSession({ exchangeUrl, sessionStorage: localStorage, profileId, fetchImpl });
+      await Promise.all([
+        revokeDelegatedDriveSession({ exchangeUrl, sessionStorage: localStorage, profileId, fetchImpl }),
+        revokeDelegatedGmailSession({ exchangeUrl, sessionStorage: localStorage, profileId, fetchImpl }),
+        revokeDelegatedGoogleServicesSession({ exchangeUrl, sessionStorage: localStorage, profileId, fetchImpl })
+      ]);
       return { ok: true };
     },
     async getSession(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
       const profileId = normalizeAuthProfileId(claimedProfileId);
       const saved = loadProfile(localStorage, profileId);
       if (!saved) return { signedIn: false };
-      return { signedIn: true, profile: saved.profile, savedAt: saved.savedAt };
+      const services = loadGoogleServicesSession(localStorage, () => Date.now(), profileId);
+      const result = { signedIn: true, profile: saved.profile, savedAt: saved.savedAt };
+      return services ? { ...result, servicesConnected: true, scopes: GOOGLE_SERVICES_SCOPES } : result;
     },
     onEvent(listener) {
       listeners.add(listener);

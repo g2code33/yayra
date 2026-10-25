@@ -75,14 +75,26 @@ export CLOUDFLARE_PROJECT_NAME='yayra'
 npm run deploy:cloudflare
 ```
 
-## 3a. Google OAuth and delegated Drive sessions
+## 3a. Google OAuth and delegated Gmail/Drive/Google-services sessions
 
 The Worker is the token-isolation boundary for Web/PWA and Capacitor. Basic
 Google sign-in uses `/auth/google/exchange` and returns only a verified profile.
-The separately consented Drive fallback stores Google credentials encrypted in
-Cloudflare KV and gives the app only an opaque, origin-bound capability for
-`/api/drive/download`; `/api/drive/session/revoke` deletes it on logout before
-best-effort provider revocation.
+Separately consented Gmail-readonly, Drive-readonly, and broader Google-services
+flows store Google credentials encrypted in Cloudflare KV and give the app only
+opaque, origin-bound capabilities. Gmail uses `/api/gmail/messages`,
+`/api/gmail/message`, and `/api/gmail/session/revoke`; Drive uses
+`/api/drive/download` and `/api/drive/session/revoke`; Google services use
+`/api/google/services?service=<allow-listed-id>` and
+`/api/google/services/session/revoke` with a `YayraServices <id>` Authorization
+header. Revocation deletes the local capability before best-effort provider
+revocation.
+
+The Google-services session uses separate `google-services-session:` KV keys
+and stores only the scopes Google actually granted. The service endpoint builds
+its upstream Google API URL from the static allow-list in
+`src/services/googleServiceCatalog.js`; renderer-provided upstream URLs are
+never accepted. Responses are bounded and normalized to display fields, with
+unsafe URLs dropped.
 
 Create the applicable OAuth client bindings as Worker secrets (never `[vars]`):
 
@@ -98,7 +110,15 @@ all deployment-specific OAuth configuration out of the repository; native
 Google client types do not have client secrets. Omit a platform binding if that
 platform is not shipped.
 
-Provision production and preview KV namespaces once:
+Enable the Gmail, Drive, Calendar, YouTube Data, People, Photos Library, Tasks,
+and Classroom APIs as applicable to the Google-services previews you ship, and
+configure the OAuth consent screen for the enumerated read-only scopes in
+`docs/GOOGLE_SIGNIN.md`. Gmail and other restricted scopes may require Google
+verification, a privacy policy, and a security assessment.
+
+Provision production and preview KV namespaces once. The binding retains its
+legacy `GOOGLE_DRIVE_SESSIONS` name for deployment compatibility, but stores
+separately prefixed Gmail, Drive, and Google-services records:
 
 ```bash
 npx --yes wrangler@4 kv namespace create GOOGLE_DRIVE_SESSIONS --config wrangler.worker.toml
@@ -125,8 +145,8 @@ openssl rand -base64 48 | npx --yes wrangler@4 secret put GOOGLE_DRIVE_SESSION_S
 
 The secret must be at least 32 characters. Never reuse an OAuth client secret,
 Cloudflare API token, NVIDIA key, or package-signing key. Rotating this value or
-deleting the namespace intentionally invalidates every delegated session; users
-will be prompted to reconnect. Deploy after adding the binding:
+deleting the namespace intentionally invalidates every delegated Gmail/Drive
+session; users will be prompted to reconnect. Deploy after adding the binding:
 
 ```bash
 npm run deploy:cloudflare:worker
@@ -139,9 +159,10 @@ npx --yes wrangler@4 kv namespace list
 npx --yes wrangler@4 secret list --config wrangler.worker.toml
 ```
 
-The Drive routes return `501 drive_session_not_configured` unless the KV binding
-supports `get`, `put`, and `delete` and the encryption secret is present. This
-is intentional fail-closed behavior. Keep
+The delegated routes return `501 drive_session_not_configured`,
+`gmail_session_not_configured`, or `google_services_session_not_configured`
+unless the KV binding supports `get`, `put`, and `delete` and the encryption
+secret is present. This is intentional fail-closed behavior. Keep
 `GOOGLE_WEB_ALLOWED_ORIGINS`/`GOOGLE_NATIVE_ALLOWED_ORIGINS` exact, register
 matching callbacks in Google Cloud, and read `docs/GOOGLE_SIGNIN.md` for the
 OAuth client matrix, threat model, revocation behavior, and manual tests.

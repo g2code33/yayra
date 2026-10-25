@@ -429,6 +429,103 @@ test('Drive delegation keeps Google tokens encrypted in Worker KV and streams a 
   }
 });
 
+test('Gmail delegation keeps tokens encrypted, origin-bound, and returns only sanitized mailbox data', async () => {
+  const originalFetch = globalThis.fetch;
+  const records = new Map();
+  const kv = {
+    async get(key) { return records.get(key) || null; },
+    async put(key, value) { records.set(key, value); },
+    async delete(key) { records.delete(key); }
+  };
+  const env = {
+    ...AUTH_ENV,
+    GOOGLE_DRIVE_SESSIONS: kv,
+    GOOGLE_DRIVE_SESSION_SECRET: 'test-only-delegated-session-secret-32-bytes-minimum'
+  };
+  const encoded = Buffer.from('Private message body', 'utf8').toString('base64url');
+  const upstream = [];
+  globalThis.fetch = async (target, options = {}) => {
+    const url = String(target);
+    upstream.push({ url, options });
+    if (url.includes('oauth2.googleapis.com/token')) {
+      return new Response(JSON.stringify({
+        access_token: 'ya29.gmail-private', refresh_token: '1//gmail-refresh-private', expires_in: 3600,
+        scope: 'openid email profile https://www.googleapis.com/auth/gmail.readonly'
+      }), { status: 200 });
+    }
+    if (url.includes('/oauth2/v3/userinfo')) {
+      return new Response(JSON.stringify({ sub: 'gmail-user', name: 'Gmail User', email: 'gmail@example.com' }), { status: 200 });
+    }
+    if (url.includes('/gmail/v1/users/me/messages?')) {
+      return new Response(JSON.stringify({ messages: [{ id: 'msg_123' }], resultSizeEstimate: 1 }), { status: 200 });
+    }
+    if (url.includes('msg_123?format=metadata')) {
+      return new Response(JSON.stringify({
+        id: 'msg_123', threadId: 'thread_123', labelIds: ['INBOX', 'UNREAD'], snippet: 'Private preview', internalDate: '1700000000000',
+        payload: { headers: [{ name: 'Subject', value: 'A subject' }, { name: 'From', value: 'Sender <sender@example.com>' }] }
+      }), { status: 200 });
+    }
+    if (url.includes('msg_123?format=full')) {
+      return new Response(JSON.stringify({
+        id: 'msg_123', threadId: 'thread_123', labelIds: ['INBOX'], snippet: 'Private preview', internalDate: '1700000000000',
+        payload: {
+          mimeType: 'text/plain', body: { data: encoded },
+          headers: [{ name: 'Subject', value: 'A subject' }, { name: 'From', value: 'Sender <sender@example.com>' }]
+        }
+      }), { status: 200 });
+    }
+    if (url === 'https://oauth2.googleapis.com/revoke') return new Response('', { status: 200 });
+    throw new Error(`unexpected upstream: ${url}`);
+  };
+  try {
+    const exchange = await worker.fetch(exchangeRequest({
+      code: 'gmail-code', codeVerifier: VALID_CODE_VERIFIER,
+      redirectUri: 'https://yayra.pages.dev/auth/callback', platform: 'web', capability: 'gmail-readonly'
+    }, 'POST', { Origin: 'https://yayra.pages.dev', 'cf-connecting-ip': '203.0.113.250' }), env);
+    assert.equal(exchange.status, 200);
+    const exchanged = await exchange.json();
+    assert.equal(exchanged.profile.email, 'gmail@example.com');
+    assert.equal(exchanged.gmailSession.scope, 'gmail.readonly');
+    assert.match(exchanged.gmailSession.id, /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(JSON.stringify(exchanged).includes('gmail-private'), false);
+    assert.equal(records.size, 1);
+    assert.match([...records.keys()][0], /^gmail-session:/);
+    assert.equal([...records.values()][0].includes('gmail-refresh-private'), false);
+
+    const authorization = `YayraGmail ${exchanged.gmailSession.id}`;
+    const list = await worker.fetch(new Request('https://yayra-updates-api.g2code335.workers.dev/api/gmail/messages?maxResults=25&q=in%3Ainbox', {
+      headers: { Origin: 'https://yayra.pages.dev', Authorization: authorization, 'cf-connecting-ip': '203.0.113.251' }
+    }), env);
+    assert.equal(list.status, 200);
+    const listed = await list.json();
+    assert.equal(listed.messages[0].headers.subject, 'A subject');
+    assert.equal(JSON.stringify(listed).includes('ya29.'), false);
+
+    const opened = await worker.fetch(new Request('https://yayra-updates-api.g2code335.workers.dev/api/gmail/message?id=msg_123', {
+      headers: { Origin: 'https://yayra.pages.dev', Authorization: authorization, 'cf-connecting-ip': '203.0.113.252' }
+    }), env);
+    assert.equal(opened.status, 200);
+    assert.equal((await opened.json()).message.bodyText, 'Private message body');
+    const gmailCalls = upstream.filter((call) => call.url.includes('gmail.googleapis.com'));
+    assert.ok(gmailCalls.length >= 3);
+    assert.ok(gmailCalls.every((call) => call.options.headers.Authorization === 'Bearer ya29.gmail-private'));
+
+    const foreign = await worker.fetch(new Request('https://yayra-updates-api.g2code335.workers.dev/api/gmail/messages?maxResults=25', {
+      headers: { Origin: 'https://attacker.example', Authorization: authorization, 'cf-connecting-ip': '203.0.113.253' }
+    }), env);
+    assert.equal(foreign.status, 403);
+
+    const revoke = await worker.fetch(new Request('https://yayra-updates-api.g2code335.workers.dev/api/gmail/session/revoke', {
+      method: 'POST',
+      headers: { Origin: 'https://yayra.pages.dev', Authorization: authorization, 'cf-connecting-ip': '203.0.113.254' }
+    }), env);
+    assert.equal(revoke.status, 200);
+    assert.equal(records.size, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('auth exchange passes Google OAuth error codes through without echoing request contents', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response(JSON.stringify({ error: 'invalid_grant', error_description: 'Code was already redeemed.' }), { status: 400 });
@@ -770,3 +867,95 @@ function makeFakeEdgeCache() {
     }
   };
 }
+
+test('Google services delegation reflects the exact account, keeps tokens encrypted, and returns only sanitized service items', async () => {
+  const originalFetch = globalThis.fetch;
+  const records = new Map();
+  const kv = {
+    async get(key) { return records.get(key) || null; },
+    async put(key, value) { records.set(key, value); },
+    async delete(key) { records.delete(key); }
+  };
+  const env = {
+    ...AUTH_ENV,
+    GOOGLE_DRIVE_SESSIONS: kv,
+    GOOGLE_DRIVE_SESSION_SECRET: 'test-only-delegated-session-secret-32-bytes-minimum'
+  };
+  const scope = [
+    'openid email profile',
+    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/drive.readonly',
+    'https://www.googleapis.com/auth/calendar.readonly'
+  ].join(' ');
+  const upstream = [];
+  globalThis.fetch = async (target, options = {}) => {
+    const url = String(target);
+    upstream.push({ url, options });
+    if (url.includes('oauth2.googleapis.com/token')) {
+      return new Response(JSON.stringify({
+        access_token: 'ya29.services-private', refresh_token: '1//services-refresh-private',
+        expires_in: 3600, scope
+      }), { status: 200 });
+    }
+    if (url.includes('/oauth2/v3/userinfo')) {
+      return new Response(JSON.stringify({ sub: 'services-user', name: 'Selected User', email: 'selected@example.com' }), { status: 200 });
+    }
+    if (url.includes('/drive/v3/files?')) {
+      return new Response(JSON.stringify({ files: [
+        { id: 'file-1', name: 'Private proposal.docx', modifiedTime: '2026-10-25T00:00:00Z', webViewLink: 'https://docs.google.com/document/d/file-1' },
+        { id: 'file-2', name: '<script>unsafe</script>', modifiedTime: '2026-10-24T00:00:00Z', webViewLink: 'javascript:alert(1)' }
+      ] }), { status: 200 });
+    }
+    if (url === 'https://oauth2.googleapis.com/revoke') return new Response('', { status: 200 });
+    throw new Error(`unexpected upstream: ${url}`);
+  };
+  try {
+    const exchange = await worker.fetch(exchangeRequest({
+      code: 'services-code', codeVerifier: VALID_CODE_VERIFIER,
+      redirectUri: 'https://yayra.pages.dev/auth/callback', platform: 'web', capability: 'google-services'
+    }, 'POST', { Origin: 'https://yayra.pages.dev', 'cf-connecting-ip': '203.0.113.261' }), env);
+    assert.equal(exchange.status, 200);
+    const exchanged = await exchange.json();
+    assert.equal(exchanged.profile.email, 'selected@example.com');
+    assert.equal(exchanged.googleServicesSession.scope, 'google.services');
+    assert.match(exchanged.googleServicesSession.id, /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(JSON.stringify(exchanged).includes('services-private'), false);
+    assert.equal(records.size, 1);
+    assert.match([...records.keys()][0], /^google-services-session:/);
+    assert.equal([...records.values()][0].includes('services-refresh-private'), false);
+
+    const authorization = `YayraServices ${exchanged.googleServicesSession.id}`;
+    const serviceUrl = 'https://yayra-updates-api.g2code335.workers.dev/api/google/services?service=drive';
+    const list = await worker.fetch(new Request(serviceUrl, {
+      headers: { Origin: 'https://yayra.pages.dev', Authorization: authorization, 'cf-connecting-ip': '203.0.113.262' }
+    }), env);
+    assert.equal(list.status, 200);
+    const listed = await list.json();
+    assert.equal(listed.ok, true);
+    assert.equal(listed.service, 'drive');
+    assert.equal(listed.items[0].title, 'Private proposal.docx');
+    assert.equal(listed.items[1].url, '', 'unsafe upstream URL is discarded');
+    assert.equal(JSON.stringify(listed).includes('ya29.'), false);
+    assert.ok(upstream.some((call) => call.url.includes('/drive/v3/files?') && call.options.headers.Authorization === 'Bearer ya29.services-private'));
+
+    const foreign = await worker.fetch(new Request(serviceUrl, {
+      headers: { Origin: 'https://attacker.example', Authorization: authorization, 'cf-connecting-ip': '203.0.113.263' }
+    }), env);
+    assert.equal(foreign.status, 403);
+
+    const unknown = await worker.fetch(new Request(serviceUrl.replace('service=drive', 'service=not-real'), {
+      headers: { Origin: 'https://yayra.pages.dev', Authorization: authorization, 'cf-connecting-ip': '203.0.113.264' }
+    }), env);
+    assert.equal(unknown.status, 400);
+
+    const revoke = await worker.fetch(new Request('https://yayra-updates-api.g2code335.workers.dev/api/google/services/session/revoke', {
+      method: 'POST',
+      headers: { Origin: 'https://yayra.pages.dev', Authorization: authorization, 'cf-connecting-ip': '203.0.113.265' }
+    }), env);
+    assert.equal(revoke.status, 200);
+    assert.deepEqual(await revoke.json(), { ok: true, providerRevoked: true });
+    assert.equal(records.size, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

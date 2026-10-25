@@ -316,7 +316,7 @@ function createFakeWebContentsView() {
   };
 }
 
-function makeHarness({ authHosts, autofillPreloadPath, pageUnresponsiveReloadDelayMs, pageUnresponsiveReloadCooldownMs, downloadHandoffGraceMs, attachDownloadSession, webauthnSession, Dialog, openExternalImpl } = {}) {
+function makeHarness({ authHosts, autofillPreloadPath, pageUnresponsiveReloadDelayMs, pageUnresponsiveReloadCooldownMs, downloadHandoffGraceMs, attachDownloadSession, webauthnSession, Dialog, openExternalImpl, googleAuthParityEnabled, openGoogleChromeProfile, applyGoogleAuthUserAgentMetadata, websitePasskeyProvider } = {}) {
   const handlers = new Map();
   const listeners = new Map();
   const ipcMain = {
@@ -376,6 +376,10 @@ function makeHarness({ authHosts, autofillPreloadPath, pageUnresponsiveReloadDel
     pageUnresponsiveReloadCooldownMs,
     downloadHandoffGraceMs,
     attachDownloadSession,
+    googleAuthParityEnabled,
+    openGoogleChromeProfile,
+    applyGoogleAuthUserAgentMetadata,
+    websitePasskeyProvider,
     logger: { error: () => {}, warn: () => {} }
   });
 
@@ -797,6 +801,79 @@ test('webview bridge: top-level Google OAuth and account sign-in redirects are c
   wc.emit('will-redirect', ordinaryGoogle, { url: 'https://www.google.com/search?q=ghana', isMainFrame: true });
   assert.equal(ordinaryGoogle.prevented, false, 'ordinary Google search is not rerouted by auth handling');
   assert.deepEqual(externalCalls, [authUrl]);
+});
+
+test('Google parity: first-party sign-in loads untouched in the persistent view, while third-party OAuth stays external', async () => {
+  const chromeCalls = [];
+  const metadataCalls = [];
+  const providerCalls = { attach: [], detach: [] };
+  const provider = {
+    attach: (options) => { providerCalls.attach.push(options); return Promise.resolve({ ok: true }); },
+    detach: (wc) => providerCalls.detach.push(wc)
+  };
+  const { handlers, views, externalCalls } = makeHarness({
+    googleAuthParityEnabled: () => true,
+    openGoogleChromeProfile: (details) => { chromeCalls.push(details); return { ok: true }; },
+    applyGoogleAuthUserAgentMetadata: async (wc, options) => { metadataCalls.push({ wc, options }); return true; },
+    websitePasskeyProvider: provider
+  });
+  const loginUrl = 'https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fmail.google.com%2Fmail%2Fu%2F0%2F%23inbox';
+  const result = await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-parity', url: loginUrl, profileId: 'alice' });
+  assert.equal(result.handedOffToSystemBrowser, false);
+  assert.equal(externalCalls.length, 0, 'first-party Google sign-in is attempted in Yayra only when parity is opted in');
+  assert.equal(views[0].webContents.getURL(), loginUrl);
+  assert.equal(providerCalls.attach.length, 0, 'Yayra virtual authenticator is not attached before the Google auth document loads');
+  assert.equal(metadataCalls.length, 1, 'honest UAData metadata is applied before loadURL');
+  assert.equal(metadataCalls[0].options.userAgent.includes(`Chrome/${process.versions.chrome}`), true);
+  assert.equal(chromeCalls.length, 0);
+
+  let executed = 0;
+  views[0].webContents.executeJavaScript = async () => { executed += 1; return true; };
+  views[0].webContents.emit('dom-ready');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(executed, 0, 'Google sign-in page receives no injected page JavaScript');
+
+  const thirdParty = 'https://accounts.google.com/o/oauth2/v2/auth?client_id=site-client&redirect_uri=https%3A%2F%2Fexample.test%2Fcallback';
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-third-party', url: thirdParty, profileId: 'alice' });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(externalCalls, [thirdParty], 'third-party OAuth remains external even with parity enabled');
+});
+
+test('Google parity: private tabs never use or create persistent Google profile state', async () => {
+  const chromeCalls = [];
+  const { handlers, externalCalls, sentEvents } = makeHarness({
+    googleAuthParityEnabled: () => true,
+    openGoogleChromeProfile: (details) => { chromeCalls.push(details); return { ok: true }; }
+  });
+  const url = 'https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fmail.google.com%2F';
+  const result = await handlers.get('yayra:webview-ensure')(null, { tabId: 'private-google', url, isPrivate: true, profileId: 'alice' });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(result.handedOffToSystemBrowser, true);
+  assert.deepEqual(externalCalls, [url]);
+  assert.deepEqual(chromeCalls, [], 'private tab cannot touch the persistent Yayra Chrome cookie jar');
+  assert.equal(sentEvents.some((event) => event.payload.type === 'google-account-auth-required'), false, 'private-tab OAuth grant is not persisted in a browsing profile');
+});
+
+test('Google parity: rejected embedded sign-in falls back to a fresh ServiceLogin in the dedicated Chrome profile', async () => {
+  const chromeCalls = [];
+  const { handlers, views, sentEvents } = makeHarness({
+    googleAuthParityEnabled: () => true,
+    openGoogleChromeProfile: (details) => { chromeCalls.push(details); return { ok: true }; }
+  });
+  await handlers.get('yayra:webview-ensure')(null, {
+    tabId: 'tab-rejected', profileId: 'alice',
+    url: 'https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fmail.google.com%2Fmail%2Fu%2F0%2F'
+  });
+  const rejected = 'https://accounts.google.com/signin/rejected?continue=https%3A%2F%2Fmail.google.com%2Fmail%2Fu%2F0%2F%23inbox&hl=en';
+  views[0].webContents.emit('did-navigate', {}, rejected);
+  assert.equal(chromeCalls.length, 1);
+  const target = new URL(chromeCalls[0].url);
+  assert.equal(target.pathname, '/ServiceLogin', 'never reopen the rejected page');
+  assert.equal(target.searchParams.get('continue'), 'https://mail.google.com/mail/u/0/#inbox');
+  const event = sentEvents.find((item) => item.payload.type === 'google-sign-in-rejected');
+  assert.equal(event.payload.fallbackOpened, true);
+  assert.equal(event.payload.chromeProfileOpened, true);
+  assert.equal(JSON.stringify(event.payload).includes('continue='), false, 'continuation query does not cross IPC');
 });
 
 test('webview bridge: HTTP Google auth redirects are upgraded before the system browser opens', async () => {

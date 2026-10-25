@@ -221,6 +221,89 @@ test('authBridge: Drive consent and API download stay inside the initiating prof
   assert.deepEqual(seenAuthorizations, ['Bearer work-access', 'Bearer work-access']);
 });
 
+test('authBridge: Gmail consent, inbox metadata, and plain-text message bodies stay profile-scoped and token-free over IPC', async () => {
+  const ipcMain = fakeIpcMain();
+  const personalStore = fakeAuthStore();
+  const workStore = fakeAuthStore();
+  const workWindow = fakeWindow();
+  const workSender = { id: 880 };
+  let requestedScopes = null;
+  const requests = [];
+  const encodedBody = Buffer.from('Hello from Gmail\n<script>alert(1)</script>', 'utf8')
+    .toString('base64url');
+  const fetchImpl = async (url, options = {}) => {
+    requests.push({ url: String(url), authorization: options.headers?.Authorization });
+    if (String(url).includes('/messages?maxResults=')) {
+      return new Response(JSON.stringify({ messages: [{ id: 'msg_123' }], resultSizeEstimate: 1 }), { status: 200 });
+    }
+    if (String(url).includes('msg_123?format=metadata')) {
+      return new Response(JSON.stringify({
+        id: 'msg_123', threadId: 'thread_123', labelIds: ['INBOX', 'UNREAD'], snippet: 'Preview', internalDate: '1700000000000',
+        payload: { headers: [{ name: 'Subject', value: '<img onerror=alert(1)>' }, { name: 'From', value: 'Sender <s@example.com>' }] }
+      }), { status: 200 });
+    }
+    if (String(url).includes('msg_123?format=full')) {
+      return new Response(JSON.stringify({
+        id: 'msg_123', threadId: 'thread_123', labelIds: ['INBOX'], snippet: 'Preview', internalDate: '1700000000000',
+        payload: {
+          mimeType: 'text/plain', body: { data: encodedBody },
+          headers: [{ name: 'Subject', value: 'Safe subject' }, { name: 'From', value: 'Sender <s@example.com>' }]
+        }
+      }), { status: 200 });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  createAuthBridge({
+    ipcMain,
+    shell: { openExternal: async () => {} },
+    getMainWindow: () => fakeWindow(),
+    getWindowForWebContents: () => workWindow,
+    getProfileIdForWebContents: () => 'profile-work',
+    getWindowsForProfile: () => [workWindow],
+    authStore: personalStore,
+    getAuthStore: (profileId) => profileId === 'profile-work' ? workStore : personalStore,
+    clientId: 'client',
+    clientSecret: 'secret',
+    fetchImpl,
+    signInImpl: async ({ scopes }) => {
+      requestedScopes = scopes;
+      return {
+        profile: { sub: 'work-google', email: 'work@example.com' },
+        tokens: {
+          access_token: 'gmail-private-access', refresh_token: 'gmail-private-refresh', expires_in: 3600,
+          scope: scopes.join(' ')
+        }
+      };
+    }
+  });
+
+  const connected = await ipcMain.invoke('yayra:auth-connect-gmail', { sender: workSender }, { profileId: 'default' });
+  assert.equal(connected.ok, true);
+  assert.ok(requestedScopes.includes('https://www.googleapis.com/auth/gmail.readonly'));
+  assert.equal(personalStore.load(), null, 'a forged renderer profile id cannot receive the Gmail credential');
+  assert.equal(workStore.load().profile.email, 'work@example.com');
+
+  const listed = await ipcMain.invoke('yayra:auth-list-gmail-messages', { sender: workSender }, {
+    profileId: 'default', query: 'in:inbox', maxResults: 25
+  });
+  assert.equal(listed.ok, true);
+  assert.equal(listed.messages[0].headers.subject, '<img onerror=alert(1)>');
+  assert.equal(Object.prototype.hasOwnProperty.call(listed, 'access_token'), false);
+
+  const opened = await ipcMain.invoke('yayra:auth-get-gmail-message', { sender: workSender }, {
+    profileId: 'default', messageId: 'msg_123'
+  });
+  assert.equal(opened.ok, true);
+  assert.match(opened.message.bodyText, /Hello from Gmail/);
+  assert.ok(requests.every((entry) => entry.authorization === 'Bearer gmail-private-access'));
+  assert.equal(workWindow.sent.some((entry) => JSON.stringify(entry).includes('gmail-private')), false,
+    'Google Gmail tokens never cross IPC events');
+  assert.deepEqual(workWindow.sent.map((entry) => entry.payload.type), [
+    'gmail-connecting', 'signed-in', 'gmail-connected'
+  ]);
+});
+
 test('authBridge: different profiles may complete OAuth concurrently while duplicate work in one profile is rejected', async () => {
   const ipcMain = fakeIpcMain();
   const stores = new Map([['default', fakeAuthStore()], ['profile-work', fakeAuthStore()]]);
@@ -507,4 +590,41 @@ test('authBridge: get-session reflects no prior session as signedIn: false', asy
   createAuthBridge({ ipcMain, shell: { openExternal: async () => {} }, getMainWindow: () => win, authStore, clientId: 'c', clientSecret: 's', signInImpl: async () => ({}) });
 
   assert.deepEqual(await ipcMain.invoke('yayra:auth-get-session'), { signedIn: false });
+});
+
+test('Google services OAuth uses the Yayra-owned Chrome profile as external user-agent while app sign-in stays on the OS browser', async () => {
+  const ipcMain = fakeIpcMain();
+  const win = fakeWindow();
+  const authStore = fakeAuthStore();
+  const systemOpened = [];
+  const chromeOpened = [];
+  const consentUrl = 'https://accounts.google.com/o/oauth2/v2/auth?client_id=client&redirect_uri=http%3A%2F%2F127.0.0.1%3A45123%2Fcallback&state=one-time&code_challenge=pkce';
+  const profile = { sub: 'google-subject', email: 'owner@example.com', emailVerified: true };
+  const scopes = ['openid', 'email', 'profile', 'https://www.googleapis.com/auth/gmail.readonly'];
+  const signInImpl = async ({ openExternal }) => {
+    await openExternal(consentUrl);
+    return { profile, tokens: { access_token: 'private-token', refresh_token: 'private-refresh', scope: scopes.join(' ') } };
+  };
+  createAuthBridge({
+    ipcMain,
+    shell: { openExternal: async (url) => systemOpened.push(url) },
+    getMainWindow: () => win,
+    authStore,
+    clientId: 'client',
+    clientSecret: 'secret',
+    fetchImpl: async () => new Response('{}', { status: 200 }),
+    signInImpl,
+    openGoogleAuthorization: (url, profileId) => { chromeOpened.push({ url, profileId }); return { ok: true }; }
+  });
+
+  const result = await ipcMain.invoke('yayra:auth-connect-google-services', null, { profileId: 'profile-work' });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.profile.email, 'owner@example.com');
+  assert.deepEqual(chromeOpened, [{ url: consentUrl, profileId: 'profile-work' }]);
+  assert.deepEqual(systemOpened, [], 'Google services OAuth uses the isolated real Chrome profile');
+  assert.equal(win.sent.some((entry) => JSON.stringify(entry.payload).includes('private-token')), false, 'tokens never cross IPC');
+
+  // The existing Yayra account sign-in path remains deliberately untouched.
+  await ipcMain.invoke('yayra:auth-sign-in');
+  assert.deepEqual(systemOpened, [consentUrl], 'Yayra sign-in continues to use the OS system browser');
 });

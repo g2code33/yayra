@@ -127,27 +127,44 @@ function withLiveApiRequestHeaders(headers = {}) {
  * so the rewritten WebP URL also escapes a stale/undecodable cached f_auto
  * response without clearing cookies, logins, local storage, or unrelated cache.
  */
-function installMediaCompatibility(session, logger = console) {
+function installMediaCompatibility(session, logger = console, requestPolicy = null) {
   if (!session || (typeof session !== 'object' && typeof session !== 'function')) return false;
   if (installedSessions.has(session)) return true;
   const onBeforeRequest = session.webRequest && session.webRequest.onBeforeRequest;
   if (typeof onBeforeRequest !== 'function') return false;
+  const hasPolicy = requestPolicy && typeof requestPolicy === 'object';
+  const allWebUrls = ['https://*/*', 'http://*/*'];
 
   try {
+    // Electron allows one listener per WebRequest stage. Compose privacy and
+    // media handling here instead of installing competing listeners where the
+    // last registration silently disables the first one.
     onBeforeRequest.call(
       session.webRequest,
-      { urls: [`https://${CLOUDINARY_HOST}/*`, `http://${CLOUDINARY_HOST}/*`] },
+      { urls: hasPolicy ? allWebUrls : [`https://${CLOUDINARY_HOST}/*`, `http://${CLOUDINARY_HOST}/*`] },
       (details, callback) => {
         let result = {};
         try {
-          // Main documents/scripts are never rewritten. CSS backgrounds and
-          // <img>/<picture> requests both arrive as resourceType "image".
-          if (!details?.resourceType || details.resourceType === 'image') {
+          const policyResult = typeof requestPolicy?.beforeRequest === 'function'
+            ? requestPolicy.beforeRequest(details) || {}
+            : {};
+          if (policyResult.cancel) {
+            result = { cancel: true };
+          } else if (typeof policyResult.redirectURL === 'string') {
+            result = { redirectURL: policyResult.redirectURL };
+          } else if (!(requestPolicy?.authSurfaceParity === true
+              && typeof requestPolicy?.isAuthSurfaceRequest === 'function'
+              && requestPolicy.isAuthSurfaceRequest(details))
+            && (!details?.resourceType || details.resourceType === 'image')) {
+            // Main documents/scripts are never rewritten. CSS backgrounds and
+            // <img>/<picture> requests both arrive as resourceType "image".
+            // Google auth-surface parity also prevents Cloudinary rewriting
+            // when a login page embeds a transformed image.
             const redirectURL = rewriteCloudinaryImageUrl(details?.url);
             if (redirectURL && redirectURL !== details?.url) result = { redirectURL };
           }
         } catch (error) {
-          logger?.warn?.(`[yayra:media] compatibility rewrite failed: ${error?.message || error}`);
+          logger?.warn?.(`[yayra:media] request policy failed: ${error?.message || error}`);
         }
         try { callback(result); }
         catch { /* request was canceled while the listener was running */ }
@@ -159,22 +176,57 @@ function installMediaCompatibility(session, logger = console) {
       try {
         onBeforeSendHeaders.call(
           session.webRequest,
-          { urls: ['https://*/*', 'http://*/*'] },
+          { urls: allWebUrls },
           (details, callback) => {
-            let result = {};
+            let headers = details.requestHeaders || {};
             try {
-              if (isLiveApiRequest(details)) {
-                result = { requestHeaders: withLiveApiRequestHeaders(details.requestHeaders || {}) };
+              // Google auth-surface parity: never add Cache-Control/Pragma or
+              // Cloudinary rewrites to Google's sign-in requests. Instead add
+              // the honest UA client hints from the parity module. This is a
+              // deliberate exception to the "rewrite live API requests" rule
+              // below: the sign-in endpoints look like /api/ to Chromium.
+              const parityAuthSurface = requestPolicy?.authSurfaceParity === true
+                && typeof requestPolicy?.isAuthSurfaceRequest === 'function'
+                && requestPolicy.isAuthSurfaceRequest(details);
+              if (parityAuthSurface) {
+                if (typeof requestPolicy?.beforeSendHeaders === 'function') {
+                  headers = requestPolicy.beforeSendHeaders(details, headers) || headers;
+                }
+              } else {
+                if (isLiveApiRequest(details)) headers = withLiveApiRequestHeaders(headers);
+                if (typeof requestPolicy?.beforeSendHeaders === 'function') {
+                  headers = requestPolicy.beforeSendHeaders(details, headers) || headers;
+                }
               }
             } catch (error) {
-              logger?.warn?.(`[yayra:media] live API freshness failed: ${error?.message || error}`);
+              logger?.warn?.(`[yayra:media] request-header policy failed: ${error?.message || error}`);
             }
-            try { callback(result); } catch { /* request already canceled */ }
+            try { callback({ requestHeaders: headers }); } catch { /* request already canceled */ }
           }
         );
       } catch (error) {
         // Media decoding still works even on an older WebRequest fake/API.
-        logger?.warn?.(`[yayra:media] could not install live API freshness: ${error?.message || error}`);
+        logger?.warn?.(`[yayra:media] could not install request-header policy: ${error?.message || error}`);
+      }
+    }
+
+    const onHeadersReceived = session.webRequest && session.webRequest.onHeadersReceived;
+    if (typeof onHeadersReceived === 'function' && typeof requestPolicy?.headersReceived === 'function') {
+      try {
+        onHeadersReceived.call(
+          session.webRequest,
+          { urls: allWebUrls },
+          (details, callback) => {
+            let headers = details.responseHeaders || {};
+            try { headers = requestPolicy.headersReceived(details, headers) || headers; }
+            catch (error) {
+              logger?.warn?.(`[yayra:media] response-header policy failed: ${error?.message || error}`);
+            }
+            try { callback({ responseHeaders: headers }); } catch { /* request already canceled */ }
+          }
+        );
+      } catch (error) {
+        logger?.warn?.(`[yayra:media] could not install response-header policy: ${error?.message || error}`);
       }
     }
 

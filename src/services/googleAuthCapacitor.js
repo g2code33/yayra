@@ -25,8 +25,9 @@
  *      the matching "Android"/"iOS" Google client (these client types
  *      have NO secret - they're verified by package name + SHA-1 /
  *      bundle ID instead), fetches userinfo, and returns the verified
- *      profile. A separate Drive-readonly flow additionally returns only an
- *      opaque Worker capability; raw Google tokens remain server-side.
+ *      profile. Separate Gmail-readonly and Drive-readonly flows additionally
+ *      return only opaque Worker capabilities; raw Google tokens remain
+ *      server-side.
  *
  * WHY THE PLUGIN CHOICE (researched 2026-10): the once-popular
  * @byteowls/capacitor-oauth2 is unmaintained (last publish 2023,
@@ -58,19 +59,32 @@ import {
   buildAuthorizationUrl,
   clearProfile,
   downloadDelegatedDriveFile,
+  getDelegatedGmailMessage,
+  getDelegatedGoogleServiceItems,
   DEFAULT_AUTH_PROFILE_ID,
   DRIVE_SCOPES,
+  GMAIL_SCOPES,
+  GOOGLE_SERVICES_CAPABILITY,
+  GOOGLE_SERVICES_SCOPES,
   generatePkcePair,
   generateState,
+  listDelegatedGmailMessages,
   loadProfile,
   normalizeAuthProfileId,
   normalizeGoogleProductOrigin,
   readBoundedExchangeResponse,
   revokeDelegatedDriveSession,
+  revokeDelegatedGmailSession,
+  revokeDelegatedGoogleServicesSession,
   safeExchangeErrorCode,
   sanitizeDriveSession,
+  sanitizeGmailSession,
   sanitizeGoogleProfile,
+  sanitizeGoogleServicesSession,
   saveDriveSession,
+  saveGmailSession,
+  saveGoogleServicesSession,
+  loadGoogleServicesSession,
   saveProfile,
   validatedExchangeUrl
 } from './googleAuthWeb.js';
@@ -133,7 +147,7 @@ export async function signInWithGoogleCapacitor({
   if (!clientId) throw new Error('not_configured');
   if (!exchangeUrl) throw new Error('not_configured');
   if (platform !== 'android' && platform !== 'ios') throw new Error('invalid_platform');
-  if (!['profile', 'drive-readonly'].includes(capability)) throw new Error('invalid_capability');
+  if (!['profile', 'drive-readonly', 'gmail-readonly', GOOGLE_SERVICES_CAPABILITY].includes(capability)) throw new Error('invalid_capability');
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 10 * 60 * 1000) throw new Error('invalid_timeout');
   const safeExchangeUrl = validatedExchangeUrl(exchangeUrl);
   // The Worker and generated Android/iOS manifests are bound to this one
@@ -147,7 +161,10 @@ export async function signInWithGoogleCapacitor({
     redirectUri,
     state,
     codeChallenge,
-    ...(capability === 'drive-readonly' ? { scopes: DRIVE_SCOPES } : {})
+    ...(capability === 'drive-readonly'
+      ? { scopes: DRIVE_SCOPES }
+      : (capability === 'gmail-readonly' ? { scopes: GMAIL_SCOPES }
+        : (capability === GOOGLE_SERVICES_CAPABILITY ? { scopes: GOOGLE_SERVICES_SCOPES } : {})))
   });
 
   // Subscribe BEFORE opening the browser - on a slow device the redirect
@@ -229,8 +246,19 @@ export async function signInWithGoogleCapacitor({
   const profile = sanitizeGoogleProfile(body?.profile);
   if (!profile) throw new Error('exchange_malformed_response');
   const driveSession = capability === 'drive-readonly' ? sanitizeDriveSession(body?.driveSession) : null;
+  const gmailSession = capability === 'gmail-readonly' ? sanitizeGmailSession(body?.gmailSession) : null;
+  const googleServicesSession = capability === GOOGLE_SERVICES_CAPABILITY
+    ? sanitizeGoogleServicesSession(body?.googleServicesSession)
+    : null;
   if (capability === 'drive-readonly' && !driveSession) throw new Error('exchange_malformed_drive_session');
-  return { profile, ...(driveSession ? { driveSession } : {}) };
+  if (capability === 'gmail-readonly' && !gmailSession) throw new Error('exchange_malformed_gmail_session');
+  if (capability === GOOGLE_SERVICES_CAPABILITY && !googleServicesSession) throw new Error('exchange_malformed_google_services_session');
+  return {
+    profile,
+    ...(driveSession ? { driveSession } : {}),
+    ...(gmailSession ? { gmailSession } : {}),
+    ...(googleServicesSession ? { googleServicesSession } : {})
+  };
 }
 
 /**
@@ -315,6 +343,70 @@ export function createCapacitorAuthBridge({
         signingIn = false;
       }
     },
+    async connectGmail(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
+      if (!clientId) return { ok: false, error: 'not_configured' };
+      if (signingIn) return { ok: false, error: 'sign_in_already_in_progress' };
+      signingIn = true;
+      emit({ type: 'gmail-connecting', profileId });
+      try {
+        const { profile, gmailSession } = await signInWithGoogleCapacitor({
+          clientId, platform, exchangeUrl, redirectUri, capability: 'gmail-readonly',
+          openBrowser, closeBrowser, onUrlOpen, onBrowserFinished,
+          fetchImpl, cryptoImpl, timeoutMs
+        });
+        saveProfile(localStorage, profile, profileId);
+        saveGmailSession(localStorage, gmailSession, profileId);
+        emit({ type: 'signed-in', profileId, profile });
+        emit({ type: 'gmail-connected', profileId, profile, expiresAt: gmailSession.expiresAt });
+        return { ok: true, profile, expiresAt: gmailSession.expiresAt };
+      } catch (err) {
+        const message = err && err.message ? err.message : String(err);
+        emit({ type: 'gmail-error', profileId, message });
+        return { ok: false, error: message };
+      } finally {
+        signingIn = false;
+      }
+    },
+    async connectGoogleServices(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
+      if (!clientId) return { ok: false, error: 'not_configured' };
+      if (signingIn) return { ok: false, error: 'sign_in_already_in_progress' };
+      signingIn = true;
+      emit({ type: 'google-services-connecting', profileId });
+      try {
+        const { profile, googleServicesSession } = await signInWithGoogleCapacitor({
+          clientId, platform, exchangeUrl, redirectUri, capability: GOOGLE_SERVICES_CAPABILITY,
+          openBrowser, closeBrowser, onUrlOpen, onBrowserFinished,
+          fetchImpl, cryptoImpl, timeoutMs
+        });
+        saveProfile(localStorage, profile, profileId);
+        saveGoogleServicesSession(localStorage, googleServicesSession, profileId);
+        emit({ type: 'signed-in', profileId, profile });
+        emit({ type: 'google-services-connected', profileId, profile, expiresAt: googleServicesSession.expiresAt });
+        return { ok: true, profile, expiresAt: googleServicesSession.expiresAt };
+      } catch (err) {
+        const message = err && err.message ? err.message : String(err);
+        emit({ type: 'google-services-error', profileId, message });
+        return { ok: false, error: message };
+      } finally {
+        signingIn = false;
+      }
+    },
+    async getGoogleServiceItems(serviceId, claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
+      try {
+        const result = await getDelegatedGoogleServiceItems({ serviceId, exchangeUrl, sessionStorage: localStorage, profileId, fetchImpl });
+        return { ok: true, ...result };
+      } catch (err) {
+        return { ok: false, error: err?.message || String(err) };
+      }
+    },
+    async getGoogleServicesSession(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
+      const session = loadGoogleServicesSession(localStorage, () => Date.now(), profileId);
+      return session ? { connected: true, expiresAt: session.expiresAt, scopes: GOOGLE_SERVICES_SCOPES } : { connected: false };
+    },
     async downloadDriveFile(fileId, claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
       const profileId = normalizeAuthProfileId(claimedProfileId);
       try {
@@ -324,18 +416,42 @@ export function createCapacitorAuthBridge({
         return { ok: false, error: err?.message || String(err) };
       }
     },
+    async listGmailMessages(options = {}, claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
+      try {
+        const result = await listDelegatedGmailMessages({ options, exchangeUrl, sessionStorage: localStorage, profileId, fetchImpl });
+        return { ok: true, ...result };
+      } catch (err) {
+        return { ok: false, error: err?.message || String(err) };
+      }
+    },
+    async getGmailMessage(messageId, claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
+      const profileId = normalizeAuthProfileId(claimedProfileId);
+      try {
+        const message = await getDelegatedGmailMessage({ messageId, exchangeUrl, sessionStorage: localStorage, profileId, fetchImpl });
+        return { ok: true, message };
+      } catch (err) {
+        return { ok: false, error: err?.message || String(err) };
+      }
+    },
     async signOut(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
       const profileId = normalizeAuthProfileId(claimedProfileId);
       clearProfile(localStorage, profileId);
       emit({ type: 'signed-out', profileId });
-      await revokeDelegatedDriveSession({ exchangeUrl, sessionStorage: localStorage, profileId, fetchImpl });
+      await Promise.all([
+        revokeDelegatedDriveSession({ exchangeUrl, sessionStorage: localStorage, profileId, fetchImpl }),
+        revokeDelegatedGmailSession({ exchangeUrl, sessionStorage: localStorage, profileId, fetchImpl }),
+        revokeDelegatedGoogleServicesSession({ exchangeUrl, sessionStorage: localStorage, profileId, fetchImpl })
+      ]);
       return { ok: true };
     },
     async getSession(claimedProfileId = DEFAULT_AUTH_PROFILE_ID) {
       const profileId = normalizeAuthProfileId(claimedProfileId);
       const saved = loadProfile(localStorage, profileId);
       if (!saved) return { signedIn: false };
-      return { signedIn: true, profile: saved.profile, savedAt: saved.savedAt };
+      const services = loadGoogleServicesSession(localStorage, () => Date.now(), profileId);
+      const result = { signedIn: true, profile: saved.profile, savedAt: saved.savedAt };
+      return services ? { ...result, servicesConnected: true, scopes: GOOGLE_SERVICES_SCOPES } : result;
     },
     onEvent(listener) {
       listeners.add(listener);

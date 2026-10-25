@@ -54,6 +54,11 @@ import {
   newDocumentRecoveryId
 } from '../services/documentRecovery.js';
 import { ExtensionManager, BUILT_IN_EXTENSIONS } from '../../../browser-contract/src/extensions/ExtensionManager.js';
+import {
+  GOOGLE_SERVICE_CATALOG,
+  googleServiceById,
+  googleServiceDestination
+} from '../../../../src/services/googleServiceCatalog.js';
 
 const MAX_DOCUMENT_SIZE_MB = Math.floor(MAX_DOCUMENT_BYTES / (1024 * 1024));
 // Native captures are lossless/full-resolution so overlay text remains clear.
@@ -178,6 +183,14 @@ const GOOGLE_INTERACTIVE_SIGNIN_PATH = /^\/(?:signin\/(?:v2|challenge|identifier
 const GOOGLE_ACCOUNT_PORTAL_PATH = /^\/(?:ManageAccount(?:\/|$)|signin\/?$)?$/i;
 const GOOGLE_REJECTED_SIGNIN_PATH = /^\/(?:signin\/rejected|v3\/signin\/rejected)(?:\/|$)/i;
 const MAX_AUTH_HANDOFF_URL_LENGTH = 8192;
+const PRIVACY_GUIDE_STEPS = Object.freeze(['welcome', 'browsing', 'safebrowsing', 'cookies', 'privacy', 'completion']);
+const PRIVACY_DELETE_RANGES = Object.freeze({
+  '15m': 15 * 60 * 1000,
+  '1h': 60 * 60 * 1000,
+  '24h': 24 * 60 * 60 * 1000,
+  '7d': 7 * 24 * 60 * 60 * 1000,
+  all: null
+});
 
 // Custom pointer themes replace Chromium's context-aware cursors, so Yayra
 // hit-tests real text nodes and restores the native I-beam only over readable,
@@ -437,6 +450,21 @@ export class BrowserShell {
       settingsActiveCategory: 'floating',
       activeSettingsCategory: 'floating',
       settingsSearchQuery: '',
+      privacySettingsView: 'overview',
+      privacyGuideStep: 0,
+      privacySafetyCheck: { status: 'idle', recommendations: [], stats: null },
+      privacySiteData: { status: 'idle', sites: [], query: '', totalSites: 0, truncated: false },
+      privacyDeleteRange: 'all',
+      privacyDeleteSelections: { history: true, cookies: true, cache: true, form: false },
+      privacyBlockedSites: [],
+      privacyPasswordReport: null,
+      googleServicesPreview: { status: 'idle', serviceId: null, items: [], error: null },
+      // Dedicated REAL Chrome profile (desktop only) for genuinely signed-in
+      // Google websites. `available` is false on web/PWA/mobile.
+      googleChromeProfile: { status: 'idle', available: false, exists: false, launched: false },
+      // Main-process-verified origin of the current Google auth surface.
+      // Rendered in browser chrome (never derived from page content).
+      googleAuthSurface: { active: false, origin: '' },
       historySearchQuery: '',
       bookmarksSearchQuery: '',
       downloadsSearchQuery: '',
@@ -496,7 +524,37 @@ export class BrowserShell {
         savePasswordsEnabled: true,
         autofillEnabled: true,
         httpsFirst: true,
+        safeBrowsingLevel: 'enhanced',
         adBlockEnabled: true,
+        doNotTrack: true,
+        globalPrivacyControl: true,
+        preloadPages: false,
+        thirdPartyCookies: 'block',
+        privacySandboxTopics: false,
+        privacySandboxSuggestedAds: false,
+        privacySandboxMeasurement: false,
+        secureDnsEnabled: true,
+        secureDnsProvider: 'automatic',
+        warnPasswordExposure: true,
+        javascriptEnabled: true,
+        imagesEnabled: true,
+        allowWebsitePopups: false,
+        autoRemoveUnusedPermissions: true,
+        // Best-effort "behave like a standalone browser" parity on Google
+        // auth surfaces. OFF by default: changing request/UA behavior for
+        // every profile without an explicit choice would be surprising.
+        googleAuthParity: false,
+        // Open Google products in the dedicated real Chrome profile (where
+        // the user is genuinely signed in) instead of a Yayra tab.
+        googleOpenInChromeProfile: true,
+        cookieExceptions: [],
+        blockedAdSites: [],
+        permissionDefaults: {
+          location: 'ask', camera: 'ask', microphone: 'ask', notifications: 'ask',
+          clipboard: 'ask', midi: 'ask', usb: 'ask', serial: 'ask',
+          bluetooth: 'ask', hid: 'ask', pointerLock: 'ask', idleDetection: 'block'
+        },
+        sitePermissions: {},
         clearHistoryOnExit: false,
         restoreSessionOnLaunch: true,
         showBookmarksBar: false,
@@ -541,6 +599,15 @@ export class BrowserShell {
         signedIn: false,
         profile: null,
         error: null,
+        savedAt: null
+      },
+      // A separate, broader Google consent powers the in-Yayra Google
+      // services hub and the connected-account indicator on Google pages.
+      googleServices: {
+        status: 'idle',
+        signedIn: false,
+        profile: null,
+        scopes: [],
         savedAt: null
       },
       // Persistent top-right account menu (see renderAccountDropdown()) -
@@ -627,6 +694,9 @@ export class BrowserShell {
     // because the underlying native views persist across this class's
     // frequent full-DOM re-renders.
     this._nativeWebviewTabIds = new Set();
+    // Main-process-verified auth origin per tab, so switching tabs never
+    // leaves a stale "Verified sign-in" badge on the wrong website.
+    this._googleAuthSurfacesByTab = new Map();
     // A handoff belongs to a tab and its auth URL, not to the whole shell.
     // Keeping it here prevents chrome re-renders from reopening the provider
     // surface while the original tab URL/history remain intact.
@@ -637,6 +707,11 @@ export class BrowserShell {
     // tab-scoped to prevent render loops and restored tabs from launching a
     // browser without a fresh user action.
     this._googleAccountConnections = new Map();
+    // Gmail is rendered as a scoped, first-party in-Yayra mailbox surface.
+    // Its tab-local view state contains only sanitized message summaries/body
+    // text returned by the privileged bridge; Google bearer credentials never
+    // enter this renderer.
+    this._gmailViews = new Map();
     // Voice Search and Lens are Google features, but their pages/results
     // must remain in Yayra's own site engine. This tab-scoped marker also
     // suppresses web/PWA window.open fallbacks so these controls can never
@@ -668,6 +743,7 @@ export class BrowserShell {
     // below). Restores any previously-signed-in session and keeps the UI in
     // sync with sign-in/sign-out/error events fired from the main process.
     this._unsubscribeAuthBridge = null;
+    this._googleAccountSessionHydrated = !this.authBridge;
     if (this.authBridge) {
       this._unsubscribeAuthBridge = this.authBridge.onEvent((evt) => this.handleGoogleAuthEvent(evt));
       const accountProfileId = this.currentProfileId();
@@ -676,20 +752,33 @@ export class BrowserShell {
           // A delayed response may never hydrate a window that has since used
           // the no-window in-place fallback to another browsing profile.
           if (accountProfileId !== this.currentProfileId()) return;
+          this._googleAccountSessionHydrated = true;
           if (session?.signedIn) {
             this.state.googleAccount = { status: 'signed-in', signedIn: true, profile: session.profile, error: null, savedAt: session.savedAt || null };
+            if (session.servicesConnected) {
+              this.state.googleServices = {
+                status: 'signed-in',
+                signedIn: true,
+                profile: session.profile,
+                scopes: Array.isArray(session.scopes) ? session.scopes : [],
+                savedAt: session.savedAt || null
+              };
+              this.syncGoogleServiceAccountToPages();
+            }
             for (const record of this._googleAccountConnections.values()) {
               record.status = 'connected';
               record.error = null;
               record.autoStart = false;
             }
             this.handleAccountSignal(session.profile?.email, { source: 'yayra-account' });
-            this.render();
           }
+          this.render();
         })
         .catch(() => {
+          this._googleAccountSessionHydrated = true;
           // No prior session or the bridge isn't ready yet - leave the
           // default signed-out state as-is.
+          this.render();
         });
     }
 
@@ -866,27 +955,44 @@ export class BrowserShell {
       || GOOGLE_INTERACTIVE_SIGNIN_PATH.test(parsed.pathname);
   }
 
-  _safeGoogleProductOrigin(value) {
+  _safeGoogleProductDestination(value) {
     const parsed = this._parseBoundedAuthUrl(value);
-    if (!parsed || parsed.protocol !== 'https:' || parsed.port) return null;
+    if (!parsed || parsed.protocol !== 'https:' || parsed.port || parsed.username || parsed.password) return null;
     const host = parsed.hostname.toLowerCase();
     const googleOwned = host === 'google.com' || host.endsWith('.google.com')
       || host === 'youtube.com' || host.endsWith('.youtube.com');
     if (!googleOwned || host === 'accounts.google.com' || host === 'myaccount.google.com') return null;
-    return `${parsed.origin}/`;
+    return parsed.toString();
   }
 
-  _googleConnectionProductOrigin(record) {
+  _safeGoogleProductOrigin(value) {
+    const destination = this._safeGoogleProductDestination(value);
+    return destination ? `${new URL(destination).origin}/` : null;
+  }
+
+  isGmailProductUrl(value) {
+    const destination = this._safeGoogleProductDestination(value);
+    if (!destination) return false;
+    try { return new URL(destination).hostname.toLowerCase() === 'mail.google.com'; }
+    catch { return false; }
+  }
+
+  _googleConnectionProductDestination(record) {
     const candidates = [record?.sourceUrl, record?.requestedUrl];
     for (const raw of candidates) {
-      const direct = this._safeGoogleProductOrigin(raw);
+      const direct = this._safeGoogleProductDestination(raw);
       if (direct) return direct;
       const parsed = this._parseBoundedAuthUrl(raw);
       const continuation = parsed?.searchParams?.get('continue');
-      const continued = this._safeGoogleProductOrigin(continuation);
+      const continued = this._safeGoogleProductDestination(continuation);
       if (continued) return continued;
     }
     return null;
+  }
+
+  _googleConnectionProductOrigin(record) {
+    const destination = this._googleConnectionProductDestination(record);
+    return destination ? `${new URL(destination).origin}/` : null;
   }
 
   _ensureGoogleAccountConnection(tabId, url, { autoStart = false, reason = 'account-navigation' } = {}) {
@@ -950,7 +1056,7 @@ export class BrowserShell {
     if (!tab) return { ok: false, error: 'tab_closed' };
     const record = this._ensureGoogleAccountConnection(tabId, tab.url);
     if (!record) return { ok: false, error: 'tab_closed' };
-    if (this.state.googleAccount?.signedIn && !force) {
+    if (this.state.googleAccount?.signedIn && !force && !this.googleConnectionNeedsServices(record)) {
       record.status = 'connected';
       record.error = null;
       this.render();
@@ -971,7 +1077,13 @@ export class BrowserShell {
     record.error = null;
     record.autoStart = false;
     this.render();
-    const result = await this.signInWithGoogle();
+    const destination = this._googleConnectionProductDestination(record);
+    const needsGmail = this.isGmailProductUrl(destination);
+    const result = this.googleConnectionNeedsServices(record)
+      ? await this.connectGoogleServicesWithGoogle()
+      : (needsGmail && typeof this.authBridge?.connectGmail === 'function'
+        ? await this.connectGmailWithGoogle()
+        : await this.signInWithGoogle());
     if (this._googleAccountConnections.get(tabId) !== record) return result;
     if (!result?.ok && result?.error === 'sign_in_already_in_progress') {
       record.status = 'signing-in';
@@ -981,20 +1093,159 @@ export class BrowserShell {
       this.render();
     } else if (!result.pending && this.state.googleAccount?.signedIn) {
       record.status = 'connected';
+      if (destination) await this.openGoogleConnectionDestination(tabId, { automatic: true });
+      else this.render();
+    }
+    return result;
+  }
+
+  async openGoogleConnectionDestination(tabId, { automatic = false } = {}) {
+    const record = this._googleAccountConnections.get(tabId);
+    // Resume the EXACT initiating path, query and fragment. The verified
+    // account is reflected by Yayra's connected-account layer, never by
+    // silently rewriting the user's Google destination.
+    const destination = this._googleConnectionProductDestination(record);
+    const tab = this.state.tabs.find((item) => item.id === tabId);
+    if (destination && tab) {
+      // Resume the exact initiating path/query in the SAME Yayra tab. Opening
+      // only the origin in Chrome was the bug: it abandoned Gmail routes and
+      // reflected Chrome's cookies rather than Yayra's verified account.
+      this._googleAccountConnections.delete(tabId);
+      this._inAppOnlyGoogleTabs.add(tabId);
+      if (tab.url !== destination) {
+        tab.url = destination;
+        tab.title = this.isGmailProductUrl(destination) ? 'Gmail' : tab.title;
+        if (tabId === this.state.activeTabId) this.state.urlInputValue = this.getDisplayUrl(destination);
+      }
+      this.updateTabLoading(tabId, false);
+      this.render();
+      return { ok: true, destination, insideYayra: true, automatic };
+    }
+    // Account management itself has no cookie-independent Google web UI.
+    // Keep the verified identity visibly in this tab instead of pretending a
+    // separate Chrome cookie session was imported.
+    if (record) {
+      record.status = 'connected';
+      record.autoStart = false;
+      this._googleAccountConnections.delete(tabId);
+    }
+    if (tab && this.state.googleServices?.signedIn) {
+      tab.url = 'yayra://google-services';
+      tab.title = 'Google services';
+      if (tabId === this.state.activeTabId) this.state.urlInputValue = 'yayra://google-services';
+    }
+    this.render();
+    return { ok: true, connectedAccount: true, insideYayra: true };
+  }
+
+  syncGoogleServiceAccountToPages() {
+    const account = this.state.googleServices?.signedIn
+      ? {
+        email: this.state.googleServices?.profile?.email || '',
+        name: this.state.googleServices?.profile?.name || ''
+      }
+      : null;
+    try {
+      if (typeof this.nativeWebview?.setGoogleServiceAccount === 'function') {
+        this.nativeWebview.setGoogleServiceAccount(account).catch(() => {});
+      }
+    } catch { /* optional desktop bridge */ }
+  }
+
+  googleDestinationWithAccount(value) {
+    const destination = this._safeGoogleProductDestination(value);
+    if (!destination) return null;
+    const email = this.state.googleServices?.profile?.email || this.state.googleAccount?.profile?.email || '';
+    if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return destination;
+    try {
+      const parsed = new URL(destination);
+      parsed.searchParams.set('authuser', email);
+      return parsed.toString();
+    } catch {
+      return destination;
+    }
+  }
+
+  googleConnectionNeedsServices(record) {
+    const destination = this._googleConnectionProductDestination(record);
+    return Boolean(destination)
+      && !this.state.googleServices?.signedIn
+      && typeof this.authBridge?.connectGoogleServices === 'function';
+  }
+
+  async connectGoogleServicesWithGoogle() {
+    if (!this.authBridge?.connectGoogleServices) return { ok: false, error: 'google_services_unavailable' };
+    this.state.googleAccount = { ...this.state.googleAccount, status: 'signing-in', error: null };
+    this.state.googleServices = { ...this.state.googleServices, status: 'signing-in', error: null };
+    this.render();
+    await this._persistTabsBeforeGoogleRedirect();
+    const profileId = this.currentProfileId();
+    const result = await this.authBridge.connectGoogleServices(profileId);
+    if (!result?.ok && result?.error !== 'sign_in_already_in_progress') {
+      this.state.googleAccount = { status: 'error', signedIn: false, profile: null, error: result?.error || 'google_services_connection_failed', savedAt: null };
+      this.state.googleServices = { status: 'error', signedIn: false, profile: null, scopes: [], error: result?.error || 'google_services_connection_failed', savedAt: null };
+      this.render();
+    } else if (result?.ok && result.profile && profileId === this.currentProfileId()) {
+      this.state.googleAccount = {
+        status: 'signed-in',
+        signedIn: true,
+        profile: result.profile,
+        error: null,
+        savedAt: result.savedAt || new Date().toISOString()
+      };
+      this.state.googleServices = {
+        status: 'signed-in',
+        signedIn: true,
+        profile: result.profile,
+        scopes: Array.isArray(result.grantedScopes) ? result.grantedScopes : [],
+        error: null,
+        savedAt: result.savedAt || new Date().toISOString()
+      };
+      for (const record of this._googleAccountConnections.values()) {
+        record.status = 'connected';
+        record.error = null;
+        record.autoStart = false;
+      }
+      this.handleAccountSignal(result.profile.email, { source: 'yayra-account' });
+      this.syncGoogleServiceAccountToPages();
+      this.showTransientNotice(`Google services connected in Yayra${result.profile.email ? ` as ${result.profile.email}` : ''}.`);
       this.render();
     }
     return result;
   }
 
-  async openGoogleConnectionDestination(tabId) {
-    const record = this._googleAccountConnections.get(tabId);
-    const origin = this._googleConnectionProductOrigin(record);
-    if (origin && typeof this.authBridge?.openGoogleProduct === 'function') {
-      return this.authBridge.openGoogleProduct(origin);
+  async openGoogleService(serviceId, { inChromeProfile = null } = {}) {
+    const service = googleServiceById(serviceId);
+    if (!service) return;
+    const useChrome = inChromeProfile === null
+      ? this.state.settings.googleOpenInChromeProfile !== false
+      : Boolean(inChromeProfile);
+    const email = this.state.googleServices?.profile?.email || this.state.googleAccount?.profile?.email || '';
+    const destination = googleServiceDestination(service.id, email) || service.url;
+
+    // The dedicated real Chrome profile is the guaranteed path: Google sees a
+    // genuine external browser and the user's real website cookies. When it
+    // is unavailable, fall back to the existing in-Yayra navigation so the
+    // button never becomes a dead end.
+    if (useChrome && this.googleChromeProfileBridge) {
+      const status = this.state.googleChromeProfile || {};
+      if (status.available) {
+        const result = await this.openGoogleInChromeProfile(destination);
+        if (result?.ok) return;
+      }
     }
-    if (origin) return this.openExternally(origin);
-    if (typeof this.authBridge?.openAccountPage === 'function') return this.openGoogleAccountPage();
-    return this.openExternally('https://myaccount.google.com/');
+
+    if (!this.state.googleServices?.signedIn) {
+      this.createNewTab();
+      this.navigateActiveTab(destination);
+      const tabId = this.state.activeTabId;
+      this._ensureGoogleAccountConnection(tabId, destination, { autoStart: true, reason: 'google-service' });
+      this._scheduleGoogleAccountConnection(tabId);
+      return;
+    }
+    this.createNewTab();
+    this._inAppOnlyGoogleTabs.add(this.state.activeTabId);
+    this.navigateActiveTab(destination);
   }
 
   async _persistTabsBeforeGoogleRedirect() {
@@ -1057,29 +1308,75 @@ export class BrowserShell {
     return result;
   }
 
+  async connectGmailWithGoogle() {
+    if (!this.authBridge?.connectGmail) return { ok: false, error: 'gmail_api_unavailable' };
+    this.state.googleAccount = { ...this.state.googleAccount, status: 'signing-in', error: null };
+    this.render();
+    await this._persistTabsBeforeGoogleRedirect();
+    const profileId = this.currentProfileId();
+    const result = await this.authBridge.connectGmail(profileId);
+    if (!result?.ok && result?.error !== 'sign_in_already_in_progress') {
+      this.state.googleAccount = {
+        status: 'error', signedIn: false, profile: null,
+        error: result?.error || 'gmail_connection_failed', savedAt: null
+      };
+      this.render();
+    } else if (result?.ok && result.profile && profileId === this.currentProfileId()) {
+      this.state.googleAccount = {
+        status: 'signed-in',
+        signedIn: true,
+        profile: result.profile,
+        error: null,
+        savedAt: result.savedAt || this.state.googleAccount?.savedAt || new Date().toISOString()
+      };
+      for (const record of this._googleAccountConnections.values()) {
+        record.status = 'connected';
+        record.error = null;
+        record.autoStart = false;
+      }
+      this.handleAccountSignal(result.profile.email, { source: 'yayra-account' });
+      this.showTransientNotice(`Gmail connected inside Yayra${result.profile.email ? ` as ${result.profile.email}` : ''}.`);
+      this.render();
+    }
+    return result;
+  }
+
   // "Switch account" reuses the exact same sign-in flow: the authorization
   // URL built in electron/googleAuth.cjs already passes
   // `prompt=consent select_account`, so Google shows its account chooser
   // again even though a session is already saved, and the newly chosen
   // profile simply overwrites the old one on success.
+  async startGoogleServicesSignIn() {
+    if (typeof this.authBridge?.connectGoogleServices === 'function') return this.connectGoogleServicesWithGoogle();
+    return this.signInWithGoogle();
+  }
+
   async switchGoogleAccount() {
     this.state.isAccountMenuOpen = false;
+    if (typeof this.authBridge?.connectGoogleServices === 'function') return this.connectGoogleServicesWithGoogle();
     return this.signInWithGoogle();
   }
 
   async signOutOfGoogle() {
     if (!this.authBridge) return;
     this.state.isAccountMenuOpen = false;
+    this.state.googleAccount = { status: 'idle', signedIn: false, profile: null, error: null, savedAt: null };
+    this.state.googleServices = { status: 'idle', signedIn: false, profile: null, scopes: [], savedAt: null };
+    this.syncGoogleServiceAccountToPages();
     await this.authBridge.signOut(this.currentProfileId());
+    this.render();
   }
 
-  // Opens Google's own "Manage your Account" page in the user's system
-  // browser (never embedded - see electron/authBridge.cjs for why).
+  // Account management stays inside Yayra. Google's own account page uses a
+  // separate cookie session; the in-Yayra hub reflects the exact verified
+  // Google account and launches every product with an account hint.
   async openGoogleAccountPage() {
-    if (!this.authBridge?.openAccountPage) return;
     this.state.isAccountMenuOpen = false;
-    this.render();
-    await this.authBridge.openAccountPage();
+    if (!this.state.googleServices?.signedIn) {
+      await this.startGoogleServicesSignIn();
+      return;
+    }
+    this.openInternalPage('yayra://google-services');
   }
 
   toggleAccountMenu() {
@@ -1096,7 +1393,10 @@ export class BrowserShell {
     if (evt.profileId && evt.profileId !== this.currentProfileId()) return;
     switch (evt.type) {
       case 'signing-in':
+      case 'gmail-connecting':
+      case 'google-services-connecting':
         this.state.googleAccount = { ...this.state.googleAccount, status: 'signing-in', error: null };
+        this.state.googleServices = { ...this.state.googleServices, status: 'signing-in', error: null };
         for (const record of this._googleAccountConnections.values()) {
           record.status = 'signing-in';
           record.error = null;
@@ -1115,20 +1415,52 @@ export class BrowserShell {
           record.error = null;
           record.autoStart = false;
         }
+        if (evt.servicesConnected) {
+          this.state.googleServices = {
+            status: 'signed-in',
+            signedIn: true,
+            profile: evt.profile,
+            scopes: Array.isArray(evt.scopes) ? evt.scopes : [],
+            savedAt: evt.savedAt || new Date().toISOString()
+          };
+          this.syncGoogleServiceAccountToPages();
+        }
         this.handleAccountSignal(evt.profile?.email, { source: 'yayra-account' });
         this.showTransientNotice(`Google connected to Yayra${evt.profile?.email ? ` as ${evt.profile.email}` : ''}.`);
         break;
+      case 'gmail-connected':
+        this.showTransientNotice(`Gmail is ready inside Yayra${evt.profile?.email ? ` for ${evt.profile.email}` : ''}.`);
+        break;
+      case 'google-services-connected':
+        this.state.googleServices = {
+          status: 'signed-in',
+          signedIn: true,
+          profile: evt.profile || this.state.googleAccount?.profile || null,
+          scopes: Array.isArray(evt.grantedScopes) ? evt.grantedScopes : [],
+          savedAt: evt.savedAt || new Date().toISOString()
+        };
+        this.syncGoogleServiceAccountToPages();
+        this.showTransientNotice(`Google services are connected in Yayra${evt.profile?.email ? ` as ${evt.profile.email}` : ''}.`);
+        break;
       case 'signed-out':
         this.state.googleAccount = { status: 'idle', signedIn: false, profile: null, error: null, savedAt: null };
+        this.state.googleServices = { status: 'idle', signedIn: false, profile: null, scopes: [], savedAt: null };
+        this.syncGoogleServiceAccountToPages();
         for (const record of this._googleAccountConnections.values()) record.status = 'idle';
         break;
       case 'error':
-        this.state.googleAccount = { status: 'error', signedIn: false, profile: null, error: evt.message || 'sign_in_failed', savedAt: null };
+      case 'gmail-error':
+      case 'google-services-error': {
+        const message = evt.message || (evt.type === 'gmail-error' ? 'gmail_connection_failed' : 'sign_in_failed');
+        this.state.googleAccount = this.state.googleAccount?.signedIn
+          ? { ...this.state.googleAccount, status: 'signed-in', error: message }
+          : { status: 'error', signedIn: false, profile: null, error: message, savedAt: null };
         for (const record of this._googleAccountConnections.values()) {
           record.status = 'error';
-          record.error = evt.message || 'sign_in_failed';
+          record.error = message;
         }
         break;
+      }
       default:
         return;
     }
@@ -1486,9 +1818,17 @@ export class BrowserShell {
         console.warn('Failed to load settings in BrowserShell:', err);
       }
     }
-    // Stored settings are user-editable local data. A malformed or legacy
-    // colour must degrade to the readable black default before any native
-    // colour input or notes element receives it.
+    // Stored settings are user-editable local data. Normalize every privacy
+    // choice before it can reach native network/session policy.
+    this.normalizePrivacySettings();
+    await this.syncPrivacySettings({ notify: false });
+    // Chrome profile availability is refreshed lazily when a view that shows
+    // it is opened (see showPrivacyView / renderGoogleServicesPage). Doing it
+    // here would add an extra async tick to EVERY shell construction, which
+    // shifts Promise ordering for native-tab attach results in the Android
+    // engine tests. Deliberately not awaited or fired at startup.
+    // A malformed or legacy colour must degrade to the readable black default
+    // before any native colour input or notes element receives it.
     this.state.settings.pptxNotesColor = normalizePptxNotesColor(
       this.state.settings.pptxNotesColor
     );
@@ -3089,6 +3429,31 @@ export class BrowserShell {
     });
     omnibox.appendChild(securityBadge);
 
+    // Parity item 5: a browser-chrome-only verified-origin indicator. It is
+    // built from the main-process `google-auth-surface` event, NOT from page
+    // DOM, so a fake login page cannot draw it. It renders only for the
+    // active tab when the trusted main process reports an auth surface.
+    const authSurface = this._googleAuthSurfacesByTab.get(activeTab.id) || { active: false, origin: '' };
+    if (authSurface.active && authSurface.origin) {
+      const verified = document.createElement('div');
+      verified.className = 'fb-auth-surface-verified';
+      verified.setAttribute('role', 'status');
+      verified.setAttribute('title', 'Google origin reported by the main process from this HTTPS navigation');
+      const lock = document.createElement('span');
+      lock.className = 'fb-auth-surface-verified-lock';
+      lock.innerHTML = Icons.lock;
+      const host = document.createElement('span');
+      host.className = 'fb-auth-surface-verified-host';
+      host.textContent = authSurface.origin.replace(/^https:\/\//, '');
+      const label = document.createElement('span');
+      label.className = 'fb-auth-surface-verified-label';
+      label.textContent = 'Google sign-in origin';
+      verified.appendChild(lock);
+      verified.appendChild(host);
+      verified.appendChild(label);
+      omnibox.appendChild(verified);
+    }
+
     const tabGroupsBtn = document.createElement('button');
     tabGroupsBtn.type = 'button';
     tabGroupsBtn.className = `fb-omnibox-group-btn${activeTab.group ? ' is-grouped' : ''}`;
@@ -3647,6 +4012,12 @@ export class BrowserShell {
 
     const url = activeTab.url || '';
     const isInternalPage = !url || url === 'about:blank' || url.startsWith('yayra://');
+    const gmailProductInYayra = this.isGmailProductUrl(url);
+    if (gmailProductInYayra && !this.state.googleAccount?.signedIn
+      && this._googleAccountSessionHydrated && !this._googleAccountConnections.has(activeTab.id)) {
+      this._ensureGoogleAccountConnection(activeTab.id, url, { autoStart: true, reason: 'gmail-navigation' });
+      this._scheduleGoogleAccountConnection(activeTab.id);
+    }
     let siteFailure = this._siteFailureFor(activeTab);
     // A brand-new web/PWA frame cannot emit a useful network error while the
     // browser already knows it is offline. Record the failure before mounting
@@ -3674,20 +4045,22 @@ export class BrowserShell {
     const authHandoffOnly = this.isSystemBrowserAuthHost(url);
     const googleAccountConnectionOnly = this._googleAccountConnections.has(activeTab.id)
       || this.isGoogleAccountConnectionUrl(url);
-    this.syncNativeWebviewVisibility(activeTab.id, !isInternalPage && !overlayOpen && !authHandoffOnly && !googleAccountConnectionOnly && !siteFailure, {
-      captureActive: overlayOpen && !isInternalPage && !authHandoffOnly && !googleAccountConnectionOnly && !siteFailure
+    this.syncNativeWebviewVisibility(activeTab.id, !isInternalPage && !overlayOpen && !authHandoffOnly && !googleAccountConnectionOnly && !gmailProductInYayra && !siteFailure, {
+      captureActive: overlayOpen && !isInternalPage && !authHandoffOnly && !googleAccountConnectionOnly && !gmailProductInYayra && !siteFailure
     });
     // Same rule for the Android native tab engine (its hide path captures
     // the page frame natively, so the chrome keeps a page underneath it).
     // Recognized provider OAuth/auth URLs and first-party account connection
     // states are rendered as in-tab cards instead.
-    this.syncAndroidTabWebVisibility(activeTab.id, !isInternalPage && !overlayOpen && !authHandoffOnly && !googleAccountConnectionOnly && !siteFailure);
+    this.syncAndroidTabWebVisibility(activeTab.id, !isInternalPage && !overlayOpen && !authHandoffOnly && !googleAccountConnectionOnly && !gmailProductInYayra && !siteFailure);
 
     // LOCAL DOCUMENT TABS (yayra://doc/<id>): the integrated document
     // viewer - never the web frame path, never the native engine. This is
     // what guarantees opening a document can never navigate a browsing tab
     // away from its site.
-    if (url.startsWith('yayra://doc/')) {
+    if (gmailProductInYayra) {
+      this.renderGmailInYayra(viewport, activeTab);
+    } else if (url.startsWith('yayra://doc/')) {
       this.renderDocumentViewer(viewport, activeTab);
     } else if (url.startsWith('yayra://recover-document/')) {
       this.renderDocumentRecoveryPage(viewport, activeTab);
@@ -3695,6 +4068,8 @@ export class BrowserShell {
       this.renderNewTabPage(viewport, activeTab);
     } else if (url === 'yayra://settings') {
       this.renderInternalSettingsPage(viewport, activeTab);
+    } else if (url === 'yayra://google-services') {
+      this.renderGoogleServicesPage(viewport, activeTab);
     } else if (url === 'yayra://history') {
       this.renderInternalHistoryPage(viewport, activeTab);
     } else if (url === 'yayra://bookmarks') {
@@ -3717,6 +4092,21 @@ export class BrowserShell {
       // External Web Content Frame
       const webViewContainer = document.createElement('div');
       webViewContainer.className = 'fb-webview-container';
+      let webContentMount = webViewContainer;
+      const connectedGoogleDestination = this.state.googleAccount?.signedIn
+        ? this._safeGoogleProductDestination(activeTab.url)
+        : null;
+      if (connectedGoogleDestination && !siteFailure) {
+        // Connected Google continuations must stay in this Yayra tab on every
+        // platform, including after session restoration in a PWA where the
+        // in-memory handoff marker no longer exists.
+        this._inAppOnlyGoogleTabs.add(activeTab.id);
+        webViewContainer.classList.add('fb-google-connected-product');
+        webViewContainer.appendChild(this.buildGoogleConnectedBanner(activeTab));
+        webContentMount = document.createElement('div');
+        webContentMount.className = 'fb-google-connected-product-content';
+        webViewContainer.appendChild(webContentMount);
+      }
       // CSS-transform zoom is the web/iframe fallback only; the native
       // engine zooms for real via applyNativeZoom() and must keep its
       // untransformed container so setBounds stays accurate.
@@ -3735,7 +4125,7 @@ export class BrowserShell {
         // the card and reveals the already-painted destination.
         let pooledRetry = false;
         if (siteFailure.inFlight && !this.nativeWebview && !this._androidTabWebIds?.has(activeTab.id)) {
-          pooledRetry = this.mountPooledWebFrame(webViewContainer, activeTab);
+          pooledRetry = this.mountPooledWebFrame(webContentMount, activeTab);
           if (!pooledRetry && this._onLine()
             && !this.isKnownFrameBlockedUrl(activeTab.url)
             && !this.isSystemBrowserAuthHost(activeTab.url)) {
@@ -3747,10 +4137,10 @@ export class BrowserShell {
               allowNative: false
             });
             wrapper.style.visibility = 'hidden';
-            webViewContainer.appendChild(wrapper);
+            webContentMount.appendChild(wrapper);
           }
         }
-        webViewContainer.appendChild(this.buildOfflineFallback(activeTab.url, {
+        webContentMount.appendChild(this.buildOfflineFallback(activeTab.url, {
           tabId: activeTab.id,
           failure: siteFailure
         }));
@@ -3761,7 +4151,7 @@ export class BrowserShell {
         // the menu or checking for updates). Falls back to the classic
         // one-shot frame for the native engine, auth handoff, known
         // frame-blocked hosts and zoomed viewports.
-        const pooled = this.mountPooledWebFrame(webViewContainer, activeTab);
+        const pooled = this.mountPooledWebFrame(webContentMount, activeTab);
         if (!pooled) {
           const { wrapper } = this.createWebContentFrame(activeTab.url, {
             frameClassName: 'fb-webview-frame',
@@ -3771,7 +4161,7 @@ export class BrowserShell {
             allowNative: true
           });
 
-          webViewContainer.appendChild(wrapper);
+          webContentMount.appendChild(wrapper);
         }
       }
       viewport.appendChild(webViewContainer);
@@ -3976,6 +4366,639 @@ export class BrowserShell {
     return false;
   }
 
+  buildGoogleConnectedBanner(activeTab) {
+    const profile = this.state.googleAccount?.profile || {};
+    const banner = document.createElement('div');
+    banner.className = 'fb-google-connected-banner';
+    banner.setAttribute('role', 'status');
+    banner.setAttribute('aria-label', `Google connected in Yayra as ${profile.email || profile.name || 'Google account'}`);
+    const badge = document.createElement('span');
+    badge.className = 'fb-google-connected-banner-badge';
+    if (profile.picture) {
+      const image = document.createElement('img');
+      image.src = profile.picture;
+      image.alt = '';
+      image.referrerPolicy = 'no-referrer';
+      badge.appendChild(image);
+    } else {
+      badge.textContent = String(profile.name || profile.email || 'G').trim().slice(0, 1).toUpperCase() || 'G';
+    }
+    const copy = document.createElement('span');
+    const label = document.createElement('b');
+    label.textContent = this.state.googleServices?.profile?.email || profile.email || profile.name || 'Google account';
+    const detail = document.createElement('small');
+    detail.textContent = this.state.googleServices?.signedIn ? 'Google services connected in Yayra' : 'Connected to Yayra';
+    copy.appendChild(label);
+    copy.appendChild(detail);
+    banner.appendChild(badge);
+    banner.appendChild(copy);
+
+    const gmail = document.createElement('button');
+    gmail.type = 'button';
+    gmail.textContent = 'Gmail';
+    gmail.addEventListener('click', () => {
+      this._inAppOnlyGoogleTabs.add(activeTab.id);
+      this.navigateActiveTab('https://mail.google.com/mail/u/0/#inbox');
+    });
+    banner.appendChild(gmail);
+
+    const hub = document.createElement('button');
+    hub.type = 'button';
+    hub.className = 'fb-google-services-hub-btn';
+    hub.textContent = 'Google services';
+    hub.addEventListener('click', () => this.openInternalPage('yayra://google-services'));
+    banner.appendChild(hub);
+
+    const explanation = document.createElement('span');
+    explanation.className = 'fb-google-connected-banner-note';
+    explanation.textContent = this.state.googleServices?.signedIn ? 'Verified Google account' : 'Verified app account';
+    explanation.title = 'Yayra reflects the exact Google account selected in your secure system browser. Google web pages use their own cookie session; Yayra never copies browser cookies.';
+    banner.appendChild(explanation);
+    return banner;
+  }
+
+  _gmailView(tabId) {
+    let view = this._gmailViews.get(tabId);
+    if (!view) {
+      view = {
+        status: 'idle',
+        query: '',
+        messages: [],
+        nextPageToken: null,
+        selectedMessage: null,
+        selectedMessageId: null,
+        error: null,
+        generation: 0
+      };
+      this._gmailViews.set(tabId, view);
+    }
+    return view;
+  }
+
+  async _loadGmailMessages(tabId, { append = false } = {}) {
+    const view = this._gmailView(tabId);
+    if (!this.authBridge?.listGmailMessages) {
+      view.status = 'unavailable';
+      view.error = 'gmail_api_unavailable';
+      this.render();
+      return;
+    }
+    const generation = ++view.generation;
+    view.status = append ? 'loading-more' : 'loading';
+    view.error = null;
+    if (!append) {
+      view.messages = [];
+      view.nextPageToken = null;
+      view.selectedMessage = null;
+      view.selectedMessageId = null;
+    }
+    this.render();
+    const result = await this.authBridge.listGmailMessages({
+      query: view.query,
+      pageToken: append ? (view.nextPageToken || '') : '',
+      maxResults: 25
+    }, this.currentProfileId());
+    if (this._gmailViews.get(tabId) !== view || generation !== view.generation) return;
+    if (!result?.ok) {
+      view.status = String(result?.error || '').includes('gmail_reconnect_required') ? 'reconnect' : 'error';
+      view.error = result?.error || 'gmail_list_failed';
+    } else {
+      const incoming = Array.isArray(result.messages) ? result.messages : [];
+      const known = new Set((append ? view.messages : []).map((message) => message.id));
+      view.messages = append
+        ? [...view.messages, ...incoming.filter((message) => !known.has(message.id))]
+        : incoming;
+      view.nextPageToken = result.nextPageToken || null;
+      view.status = 'ready';
+      view.error = null;
+    }
+    if (this.state.activeTabId === tabId) this.render();
+  }
+
+  async _openGmailMessage(tabId, messageId) {
+    const view = this._gmailView(tabId);
+    if (!this.authBridge?.getGmailMessage || !/^[A-Za-z0-9_-]{1,200}$/.test(String(messageId || ''))) return;
+    const generation = ++view.generation;
+    view.status = 'message-loading';
+    view.selectedMessageId = messageId;
+    view.selectedMessage = null;
+    view.error = null;
+    this.render();
+    const result = await this.authBridge.getGmailMessage(messageId, this.currentProfileId());
+    if (this._gmailViews.get(tabId) !== view || generation !== view.generation) return;
+    if (!result?.ok) {
+      view.status = String(result?.error || '').includes('gmail_reconnect_required') ? 'reconnect' : 'error';
+      view.error = result?.error || 'gmail_message_failed';
+    } else {
+      view.selectedMessage = result.message;
+      view.status = 'message';
+    }
+    if (this.state.activeTabId === tabId) this.render();
+  }
+
+  _formatGmailDate(message) {
+    const timestamp = Number(message?.internalDate);
+    const parsed = Number.isFinite(timestamp) && timestamp > 0
+      ? new Date(timestamp)
+      : new Date(message?.headers?.date || '');
+    if (!Number.isFinite(parsed.getTime())) return '';
+    const now = new Date();
+    const sameYear = parsed.getFullYear() === now.getFullYear();
+    try {
+      return new Intl.DateTimeFormat(undefined, sameYear
+        ? { month: 'short', day: 'numeric' }
+        : { year: 'numeric', month: 'short', day: 'numeric' }).format(parsed);
+    } catch {
+      return parsed.toLocaleDateString?.() || '';
+    }
+  }
+
+  renderGmailInYayra(viewport, activeTab) {
+    const tabId = activeTab.id;
+    const record = this._googleAccountConnections.get(tabId);
+    if (!this.state.googleAccount?.signedIn || (record && record.status !== 'connected')) {
+      const holder = document.createElement('div');
+      holder.className = 'fb-gmail-auth-holder';
+      holder.appendChild(this.buildGoogleAccountConnectionFallback(activeTab.url, { tabId }));
+      viewport.appendChild(holder);
+      if (record?.autoStart && this._googleAccountSessionHydrated) this._scheduleGoogleAccountConnection(tabId);
+      return;
+    }
+
+    const profile = this.state.googleAccount.profile || {};
+    const view = this._gmailView(tabId);
+    const page = document.createElement('section');
+    page.className = 'fb-gmail-page';
+    page.setAttribute('aria-label', 'Gmail in Yayra');
+
+    const header = document.createElement('header');
+    header.className = 'fb-gmail-header';
+    const brand = document.createElement('div');
+    brand.className = 'fb-gmail-brand';
+    const gmailMark = document.createElement('span');
+    gmailMark.className = 'fb-gmail-mark';
+    gmailMark.setAttribute('aria-hidden', 'true');
+    gmailMark.textContent = 'M';
+    const title = document.createElement('strong');
+    title.textContent = 'Gmail';
+    brand.appendChild(gmailMark);
+    brand.appendChild(title);
+
+    const account = document.createElement('div');
+    account.className = 'fb-gmail-account';
+    account.title = `Gmail connected through Yayra as ${profile.email || profile.name || 'Google account'}`;
+    if (profile.picture) {
+      const avatar = document.createElement('img');
+      avatar.src = profile.picture;
+      avatar.alt = '';
+      avatar.referrerPolicy = 'no-referrer';
+      account.appendChild(avatar);
+    } else {
+      const initial = document.createElement('span');
+      initial.className = 'fb-gmail-avatar-fallback';
+      initial.textContent = String(profile.name || profile.email || 'G').trim().slice(0, 1).toUpperCase() || 'G';
+      account.appendChild(initial);
+    }
+    const identity = document.createElement('span');
+    identity.innerHTML = '<small>Connected in Yayra</small>';
+    const email = document.createElement('b');
+    email.textContent = profile.email || profile.name || 'Google account';
+    identity.appendChild(email);
+    account.appendChild(identity);
+    header.appendChild(brand);
+    header.appendChild(account);
+    page.appendChild(header);
+
+    const searchForm = document.createElement('form');
+    searchForm.className = 'fb-gmail-search';
+    const search = document.createElement('input');
+    search.type = 'search';
+    search.placeholder = 'Search mail';
+    search.setAttribute('aria-label', 'Search Gmail');
+    search.value = view.query;
+    const searchButton = document.createElement('button');
+    searchButton.type = 'submit';
+    searchButton.textContent = 'Search';
+    searchForm.appendChild(search);
+    searchForm.appendChild(searchButton);
+    searchForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      view.query = search.value.trim().slice(0, 500);
+      this._loadGmailMessages(tabId).catch(() => {});
+    });
+    page.appendChild(searchForm);
+
+    const layout = document.createElement('div');
+    layout.className = 'fb-gmail-layout';
+    const sidebar = document.createElement('nav');
+    sidebar.className = 'fb-gmail-sidebar';
+    sidebar.setAttribute('aria-label', 'Gmail folders');
+    for (const [label, query] of [['Inbox', 'in:inbox'], ['Unread', 'is:unread'], ['Starred', 'is:starred'], ['Sent', 'in:sent'], ['All mail', '']]) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = label;
+      button.className = view.query === query ? 'is-active' : '';
+      button.addEventListener('click', () => {
+        view.query = query;
+        this._loadGmailMessages(tabId).catch(() => {});
+      });
+      sidebar.appendChild(button);
+    }
+    const privacy = document.createElement('p');
+    privacy.textContent = 'Read-only Gmail API view. Chrome cookies are not copied.';
+    sidebar.appendChild(privacy);
+    layout.appendChild(sidebar);
+
+    const main = document.createElement('main');
+    main.className = 'fb-gmail-main';
+    if (view.status === 'reconnect' || view.status === 'unavailable') {
+      const empty = document.createElement('div');
+      empty.className = 'fb-gmail-empty';
+      const heading = document.createElement('h2');
+      heading.textContent = view.status === 'unavailable' ? 'Gmail is not available in this build' : 'Allow Gmail access for this account';
+      const copy = document.createElement('p');
+      copy.textContent = view.status === 'unavailable'
+        ? 'This build does not expose the scoped Gmail bridge.'
+        : `Reconnect ${profile.email || 'your Google account'} to open mail inside Yayra. Yayra requests read-only Gmail access and never imports Chrome cookies.`;
+      const connect = document.createElement('button');
+      connect.type = 'button';
+      connect.className = 'fb-btn fb-btn-primary';
+      connect.textContent = 'Continue with Google';
+      connect.disabled = view.status === 'unavailable';
+      connect.addEventListener('click', async () => {
+        const result = await this.connectGmailWithGoogle();
+        if (result?.ok && !result.pending) this._loadGmailMessages(tabId).catch(() => {});
+      });
+      empty.appendChild(heading);
+      empty.appendChild(copy);
+      empty.appendChild(connect);
+      main.appendChild(empty);
+    } else if (view.status === 'error') {
+      const empty = document.createElement('div');
+      empty.className = 'fb-gmail-empty';
+      const heading = document.createElement('h2');
+      heading.textContent = 'Gmail could not load';
+      const copy = document.createElement('p');
+      copy.textContent = this.formatGoogleSignInError(view.error);
+      const retry = document.createElement('button');
+      retry.type = 'button';
+      retry.className = 'fb-btn fb-btn-primary';
+      retry.textContent = 'Try again';
+      retry.addEventListener('click', () => this._loadGmailMessages(tabId).catch(() => {}));
+      empty.appendChild(heading);
+      empty.appendChild(copy);
+      empty.appendChild(retry);
+      main.appendChild(empty);
+    } else if (view.status === 'message' && view.selectedMessage) {
+      const message = view.selectedMessage;
+      const article = document.createElement('article');
+      article.className = 'fb-gmail-message';
+      const back = document.createElement('button');
+      back.type = 'button';
+      back.className = 'fb-gmail-back';
+      back.textContent = '← Inbox';
+      back.addEventListener('click', () => {
+        view.status = 'ready';
+        view.selectedMessage = null;
+        view.selectedMessageId = null;
+        this.render();
+      });
+      const subject = document.createElement('h1');
+      subject.textContent = message.headers?.subject || '(no subject)';
+      const meta = document.createElement('div');
+      meta.className = 'fb-gmail-message-meta';
+      const from = document.createElement('strong');
+      from.textContent = message.headers?.from || 'Unknown sender';
+      const to = document.createElement('span');
+      to.textContent = message.headers?.to ? `to ${message.headers.to}` : '';
+      const date = document.createElement('time');
+      date.textContent = message.headers?.date || this._formatGmailDate(message);
+      meta.appendChild(from);
+      meta.appendChild(to);
+      meta.appendChild(date);
+      const body = document.createElement('pre');
+      body.className = 'fb-gmail-message-body';
+      body.textContent = message.bodyText || message.snippet || 'This message has no readable text body. Attachments and remote HTML are intentionally not loaded in the read-only view.';
+      article.appendChild(back);
+      article.appendChild(subject);
+      article.appendChild(meta);
+      article.appendChild(body);
+      main.appendChild(article);
+    } else if (view.status === 'loading' || view.status === 'message-loading' || view.status === 'idle') {
+      const loading = document.createElement('div');
+      loading.className = 'fb-gmail-empty';
+      loading.setAttribute('role', 'status');
+      loading.textContent = view.status === 'message-loading' ? 'Opening message…' : 'Loading Gmail…';
+      main.appendChild(loading);
+      if (view.status === 'idle') Promise.resolve().then(() => this._loadGmailMessages(tabId)).catch(() => {});
+    } else {
+      const list = document.createElement('div');
+      list.className = 'fb-gmail-list';
+      if (!view.messages.length) {
+        const empty = document.createElement('div');
+        empty.className = 'fb-gmail-empty';
+        empty.textContent = view.query ? 'No messages matched this search.' : 'Your mailbox is empty.';
+        list.appendChild(empty);
+      }
+      for (const message of view.messages) {
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = `fb-gmail-row${message.labelIds?.includes('UNREAD') ? ' is-unread' : ''}`;
+        row.addEventListener('click', () => this._openGmailMessage(tabId, message.id).catch(() => {}));
+        const sender = document.createElement('span');
+        sender.className = 'fb-gmail-row-sender';
+        sender.textContent = message.headers?.from || 'Unknown sender';
+        const content = document.createElement('span');
+        content.className = 'fb-gmail-row-content';
+        const subject = document.createElement('b');
+        subject.textContent = message.headers?.subject || '(no subject)';
+        const snippet = document.createElement('span');
+        snippet.textContent = message.snippet ? ` — ${message.snippet}` : '';
+        content.appendChild(subject);
+        content.appendChild(snippet);
+        const date = document.createElement('time');
+        date.textContent = this._formatGmailDate(message);
+        row.appendChild(sender);
+        row.appendChild(content);
+        row.appendChild(date);
+        list.appendChild(row);
+      }
+      if (view.nextPageToken) {
+        const more = document.createElement('button');
+        more.type = 'button';
+        more.className = 'fb-gmail-more';
+        more.textContent = view.status === 'loading-more' ? 'Loading…' : 'Load more';
+        more.disabled = view.status === 'loading-more';
+        more.addEventListener('click', () => this._loadGmailMessages(tabId, { append: true }).catch(() => {}));
+        list.appendChild(more);
+      }
+      main.appendChild(list);
+    }
+    layout.appendChild(main);
+    page.appendChild(layout);
+    viewport.appendChild(page);
+  }
+
+  async loadGoogleServicePreview(serviceId) {
+    const service = googleServiceById(serviceId);
+    if (!service?.api) return;
+    if (typeof this.authBridge?.getGoogleServiceItems !== 'function') {
+      this.state.googleServicesPreview = { status: 'unavailable', serviceId, items: [], error: 'google_services_api_unavailable' };
+      this.render();
+      return;
+    }
+    this.state.googleServicesPreview = { status: 'loading', serviceId, items: [], error: null };
+    this.render();
+    const result = await this.authBridge.getGoogleServiceItems(serviceId, this.currentProfileId());
+    if (this.state.googleServicesPreview?.serviceId !== serviceId) return;
+    this.state.googleServicesPreview = result?.ok
+      ? { status: 'ready', serviceId, items: Array.isArray(result.items) ? result.items : [], error: null }
+      : { status: 'error', serviceId, items: [], error: result?.error || 'google_service_preview_failed' };
+    this.render();
+  }
+
+  renderGoogleServicesPage(viewport, activeTab) {
+    const page = document.createElement('div');
+    page.className = 'fb-google-services-page fb-internal-page';
+    const account = this.state.googleServices?.signedIn ? this.state.googleServices : this.state.googleAccount;
+    const profile = account?.profile || {};
+    const connected = this.state.googleServices?.signedIn;
+    const preview = this.state.googleServicesPreview || { status: 'idle', items: [] };
+    const previewService = googleServiceById(preview.serviceId);
+
+    // One-shot lazy refresh of Chrome availability for the services hub.
+    // It never triggers a nested render loop because of the status guard.
+    if (this.googleChromeProfileBridge && this.state.googleChromeProfile.status === 'idle') {
+      this.state.googleChromeProfile.status = 'loading';
+      void this.refreshGoogleChromeProfileStatus().then(() => this.requestRender()).catch(() => {});
+    }
+
+    const header = document.createElement('header');
+    header.className = 'fb-google-services-header';
+    const identity = document.createElement('div');
+    identity.className = 'fb-google-services-identity';
+    const mark = document.createElement('span');
+    mark.className = 'fb-google-services-mark';
+    mark.textContent = 'G';
+    const copy = document.createElement('div');
+    const title = document.createElement('h1');
+    title.textContent = 'Google services in Yayra';
+    const subtitle = document.createElement('p');
+    subtitle.textContent = connected
+      ? `Google identity verified as ${profile.email || profile.name || 'your Google account'}. API previews run in Yayra; Google websites use the separate dedicated Chrome profile.`
+      : 'Connect Google services through the external browser. When Chrome is installed, the same sign-in also creates a real Google website session in Yayra’s dedicated Chrome profile.';
+    copy.appendChild(title);
+    copy.appendChild(subtitle);
+    identity.appendChild(mark);
+    identity.appendChild(copy);
+    header.appendChild(identity);
+    const actions = document.createElement('div');
+    actions.className = 'fb-google-services-actions';
+    const connectButton = document.createElement('button');
+    connectButton.type = 'button';
+    connectButton.className = 'fb-btn fb-btn-primary fb-google-services-connect';
+    connectButton.textContent = connected ? 'Switch Google account' : 'Connect Google services';
+    connectButton.addEventListener('click', () => this.connectGoogleServicesWithGoogle().catch(() => {}));
+    actions.appendChild(connectButton);
+    if (connected) {
+      const gmailButton = document.createElement('button');
+      gmailButton.type = 'button';
+      gmailButton.className = 'fb-btn fb-btn-secondary fb-google-services-gmail';
+      gmailButton.textContent = 'Open Gmail in Yayra';
+      gmailButton.addEventListener('click', () => {
+        this.createNewTab();
+        this._inAppOnlyGoogleTabs.add(this.state.activeTabId);
+        this.navigateActiveTab('https://mail.google.com/mail/u/0/#inbox');
+      });
+      actions.appendChild(gmailButton);
+      const disconnectButton = document.createElement('button');
+      disconnectButton.type = 'button';
+      disconnectButton.className = 'fb-btn fb-btn-danger fb-google-services-disconnect';
+      disconnectButton.textContent = 'Disconnect';
+      disconnectButton.addEventListener('click', () => this.signOutOfGoogle());
+      actions.appendChild(disconnectButton);
+    }
+    header.appendChild(actions);
+    page.appendChild(header);
+
+    // Dedicated real Chrome profile: the guaranteed way to use Google's own
+    // websites while genuinely signed in. Clearly separated from Yayra's
+    // OAuth-verified app identity above.
+    const chromeProfile = this.state.googleChromeProfile || {};
+    const chromeAvailable = Boolean(this.googleChromeProfileBridge) && chromeProfile.available;
+    const chromePanel = document.createElement('section');
+    chromePanel.className = 'fb-google-services-chrome-panel';
+    const chromeTitle = document.createElement('h2');
+    chromeTitle.textContent = 'Real Google website sign-in (dedicated Chrome)';
+    const chromeCopy = document.createElement('p');
+    chromeCopy.textContent = chromeAvailable
+      ? 'Yayra launches a separate real Chrome window with its own Yayra-owned profile. Sign in once and Google Account, Gmail and Drive open genuinely signed in. Yayra never reads or copies its cookies.'
+      : 'Install Google Chrome, Microsoft Edge or Chromium to use a dedicated Yayra-owned browser profile. Until then, Google websites open in your default system browser.';
+    const chromeActions = document.createElement('div');
+    chromeActions.className = 'fb-google-services-chrome-actions';
+    const chromeSignIn = document.createElement('button');
+    chromeSignIn.type = 'button';
+    chromeSignIn.className = 'fb-btn fb-btn-primary';
+    chromeSignIn.textContent = connected ? 'Open Google Account in Chrome' : 'Connect & open Google Account';
+    chromeSignIn.disabled = !chromeAvailable;
+    chromeSignIn.addEventListener('click', () => (connected
+      ? this.openGoogleInChromeProfile('https://myaccount.google.com/')
+      : this.connectGoogleWebsitesInChrome()).catch(() => {}));
+    chromeActions.appendChild(chromeSignIn);
+    const chromeSettings = document.createElement('button');
+    chromeSettings.type = 'button';
+    chromeSettings.className = 'fb-btn fb-btn-secondary';
+    chromeSettings.textContent = 'Google sign-in settings';
+    chromeSettings.addEventListener('click', () => this.showPrivacyView('google-signin'));
+    chromeActions.appendChild(chromeSettings);
+    chromePanel.appendChild(chromeTitle);
+    chromePanel.appendChild(chromeCopy);
+    chromePanel.appendChild(chromeActions);
+    page.appendChild(chromePanel);
+
+    if (!connected) {
+      const empty = document.createElement('section');
+      empty.className = 'fb-google-services-empty';
+      const heading = document.createElement('h2');
+      heading.textContent = 'Use Google Account, Gmail, Drive and more inside Yayra';
+      const copy2 = document.createElement('p');
+      copy2.textContent = 'Yayra opens Google’s consent in Chrome or your system browser. When you return, the exact selected account is shown here and on Google pages opened inside Yayra. Yayra never copies browser cookies or puts Google tokens in a return URL.';
+      const connect = document.createElement('button');
+      connect.type = 'button';
+      connect.className = 'fb-btn fb-btn-primary';
+      connect.textContent = 'Continue with Google';
+      connect.addEventListener('click', () => this.connectGoogleServicesWithGoogle().catch(() => {}));
+      empty.appendChild(heading);
+      empty.appendChild(copy2);
+      empty.appendChild(connect);
+      page.appendChild(empty);
+      viewport.appendChild(page);
+      return;
+    }
+
+    const notice = document.createElement('div');
+    notice.className = 'fb-google-services-status';
+    notice.innerHTML = `<span>${Icons.shield}</span><p><strong>Google identity verified:</strong> ${escapeHtml(profile.email || profile.name || 'Google account')}. This is separate from Yayra’s own account sign-in. Google website cookies remain in the dedicated Chrome profile; API previews and the limited Gmail surface run in Yayra.</p>`;
+    page.appendChild(notice);
+
+    if (previewService) {
+      const panel = document.createElement('section');
+      panel.className = 'fb-google-services-preview';
+      const panelHeader = document.createElement('div');
+      panelHeader.className = 'fb-google-services-preview-header';
+      const panelTitle = document.createElement('h2');
+      panelTitle.textContent = `${previewService.title} preview`;
+      const close = document.createElement('button');
+      close.type = 'button';
+      close.className = 'fb-btn fb-btn-secondary';
+      close.textContent = 'Close';
+      close.addEventListener('click', () => {
+        this.state.googleServicesPreview = { status: 'idle', serviceId: null, items: [], error: null };
+        this.render();
+      });
+      panelHeader.appendChild(panelTitle);
+      panelHeader.appendChild(close);
+      panel.appendChild(panelHeader);
+      if (preview.status === 'loading') {
+        const loading = document.createElement('p');
+        loading.textContent = 'Loading your private Google data…';
+        panel.appendChild(loading);
+      } else if (preview.status === 'error' || preview.status === 'unavailable') {
+        const error = document.createElement('p');
+        error.textContent = this.formatGoogleSignInError(preview.error);
+        panel.appendChild(error);
+      } else if (!preview.items.length) {
+        const empty = document.createElement('p');
+        empty.textContent = 'No recent items were returned for this service.';
+        panel.appendChild(empty);
+      } else {
+        const list = document.createElement('div');
+        list.className = 'fb-google-services-items';
+        for (const item of preview.items) {
+          const row = document.createElement('button');
+          row.type = 'button';
+          row.className = 'fb-google-services-item';
+          const itemTitle = document.createElement('strong');
+          itemTitle.textContent = item.title || 'Untitled';
+          const detail = document.createElement('small');
+          detail.textContent = item.detail || '';
+          row.appendChild(itemTitle);
+          row.appendChild(detail);
+          if (item.url) {
+            row.addEventListener('click', () => {
+              this.createNewTab();
+              this._inAppOnlyGoogleTabs.add(this.state.activeTabId);
+              this.navigateActiveTab(item.url);
+            });
+          } else {
+            row.disabled = true;
+          }
+          list.appendChild(row);
+        }
+        panel.appendChild(list);
+      }
+      page.appendChild(panel);
+    }
+
+    const groups = new Map();
+    for (const service of GOOGLE_SERVICE_CATALOG) {
+      if (!groups.has(service.group)) groups.set(service.group, []);
+      groups.get(service.group).push(service);
+    }
+    for (const [groupName, services] of groups) {
+      const section = document.createElement('section');
+      section.className = 'fb-google-services-group';
+      const heading = document.createElement('h2');
+      heading.textContent = groupName;
+      section.appendChild(heading);
+      const grid = document.createElement('div');
+      grid.className = 'fb-google-services-grid';
+      for (const service of services) {
+        const card = document.createElement('article');
+        card.className = 'fb-google-services-card';
+        const icon = document.createElement('span');
+        icon.className = 'fb-google-services-card-icon';
+        icon.textContent = service.icon || 'G';
+        const name = document.createElement('strong');
+        name.textContent = service.title;
+        const label = document.createElement('small');
+        label.textContent = service.scope
+          ? 'Connected data available'
+          : (chromeAvailable && this.state.settings.googleOpenInChromeProfile !== false ? 'Opens in dedicated Chrome' : 'Opens in Yayra');
+        const open = document.createElement('button');
+        open.type = 'button';
+        open.className = 'fb-btn fb-btn-primary fb-google-services-open';
+        open.textContent = 'Open';
+        open.addEventListener('click', () => this.openGoogleService(service.id).catch(() => {}));
+        card.appendChild(icon);
+        card.appendChild(name);
+        card.appendChild(label);
+        card.appendChild(open);
+        if (this.googleChromeProfileBridge && chromeAvailable) {
+          const chromeOpen = document.createElement('button');
+          chromeOpen.type = 'button';
+          chromeOpen.className = 'fb-btn fb-btn-secondary fb-google-services-chrome-open';
+          chromeOpen.textContent = 'Chrome';
+          chromeOpen.setAttribute('title', `Open ${service.title} in Yayra's dedicated real Chrome profile`);
+          chromeOpen.addEventListener('click', () => this.openGoogleService(service.id, { inChromeProfile: true }).catch(() => {}));
+          card.appendChild(chromeOpen);
+        }
+        if (service.api) {
+          const previewButton = document.createElement('button');
+          previewButton.type = 'button';
+          previewButton.className = 'fb-btn fb-btn-secondary fb-google-services-preview-btn';
+          previewButton.textContent = 'Preview';
+          previewButton.addEventListener('click', () => this.loadGoogleServicePreview(service.id).catch(() => {}));
+          card.appendChild(previewButton);
+        }
+        grid.appendChild(card);
+      }
+      section.appendChild(grid);
+      page.appendChild(section);
+    }
+    viewport.appendChild(page);
+  }
+
   buildGoogleAccountConnectionFallback(url, { tabId = null } = {}) {
     const fallback = document.createElement('div');
     const record = this._ensureGoogleAccountConnection(tabId, url);
@@ -3999,7 +5022,7 @@ export class BrowserShell {
       ? 'Google is connected to Yayra'
       : (signingIn ? 'Finish connecting Google' : (failed ? 'Google connection did not finish' : 'Connect Google to Yayra'));
     const body = connected
-      ? `${escapeHtml(account.profile.email || account.profile.name || 'Your Google account')} is connected to Yayra and stays signed in here on this device. Supported Google actions use the verified OAuth connection after Chrome returns to Yayra. For security, Chrome cookies are never copied; services such as Drive use a scoped Google API session instead.`
+      ? `${escapeHtml(account.profile.email || account.profile.name || 'Your Google account')} is connected to Yayra and stays active here on this device. Continue returns to the exact tab and destination that started sign-in. Gmail opens in Yayra through Google’s scoped API; Chrome cookies are never copied.`
       : (signingIn
         ? 'Complete the Google consent page in your secure system browser. Its verified one-time callback will return the account to Yayra automatically.'
         : (failed
@@ -4397,6 +5420,9 @@ export class BrowserShell {
       pointerTheme: this.state.settings.pointerTheme || 'system',
       pointerSize: this.state.settings.pointerSize || 'normal'
     }).then((res) => {
+      // Ignore late results from a shell that has since been destroyed. The
+      // global Capacitor bridge may already belong to another instance.
+      if (this._destroyed) return;
       if (res && res.ok === false) {
         this._androidTabWebEngineUnavailable(wrapper, tabId, url);
         return;
@@ -4407,7 +5433,7 @@ export class BrowserShell {
       // attached surface's own visibility now, honouring overlays.
       this.syncAndroidTabWebVisibility(tabId, !this.hasBlockingOverlay() && this.state.activeTabId === tabId);
     }).catch(() => {
-      this._androidTabWebEngineUnavailable(wrapper, tabId, url);
+      if (!this._destroyed) this._androidTabWebEngineUnavailable(wrapper, tabId, url);
     });
 
     const previousObserver = this._androidTabWebResizeObservers.get(tabId);
@@ -4426,6 +5452,11 @@ export class BrowserShell {
    *  the engine. */
   _androidTabWebEngineUnavailable(wrapper, tabId, url) {
     this._androidTabWebIds.delete(tabId);
+    // A tabWebAttach promise can resolve after this shell was destroyed. The
+    // global window.Capacitor may then belong to a DIFFERENT shell instance,
+    // so opening an external browser here would leak a dead shell's URL into
+    // the live shell. Fail closed on a torn-down instance.
+    if (this._destroyed) return;
     const autoOpened = this.maybeAutoOpenBlockedExternally(url, tabId);
     wrapper.appendChild(this.buildFrameBlockedFallback(url, { autoOpened }));
   }
@@ -5124,12 +6155,55 @@ export class BrowserShell {
         if (tabId === this.state.activeTabId) this.requestRender();
         break;
       }
+      case 'google-sign-in-rejected': {
+        // Google refused the in-Yayra attempt ("This browser or app may not
+        // be secure"). The main process has already opened the same
+        // destination in Yayra's dedicated real Chrome profile. Be honest
+        // about what happened instead of pretending the tab is signed in.
+        this.updateTabLoading(tabId, false);
+        this.showTransientNotice(evt.chromeProfileOpened
+          ? 'Google requires a standalone browser for this sign-in. Yayra opened a fresh Google sign-in in its dedicated Chrome profile.'
+          : evt.fallbackOpened
+            ? 'Google requires a standalone browser for this sign-in. Yayra opened the page in your system browser; sign in there and return to Yayra.'
+            : 'Google requires a standalone browser for this sign-in. Install Chrome, Edge or Chromium, or open Google in your system browser.');
+        break;
+      }
+      case 'google-webauthn-fallback': {
+        this.showTransientNotice(evt.chromeProfileOpened
+          ? 'Google passkey selection requires a standalone browser. Yayra opened this page in its dedicated Chrome profile.'
+          : evt.fallbackOpened
+            ? 'Google passkey selection requires a standalone browser. Yayra opened this page in your system browser.'
+            : 'Google passkey selection is not available in this embedded page. Open it in the dedicated Chrome profile or your system browser.');
+        break;
+      }
+      case 'google-auth-surface': {
+        // Parity item 5: main-process-verified origin for browser chrome.
+        // Only the origin is used; it never comes from page JavaScript.
+        const authSurface = {
+          active: Boolean(evt.active),
+          origin: typeof evt.origin === 'string' && /^https:\/\/[a-z0-9.-]+$/i.test(evt.origin) ? evt.origin : ''
+        };
+        if (authSurface.active && authSurface.origin) this._googleAuthSurfacesByTab.set(tabId, authSurface);
+        else this._googleAuthSurfacesByTab.delete(tabId);
+        if (tabId === this.state.activeTabId) this.requestRender();
+        break;
+      }
       case 'google-account-auth-required': {
         // Google Account/Gmail redirected into a first-party ServiceLogin
         // route. A raw external handoff would authenticate only the other
         // browser and leave Yayra unchanged (the reported priority bug).
-        // Start Yayra's own callback-returning OAuth flow and replace this
-        // stale native surface with a connected-account status card.
+        // If Google services are already connected, never start another
+        // consent loop: return to the in-Yayra hub with the exact account.
+        if (this.state.googleServices?.signedIn && tab) {
+          this._googleAccountConnections.delete(tabId);
+          tab.url = 'yayra://google-services';
+          tab.title = 'Google services';
+          if (tabId === this.state.activeTabId) this.state.urlInputValue = 'yayra://google-services';
+          this.updateTabLoading(tabId, false);
+          this.render();
+          this.showTransientNotice('Google’s web page requires its own cookie session. Yayra kept your verified account and returned you to Google services.');
+          break;
+        }
         this.requestGoogleAccountConnection(tabId, { reason: evt.reason || 'navigation' });
         break;
       }
@@ -5258,6 +6332,9 @@ export class BrowserShell {
         break;
       case 'email-address-captured':
         this.rememberEmailAddress(evt.email, tab, evt.url).catch(() => {});
+        break;
+      case 'popup-blocked':
+        this.showTransientNotice('Yayra blocked a website pop-up. Allow pop-ups in Privacy & Security > Site settings if you trust this site.');
         break;
       case 'new-window-request':
         if (evt.url) {
@@ -5933,7 +7010,8 @@ export class BrowserShell {
       const parsed = new URL(value);
       const host = parsed.hostname.toLowerCase();
       return parsed.protocol === 'https:'
-        && (host === 'google.com' || host.endsWith('.google.com'));
+        && (host === 'google.com' || host.endsWith('.google.com')
+          || host === 'youtube.com' || host.endsWith('.youtube.com'));
     } catch {
       return false;
     }
@@ -7197,6 +8275,9 @@ export class BrowserShell {
     if (code.includes('access_denied')) return 'Google sign-in was cancelled or declined.';
     if (code.startsWith('token_exchange_failed')) return 'Google returned to Yayra, but the secure sign-in exchange failed. Please try again.';
     if (code.startsWith('userinfo_failed')) return 'Yayra signed in but could not read your basic Google profile. Please try again.';
+    if (code.includes('gmail_scope_not_granted')) return 'Google did not grant read-only Gmail access. Reconnect and allow Gmail to open it inside Yayra.';
+    if (code.includes('gmail_reconnect_required')) return 'The Gmail permission expired or is missing. Reconnect this Google account to continue.';
+    if (code.includes('gmail_list_failed') || code.includes('gmail_message_failed')) return 'Gmail could not load this request. Please try again.';
     if (/fetch failed|network/i.test(code)) return 'Yayra could not reach Google. Check your connection and try again.';
     return 'Please try again.';
   }
@@ -7234,6 +8315,7 @@ export class BrowserShell {
           </div>
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap;">
+          <button class="fb-btn fb-btn-primary fb-in-google-services-btn">Google services in Yayra</button>
           <button class="fb-btn fb-btn-secondary fb-in-google-manage-btn">Manage Google Account ${Icons.externalLink || '↗'}</button>
           <button class="fb-btn fb-btn-secondary fb-in-google-switch-btn">Switch account</button>
           <button class="fb-btn fb-btn-secondary fb-in-google-signout-btn">Sign out</button>
@@ -7699,29 +8781,8 @@ export class BrowserShell {
               prevents restyling external sites inside cross-origin frames.
             </p>
           </section>
-          <section class="fb-settings-group-card" id="sec-privacy" style="${activeCat === 'privacy' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
-            <h3 class="fb-settings-group-title">${Icons.shield} Privacy & Security</h3>
-            <div class="fb-setting-toggle-row">
-              <div>
-                <strong>HTTPS-First Mode</strong>
-                <p>Automatically upgrades connections to secure HTTPS whenever available.</p>
-              </div>
-              <input type="checkbox" id="fb-in-set-https" ${this.state.settings.httpsFirst !== false ? 'checked' : ''} />
-            </div>
-            <div class="fb-setting-toggle-row">
-              <div>
-                <strong>Ad & Tracker Shield</strong>
-                <p>Blocks intrusive advertising, third-party analytics, and telemetry beacons.</p>
-              </div>
-              <input type="checkbox" id="fb-in-set-adblock" ${this.state.settings.adBlockEnabled !== false ? 'checked' : ''} />
-            </div>
-            <div class="fb-setting-row" style="margin-top:10px;">
-              <div>
-                <strong>Clear Browsing Data</strong>
-                <p>Deletes history, cookies, cache, and cached credentials.</p>
-              </div>
-              <button class="fb-btn fb-btn-danger fb-in-open-cleardata-btn">Clear Data Now</button>
-            </div>
+          <section class="fb-settings-group-card fb-privacy-hub" id="sec-privacy" style="${activeCat === 'privacy' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
+            ${this.renderPrivacySettingsHtml()}
           </section>
 
           <!-- Passwords & Autofill Link -->
@@ -7952,6 +9013,7 @@ export class BrowserShell {
     this.bindUpdatesSettingsActions(page);
     this.bindReaderSettingsActions(page);
     this.bindPerformanceSettingsActions(page);
+    this.bindPrivacySettingsActions(page);
 
     // Search filter
     const searchInput = page.querySelector('#fb-in-settings-search') || page.querySelector('#fb-settings-search-input');
@@ -8257,7 +9319,7 @@ export class BrowserShell {
     });
 
     page.querySelector('.fb-in-google-signin-btn')?.addEventListener('click', () => {
-      this.signInWithGoogle();
+      this.startGoogleServicesSignIn();
     });
 
     page.querySelector('.fb-in-google-signout-btn')?.addEventListener('click', () => {
@@ -8266,6 +9328,10 @@ export class BrowserShell {
 
     page.querySelector('.fb-in-google-switch-btn')?.addEventListener('click', () => {
       this.switchGoogleAccount();
+    });
+
+    page.querySelector('.fb-in-google-services-btn')?.addEventListener('click', () => {
+      this.openInternalPage('yayra://google-services');
     });
 
     page.querySelector('.fb-in-google-manage-btn')?.addEventListener('click', () => {
@@ -10308,6 +11374,13 @@ export class BrowserShell {
   get systemBridge() {
     if (typeof window === 'undefined') return null;
     return (window.yayra && window.yayra.system) || (window.ibrowse && window.ibrowse.system) || null;
+  }
+
+  /** window.yayra.googleChromeProfile (Electron preload): dedicated real Chrome. */
+  get googleChromeProfileBridge() {
+    if (typeof window === 'undefined') return null;
+    return (window.yayra && window.yayra.googleChromeProfile)
+      || (window.ibrowse && window.ibrowse.googleChromeProfile) || null;
   }
 
   /** Generic single-line text prompt (window.prompt is dead in Electron renderers). */
@@ -13925,6 +14998,8 @@ export class BrowserShell {
         this.renderNewTabPage(miniViewport, activeTab);
       } else if (url === 'yayra://settings') {
         this.renderInternalSettingsPage(miniViewport, activeTab);
+      } else if (url === 'yayra://google-services') {
+        this.renderGoogleServicesPage(miniViewport, activeTab);
       } else if (url === 'yayra://history') {
         this.renderInternalHistoryPage(miniViewport, activeTab);
       } else if (url === 'yayra://bookmarks') {
@@ -15116,6 +16191,7 @@ export class BrowserShell {
         ${vaultSummaryHtml}
         ${profilesHtml}
         <div class="fb-account-dropdown-actions">
+          <button class="fb-btn fb-btn-primary fb-account-services-btn" style="width:100%; justify-content:flex-start;">${Icons.google} Google services in Yayra</button>
           <button class="fb-btn fb-btn-secondary fb-account-manage-btn" style="width:100%; justify-content:flex-start;">${Icons.externalLink} Manage Google Account</button>
           <button class="fb-btn fb-btn-secondary fb-account-settings-btn" style="width:100%; justify-content:flex-start;">${Icons.info} Yayra account settings</button>
           <button class="fb-btn fb-btn-secondary fb-account-switch-btn" style="width:100%; justify-content:flex-start;">${Icons.userCircle} Switch account</button>
@@ -15139,7 +16215,8 @@ export class BrowserShell {
         ${vaultSummaryHtml}
         ${profilesHtml}
         <div class="fb-account-dropdown-actions">
-          <button class="fb-btn fb-btn-primary fb-account-signin-btn" style="width:100%;" ${isSigningIn ? 'disabled' : ''}>${isSigningIn ? 'Signing in&hellip;' : 'Sign in with Google'}</button>
+          <button class="fb-btn fb-btn-primary fb-account-signin-btn" style="width:100%;" ${isSigningIn ? 'disabled' : ''}>${isSigningIn ? 'Signing in&hellip;' : 'Sign in to Google services'}</button>
+          <button class="fb-btn fb-btn-secondary fb-account-services-btn" style="width:100%; justify-content:flex-start;">${Icons.google} Open Google services</button>
           <button class="fb-btn fb-btn-secondary fb-account-settings-btn" style="width:100%; justify-content:flex-start;">${Icons.info} Yayra account settings</button>
         </div>
       `;
@@ -15155,9 +16232,13 @@ export class BrowserShell {
       else this.registerAccountPasskey();
     });
     dropdown.querySelector('.fb-account-manage-btn')?.addEventListener('click', () => this.openGoogleAccountPage());
+    dropdown.querySelector('.fb-account-services-btn')?.addEventListener('click', () => {
+      this.state.isAccountMenuOpen = false;
+      this.openInternalPage('yayra://google-services');
+    });
     dropdown.querySelector('.fb-account-switch-btn')?.addEventListener('click', () => this.switchGoogleAccount());
     dropdown.querySelector('.fb-account-signout-btn')?.addEventListener('click', () => this.signOutOfGoogle());
-    dropdown.querySelector('.fb-account-signin-btn')?.addEventListener('click', () => this.signInWithGoogle());
+    dropdown.querySelector('.fb-account-signin-btn')?.addEventListener('click', () => this.startGoogleServicesSignIn());
     dropdown.querySelector('.fb-account-settings-btn')?.addEventListener('click', () => {
       this.state.isAccountMenuOpen = false;
       this.state.settingsActiveCategory = 'account';
@@ -18176,6 +19257,8 @@ export class BrowserShell {
     this.destroyNativeWebview(tabId);
     this._systemBrowserHandoffs.delete(tabId);
     this._googleAccountConnections.delete(tabId);
+    this._googleAuthSurfacesByTab.delete(tabId);
+    this._gmailViews.delete(tabId);
     this._inAppOnlyGoogleTabs.delete(tabId);
     this._pageSnapshots.delete(tabId); // closed tab, dead preview
 
@@ -18612,6 +19695,7 @@ export class BrowserShell {
     // again; passive chrome updates may not.
     this._systemBrowserHandoffs.delete(activeTab.id);
     this._googleAccountConnections.delete(activeTab.id);
+    this._gmailViews.delete(activeTab.id);
     if (this.isGoogleAccountConnectionUrl(targetUrl)) {
       this._googleAccountConnections.set(activeTab.id, {
         requestedUrl: targetUrl,
@@ -18697,6 +19781,7 @@ export class BrowserShell {
       return trimmed;
     }
     if (trimmed === 'settings') return 'yayra://settings';
+    if (trimmed === 'google' || trimmed === 'google services' || trimmed === 'google-services') return 'yayra://google-services';
     if (trimmed === 'history') return 'yayra://history';
     if (trimmed === 'bookmarks') return 'yayra://bookmarks';
     if (trimmed === 'downloads') return 'yayra://downloads';
@@ -19897,12 +20982,947 @@ export class BrowserShell {
     return theme;
   }
 
+  privacySettingsViewName(value) {
+    return [
+      'overview', 'guide', 'clear-data', 'cookies', 'site-settings',
+      'site-data', 'security', 'ad-privacy', 'ad-topics',
+      'site-suggested-ads', 'ad-measurement', 'permissions', 'google-signin'
+    ].includes(value) ? value : 'overview';
+  }
+
+  normalizePrivacySettings() {
+    const s = this.state.settings;
+    const bool = (key, fallback) => typeof s[key] === 'boolean' ? s[key] : fallback;
+    const choice = (key, values, fallback) => values.includes(s[key]) ? s[key] : fallback;
+    s.httpsFirst = bool('httpsFirst', true);
+    s.safeBrowsingLevel = choice('safeBrowsingLevel', ['enhanced', 'standard', 'off'], 'enhanced');
+    s.adBlockEnabled = bool('adBlockEnabled', true);
+    s.doNotTrack = bool('doNotTrack', true);
+    s.globalPrivacyControl = bool('globalPrivacyControl', true);
+    s.thirdPartyCookies = choice('thirdPartyCookies', ['allow', 'block'], 'block');
+    s.privacySandboxTopics = bool('privacySandboxTopics', false);
+    s.privacySandboxSuggestedAds = bool('privacySandboxSuggestedAds', false);
+    s.privacySandboxMeasurement = bool('privacySandboxMeasurement', false);
+    s.secureDnsEnabled = bool('secureDnsEnabled', true);
+    s.secureDnsProvider = choice('secureDnsProvider', ['automatic', 'cloudflare', 'google', 'quad9', 'off'], 'automatic');
+    s.warnPasswordExposure = bool('warnPasswordExposure', true);
+    s.javascriptEnabled = bool('javascriptEnabled', true);
+    s.imagesEnabled = bool('imagesEnabled', true);
+    s.preloadPages = bool('preloadPages', false);
+    s.allowWebsitePopups = bool('allowWebsitePopups', false);
+    s.autoRemoveUnusedPermissions = bool('autoRemoveUnusedPermissions', true);
+    s.googleAuthParity = bool('googleAuthParity', false);
+    s.googleOpenInChromeProfile = bool('googleOpenInChromeProfile', true);
+    const cleanHostList = (value) => Array.isArray(value)
+      ? Array.from(new Set(value
+        .map((host) => String(host || '').trim().toLowerCase().replace(/^\.+|\.+$/g, ''))
+        .filter((host) => host && host.length <= 253 && /^[a-z0-9.-]+$/i.test(host)))).slice(0, 100)
+      : [];
+    s.cookieExceptions = cleanHostList(s.cookieExceptions);
+    s.blockedAdSites = cleanHostList(s.blockedAdSites);
+    const permissionKeys = ['location', 'camera', 'microphone', 'notifications', 'clipboard', 'midi', 'usb', 'serial', 'bluetooth', 'hid', 'pointerLock', 'idleDetection'];
+    const defaults = s.permissionDefaults && typeof s.permissionDefaults === 'object' ? s.permissionDefaults : {};
+    s.permissionDefaults = Object.fromEntries(permissionKeys.map((key) => {
+      if (!(key in defaults)) return [key, key === 'idleDetection' ? 'block' : 'ask'];
+      return [key, ['ask', 'allow', 'block'].includes(defaults[key]) ? defaults[key] : 'block'];
+    }));
+    const sitePermissions = s.sitePermissions && typeof s.sitePermissions === 'object' && !Array.isArray(s.sitePermissions) ? s.sitePermissions : {};
+    s.sitePermissions = Object.fromEntries(Object.entries(sitePermissions).slice(0, 100).map(([origin, values]) => {
+      let safeOrigin = null;
+      try {
+        const parsed = new URL(origin);
+        if (['https:', 'http:'].includes(parsed.protocol) && !parsed.username && !parsed.password) safeOrigin = parsed.origin;
+      } catch { /* invalid origin */ }
+      const safeValues = Object.fromEntries(permissionKeys
+        .filter((key) => ['allow', 'block'].includes(values?.[key]))
+        .map((key) => [key, values[key]]));
+      return [safeOrigin, safeValues];
+    }).filter(([origin, values]) => origin && Object.keys(values).length));
+    this.state.privacySettingsView = this.privacySettingsViewName(this.state.privacySettingsView);
+    const step = Number(this.state.privacyGuideStep);
+    this.state.privacyGuideStep = Number.isInteger(step) ? Math.max(0, Math.min(PRIVACY_GUIDE_STEPS.length - 1, step)) : 0;
+  }
+
+  async syncPrivacySettings({ notify = false } = {}) {
+    const webview = this.nativeWebview;
+    if (typeof webview?.setPrivacySettings !== 'function') return { ok: false, reason: 'desktop-only' };
+    try {
+      const result = await webview.setPrivacySettings(this.state.settings);
+      // Keep the trusted main-process parity switch in lockstep with the
+      // profile-scoped setting. It is best-effort: an older preload simply
+      // leaves parity off and Yayra's existing behavior is unchanged.
+      if (typeof webview.setGoogleAuthParity === 'function') {
+        void webview.setGoogleAuthParity(this.state.settings.googleAuthParity === true).catch?.(() => {});
+      }
+      if (result?.reloadRecommended && notify) {
+        this.showTransientNotice('JavaScript protection changed. Reload open websites for the new setting to take full effect.');
+      }
+      return result || { ok: false };
+    } catch {
+      return { ok: false, reason: 'privacy-sync-failed' };
+    }
+  }
+
+  /** Fetch the dedicated Chrome profile availability from main (desktop). */
+  async refreshGoogleChromeProfileStatus() {
+    const api = this.googleChromeProfileBridge;
+    if (!api || typeof api.status !== 'function') {
+      this.state.googleChromeProfile = { status: 'unavailable', available: false, exists: false, launched: false };
+      return this.state.googleChromeProfile;
+    }
+    try {
+      const result = await api.status();
+      this.state.googleChromeProfile = {
+        status: 'ready',
+        available: Boolean(result?.available),
+        exists: Boolean(result?.exists),
+        launched: Boolean(result?.launched)
+      };
+    } catch {
+      this.state.googleChromeProfile = { status: 'error', available: false, exists: false, launched: false };
+    }
+    return this.state.googleChromeProfile;
+  }
+
+  /**
+   * Obtain a verified Google profile through explicit services consent in the
+   * dedicated Chrome profile, then open the real Account website in that same
+   * profile. This is the supported way to both create the website cookie
+   * session and reflect the exact selected email in Yayra.
+   */
+  async connectGoogleWebsitesInChrome() {
+    const result = await this.connectGoogleServicesWithGoogle();
+    if (!result?.ok) return result;
+    await this.openGoogleInChromeProfile('https://myaccount.google.com/');
+    return result;
+  }
+
+  /** Open a Google-owned destination in Yayra's dedicated real Chrome. */
+  async openGoogleInChromeProfile(url = 'https://myaccount.google.com/', { signIn = false } = {}) {
+    const api = this.googleChromeProfileBridge;
+    if (!api) {
+      this.showTransientNotice('A dedicated Chrome profile is available in the Yayra desktop app only.');
+      return { ok: false, error: 'desktop-only' };
+    }
+    try {
+      const result = signIn && typeof api.signIn === 'function'
+        ? await api.signIn()
+        : await api.open(url);
+      if (!result?.ok) {
+        this.showTransientNotice(result?.error === 'chrome_binary_not_found'
+          ? 'No Chrome, Edge or Chromium installation was found. Install one, then try again.'
+          : `Yayra could not open the Chrome profile: ${result?.error || 'unknown error'}.`);
+        return result;
+      }
+      await this.refreshGoogleChromeProfileStatus();
+      this.showTransientNotice('Opened in Yayra’s dedicated Chrome profile. Sign in there once; it stays signed in.');
+      this.render();
+      return result;
+    } catch (err) {
+      this.showTransientNotice(`Yayra could not open the Chrome profile: ${err?.message || 'unknown error'}.`);
+      return { ok: false, error: 'chrome_profile_open_failed' };
+    }
+  }
+
+  async configureSecureDns() {
+    const configure = this.systemBridge?.configureSecureDns;
+    if (typeof configure !== 'function') return { ok: false, reason: 'desktop-only' };
+    try {
+      return await configure({
+        enabled: this.state.settings.secureDnsEnabled !== false,
+        provider: this.state.settings.secureDnsProvider || 'automatic'
+      });
+    } catch {
+      return { ok: false, reason: 'configuration-failed' };
+    }
+  }
+
+  privacyPasswordAudit() {
+    const items = Array.isArray(this.state.passwordsItems) ? this.state.passwordsItems : [];
+    const byPassword = new Map();
+    const weak = [];
+    for (const item of items) {
+      const password = String(item?.password || '');
+      const key = password;
+      byPassword.set(key, (byPassword.get(key) || 0) + 1);
+      const weakReason = password.length === 0 ? 'empty'
+        : password.length < 8 ? 'short'
+          : /^(?:password|123456|qwerty|letmein|admin|welcome)/i.test(password) ? 'common'
+            : /^(?:(.)\1+)$/.test(password) ? 'repetitive'
+              : null;
+      if (weakReason) weak.push({ origin: item?.origin || 'Saved site', reason: weakReason });
+    }
+    const reused = Array.from(byPassword.values()).filter((count) => count > 1).reduce((sum, count) => sum + count, 0);
+    return { total: items.length, weak: weak.length, reused, weakSites: weak.slice(0, 8) };
+  }
+
+  async runPrivacySafetyCheck() {
+    this.state.privacySafetyCheck = { status: 'checking', recommendations: [], stats: null };
+    this.render();
+    this.state.privacyPasswordReport = this.privacyPasswordAudit();
+    const status = typeof this.nativeWebview?.privacyStatus === 'function'
+      ? await this.nativeWebview.privacyStatus().catch(() => null)
+      : null;
+    const policyRecommendations = status?.recommendations || [];
+    const setting = this.state.settings;
+    const local = [];
+    if (setting.safeBrowsingLevel !== 'enhanced') local.push('safe-browsing');
+    if (setting.thirdPartyCookies !== 'block') local.push('third-party-cookies');
+    if (!setting.adBlockEnabled) local.push('tracker-protection');
+    if (setting.privacySandboxTopics || setting.privacySandboxSuggestedAds || setting.privacySandboxMeasurement) local.push('ad-privacy');
+    if (!setting.warnPasswordExposure) local.push('password-checkup');
+    if (setting.warnPasswordExposure && (this.state.privacyPasswordReport?.weak || this.state.privacyPasswordReport?.reused)) {
+      local.push('saved-password-weak-or-reused');
+    }
+    const recommendations = Array.from(new Set([...policyRecommendations, ...local]));
+    this.state.privacySafetyCheck = {
+      status: 'done',
+      recommendations,
+      stats: status?.stats || null,
+      passwordReport: this.state.privacyPasswordReport,
+      unavailable: !status?.ok
+    };
+    this.render();
+  }
+
+  async loadPrivacySiteData() {
+    if (typeof this.nativeWebview?.listSiteData !== 'function') {
+      this.state.privacySiteData = {
+        ...this.state.privacySiteData,
+        status: 'unavailable',
+        sites: [],
+        totalSites: 0,
+        truncated: false
+      };
+      this.render();
+      return;
+    }
+    this.state.privacySiteData.status = 'loading';
+    this.render();
+    const result = await this.nativeWebview.listSiteData().catch(() => null);
+    this.state.privacySiteData = {
+      ...this.state.privacySiteData,
+      status: result?.ok ? 'done' : 'error',
+      sites: Array.isArray(result?.sites) ? result.sites : [],
+      totalSites: Number(result?.totalSites) || 0,
+      truncated: Boolean(result?.truncated)
+    };
+    this.render();
+  }
+
+  showPrivacyView(view) {
+    this.state.privacySettingsView = this.privacySettingsViewName(view);
+    this.state.settingsSearchQuery = '';
+    this.state.settingsActiveCategory = 'privacy';
+    this.state.activeSettingsCategory = 'privacy';
+    if (this.state.privacySettingsView === 'site-data' && this.state.privacySiteData.status === 'idle') {
+      void this.loadPrivacySiteData();
+    }
+    if (this.state.privacySettingsView === 'google-signin') {
+      // Lazy, non-blocking: only the view that displays Chrome availability
+      // triggers the IPC, so shell startup ordering is unchanged everywhere.
+      void this.refreshGoogleChromeProfileStatus().then(() => this.render()).catch(() => {});
+    }
+    this.render();
+  }
+
+  getPrivacyDeleteCutoff() {
+    const range = PRIVACY_DELETE_RANGES[this.state.privacyDeleteRange] === undefined
+      ? PRIVACY_DELETE_RANGES.all
+      : PRIVACY_DELETE_RANGES[this.state.privacyDeleteRange];
+    return range === null ? null : Date.now() - range;
+  }
+
+  async deletePrivacyBrowsingData() {
+    const range = this.state.privacyDeleteRange || 'all';
+    const cutoff = this.getPrivacyDeleteCutoff();
+    const done = [];
+    try {
+      const selections = { ...this.state.privacyDeleteSelections };
+      if (selections.history && this.historyRepo) {
+        if (range === 'all' && typeof this.historyRepo.clearHistory === 'function') {
+          await this.historyRepo.clearHistory();
+          done.push('browsing history');
+        } else if (range !== 'all' && typeof this.historyRepo.getEntries === 'function'
+          && typeof this.historyRepo.setEntries === 'function') {
+          const entries = await this.historyRepo.getEntries(1000);
+          await this.historyRepo.setEntries(entries.filter((entry) => Number(entry?.lastVisitedAt || entry?.timestamp || 0) < (cutoff || 0)));
+          done.push('older browsing history');
+        } else if (range === 'all') {
+          await this.historyRepo.clear?.();
+          done.push('browsing history');
+        }
+      }
+      if (typeof this.systemBridge?.clearBrowsingData === 'function') {
+        const result = await this.systemBridge.clearBrowsingData({
+          cache: Boolean(selections.cache),
+          cookies: Boolean(selections.cookies),
+          since: cutoff,
+          form: range === 'all' && Boolean(selections.form)
+        });
+        if (!result?.ok) throw new Error(result?.reason || 'clear-failed');
+        if (selections.cookies) done.push(range === 'all' ? 'cookies and site data' : 'cookies created in this time range');
+        if (selections.cache) done.push('cached images and files');
+        if (selections.form && range === 'all') done.push('autofill form data');
+      } else if (selections.cache || selections.cookies) {
+        if (selections.cache) await this.privacyManager?.clearCache?.();
+        if (selections.cookies) await this.privacyManager?.clearCookies?.();
+        done.push('local cache and cookies');
+      }
+      if (range === 'all' && selections.history) {
+        this.state.historyItems = [];
+      }
+      if (range === 'all' && selections.cookies) {
+        this.state.privacySiteData = { ...this.state.privacySiteData, status: 'idle', sites: [], totalSites: 0 };
+      }
+      this.state.settingsActiveCategory = 'privacy';
+      this.state.privacySettingsView = 'overview';
+      this.render();
+      this.showTransientNotice(`Delete browsing data completed: ${done.join(', ')}.`);
+    } catch (error) {
+      this.showTransientNotice(`Delete browsing data failed: ${error?.message || 'unknown error'}.`);
+    }
+  }
+
+  applyRecommendedPrivacySettings() {
+    const s = this.state.settings;
+    Object.assign(s, {
+      httpsFirst: true,
+      safeBrowsingLevel: 'enhanced',
+      adBlockEnabled: true,
+      doNotTrack: true,
+      globalPrivacyControl: true,
+      thirdPartyCookies: 'block',
+      privacySandboxTopics: false,
+      privacySandboxSuggestedAds: false,
+      privacySandboxMeasurement: false,
+      secureDnsEnabled: true,
+      secureDnsProvider: 'automatic',
+      warnPasswordExposure: true,
+      javascriptEnabled: true,
+      imagesEnabled: true,
+      preloadPages: false,
+      allowWebsitePopups: false,
+      autoRemoveUnusedPermissions: true,
+      googleAuthParity: false,
+      googleOpenInChromeProfile: true
+    });
+    this.persistSettings();
+    void this.configureSecureDns();
+    void this.runPrivacySafetyCheck();
+    this.showTransientNotice('Maximum protection applied. Website logins remain isolated per Yayra profile.');
+  }
+
+  privacyHostInput(value) {
+    return String(value || '')
+      .trim()
+      .toLowerCase()
+      .replace(/^https?:\/\//, '')
+      .split(/[/?#]/)[0]
+      .replace(/^\.+|\.+$/g, '')
+      .slice(0, 253);
+  }
+
+  addPrivacyHostException(kind = 'cookie') {
+    const key = kind === 'ad' ? 'blockedAdSites' : 'cookieExceptions';
+    const owner = this.rootElement || document;
+    const input = owner.querySelector(kind === 'ad' ? '#fb-privacy-blocked-site' : '#fb-privacy-cookie-site');
+    const host = this.privacyHostInput(input?.value);
+    if (!host || !/^[a-z0-9.-]+$/i.test(host) || host.includes('..')) {
+      this.showTransientNotice('Enter a valid website address, for example example.com.');
+      return;
+    }
+    const list = Array.isArray(this.state.settings[key]) ? this.state.settings[key] : [];
+    if (!list.includes(host)) this.state.settings[key] = [...list, host].slice(0, 100);
+    if (input) input.value = '';
+    this.persistSettings();
+    this.render();
+  }
+
+  removePrivacyHostException(host, kind = 'cookie') {
+    const key = kind === 'ad' ? 'blockedAdSites' : 'cookieExceptions';
+    this.state.settings[key] = (Array.isArray(this.state.settings[key]) ? this.state.settings[key] : [])
+      .filter((item) => item !== host);
+    this.persistSettings();
+    this.render();
+  }
+
+  renderPrivacyNavCard(view, icon, title, description) {
+    return `
+      <button type="button" class="fb-privacy-nav-card" data-privacy-view="${escapeAttr(view)}">
+        <span class="fb-privacy-nav-icon">${icon}</span>
+        <span class="fb-privacy-nav-text"><strong>${escapeHtml(title)}</strong><small>${escapeHtml(description)}</small></span>
+        <span class="fb-privacy-nav-chevron">›</span>
+      </button>`;
+  }
+
+  renderPrivacyPageHeader(title, description, back = 'overview') {
+    return `
+      <div class="fb-privacy-page-header">
+        <button type="button" class="fb-privacy-back" data-privacy-view="${escapeAttr(back)}" aria-label="Back">‹</button>
+        <div><h3>${escapeHtml(title)}</h3><p>${escapeHtml(description)}</p></div>
+      </div>`;
+  }
+
+  renderPrivacySelect(setting, options, selected) {
+    return `<select class="fb-select" data-privacy-setting="${escapeAttr(setting)}" aria-label="${escapeAttr(setting)}">
+      ${options.map(([value, label]) => `<option value="${escapeAttr(value)}" ${String(selected) === String(value) ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}
+    </select>`;
+  }
+
+  renderPrivacyToggle(setting, checked, description = '', id = '') {
+    return `<input type="checkbox" data-privacy-setting="${escapeAttr(setting)}" ${checked ? 'checked' : ''} ${description ? `aria-label="${escapeAttr(description)}"` : ''} ${id ? `id="${escapeAttr(id)}"` : ''} />`;
+  }
+
+  renderPrivacyRow(title, description, control) {
+    return `<div class="fb-privacy-row"><div><strong>${escapeHtml(title)}</strong><p>${escapeHtml(description)}</p></div>${control}</div>`;
+  }
+
+  renderPrivacySettingsHtml() {
+    const view = this.privacySettingsViewName(this.state.privacySettingsView);
+    const s = this.state.settings;
+    const shield = Icons.shield;
+    const search = Icons.search;
+    const settings = Icons.settings;
+    const lock = Icons.lock;
+    const info = Icons.info;
+    const trash = Icons.trash;
+
+    if (view === 'guide') {
+      const step = this.state.privacyGuideStep;
+      const stepId = PRIVACY_GUIDE_STEPS[step];
+      const content = {
+        welcome: {
+          title: 'A guide to your privacy choices',
+          text: 'Take a guided tour of the controls that keep your browsing private. Every choice applies immediately and stays in this Yayra profile.',
+          controls: ''
+        },
+        browsing: {
+          title: 'Choose your search and browsing quality',
+          text: 'Predictive preloading can make pages appear faster, but it can contact sites before you choose to visit them. Keep it off for maximum privacy.',
+          controls: `<div class="fb-privacy-guide-columns"><div><h5>When on</h5><p>Yayra allows prefetch hints from sites you visit. Search and browsing can become faster.</p></div><div><h5>Things to consider</h5><p>Preloading may contact a site before you click. Your history and cookies stay isolated in this profile.</p></div></div>`
+            + this.renderPrivacyRow('Allow page preloading', 'Let websites request speculative navigation.', this.renderPrivacyToggle('preloadPages', s.preloadPages))
+        },
+        safebrowsing: {
+          title: 'Choose Yayra threat protection',
+          text: 'Enhanced protection applies local URL hardening and tracker blocking. Standard protection keeps the essentials; off disables proactive warnings.',
+          controls: `<div class="fb-privacy-guide-columns"><div><h5>Enhanced</h5><p>Blocks known tracking endpoints, credential-in-URL traps and suspicious navigation patterns locally.</p></div><div><h5>Standard</h5><p>Blocks known tracking endpoints without predictive preloading.</p></div></div>`
+            + `<div class="fb-privacy-row-list">${[
+              ['enhanced', 'Enhanced protection', 'Local threat-pattern detection and tracker blocking.'],
+              ['standard', 'Standard protection', 'Local tracker blocking and safe redirect checks.'],
+              ['off', 'No protection', 'Not recommended.']
+            ].map(([value, title, description]) => `<label class="fb-privacy-row"><span><strong>${title}</strong><br><small>${description}</small></span><input type="radio" name="fb-privacy-safebrowsing" value="${value}" data-privacy-setting="safeBrowsingLevel" ${s.safeBrowsingLevel === value ? 'checked' : ''} /></label>`).join('')}</div>`
+        },
+        cookies: {
+          title: 'Choose your third-party cookie preference',
+          text: 'Cross-site cookies let unrelated websites follow activity across pages. Yayra can strip them from requests and responses.',
+          controls: `<div class="fb-privacy-guide-columns"><div><h5>Block third-party cookies</h5><p>Sites cannot use cross-site cookies to connect your activity. Use a site exception only for an embedded service you trust.</p></div><div><h5>Allow third-party cookies</h5><p>Some embedded sign-ins work, but cross-site tracking becomes possible.</p></div></div>`
+            + this.renderPrivacyRow('Third-party cookies', 'Recommended: Block third-party cookies.', this.renderPrivacySelect('thirdPartyCookies', [['block', 'Block third-party cookies'], ['allow', 'Allow third-party cookies']], s.thirdPartyCookies))
+        },
+        privacy: {
+          title: 'Choose your privacy signals',
+          text: 'Yayra can tell sites that you do not want tracking or sale/sharing of personal data, and disable ad-personalization APIs.',
+          controls: `<div class="fb-privacy-row-list">
+            ${this.renderPrivacyRow('Send Do Not Track', 'Adds DNT: 1 to website requests.', this.renderPrivacyToggle('doNotTrack', s.doNotTrack))}
+            ${this.renderPrivacyRow('Global Privacy Control', 'Adds Sec-GPC: 1 to supported websites.', this.renderPrivacyToggle('globalPrivacyControl', s.globalPrivacyControl))}
+            ${this.renderPrivacyRow('Ad topics', 'Blocks browser ad-topic headers.', this.renderPrivacyToggle('privacySandboxTopics', s.privacySandboxTopics))}
+          </div>`
+        },
+        completion: {
+          title: 'Review complete',
+          text: 'Your selected protections are active now. Run Safety Check any time to review your protection status.',
+          controls: `<div class="fb-privacy-row-list">
+            ${this.renderPrivacyNavCard('ad-privacy', info, 'Ad privacy', 'Review topics, site-suggested ads and measurement controls.')}
+            ${this.renderPrivacyNavCard('security', lock, 'Security', 'Review Safe Browsing, secure DNS and password warnings.')}
+            ${this.renderPrivacyNavCard('site-settings', settings, 'Site settings', 'Review permissions and stored site data.')}
+          </div>`
+        }
+      }[stepId];
+      return `${this.renderPrivacyPageHeader('Privacy Guide', 'Step-by-step privacy controls.')}
+        <div class="fb-privacy-body fb-privacy-guide-card">
+          <div class="fb-privacy-guide-steps">${PRIVACY_GUIDE_STEPS.map((_, index) => `<span class="${index === step ? 'active' : ''}"></span>`).join('')}</div>
+          <div class="fb-privacy-guide-illustration">${shield}</div>
+          <h4>${escapeHtml(content.title)}</h4>
+          <p>${escapeHtml(content.text)}</p>
+          ${content.controls}
+          <div class="fb-privacy-guide-actions">
+            ${step > 0 ? '<button type="button" class="fb-btn fb-btn-secondary" data-privacy-action="guide-back">Back</button>' : '<span></span>'}
+            ${step < PRIVACY_GUIDE_STEPS.length - 1
+              ? '<button type="button" class="fb-btn fb-btn-primary" data-privacy-action="guide-next">Next</button>'
+              : '<button type="button" class="fb-btn fb-btn-primary" data-privacy-action="guide-done">Done</button>'}
+          </div>
+        </div>`;
+    }
+
+    if (view === 'google-signin') {
+      const chromeProfile = this.state.googleChromeProfile || {};
+      const desktop = Boolean(this.nativeWebview);
+      const parity = s.googleAuthParity === true;
+      const openInChrome = s.googleOpenInChromeProfile !== false;
+      const statusText = !desktop
+        ? 'This is the web version of Yayra. Real Google website sign-in needs the desktop app with a dedicated Chrome profile.'
+        : chromeProfile.available
+          ? (chromeProfile.launched
+            ? 'A Yayra-owned Chrome profile is active. Sign in there once and Google websites stay signed in across restarts.'
+            : 'A real Chrome/Chromium installation was found. Yayra will launch it with its own isolated profile - your personal Chrome stays untouched.')
+          : 'No Chrome, Edge or Chromium installation was found. Yayra will use your default system browser instead.';
+      return `${this.renderPrivacyPageHeader('Google sign-in', 'How Yayra handles Google website sessions.', 'overview')}
+        <div class="fb-privacy-body">
+          <div class="fb-privacy-status ${chromeProfile.available || !desktop ? '' : 'is-warning'}">${escapeHtml(statusText)}</div>
+          <div class="fb-privacy-section-label">Guaranteed: dedicated Chrome profile</div>
+          <div class="fb-privacy-row-list">
+            ${this.renderPrivacyRow('Connect Google and create a real website session', 'Explicit Google services consent opens in Yayra’s dedicated Chrome profile. The loopback callback returns the exact verified email to Yayra; Chrome keeps the real website cookies. Read-only Gmail/Drive and other requested services are covered by the consent screen.', `<button type="button" class="fb-btn fb-btn-primary" data-privacy-action="chrome-profile-connect" ${desktop ? '' : 'disabled'}>Connect & open Google Account</button>`)}
+            ${this.renderPrivacyRow('Open Google products in Chrome', 'Google services opened from the hub use the dedicated Chrome profile, where you are genuinely signed in.', this.renderPrivacyToggle('googleOpenInChromeProfile', openInChrome))}
+            ${this.renderPrivacyRow('Open Google Account (website only)', 'Open myaccount.google.com directly in the dedicated profile. This creates or reuses Google’s website session, but does not by itself send the selected email back to Yayra; use “Connect & open Google Account” when you also want the verified email reflected in Yayra.', `<button type="button" class="fb-btn fb-btn-secondary" data-privacy-action="chrome-profile-open-account" ${desktop ? '' : 'disabled'}>Open</button>`)}
+          </div>
+          <div class="fb-privacy-section-label">Best effort: sign in inside a Yayra tab</div>
+          <div class="fb-privacy-status is-warning">Google does not publish a browser allowlist. These changes remove the signals Google associates with embedded or automated browsers, but acceptance cannot be guaranteed. If Google still refuses, Yayra opens that page in the dedicated Chrome profile automatically.</div>
+          <div class="fb-privacy-row-list">
+            ${this.renderPrivacyRow('Standalone-browser parity', 'On Google sign-in pages: honest client hints, no page scripts or header rewriting, no injected WebAuthn shim, a main-process origin indicator, and automatic Chrome fallback when Google rejects the embedded flow.', this.renderPrivacyToggle('googleAuthParity', parity))}
+          </div>
+          <div class="fb-privacy-section-label">What parity changes</div>
+          <div class="fb-privacy-guide-columns">
+            <div><h5>Removed on accounts.google.com</h5><p>Yayra page scripts, autofill DOM, connected-account overlay, WebAuthn watchdog, media shims, pointer CSS, request/response header rewriting, tracker and cookie stripping. If Electron needs an app-mediated passkey chooser, the page opens in real Chrome instead.</p></div>
+            <div><h5>Kept everywhere</h5><p>Per-profile isolated sessions, Privacy Shield on all other sites, third-party OAuth in the external browser, encrypted Yayra account sign-in, and the exact account shown in Yayra’s own browser chrome.</p></div>
+          </div>
+        </div>`;
+    }
+
+    if (view === 'clear-data') {
+      const ranges = [['15m', 'Last 15 min'], ['1h', 'Last hour'], ['24h', 'Last 24 hours'], ['7d', 'Last 7 days'], ['all', 'All time']];
+      const selections = this.state.privacyDeleteSelections;
+      return `${this.renderPrivacyPageHeader('Delete browsing data', 'Select a time range and data types, then delete.')}
+        <div class="fb-privacy-body">
+          <div class="fb-privacy-row-card">
+            <strong>Time range</strong>
+            <div class="fb-privacy-delete-ranges" style="margin-top:10px;">
+              ${ranges.map(([id, label]) => `<button type="button" class="${this.state.privacyDeleteRange === id ? 'active' : ''}" data-privacy-range="${id}">${label}</button>`).join('')}
+            </div>
+          </div>
+          <div class="fb-privacy-row-card fb-privacy-checklist">
+            <label><input type="checkbox" data-privacy-delete="history" ${selections.history ? 'checked' : ''} /><span><strong>Browsing history</strong><br><small>Removes visited pages from this Yayra profile.</small></span></label>
+            <label><input type="checkbox" data-privacy-delete="cookies" ${selections.cookies ? 'checked' : ''} /><span><strong>Cookies and other site data</strong><br><small>Signs you out of most websites. Yayra’s own Google connection can be managed from Account.</small></span></label>
+            <label><input type="checkbox" data-privacy-delete="cache" ${selections.cache ? 'checked' : ''} /><span><strong>Cached images and files</strong><br><small>Clears stored page files; websites may load slower next time.</small></span></label>
+            <label><input type="checkbox" data-privacy-delete="form" ${selections.form ? 'checked' : ''} /><span><strong>Autofill form data</strong><br><small>All-time deletion only. Saved passwords in your vault are not deleted.</small></span></label>
+          </div>
+          <div class="fb-privacy-status ${this.state.privacyDeleteRange !== 'all' ? 'is-warning' : ''}">
+            ${this.state.privacyDeleteRange === 'all'
+              ? 'All time: cookies, site storage and history in the selected categories will be removed from this profile.'
+              : 'Time-limited deletion removes history and matching cookies. IndexedDB cannot be age-filtered by Electron, so it is preserved to avoid over-deletion.'}
+          </div>
+          <div class="fb-privacy-modal-actions">
+            <button type="button" class="fb-btn fb-btn-secondary" data-privacy-view="overview">Cancel</button>
+            <button type="button" class="fb-btn fb-btn-danger" data-privacy-action="delete-data">Delete data</button>
+          </div>
+        </div>`;
+    }
+
+    if (view === 'cookies') {
+      const exceptions = Array.isArray(s.cookieExceptions) ? s.cookieExceptions : [];
+      return `${this.renderPrivacyPageHeader('Third-party cookies', 'Control cross-site cookies and trusted exceptions.', 'site-settings')}
+        <div class="fb-privacy-body">
+          <div class="fb-privacy-row-card">
+            <h4>Third-party cookies</h4>
+            <p>A site you visit can embed content from another site. Cookies set by those other sites are called third-party cookies.</p>
+            ${this.renderPrivacySelect('thirdPartyCookies', [['block', 'Block third-party cookies'], ['allow', 'Allow third-party cookies']], s.thirdPartyCookies)}
+          </div>
+          <div class="fb-privacy-status ${s.thirdPartyCookies === 'block' ? '' : 'is-warning'}">${s.thirdPartyCookies === 'block'
+            ? 'Blocking is active in this profile. Yayra strips cross-site Cookie and Set-Cookie headers.'
+            : 'Third-party cookies are allowed. Cross-site tracking is possible.'}</div>
+          <div class="fb-privacy-section-label">Advanced</div>
+          <div class="fb-privacy-row-list">
+            ${this.renderPrivacyRow('Send a “Do Not Track” request', 'Sites use their discretion when responding.', this.renderPrivacyToggle('doNotTrack', s.doNotTrack))}
+            ${this.renderPrivacyRow('Global Privacy Control', 'Signals that you opt out of sale/sharing where supported.', this.renderPrivacyToggle('globalPrivacyControl', s.globalPrivacyControl))}
+            ${this.renderPrivacyRow('View permissions and data stored across sites', 'See cookie/site-storage counts for this profile.', '<button type="button" class="fb-btn fb-btn-secondary" data-privacy-view="site-data">View site data</button>')}
+          </div>
+          <div class="fb-privacy-row-card">
+            <strong>Sites allowed to use third-party cookies</strong>
+            <p>Inserting a domain before a site creates an exception for that domain and its subdomains.</p>
+            <div class="fb-privacy-exception-row">
+              <input type="text" class="fb-input" id="fb-privacy-cookie-site" placeholder="example.com" />
+              <button type="button" class="fb-btn fb-btn-secondary" data-privacy-action="add-cookie-exception">Add</button>
+            </div>
+            <div class="fb-privacy-site-list" style="margin-top:10px;">
+              ${exceptions.length ? exceptions.map((host) => `<div class="fb-privacy-site-row"><span><strong>${escapeHtml(host)}</strong><small>Allowed for this site</small></span><button type="button" class="fb-btn fb-btn-danger" data-privacy-remove-exception="${escapeAttr(host)}">Remove</button></div>`).join('')
+                : '<div class="fb-empty-state">No cookie exceptions. This is the most private setting.</div>'}
+            </div>
+          </div>
+        </div>`;
+    }
+
+    if (view === 'site-settings') {
+      const recent = (Array.isArray(this.state.historyItems) ? this.state.historyItems : []).slice(0, 3);
+      return `${this.renderPrivacyPageHeader('Site settings', 'Permissions, content, and data stored by websites.')}
+        <div class="fb-privacy-body">
+          <div class="fb-privacy-section-label">Recent activity</div>
+          <div class="fb-privacy-row-list">
+            ${recent.length ? recent.map((item) => `<div class="fb-privacy-row"><div><strong>${escapeHtml(item.title || item.url || 'Website')}</strong><p>${escapeHtml(item.url || '')}</p></div><button type="button" class="fb-btn fb-btn-secondary" data-privacy-view="permissions">Review</button></div>`).join('')
+              : '<div class="fb-privacy-status">No website activity in this profile yet.</div>'}
+            ${this.renderPrivacyNavCard('site-data', search, 'View permissions and data stored across sites', 'Review cookies and site storage by website.')}
+          </div>
+          <div class="fb-privacy-section-label">Permissions</div>
+          <div class="fb-privacy-link-grid">
+            ${this.renderPrivacyNavCard('permissions', settings, 'Location', `Default: ${escapeHtml(s.permissionDefaults.location)}.`)}
+            ${this.renderPrivacyNavCard('permissions', settings, 'Camera', `Default: ${escapeHtml(s.permissionDefaults.camera)}.`)}
+            ${this.renderPrivacyNavCard('permissions', settings, 'Microphone', `Default: ${escapeHtml(s.permissionDefaults.microphone)}.`)}
+            ${this.renderPrivacyNavCard('permissions', settings, 'Notifications', `Default: ${escapeHtml(s.permissionDefaults.notifications)}.`)}
+            ${this.renderPrivacyNavCard('cookies', settings, 'Embedded content', 'Third-party cookies and embedded-site data.')}
+            ${this.renderPrivacyNavCard('permissions', settings, 'Additional permissions', 'Clipboard, MIDI, USB, serial, Bluetooth and HID.')}
+          </div>
+          <div class="fb-privacy-section-label">Content</div>
+          <div class="fb-privacy-row-list">
+            ${this.renderPrivacyNavCard('cookies', settings, 'Third-party cookies', s.thirdPartyCookies === 'block' ? 'Third-party cookies are blocked' : 'Third-party cookies are allowed')}
+            ${this.renderPrivacyRow('JavaScript', 'Sites can run JavaScript. Turn off only if a website requires troubleshooting.', this.renderPrivacyToggle('javascriptEnabled', s.javascriptEnabled))}
+            ${this.renderPrivacyRow('Images', 'Sites can show images.', this.renderPrivacyToggle('imagesEnabled', s.imagesEnabled))}
+            ${this.renderPrivacyRow('Pop-ups and redirects', 'Allow sites to request pop-up windows.', this.renderPrivacyToggle('allowWebsitePopups', s.allowWebsitePopups))}
+            ${this.renderPrivacyRow('Automatically clear permissions from unused sites', 'Turning this on removes saved site decisions and asks again.', this.renderPrivacyToggle('autoRemoveUnusedPermissions', s.autoRemoveUnusedPermissions))}
+          </div>
+        </div>`;
+    }
+
+    if (view === 'site-data') {
+      const data = this.state.privacySiteData;
+      const query = String(data.query || '').toLowerCase().trim();
+      const sites = (Array.isArray(data.sites) ? data.sites : []).filter((site) => !query || String(site.host || '').includes(query));
+      return `${this.renderPrivacyPageHeader('See all site data and permissions', 'Cookie and site-storage counts are read from this profile’s Chromium sessions.', 'site-settings')}
+        <div class="fb-privacy-body">
+          <div class="fb-privacy-exception-row">
+            <input type="text" class="fb-input" id="fb-privacy-site-search" placeholder="Filter sites on page" value="${escapeAttr(data.query || '')}" />
+            <button type="button" class="fb-btn fb-btn-secondary" data-privacy-action="refresh-site-data">${Icons.refresh} Refresh</button>
+          </div>
+          <div class="fb-privacy-status ${data.status === 'unavailable' || data.status === 'error' ? 'is-warning' : ''}">
+            ${data.status === 'loading' ? 'Reading site data…'
+              : data.status === 'unavailable' ? 'Site storage inspection requires the Yayra desktop app.'
+                : data.status === 'error' ? 'Could not read site data for this profile.'
+                  : `${escapeHtml(String(data.totalSites || 0))} website${Number(data.totalSites) === 1 ? '' : 's'} with cookies.${data.truncated ? ' Showing the first 1,000.' : ''}`}
+          </div>
+          <div class="fb-privacy-site-list">
+            ${sites.length ? sites.map((site) => `<div class="fb-privacy-site-row" data-privacy-site-host="${escapeAttr(site.host)}"><span><strong>${escapeHtml(site.host)}</strong><small>${escapeHtml(String(site.cookies || 0))} cookie${Number(site.cookies) === 1 ? '' : 's'}${site.secureCookies ? ` · ${escapeHtml(String(site.secureCookies))} secure` : ''}</small></span><button type="button" class="fb-btn fb-btn-danger" data-privacy-remove-site="${escapeAttr(site.host)}">Delete</button></div>`).join('')
+              : `<div class="fb-empty-state">${query ? 'No website matches that filter.' : 'No website cookies found for this profile.'}</div>`}
+          </div>
+          ${sites.length ? '<button type="button" class="fb-btn fb-btn-danger" data-privacy-action="delete-displayed-site-data">Delete displayed data</button>' : ''}
+        </div>`;
+    }
+
+    if (view === 'security') {
+      return `${this.renderPrivacyPageHeader('Security', 'Safe Browsing, secure connections, passwords and DNS.')}
+        <div class="fb-privacy-body">
+          <div class="fb-privacy-section-label">Yayra threat protection</div>
+          <div class="fb-privacy-row-list">
+            ${[['enhanced', 'Enhanced protection', 'Local threat-pattern detection, credential-in-URL blocking and tracker protection.'],
+              ['standard', 'Standard protection', 'Local tracker blocking and HTTPS redirect checks.'],
+              ['off', 'No protection (not recommended)', 'Yayra will not apply proactive website protection.']]
+              .map(([value, title, description]) => `<label class="fb-privacy-row"><span><strong>${title}</strong><p>${description}</p></span><input type="radio" name="fb-privacy-safebrowsing" value="${value}" data-privacy-setting="safeBrowsingLevel" ${s.safeBrowsingLevel === value ? 'checked' : ''} /></label>`).join('')}
+          </div>
+          <div class="fb-privacy-section-label">Secure connections</div>
+          <div class="fb-privacy-row-list">
+            ${this.renderPrivacyRow('Always use secure connections', 'Upgrades http:// navigation to https:// when the site supports it.', this.renderPrivacyToggle('httpsFirst', s.httpsFirst))}
+            ${this.renderPrivacyRow('Use secure DNS', 'Encrypts DNS lookups with an audited resolver or your system’s automatic secure mode.', this.renderPrivacyToggle('secureDnsEnabled', s.secureDnsEnabled))}
+            ${this.renderPrivacyRow('DNS provider', 'Only pre-defined, trusted DNS-over-HTTPS providers are accepted.', this.renderPrivacySelect('secureDnsProvider', [['automatic', 'OS default (automatic)'], ['cloudflare', 'Cloudflare 1.1.1.1'], ['google', 'Google Public DNS'], ['quad9', 'Quad9'], ['off', 'Off']], s.secureDnsProvider))}
+          </div>
+          <div class="fb-privacy-section-label">Advanced</div>
+          <div class="fb-privacy-row-list">
+            ${this.renderPrivacyRow('Warn if a saved password is weak or reused', 'Checks local encrypted vault entries for short, common and reused passwords. No password leaves this device.', this.renderPrivacyToggle('warnPasswordExposure', s.warnPasswordExposure))}
+            ${this.renderPrivacyRow('Password Checkup', 'Run a local weak/reused password scan now.', `<button type="button" class="fb-btn fb-btn-secondary" data-privacy-action="password-check">${lock} Check now</button>`)}
+            ${this.renderPrivacyRow('JavaScript optimization & security', s.javascriptEnabled === false ? 'JavaScript is currently blocked. Sites may not function.' : 'JavaScript is allowed for ordinary websites.', `<button type="button" class="fb-btn fb-btn-secondary" data-privacy-action="toggle-javascript">${s.javascriptEnabled ? 'Turn off' : 'Turn on'}</button>`)}
+            ${this.renderPrivacyRow('Manage security keys', 'Open Yayra’s encrypted passkey and password vault.', '<button type="button" class="fb-btn fb-btn-secondary" data-privacy-action="open-vault">Open vault</button>')}
+            ${this.renderPrivacyRow('Manage certificates', 'Certificate roots are validated by Chromium and your operating system trust store.', `<button type="button" class="fb-btn fb-btn-secondary" data-privacy-action="certificate-info">${info} Learn more</button>`)}
+            ${this.renderPrivacyRow('Google Advanced Protection Program', 'Open Google’s strongest account-security enrollment inside Yayra.', '<button type="button" class="fb-btn fb-btn-secondary" data-privacy-action="advanced-protection">Open</button>')}
+          </div>
+        </div>`;
+    }
+
+    if (view === 'ad-privacy') {
+      return `${this.renderPrivacyPageHeader('Ad privacy', 'Control ad topics, site-suggested ads and measurement.', 'overview')}
+        <div class="fb-privacy-body">
+          <div class="fb-privacy-status">Ad-personalization APIs are off by default. Yayra blocks their browser headers and response registrations locally.</div>
+          <div class="fb-privacy-link-grid">
+            ${this.renderPrivacyNavCard('ad-topics', info, 'Ad topics', s.privacySandboxTopics ? 'Ad topics are on' : 'Ad topics are off')}
+            ${this.renderPrivacyNavCard('site-suggested-ads', settings, 'Site-suggested ads', s.privacySandboxSuggestedAds ? 'Site-suggested ads are on' : 'Site-suggested ads are off')}
+            ${this.renderPrivacyNavCard('ad-measurement', search, 'Ad measurement', s.privacySandboxMeasurement ? 'Ad measurement is on' : 'Ad measurement is off')}
+          </div>
+          <div class="fb-privacy-row-list">
+            ${this.renderPrivacyRow('Send a “Do Not Track” request', 'Adds DNT: 1 to website requests.', this.renderPrivacyToggle('doNotTrack', s.doNotTrack))}
+            ${this.renderPrivacyRow('Global Privacy Control', 'Adds Sec-GPC: 1 to supported websites.', this.renderPrivacyToggle('globalPrivacyControl', s.globalPrivacyControl))}
+          </div>
+        </div>`;
+    }
+
+    if (view === 'ad-topics' || view === 'site-suggested-ads' || view === 'ad-measurement') {
+      const configurations = {
+        'ad-topics': { title: 'Ad topics', setting: 'privacySandboxTopics', description: 'Topics are inferred from recent browsing and can be used to show personalized ads.' },
+        'site-suggested-ads': { title: 'Site-suggested ads', setting: 'privacySandboxSuggestedAds', description: 'Websites can use your activity on that site to suggest ads.' },
+        'ad-measurement': { title: 'Ad measurement', setting: 'privacySandboxMeasurement', description: 'Sites can ask the browser to report limited ad-performance events.' }
+      };
+      const config = configurations[view];
+      const enabled = Boolean(s[config.setting]);
+      return `${this.renderPrivacyPageHeader(config.title, 'This setting applies to every website in this Yayra profile.', 'ad-privacy')}
+        <div class="fb-privacy-body">
+          <div class="fb-privacy-row-card">
+            ${this.renderPrivacyRow(config.title, config.description, this.renderPrivacyToggle(config.setting, enabled))}
+            <p>Off means Yayra removes the corresponding browser headers and response registrations. Sites may still show non-personalized ads.</p>
+          </div>
+          <div class="fb-privacy-guide-columns">
+            <div><h5>When on</h5><p>${escapeHtml(config.title)} browser headers are allowed. Sites can use this data for ad personalization or measurement.</p></div>
+            <div><h5>When off</h5><p>Yayra removes the headers and registration responses, minimizing cross-site ad profiling.</p></div>
+          </div>
+          ${view === 'site-suggested-ads' ? `<div class="fb-privacy-row-card">
+            <strong>Sites you blocked</strong>
+            <p>Keep a local list of sites whose ad suggestions you do not want.</p>
+            <div class="fb-privacy-exception-row">
+              <input type="text" class="fb-input" id="fb-privacy-blocked-site" placeholder="example.com" />
+              <button type="button" class="fb-btn fb-btn-secondary" data-privacy-action="add-blocked-site">Add</button>
+            </div>
+            <div class="fb-privacy-site-list" style="margin-top:10px;">
+              ${(Array.isArray(s.blockedAdSites) ? s.blockedAdSites : []).map((host) => `<div class="fb-privacy-site-row"><strong>${escapeHtml(host)}</strong><button type="button" class="fb-btn fb-btn-danger" data-privacy-remove-blocked-site="${escapeAttr(host)}">Remove</button></div>`).join('') || '<div class="fb-empty-state">No blocked sites.</div>'}
+            </div>
+          </div>` : ''}
+        </div>`;
+    }
+
+    if (view === 'permissions') {
+      const defaults = s.permissionDefaults || {};
+      const labels = {
+        location: 'Location', camera: 'Camera', microphone: 'Microphone', notifications: 'Notifications',
+        clipboard: 'Clipboard', midi: 'MIDI devices', usb: 'USB devices', serial: 'Serial ports',
+        bluetooth: 'Bluetooth', hid: 'HID devices', pointerLock: 'Pointer lock', idleDetection: 'Idle detection'
+      };
+      const sitePermissions = Object.entries(s.sitePermissions || {});
+      return `${this.renderPrivacyPageHeader('Site permissions', 'Choose defaults and review saved per-site decisions.', 'site-settings')}
+        <div class="fb-privacy-body">
+          <div class="fb-privacy-section-label">Default permissions</div>
+          <div class="fb-privacy-permission-table">
+            ${Object.entries(labels).map(([key, label]) => `<label><span>${escapeHtml(label)}</span><select class="fb-select" data-privacy-permission="${escapeAttr(key)}">
+              ${[['ask', 'Ask'], ['allow', 'Allow'], ['block', 'Block']].map(([value, text]) => `<option value="${value}" ${(defaults[key] || 'ask') === value ? 'selected' : ''}>${text}</option>`).join('')}
+            </select></label>`).join('')}
+          </div>
+          <div class="fb-privacy-status">“Ask” shows a trusted native Yayra prompt. “Always allow” on that prompt saves a per-site decision here.</div>
+          <div class="fb-privacy-section-label">Saved site decisions</div>
+          <div class="fb-privacy-site-list">
+            ${sitePermissions.length ? sitePermissions.map(([origin, values]) => `<div class="fb-privacy-site-row"><span><strong>${escapeHtml(origin)}</strong><small>${escapeHtml(Object.entries(values).map(([key, value]) => `${key}: ${value}`).join(' · '))}</small></span><button type="button" class="fb-btn fb-btn-danger" data-privacy-remove-permission="${escapeAttr(origin)}">Remove</button></div>`).join('')
+              : '<div class="fb-empty-state">No saved per-site decisions.</div>'}
+          </div>
+          <div class="fb-privacy-row-list">
+            ${this.renderPrivacyRow('Automatically clear permissions from unused sites', 'Turning this on clears saved decisions immediately.', this.renderPrivacyToggle('autoRemoveUnusedPermissions', s.autoRemoveUnusedPermissions))}
+            ${this.renderPrivacyNavCard('site-data', trash, 'View permissions and data stored across sites', 'Delete cookies and site storage for a website.')}
+          </div>
+        </div>`;
+    }
+
+    const safety = this.state.privacySafetyCheck;
+    const stats = safety.stats;
+    const passwordReport = safety.passwordReport;
+    const statsLine = stats
+      ? `${Number(stats.blockedTrackers || 0)} tracker requests blocked · ${Number(stats.blockedCookies || 0)} cross-site cookies stripped · ${Number(stats.blockedUnsafe || 0)} unsafe requests stopped this session.`
+      : 'Yayra checks your protection settings without uploading URLs or passwords.';
+    return `<div class="fb-privacy-page-header"><div><h3>Privacy and security</h3><p>Profile-scoped protection. Settings persist across restarts.</p></div></div>
+      <div class="fb-privacy-body">
+        <div class="fb-privacy-safety-card">
+          <div><strong>Safety Check</strong><p>${escapeHtml(statsLine)}</p></div>
+          <button type="button" class="fb-btn fb-btn-primary" data-privacy-action="safety-check" ${safety.status === 'checking' ? 'disabled' : ''}>${safety.status === 'checking' ? 'Checking…' : 'Go to Safety Check'}</button>
+        </div>
+        ${safety.status === 'done' ? `<div class="fb-privacy-status ${safety.recommendations.length ? 'is-warning' : ''}">
+          ${safety.recommendations.length
+            ? `${escapeHtml(String(safety.recommendations.length))} recommendation${safety.recommendations.length === 1 ? '' : 's'}: ${escapeHtml(safety.recommendations.join(', '))}. Use “Maximum protection” to apply every recommended setting.`
+            : 'All recommended protections are active for this profile.'}
+          ${passwordReport ? ` Local password scan: ${escapeHtml(String(passwordReport.total))} saved password${passwordReport.total === 1 ? '' : 's'}, ${escapeHtml(String(passwordReport.weak))} weak, ${escapeHtml(String(passwordReport.reused))} reused.` : ''}
+        </div>` : ''}
+        <div class="fb-privacy-link-grid">
+          ${this.renderPrivacyNavCard('guide', shield, 'Privacy Guide', 'A guided tour of key privacy and security controls.')}
+          ${this.renderPrivacyNavCard('clear-data', trash, 'Delete browsing data', 'Choose a time range and clear history, cookies and cache.')}
+          ${this.renderPrivacyNavCard('cookies', lock, 'Third-party cookies', s.thirdPartyCookies === 'block' ? 'Third-party cookies are blocked' : 'Third-party cookies are allowed')}
+          ${this.renderPrivacyNavCard('ad-privacy', info, 'Ad privacy', 'Ad topics, site-suggested ads and ad measurement.')}
+          ${this.renderPrivacyNavCard('site-settings', settings, 'Site settings', 'Permissions, JavaScript, images, pop-ups and site data.')}
+          ${this.renderPrivacyNavCard('security', shield, 'Security', `Threat protection: ${escapeHtml(s.safeBrowsingLevel)} · Secure DNS: ${s.secureDnsEnabled ? 'on' : 'off'}`)}
+          ${this.renderPrivacyNavCard('google-signin', lock, 'Google sign-in', `Real Chrome profile: ${(this.state.googleChromeProfile || {}).available ? 'available' : 'not found'} · Parity: ${s.googleAuthParity ? 'on' : 'off'}`)}
+        </div>
+        <div class="fb-privacy-section-label">Core protections</div>
+        <div class="fb-privacy-row-list">
+          ${this.renderPrivacyRow('HTTPS-First Mode', 'Automatically upgrades connections to secure HTTPS.', this.renderPrivacyToggle('httpsFirst', s.httpsFirst, 'HTTPS-First Mode', 'fb-in-set-https'))}
+          ${this.renderPrivacyRow('Ad & Tracker Shield', 'Blocks known advertising, analytics and telemetry endpoints.', this.renderPrivacyToggle('adBlockEnabled', s.adBlockEnabled, 'Ad and Tracker Shield', 'fb-in-set-adblock'))}
+          ${this.renderPrivacyRow('Third-party cookies', 'Strip cross-site cookies from requests and responses.', this.renderPrivacySelect('thirdPartyCookies', [['block', 'Block third-party cookies'], ['allow', 'Allow third-party cookies']], s.thirdPartyCookies))}
+          ${this.renderPrivacyRow('Do Not Track & Global Privacy Control', 'Sends DNT and Sec-GPC privacy signals.', `<div style="display:flex; gap:12px;">${this.renderPrivacyToggle('doNotTrack', s.doNotTrack, 'Do Not Track')}${this.renderPrivacyToggle('globalPrivacyControl', s.globalPrivacyControl, 'Global Privacy Control')}</div>`)}
+          ${this.renderPrivacyRow('Use secure DNS', 'Encrypt DNS lookups with a trusted resolver.', this.renderPrivacyToggle('secureDnsEnabled', s.secureDnsEnabled))}
+          ${this.renderPrivacyRow('Clear browsing data', 'Deletes selected history, cookies and cache from this profile.', '<button type="button" class="fb-btn fb-btn-danger" data-privacy-view="clear-data">Clear Data Now</button>')}
+          ${this.renderPrivacyRow('Maximum protection', 'Apply every recommended privacy and security setting.', '<button type="button" class="fb-btn fb-btn-primary" data-privacy-action="apply-recommended">Apply all</button>')}
+        </div>
+      </div>`;
+  }
+
+  bindPrivacySettingsActions(page) {
+    if (!page?.querySelectorAll) return;
+    for (const button of page.querySelectorAll('[data-privacy-view]') || []) {
+      button.addEventListener('click', () => this.showPrivacyView(button.getAttribute('data-privacy-view')));
+    }
+    for (const control of page.querySelectorAll('[data-privacy-setting]') || []) {
+      const setting = control.getAttribute('data-privacy-setting');
+      if (!setting) continue;
+      const controlType = String(control.getAttribute?.('type') || control.type || '').toLowerCase();
+      control.addEventListener('change', async () => {
+        if (controlType === 'checkbox') {
+          this.state.settings[setting] = Boolean(control.checked);
+          if (setting === 'autoRemoveUnusedPermissions' && control.checked) {
+            this.state.settings.sitePermissions = {};
+          }
+        } else if (controlType === 'radio') {
+          if (!control.checked) return;
+          this.state.settings[setting] = control.value;
+        } else {
+          this.state.settings[setting] = control.value;
+        }
+        this.persistSettings();
+        if (setting === 'googleAuthParity') {
+          // Immediately push the trusted main-process switch; it controls
+          // script injection and header rewriting on auth surfaces.
+          const native = this.nativeWebview;
+          if (typeof native?.setGoogleAuthParity === 'function') {
+            try { await native.setGoogleAuthParity(this.state.settings.googleAuthParity === true); } catch { /* older build */ }
+          }
+          this.showTransientNotice(this.state.settings.googleAuthParity
+            ? 'Standalone-browser parity enabled. Reload the Google sign-in page to try it.'
+            : 'Standalone-browser parity disabled.');
+        }
+        if (setting === 'secureDnsEnabled' || setting === 'secureDnsProvider') {
+          const result = await this.configureSecureDns();
+          if (!result?.ok && result?.reason !== 'desktop-only') {
+            this.showTransientNotice('Secure DNS could not be configured on this Electron build.');
+          }
+        }
+        if (control.closest('.fb-privacy-guide-card') && controlType !== 'radio') return;
+        this.render();
+      });
+    }
+    for (const select of page.querySelectorAll('[data-privacy-permission]') || []) {
+      select.addEventListener('change', () => {
+        const key = select.getAttribute('data-privacy-permission');
+        if (!key || !['ask', 'allow', 'block'].includes(select.value)) return;
+        this.state.settings.permissionDefaults[key] = select.value;
+        this.persistSettings();
+        this.showTransientNotice(`Default ${key} permission set to ${select.value}.`);
+      });
+    }
+    for (const button of page.querySelectorAll('[data-privacy-range]') || []) {
+      button.addEventListener('click', () => {
+        this.state.privacyDeleteRange = button.getAttribute('data-privacy-range') || 'all';
+        this.render();
+      });
+    }
+    for (const checkbox of page.querySelectorAll('[data-privacy-delete]') || []) {
+      checkbox.addEventListener('change', () => {
+        const key = checkbox.getAttribute('data-privacy-delete');
+        if (!key) return;
+        this.state.privacyDeleteSelections[key] = Boolean(checkbox.checked);
+      });
+    }
+    for (const button of page.querySelectorAll('[data-privacy-action]') || []) {
+      button.addEventListener('click', async () => {
+        const action = button.getAttribute('data-privacy-action');
+        if (action === 'safety-check') await this.runPrivacySafetyCheck();
+        else if (action === 'chrome-profile-connect') await this.connectGoogleWebsitesInChrome();
+        else if (action === 'chrome-profile-open-account') await this.openGoogleInChromeProfile('https://myaccount.google.com/');
+        else if (action === 'apply-recommended') this.applyRecommendedPrivacySettings();
+        else if (action === 'guide-next') {
+          this.state.privacyGuideStep = Math.min(PRIVACY_GUIDE_STEPS.length - 1, this.state.privacyGuideStep + 1);
+          this.render();
+        } else if (action === 'guide-back') {
+          this.state.privacyGuideStep = Math.max(0, this.state.privacyGuideStep - 1);
+          this.render();
+        } else if (action === 'guide-done') {
+          this.state.privacyGuideStep = 0;
+          this.showPrivacyView('overview');
+        } else if (action === 'delete-data') {
+          const selections = this.state.privacyDeleteSelections;
+          if (!Object.values(selections).some(Boolean)) {
+            this.showTransientNotice('Select at least one type of data to delete.');
+            return;
+          }
+          const confirmed = typeof confirm !== 'function' || confirm('Delete the selected browsing data from this Yayra profile?');
+          if (confirmed) await this.deletePrivacyBrowsingData();
+        } else if (action === 'add-cookie-exception') this.addPrivacyHostException('cookie');
+        else if (action === 'add-blocked-site') this.addPrivacyHostException('ad');
+        else if (action === 'refresh-site-data') await this.loadPrivacySiteData();
+        else if (action === 'password-check') {
+          const report = this.privacyPasswordAudit();
+          this.state.privacyPasswordReport = report;
+          this.showTransientNotice(`Local password scan: ${report.weak} weak and ${report.reused} reused passwords found. No password left this device.`);
+        } else if (action === 'toggle-javascript') {
+          this.state.settings.javascriptEnabled = this.state.settings.javascriptEnabled === false;
+          this.persistSettings();
+          this.render();
+          this.showTransientNotice('Reload open websites for the JavaScript setting to take full effect.');
+        } else if (action === 'open-vault') {
+          this.openInternalPage('yayra://passwords');
+        } else if (action === 'certificate-info') {
+          this.showTransientNotice('Yayra uses Chromium’s certificate verifier and your operating system trust store. Invalid TLS certificates are never silently accepted.');
+        } else if (action === 'advanced-protection') {
+          this.createNewTab();
+          this.navigateActiveTab('https://landing.google.com/advancedprotection/');
+        } else if (action === 'delete-displayed-site-data') {
+          const hosts = Array.from(page.querySelectorAll('[data-privacy-site-host]')).map((row) => row.getAttribute('data-privacy-site-host'));
+          if (!hosts.length) return;
+          const confirmed = typeof confirm !== 'function' || confirm(`Delete cookies and site storage for ${hosts.length} displayed website${hosts.length === 1 ? '' : 's'}?`);
+          if (!confirmed) return;
+          const remove = this.nativeWebview?.removeSiteData;
+          if (typeof remove !== 'function') {
+            this.showTransientNotice('Deleting individual site data requires the Yayra desktop app.');
+            return;
+          }
+          for (const host of hosts) {
+            try { await remove(host); } catch { /* continue */ }
+          }
+          await this.loadPrivacySiteData();
+        }
+      });
+    }
+    for (const button of page.querySelectorAll('[data-privacy-remove-exception]') || []) {
+      button.addEventListener('click', () => this.removePrivacyHostException(button.getAttribute('data-privacy-remove-exception'), 'cookie'));
+    }
+    for (const button of page.querySelectorAll('[data-privacy-remove-blocked-site]') || []) {
+      button.addEventListener('click', () => this.removePrivacyHostException(button.getAttribute('data-privacy-remove-blocked-site'), 'ad'));
+    }
+    for (const button of page.querySelectorAll('[data-privacy-remove-site]') || []) {
+      button.addEventListener('click', async () => {
+        const host = button.getAttribute('data-privacy-remove-site');
+        if (!host || typeof this.nativeWebview?.removeSiteData !== 'function') {
+          this.showTransientNotice('Deleting individual site data requires the Yayra desktop app.');
+          return;
+        }
+        const result = await this.nativeWebview.removeSiteData(host);
+        if (result?.ok) this.showTransientNotice(`Deleted site data for ${host}.`);
+        await this.loadPrivacySiteData();
+      });
+    }
+    for (const button of page.querySelectorAll('[data-privacy-remove-permission]') || []) {
+      button.addEventListener('click', () => {
+        const origin = button.getAttribute('data-privacy-remove-permission');
+        if (!origin) return;
+        delete this.state.settings.sitePermissions[origin];
+        this.persistSettings();
+        this.render();
+      });
+    }
+    const siteSearch = page.querySelector('#fb-privacy-site-search');
+    siteSearch?.addEventListener('input', (event) => {
+      const query = String(event?.target?.value || '').toLowerCase().trim();
+      this.state.privacySiteData.query = query;
+      for (const row of page.querySelectorAll('[data-privacy-site-host]') || []) {
+        const host = String(row.getAttribute('data-privacy-site-host') || '').toLowerCase();
+        row.style.display = !query || host.includes(query) ? '' : 'none';
+      }
+    });
+    if (this.state.privacySettingsView === 'site-data' && this.state.privacySiteData.status === 'idle') {
+      void this.loadPrivacySiteData();
+    }
+  }
+
   /**
    * Persists the current settings snapshot to the settings repository and
    * localStorage. Fire-and-forget: UI changes always apply immediately
    * even if persistence fails (e.g. storage quota exceeded).
    */
   persistSettings() {
+    this.normalizePrivacySettings();
+    void this.syncPrivacySettings({ notify: false });
     if (this.settingsRepo && typeof this.settingsRepo.updateSettings === 'function') {
       try {
         const result = this.settingsRepo.updateSettings(this.state.settings);
@@ -20073,6 +22093,7 @@ export class BrowserShell {
     if (tab.title && tab.title !== 'New Tab' && tab.title !== documentTitle) return tab.title;
     if (!tab.url || tab.url === 'yayra://newtab') return tab.isPrivate ? 'Incognito Tab' : 'New Tab';
     if (tab.url === 'yayra://settings') return 'Settings';
+    if (tab.url === 'yayra://google-services') return 'Google services';
     if (tab.url === 'yayra://history') return 'History';
     if (tab.url === 'yayra://bookmarks') return 'Bookmarks';
     if (tab.url === 'yayra://downloads') return 'Downloads';
@@ -22731,6 +24752,7 @@ export class BrowserShell {
     }
     this._inAppOnlyGoogleTabs?.clear?.();
     this._googleAccountConnections?.clear?.();
+    this._gmailViews?.clear?.();
     if (this.webFrameLayer) {
       this.webFrameLayer.remove();
       this.webFrameLayer = null;

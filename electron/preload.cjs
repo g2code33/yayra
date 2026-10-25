@@ -63,6 +63,15 @@ const api = {
     }),
     setPointerTheme: (tabId, theme, size) => ipcRenderer.invoke('yayra:webview-set-pointer-theme', { tabId, theme, size }),
     setBackgroundThrottling: (enabled) => ipcRenderer.invoke('yayra:webview-set-background-throttling', { enabled }),
+    setPrivacySettings: (settings = {}) => ipcRenderer.invoke('yayra:webview-privacy-set', settings),
+    // Best-effort standalone-browser parity on Google auth surfaces. Default
+    // off; the Security Center sets it per Yayra profile. See
+    // electron/googleAuthParity.cjs for exactly what changes.
+    setGoogleAuthParity: (enabled = false) => ipcRenderer.invoke('yayra:webview-google-auth-parity-set', { enabled: enabled === true }),
+    setGoogleServiceAccount: (profile = null) => ipcRenderer.invoke('yayra:webview-set-google-service-account', profile),
+    privacyStatus: () => ipcRenderer.invoke('yayra:webview-privacy-status'),
+    listSiteData: () => ipcRenderer.invoke('yayra:webview-site-data-list'),
+    removeSiteData: (host) => ipcRenderer.invoke('yayra:webview-site-data-remove', { host }),
     taskTabs: () => ipcRenderer.invoke('yayra:webview-list-task-tabs'),
     setBounds: (tabId, bounds) => ipcRenderer.invoke('yayra:webview-set-bounds', { tabId, bounds }),
     setVisible: (tabId, visible, options = {}) => ipcRenderer.invoke('yayra:webview-set-visible', { tabId, visible, capture: Boolean(options && options.capture) }),
@@ -119,8 +128,8 @@ const api = {
   },
   // Callback-returning Google OAuth. Chrome owns the provider ceremony;
   // the verified result returns to Yayra and persists through the encrypted
-  // main-process store. Scoped Drive API access stays behind IPC, so neither
-  // Google bearer tokens nor refresh tokens enter renderer JavaScript.
+  // main-process store. Scoped Gmail/Drive API access stays behind IPC, so
+  // neither Google bearer tokens nor refresh tokens enter renderer JavaScript.
   auth: {
     // Every app-account operation carries this shell window's browsing
     // profile. The main process pre-pins native shell windows (or resolves an
@@ -129,17 +138,37 @@ const api = {
     signIn: (profileId = 'default') => ipcRenderer.invoke('yayra:auth-sign-in', { profileId }),
     connectDrive: (profileId = 'default') => ipcRenderer.invoke('yayra:auth-connect-drive', { profileId }),
     downloadDriveFile: (fileId, profileId = 'default') => ipcRenderer.invoke('yayra:auth-download-drive-file', { fileId, profileId }),
+    connectGmail: (profileId = 'default') => ipcRenderer.invoke('yayra:auth-connect-gmail', { profileId }),
+    connectGoogleServices: (profileId = 'default') => ipcRenderer.invoke('yayra:auth-connect-google-services', { profileId }),
+    getGoogleServiceItems: (serviceId, profileId = 'default') => ipcRenderer.invoke('yayra:auth-get-google-service-items', { serviceId, profileId }),
+    getGoogleServicesSession: (profileId = 'default') => ipcRenderer.invoke('yayra:auth-get-session', { profileId }),
+    listGmailMessages: (options = {}, profileId = 'default') => ipcRenderer.invoke('yayra:auth-list-gmail-messages', { ...options, profileId }),
+    getGmailMessage: (messageId, profileId = 'default') => ipcRenderer.invoke('yayra:auth-get-gmail-message', { messageId, profileId }),
     signOut: (profileId = 'default') => ipcRenderer.invoke('yayra:auth-sign-out', { profileId }),
     getSession: (profileId = 'default') => ipcRenderer.invoke('yayra:auth-get-session', { profileId }),
     openAccountPage: () => ipcRenderer.invoke('yayra:auth-open-account-page'),
     // Credential-free product origins only; main validates exact HTTPS Google
-    // ownership before invoking the OS browser.
-    openGoogleProduct: (origin) => ipcRenderer.invoke('yayra:auth-open-google-product', { origin }),
+    // ownership before invoking the OS browser (or the dedicated Chrome
+    // profile when available - see googleChromeProfile below).
+    openGoogleProduct: (origin, options = {}) => ipcRenderer.invoke('yayra:auth-open-google-product', { origin, ...options }),
     onEvent: (callback) => {
       const listener = (_event, payload) => callback(payload);
       ipcRenderer.on(AUTH_EVENT_CHANNEL, listener);
       return () => ipcRenderer.removeListener(AUTH_EVENT_CHANNEL, listener);
     }
+  },
+  // Dedicated REAL Chrome profile for genuinely signed-in Google websites.
+  // Yayra never reads or copies its cookies; it only launches Chrome with a
+  // Yayra-owned --user-data-dir and opens allow-listed Google destinations.
+  // Presence of `window.yayra.googleChromeProfile` is how BrowserShell knows
+  // the desktop build can offer "Open in Chrome" instead of a fake session.
+  googleChromeProfile: {
+    status: () => ipcRenderer.invoke('yayra:chrome-profile-status'),
+    open: (url) => ipcRenderer.invoke('yayra:chrome-profile-open', { url }),
+    // Opens myaccount.google.com in the dedicated profile to perform the
+    // actual Google website sign-in once. Cookies persist across restarts.
+    signIn: () => ipcRenderer.invoke('yayra:chrome-profile-sign-in'),
+    close: () => ipcRenderer.invoke('yayra:chrome-profile-close')
   },
   // Real download tracking (see electron/downloadsBridge.cjs). Presence of
   // `window.yayra.downloads` is how the renderer knows this build can show
@@ -278,7 +307,8 @@ const api = {
       }
     },
     // Real Chromium cache/site-data clearing across all Yayra sessions.
-    clearBrowsingData: ({ cache = true, cookies = false } = {}) => ipcRenderer.invoke('yayra:clear-browsing-data', { cache, cookies })
+    clearBrowsingData: ({ cache = true, cookies = false, since = null, form = false } = {}) => ipcRenderer.invoke('yayra:clear-browsing-data', { cache, cookies, since, form }),
+    configureSecureDns: ({ enabled = true, provider = 'automatic' } = {}) => ipcRenderer.invoke('yayra:configure-secure-dns', { enabled, provider })
   }
 };
 

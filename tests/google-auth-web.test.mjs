@@ -5,6 +5,8 @@ import {
   CALLBACK_PATH,
   DRIVE_SCOPES,
   DRIVE_SESSION_KEY,
+  GMAIL_SCOPES,
+  GMAIL_SESSION_KEY,
   PENDING_KEY,
   PROFILE_KEY,
   authStorageKey,
@@ -18,12 +20,16 @@ import {
   driveRevokeUrlForExchange,
   generatePkcePair,
   generateState,
+  getDelegatedGmailMessage,
+  listDelegatedGmailMessages,
   loadDriveSession,
+  loadGmailSession,
   loadProfile,
   normalizeGoogleProductOrigin,
   parseCallbackParams,
   revokeDelegatedDriveSession,
   saveDriveSession,
+  saveGmailSession,
   saveProfile
 } from '../src/services/googleAuthWeb.js';
 import { resolveWebGoogleAuthConfig } from '../src/config/googleAuthWeb.js';
@@ -102,6 +108,26 @@ test('Drive authorization is a separate explicit consent with only drive.readonl
   assert.equal(parsed.searchParams.get('scope'), DRIVE_SCOPES.join(' '));
   assert.equal(parsed.searchParams.get('access_type'), 'offline');
   assert.equal(JSON.parse(session.getItem(PENDING_KEY)).capability, 'drive-readonly');
+});
+
+test('Gmail authorization is an explicit read-only consent that preserves the callback destination', async () => {
+  const session = fakeStorage();
+  let target = '';
+  await beginSignIn({
+    clientId: CLIENT_ID,
+    origin: ORIGIN,
+    returnTo: '/?restored=gmail',
+    capability: 'gmail-readonly',
+    sessionStorage: session,
+    navigate: (url) => { target = url; }
+  });
+  const parsed = new URL(target);
+  assert.equal(parsed.searchParams.get('scope'), GMAIL_SCOPES.join(' '));
+  assert.equal(parsed.searchParams.get('access_type'), 'offline');
+  assert.equal(parsed.searchParams.get('include_granted_scopes'), 'true');
+  const pending = JSON.parse(session.getItem(PENDING_KEY));
+  assert.equal(pending.capability, 'gmail-readonly');
+  assert.equal(pending.returnTo, '/?restored=gmail');
 });
 
 test('web authorization URL rejects broad scopes and malformed PKCE/state inputs', () => {
@@ -288,6 +314,72 @@ test('Drive callback returns only an opaque persistent session and delegated dow
   assert.equal(revokeCall.url, driveRevokeUrlForExchange(EXCHANGE_URL));
   assert.equal(revokeCall.options.headers.Authorization, `YayraDrive ${sessionId}`);
   assert.equal(persistentStorage.getItem(DRIVE_SESSION_KEY), null, 'logout removes the local capability before its network request');
+});
+
+test('Gmail callback persists only an opaque capability and mailbox requests never expose Google tokens', async () => {
+  const pending = pendingSession({ capability: 'gmail-readonly', returnTo: '/?gmail=1' });
+  const sessionId = 'G'.repeat(43);
+  let exchangeBody;
+  const completed = await completeSignIn({
+    search: `?code=gmail-code&state=${VALID_WEB_STATE}`,
+    origin: ORIGIN,
+    exchangeUrl: EXCHANGE_URL,
+    sessionStorage: pending,
+    fetchImpl: async (_url, options) => {
+      exchangeBody = JSON.parse(options.body);
+      return new Response(JSON.stringify({
+        profile: { sub: 'gmail-user', name: 'Ama', email: 'ama@example.com' },
+        gmailSession: { id: sessionId, expiresAt: '2099-01-01T00:00:00.000Z', scope: 'gmail.readonly' }
+      }), { status: 200 });
+    }
+  });
+  assert.equal(exchangeBody.capability, 'gmail-readonly');
+  assert.equal(completed.gmailSession.id, sessionId);
+  assert.equal(completed.returnTo, '/?gmail=1');
+  assert.equal(JSON.stringify(completed).includes('access_token'), false);
+
+  const storage = fakeStorage();
+  saveGmailSession(storage, completed.gmailSession, 'profile-work');
+  assert.equal(loadGmailSession(storage, () => Date.now(), 'profile-work').id, sessionId);
+  assert.equal(storage.getItem(authStorageKey(GMAIL_SESSION_KEY, 'profile-work')).includes('ya29'), false);
+
+  const calls = [];
+  const listed = await listDelegatedGmailMessages({
+    options: { query: 'in:inbox', maxResults: 25 },
+    exchangeUrl: EXCHANGE_URL,
+    sessionStorage: storage,
+    profileId: 'profile-work',
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return new Response(JSON.stringify({
+        messages: [{
+          id: 'msg_1', threadId: 'thread_1', labelIds: ['INBOX'], snippet: 'Hello', internalDate: '1700000000000',
+          headers: { subject: 'Welcome', from: 'sender@example.com', to: 'ama@example.com', date: 'Tue' }
+        }],
+        nextPageToken: 'NEXT_1', resultSizeEstimate: 1
+      }), { status: 200 });
+    }
+  });
+  assert.equal(listed.messages[0].headers.subject, 'Welcome');
+  assert.equal(listed.nextPageToken, 'NEXT_1');
+  assert.equal(calls[0].options.headers.Authorization, `YayraGmail ${sessionId}`);
+  assert.match(calls[0].url, /\/api\/gmail\/messages/);
+
+  const opened = await getDelegatedGmailMessage({
+    messageId: 'msg_1',
+    exchangeUrl: EXCHANGE_URL,
+    sessionStorage: storage,
+    profileId: 'profile-work',
+    fetchImpl: async (_url, options) => {
+      assert.equal(options.headers.Authorization, `YayraGmail ${sessionId}`);
+      return new Response(JSON.stringify({ message: {
+        id: 'msg_1', threadId: 'thread_1', labelIds: ['INBOX'], snippet: 'Hello', internalDate: '1700000000000',
+        headers: { subject: 'Welcome', from: 'sender@example.com', to: 'ama@example.com', date: 'Tue' },
+        bodyText: '<script>is rendered as text</script>', bodyTruncated: false
+      } }), { status: 200 });
+    }
+  });
+  assert.equal(opened.bodyText, '<script>is rendered as text</script>');
 });
 
 test('Drive logout removes the local capability even when Worker revocation is offline', async () => {

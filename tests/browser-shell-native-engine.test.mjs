@@ -461,7 +461,9 @@ test('Native engine: the authenticated invoke result reflects and restores Googl
     assert.equal(first.state.googleAccount.signedIn, true, 'the invoke completion updates the initiating Yayra window');
     assert.equal(first.state.googleAccount.profile.email, profile.email);
     assert.equal(first.state.googleAccount.savedAt, persisted.savedAt);
-    assert.match(first.rootElement.querySelector('.fb-google-account-connection').textContent, /Google is connected to Yayra/);
+    assert.equal(first.getActiveTab().url, 'https://www.youtube.com/', 'the invoke result automatically resumes the initiating destination');
+    assert.match(first.rootElement.querySelector('.fb-google-connected-banner')?.textContent || '', /returned@example\.com/,
+      'the resumed product visibly reflects the exact verified account');
     first.destroy();
     first = null;
 
@@ -478,16 +480,52 @@ test('Native engine: the authenticated invoke result reflects and restores Googl
   }
 });
 
-test('Native engine: Google product login redirect starts Yayra connection and clears the canceled embedded load', async () => {
+test('Native engine: connected Google continuation keeps the full destination in Yayra and visibly reflects the exact account', async () => {
+  const profile = { sub: 'google-reflect', email: 'selected@example.com', name: 'Selected Account' };
+  let externalProductCalls = 0;
+  const auth = {
+    getSession: async () => ({ signedIn: true, profile, savedAt: '2026-10-25T00:00:00.000Z' }),
+    onEvent: () => () => {},
+    signIn: async () => ({ ok: true, profile }),
+    signOut: async () => ({ ok: true }),
+    openAccountPage: async () => ({ ok: true }),
+    openGoogleProduct: async () => { externalProductCalls += 1; return { ok: true }; }
+  };
+  const { calls, uninstall } = installFakeNativeWebview({ auth });
+  try {
+    const container = document.createElement('div');
+    const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+    await shell.initialize();
+    await new Promise((resolve) => setImmediate(resolve));
+    const destination = 'https://www.google.com/search?q=accra+weather&hl=en#result';
+    shell.navigateActiveTab(`https://accounts.google.com/ServiceLogin?continue=${encodeURIComponent(destination)}`);
+    const tab = shell.getActiveTab();
+    assert.ok(shell.rootElement.querySelector('.fb-google-account-continue-btn'));
+
+    shell.rootElement.querySelector('.fb-google-account-continue-btn').click();
+    await Promise.resolve();
+    assert.equal(tab.url, destination, 'path, query, and fragment from the initiating Google destination are restored');
+    assert.equal(externalProductCalls, 0, 'continuation is not abandoned to Chrome');
+    assert.ok(calls.ensure.some((call) => call.url === destination), 'the exact destination resumes in Yayra’s site engine');
+    assert.match(shell.rootElement.querySelector('.fb-google-connected-banner')?.textContent || '', /selected@example\.com/,
+      'the Google page receives a persistent Yayra account reflection instead of a generic Sign in state');
+    shell.destroy();
+  } finally {
+    uninstall();
+  }
+});
+
+test('Native engine: Gmail login resumes the exact destination inside Yayra with the selected account', async () => {
   const listeners = new Set();
-  let continuedOrigin = null;
+  let gmailConnectCalls = 0;
   const auth = {
     getSession: async () => ({ signedIn: false }),
     onEvent: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
     signIn: async () => ({ ok: true, pending: true }),
+    connectGmail: async () => { gmailConnectCalls += 1; return { ok: true, pending: true }; },
+    listGmailMessages: async () => ({ ok: true, messages: [], nextPageToken: null }),
     signOut: async () => ({ ok: true }),
-    openAccountPage: async () => ({ ok: true }),
-    openGoogleProduct: async (origin) => { continuedOrigin = origin; return { ok: true }; }
+    openAccountPage: async () => ({ ok: true })
   };
   const { fake, uninstall } = installFakeNativeWebview({ auth });
   try {
@@ -502,19 +540,25 @@ test('Native engine: Google product login redirect starts Yayra connection and c
     fake.emit({ tabId: tab.id, type: 'loading-stop' });
     fake.emit({ tabId: tab.id, type: 'google-account-auth-required', provider: 'google', reason: 'navigation' });
     shell.render();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
 
     assert.equal(tab.isLoading, false, 'the canceled ServiceLogin cannot leave the source tab spinner stuck');
     assert.equal(tab.url, 'https://mail.google.com/', 'the product URL is preserved for secure continuation');
     assert.equal(shell.state.activeTabId, tab.id);
-    assert.ok(shell._nativeWebviewTabIds.has(tab.id), 'the source WebContentsView remains associated for cleanup');
+    assert.equal(shell._nativeWebviewTabIds.has(tab.id), false,
+      'Gmail uses the scoped in-Yayra mailbox surface instead of returning to a cookie-less web view');
     assert.ok(shell.rootElement.querySelector('.fb-google-account-connection'), 'the stale product surface is hidden by connection state');
+    assert.equal(gmailConnectCalls, 1, 'the initiating Gmail tab requests Gmail scope during its one OAuth trip');
 
     for (const listener of listeners) listener({ type: 'signed-in', profile: { sub: 'g-product', email: 'person@example.com' } });
-    shell.rootElement.querySelector('.fb-google-account-continue-btn')?.click();
     await Promise.resolve();
-    assert.equal(continuedOrigin, 'https://mail.google.com/',
-      'continuation passes only the credential-free product origin to the native bridge');
-    assert.ok(fake, 'native event source remains alive');
+    await Promise.resolve();
+    assert.equal(tab.url, 'https://mail.google.com/', 'the exact initiating Gmail destination remains in the tab');
+    assert.ok(shell.rootElement.querySelector('.fb-gmail-page'), 'Gmail resumes automatically inside Yayra');
+    assert.match(shell.rootElement.querySelector('.fb-gmail-account')?.textContent || '', /person@example\.com/,
+      'the account selected in Chrome is visibly reflected in the resumed Gmail tab');
+    assert.ok(fake, 'native event source remains alive for other tabs');
   } finally {
     uninstall();
   }

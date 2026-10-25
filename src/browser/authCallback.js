@@ -17,7 +17,13 @@
  * On any failure: show the error honestly with a way back into the app -
  * never a blank page.
  */
-import { completeSignIn, saveDriveSession, saveProfile } from '../services/googleAuthWeb.js';
+import {
+  completeSignIn,
+  saveDriveSession,
+  saveGmailSession,
+  saveGoogleServicesSession,
+  saveProfile
+} from '../services/googleAuthWeb.js';
 import { resolveWebGoogleAuthConfig } from '../config/googleAuthWeb.js';
 
 const statusEl = document.getElementById('auth-status');
@@ -30,7 +36,7 @@ async function run() {
     return fail('Google sign-in is not configured for this deployment.');
   }
   try {
-    const { profile, profileId = 'default', driveSession, returnTo } = await completeSignIn({
+    const { profile, profileId = 'default', driveSession, gmailSession, googleServicesSession, returnTo } = await completeSignIn({
       search: window.location.search,
       origin: window.location.origin,
       pathname: window.location.pathname,
@@ -43,9 +49,15 @@ async function run() {
     // Google token. Persist it so the reflected Yayra connection survives a
     // browser/PWA restart; the Worker keeps encrypted Google credentials.
     if (driveSession) saveDriveSession(window.localStorage, driveSession, profileId);
-    if (statusEl) statusEl.textContent = driveSession
-      ? `Google Drive connected for ${profile.email} — returning to Yayra…`
-      : `Signed in as ${profile.email} — returning to Yayra…`;
+    if (gmailSession) saveGmailSession(window.localStorage, gmailSession, profileId);
+    if (googleServicesSession) saveGoogleServicesSession(window.localStorage, googleServicesSession, profileId);
+    if (statusEl) statusEl.textContent = googleServicesSession
+      ? `Google services connected for ${profile.email} — returning to Yayra…`
+      : (driveSession
+        ? `Google Drive connected for ${profile.email} — returning to Yayra…`
+        : (gmailSession
+          ? `Gmail connected for ${profile.email} — returning to Yayra…`
+          : `Signed in as ${profile.email} — returning to Yayra…`));
     // Only ever return to a same-origin path - a stored absolute URL (which
     // beginSignIn never writes, but defense in depth) must not become an
     // open redirect.

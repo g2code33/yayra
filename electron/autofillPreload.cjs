@@ -16,6 +16,25 @@
 
 const { ipcRenderer, contextBridge } = require('electron');
 
+// Google auth-surface parity: Yayra must not insert ANY script or DOM into
+// accounts.google.com / consent.google.com / myaccount.google.com. Google's
+// secure-browser policy explicitly names "insert custom scripts" and "access
+// session cookies" as disqualifying embedded-user-agent capabilities, and its
+// risk engine can detect main-world injections and injected DOM nodes.
+//
+// This guard is evaluated at document start in the isolated preload, before
+// any executeInMainWorld call. On an auth surface the whole enhancement layer
+// is skipped: native Chromium WebAuthn/passkeys, autofill and form handling
+// run exactly as they would in a standalone browser. No automation flag is
+// set and nothing is reported to Google.
+const GOOGLE_AUTH_SURFACE_HOST = (() => {
+  try {
+    const host = String((typeof location !== 'undefined' && location && location.hostname) || '').toLowerCase();
+    return /^(?:accounts|consent|myaccount)\.google\.com$/.test(host);
+  } catch { return false; }
+})();
+
+if (!GOOGLE_AUTH_SURFACE_HOST) {
 const CAPTURE_CHANNEL = 'yayra:autofill-captured';
 const DETECTED_CHANNEL = 'yayra:autofill-form-detected';
 const FILL_CHANNEL = 'yayra:autofill-fill';
@@ -870,3 +889,5 @@ ipcRenderer.on(FILL_CHANNEL, (_event, { username, password } = {}) => {
     }
   } catch { /* never break the page */ }
 });
+
+} // end !GOOGLE_AUTH_SURFACE_HOST: zero page scripts on Google auth surfaces
