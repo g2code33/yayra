@@ -616,7 +616,7 @@ test('Requirement 2, 4, 6: Floating Mini-Browser Window opens standalone, is mov
   assert.ok(miniWin.querySelector('.fb-mini-tabstrip'), 'Mini must use the shared tab-strip header');
   assert.ok(miniWin.querySelector('.fb-mini-omnibox'), 'Mini omnibox must exist');
   assert.ok(miniWin.querySelector('.fb-mini-download-btn'), 'Mini downloads button must exist');
-  assert.ok(miniWin.querySelector('.fb-mini-extensions-btn'), 'Mini extensions button must exist');
+  assert.ok(miniWin.querySelector('.fb-mini-tools-btn'), 'Mini Tools button must exist');
   assert.ok(miniWin.querySelector('.fb-mini-drawer-btn'), 'Mini menu button must exist');
   assert.ok(miniWin.querySelector('.fb-mini-duplicate-btn'), 'Duplicate button must exist');
 
@@ -705,13 +705,17 @@ test('Requirement 4 & 10: Toolbar Brand Logo beside Lock & Transparent Action Bu
   assert.ok(brand, 'App brand logo and name must be present in toolbar');
   assert.ok(brand.textContent.includes('yayra'));
 
-  // Downloads and extensions buttons present without white background
+  // Downloads stays separate; adjacent utility actions are consolidated.
   const dlBtn = container.querySelector('.fb-toolbar-downloads-btn');
-  const extBtn = container.querySelector('.fb-toolbar-extensions-btn');
+  const toolsBtn = container.querySelector('.fb-toolbar-tools-btn');
   const starBtn = container.querySelector('.fb-omnibox-star');
 
   assert.ok(dlBtn, 'Downloads toolbar button must exist');
-  assert.ok(extBtn, 'Extensions toolbar button must exist');
+  assert.ok(toolsBtn, 'Tools toolbar button must exist');
+  toolsBtn.click();
+  assert.ok(container.querySelector('.fb-tools-dropdown'), 'Tools opens its compact popover');
+  assert.ok(container.querySelector('[data-tool="calculator"]'), 'Calculator is available from Tools');
+  assert.ok(container.querySelector('[data-tool="extensions"]'), 'Extensions remain available from Tools');
   assert.ok(starBtn, 'Star button must exist');
 });
 
@@ -878,6 +882,19 @@ test('Settings page: every toggle and dropdown applies IMMEDIATELY on change and
   engineSelect.dispatchEvent({ type: 'change', target: engineSelect });
   assert.equal(shell.state.settings.searchEngine, 'duckduckgo');
 
+  // --- Customizable toolbar slots repaint both the main and mini toolbars ---
+  const toolbarAction1 = container.querySelector('#fb-in-toolbar-action-1');
+  assert.ok(toolbarAction1, 'toolbar quick-action setting must exist');
+  toolbarAction1.value = 'history';
+  toolbarAction1.dispatchEvent({ type: 'change', target: toolbarAction1 });
+  assert.deepEqual(shell.state.settings.toolbarQuickActions, ['downloads', 'tools', 'history', 'dictionary']);
+  assert.ok(container.querySelector('.fb-quick-history-btn'), 'main toolbar renders the selected action');
+  assert.equal(container.querySelector('.fb-quick-documents-btn'), null, 'replaced action leaves the toolbar');
+  shell.openFloatingMini();
+  const miniToolbar = document.getElementById('yayra-floating-popup-window');
+  assert.ok(miniToolbar?.querySelector('.fb-mini-history-btn'), 'mini toolbar shares the selected profile action');
+  assert.ok(miniToolbar?.querySelector('.fb-mini-dictionary-btn'), 'second customizable action remains in the mini toolbar');
+
   // --- Privacy / behavior checkboxes ---
   const toggles = [
     ['#fb-in-set-https', 'httpsFirst'],
@@ -904,6 +921,7 @@ test('Settings page: every toggle and dropdown applies IMMEDIATELY on change and
   assert.equal(persisted.theme, 'light');
   assert.equal(persisted.colorTheme, 'purple');
   assert.equal(persisted.searchEngine, 'duckduckgo');
+  assert.deepEqual(persisted.toolbarQuickActions, ['downloads', 'tools', 'history', 'dictionary']);
   assert.equal(persisted.httpsFirst, true);
   assert.equal(persisted.adBlockEnabled, true);
   assert.equal(persisted.restoreSessionOnLaunch, true);

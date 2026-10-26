@@ -3,6 +3,8 @@
  * Deep Navy, Cyan/Blue accents, Translucent surfaces, Soft shadows, Modern typography.
  */
 
+@import url('./scientific-calculator.css');
+
 :root {
   /* Default Dark Mode Theme Variables */
   --fb-bg-app: #060b19;
@@ -5363,8 +5365,6 @@ button.fb-site-passkey-indicator {
 .fb-mini-navbar .fb-omnibox-group-btn,
 .fb-mini-navbar .fb-site-passkey-indicator,
 .fb-mini-navbar .fb-update-chip,
-.fb-mini-navbar .fb-toolbar-extensions-btn,
-.fb-mini-navbar .fb-mini-extensions-btn,
 .fb-mini-navbar .fb-account-btn {
   display: none !important;
 }
@@ -7097,9 +7097,8 @@ button.fb-site-passkey-indicator {
   font-size: 11px !important;
 }
 
-/* Downloads and Extensions Buttons: Transparent without white background */
+/* Toolbar action buttons are transparent and compact. */
 .fb-toolbar-downloads-btn,
-.fb-toolbar-extensions-btn,
 .fb-toolbar-action-btn {
   background: transparent !important;
   border: none !important;
@@ -7115,7 +7114,6 @@ button.fb-site-passkey-indicator {
 }
 
 .fb-toolbar-downloads-btn:hover,
-.fb-toolbar-extensions-btn:hover,
 .fb-toolbar-action-btn:hover {
   background: rgba(255, 255, 255, 0.08) !important;
   color: var(--fb-text-primary) !important;

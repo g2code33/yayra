@@ -1,0 +1,33 @@
+# Yayra Scientific Calculator — implemented scope
+
+Open the offline workspace at `yayra://calculator`, from the browser **Tools** menu or a configured quick-action slot, or in the floating mini browser. Calculator parsing, arithmetic, plotting, integration, unit conversion and saved data are local. The calculator makes no network, cloud-compute, account or AI requests. Regular data belongs to the active Yayra profile; private-session records remain in memory and are not written to that profile.
+
+## Calculator and personal data
+
+- A cursor-editable expression field supports keyboard entry and a hardware-style scientific keypad. The keypad includes SHIFT, ALPHA, MODE, HYP, DEG/RAD/GRAD cycling, normalization/notation selection, fraction entry/display, scientific notation, answer and memory keys. Fraction results can be sent back into the expression as an exact-looking `numerator/denominator` value; the display uses a bounded continued-fraction approximation and is not a symbolic proof of rationality.
+- The evaluator is a bounded tokenizer/parser with an allow-listed function and constant table. It never evaluates JavaScript. It supports arithmetic, implicit multiplication, right-associative powers, remainder, percent, factorial, variables and the documented functions/constants in `scientificCalculator.js`. Invalid, oversized and non-finite calculations are rejected.
+- Significant digits and automatic/scientific/engineering notation are configurable. Results include explanatory working where available, and remain distinguishable from calculator history.
+- Local History, Saved results, numeric Variables, MC/MR/M+/M− memory, built-in Formula references and personal formulas, and named Notes/Notebooks are available. JSON backup export/import is schema-checked, sanitized and bounded. Saved vocabulary/dictionary records are separate and are not affected by calculator data operations.
+- Calculator storage schema 2 adds graph configuration, the 3D expression, custom formulas and fraction-display preference. A newer unknown schema is not overwritten by this version.
+
+## Scientific workspaces
+
+- **2D graph:** plot several independently editable, colored expressions. Configure ranges, zoom, pan, reset, toggle/remove/add curves, export SVG and print the graph. Root, intersection and extrema tools use sampled/bracketed numerical methods; results are estimates, not symbolic solutions. Tangential roots and narrow features can be missed.
+- **3D:** interactively rotate and zoom a bounded sampled surface of the form `z = f(x,y)`. It is a local canvas projection with domain gaps, not a general implicit/parametric 3D renderer.
+- **Integrals:** estimate definite one-variable integrals with adaptive Simpson or convergence-checked composite trapezoid methods, a user tolerance, evaluation bounds and an error estimate. Results are explicitly numerical approximations; non-finite or non-convergent cases are reported.
+- **Equation solver:** solve real linear equations of the form `ax + b = c` and real/degenerate quadratic equations of the form `ax² + bx + c = 0`. This is not a general symbolic algebra system.
+- **Units:** dimension-checked conversions over the catalogued SI/scientific units in the service. Supported groups include length, area, volume, mass, time, speed, acceleration, force, pressure, energy, power, frequency, current, voltage, resistance, charge, amount, concentrations and temperature. Temperature offsets are handled separately. The unit list is explicit; arbitrary expression-level dimensional analysis is not performed.
+- **Chemistry:** common-formula molar mass from a fixed approximate atomic-weight table (nested parentheses supported), mass-to-moles arithmetic, molarity from amount and final volume, ideal concentration-based pH, and a Henderson–Hasselbalch buffer estimate. These do not balance reactions or model non-ideal behavior; verify assumptions and authoritative values.
+- **Pharmacy arithmetic:** user-input dilution (`C₁V₁ = C₂V₂`), supplied rate × mass, volumetric mL/h, gravity-flow arithmetic and concentration × volumetric rate. These tools do not select a medicine, determine an appropriate dose or rate, or provide clinical guidance. Independently verify values with official product information and an authorized clinician or pharmacist. Never use these calculations alone to prepare or administer a medicine.
+
+## Browser integration and presentation
+
+The calculator is integrated with normal tabs and the floating mini browser, including private-session isolation. Graph printing includes the graph artwork. The workspace and keypad adapt to narrow screens; workspaces can be navigated as tabs/sections rather than relying on a permanently side-by-side desktop layout.
+
+The compact browser toolbar has four quick-action slots: **Downloads** and **Tools** remain available, plus two profile-configurable actions selected in **Settings → Toolbar quick actions**. Available extras include Documents, Dictionary, Extensions & Shields, Calculator, History, Bookmarks, Settings and Passwords. Main and mini toolbars use the same saved profile selection. Documents, Dictionary, Downloads and other existing browser features remain separate from the calculator.
+
+## Important limitations
+
+This is a practical local numeric workspace, **not** a computer algebra system, medication reference, clinical decision-support system, laboratory information system or validated dosing device. It does not provide complex/matrix/statistics modes, general symbolic proofs, broad equation systems, regression, arbitrary implicit/parametric graphing, reaction balancing, a drug database, interaction checking, route/frequency advice or patient-specific recommendations. Graph analysis can miss features between samples, and the 3D plot is a sampled explicit surface only. Concentration-based pH and buffer outputs rely on stated ideal assumptions. Atomic weights are a fixed approximation table for common elements.
+
+Calculator history and saved information use local app/profile storage; the calculator does not itself provide end-to-end encryption or server synchronization. Use the built-in backup feature when moving or archiving a profile. These limitations are deliberate; features requiring reference datasets need provenance, license, attribution, version and integrity review before inclusion.

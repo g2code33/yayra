@@ -19,5 +19,8 @@ export * from './components/FloatingBubble.js';
 export * from './components/WindowControls.js';
 export * from './components/BrowserToolbar.js';
 export * from './components/BrowserShell.js';
+export * from './components/ScientificCalculator.js';
+export * from './services/scientificCalculator.js';
+export * from './services/scientificCalculatorStorage.js';
 
 export * from './dashboard/MainDashboard.js';

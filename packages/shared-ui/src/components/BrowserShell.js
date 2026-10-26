@@ -17,6 +17,8 @@
  */
 
 import { Icons } from '../icons/icons.js';
+import { ScientificCalculator } from './ScientificCalculator.js';
+import { createScientificCalculatorRepo, defaultScientificCalculatorData } from '../services/scientificCalculatorStorage.js';
 import qrcode from '../vendor/qrcode.js';
 import {
   classifyDocument,
@@ -304,6 +306,24 @@ export class BrowserShell {
     // Desktop files recover through opaque ids owned by electron/documentLibrary.
     // Web/PWA/mobile picker files have no durable filesystem handle, so keep
     // their exact bytes in profile-scoped IndexedDB for open-tab recovery.
+    this._volatileCalculatorStore = new Map();
+    this._privateScientificCalculatorStore = new Map();
+    const volatileCalculatorStore = this._volatileCalculatorStore;
+    const privateCalculatorStore = this._privateScientificCalculatorStore;
+    const calculatorStorage = this.profileStorage || this.storageAdapter || {
+      async get(key) { return volatileCalculatorStore.get(key) ?? null; },
+      async set(key, value) { volatileCalculatorStore.set(key, value); }
+    };
+    this.scientificCalculatorRepo = options.scientificCalculatorRepo
+      || createScientificCalculatorRepo(calculatorStorage);
+    this.privateScientificCalculatorRepo = createScientificCalculatorRepo({
+      async get(key) { return privateCalculatorStore.get(key) ?? null; },
+      async set(key, value) { privateCalculatorStore.set(key, value); }
+    });
+    this.scientificCalculatorData = defaultScientificCalculatorData();
+    this._scientificCalculatorViews = new WeakMap();
+    this._scientificCalculatorWrite = Promise.resolve();
+
     this.documentRecoveryRepo = options.documentRecoveryRepo || createDocumentRecoveryRepo({
       getProfileId: () => this.currentProfileId()
     });
@@ -491,6 +511,7 @@ export class BrowserShell {
         theme: 'dark',
         colorTheme: 'blue',
         searchEngine: 'google', // Requirement 13: Default search engine is Google
+        toolbarQuickActions: ['downloads', 'tools', 'documents', 'dictionary'],
         dictionaryLookupDestination: 'new-tab',
         dictionaryGlobalLookupEnabled: false,
         dictionaryGlobalLookupShortcut: 'CommandOrControl+Alt+D',
@@ -646,6 +667,7 @@ export class BrowserShell {
       // expands all items inline without changing tabs.
       isDownloadsDropdownOpen: false,
       isDownloadsDropdownExpanded: false,
+      isToolsDropdownOpen: false,
       // True while a transient popup that is NOT part of render() (omnibox
       // search-suggestion dropdown) is covering the page area. On Electron
       // the native page surface must be hidden for the popup to be seen at
@@ -958,6 +980,7 @@ export class BrowserShell {
       s.isSecurityDropdownOpen ||
       s.isAccountMenuOpen ||
       s.isDownloadsDropdownOpen ||
+      s.isToolsDropdownOpen ||
       s.isFloatingMiniOpen ||
       s.isRadialLauncherOpen ||
       (s.findInPage && s.findInPage.isOpen) ||
@@ -2385,6 +2408,9 @@ export class BrowserShell {
     if (this.state.isDownloadsDropdownOpen) {
       this.renderDownloadsDropdown(shell);
     }
+    if (this.state.isToolsDropdownOpen && !this.state.isFloatingMiniOpen) {
+      this.renderToolsDropdown(shell);
+    }
 
     // Chrome-style "Keep your browsing separate?" profile suggestion
     if (this.state.profileSuggestion) {
@@ -2760,16 +2786,21 @@ export class BrowserShell {
     const hadDropdown = Boolean(
       this.state.isSecurityDropdownOpen ||
       this.state.isAccountMenuOpen ||
-      this.state.isDownloadsDropdownOpen
+      this.state.isDownloadsDropdownOpen ||
+      this.state.isToolsDropdownOpen
     );
     if (!hadDropdown) return;
     this.state.isSecurityDropdownOpen = false;
     this.state.isAccountMenuOpen = false;
     this.state.isDownloadsDropdownOpen = false;
     this.state.isDownloadsDropdownExpanded = false;
+    this.state.isToolsDropdownOpen = false;
     try {
-      for (const selector of ['.fb-dropdown-scrim', '.fb-security-dropdown', '.fb-account-dropdown', '.fb-downloads-dropdown']) {
+      for (const selector of ['.fb-dropdown-scrim', '.fb-security-dropdown', '.fb-account-dropdown', '.fb-downloads-dropdown', '.fb-tools-dropdown', '.fb-tools-dropdown-scrim']) {
         for (const el of this.rootElement?.querySelectorAll?.(selector) || []) el.remove?.();
+      }
+      if (typeof document !== 'undefined') {
+        for (const el of document.querySelectorAll?.('.fb-tools-dropdown, .fb-tools-dropdown-scrim') || []) el.remove?.();
       }
     } catch { /* a concurrent render already removed them */ }
 
@@ -3679,52 +3710,12 @@ export class BrowserShell {
       toolbarActions.appendChild(updateChip);
     }
 
-    // Requirement 10: Downloads Button (Transparent, Compact, Matching Star Size)
-    // Smart: while anything is downloading it wears a revolving progress
-    // ring tracking the live percentage (updated in place - see
-    // updateDownloadIndicator()). Clicking opens the downloads DROPDOWN
-    // (latest 5 + actions), never yanking the user to a new tab - the
-    // full yayra://downloads page is one button away inside it.
-    const dlBtn = document.createElement('button');
-    dlBtn.className = 'fb-action-btn fb-btn-downloads fb-toolbar-downloads-btn fb-toolbar-action-btn';
-    dlBtn.setAttribute('aria-label', 'Downloads');
-    dlBtn.innerHTML = `${this.renderDownloadRingHtml()}${Icons.download}`;
-    dlBtn.setAttribute('title', this.describeDownloadActivity());
-    dlBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      this.state.isDownloadsDropdownOpen = !this.state.isDownloadsDropdownOpen;
-      if (!this.state.isDownloadsDropdownOpen) this.state.isDownloadsDropdownExpanded = false;
-      this.render();
-    });
-    toolbarActions.appendChild(dlBtn);
-
-    // Local Documents hub sits directly beside Downloads. It is a full
-    // library page (not another transient dropdown), so filtering and file
-    // management stay usable even with thousands of remembered originals.
-    const documentsBtn = document.createElement('button');
-    documentsBtn.className = 'fb-action-btn fb-btn-documents fb-toolbar-documents-btn fb-toolbar-action-btn';
-    documentsBtn.setAttribute('title', 'Documents');
-    documentsBtn.setAttribute('aria-label', 'Open Documents library');
-    documentsBtn.innerHTML = Icons.document;
-    documentsBtn.addEventListener('click', () => this.openInternalPage('yayra://documents'));
-    toolbarActions.appendChild(documentsBtn);
-
-    const dictionaryBtn = document.createElement('button');
-    dictionaryBtn.className = 'fb-action-btn fb-btn-dictionary fb-toolbar-dictionary-btn fb-toolbar-action-btn';
-    dictionaryBtn.setAttribute('title', 'Offline Dictionary · Ctrl+Alt+Shift+D on selected text');
-    dictionaryBtn.setAttribute('aria-label', 'Open Offline Dictionary');
-    dictionaryBtn.innerHTML = Icons.dictionary;
-    dictionaryBtn.addEventListener('click', () => this.openInternalPage('yayra://dictionary'));
-    toolbarActions.appendChild(dictionaryBtn);
-
-    // Requirement 10: Extensions & Shields Button (Transparent, Compact, Matching Star Size)
-    const extBtn = document.createElement('button');
-    extBtn.className = 'fb-action-btn fb-btn-extensions fb-toolbar-extensions-btn fb-toolbar-action-btn';
-    extBtn.setAttribute('title', 'Extensions & Shields');
-    extBtn.setAttribute('aria-label', 'Extensions and Content Shields');
-    extBtn.innerHTML = Icons.shield;
-    extBtn.addEventListener('click', () => this.openInternalPage('yayra://extensions'));
-    toolbarActions.appendChild(extBtn);
+    // The first two utility slots stay dedicated to Downloads and Tools;
+    // Settings lets each profile choose two additional quick actions.
+    for (const actionId of this.getToolbarQuickActions()) {
+      const button = this.createToolbarQuickAction(actionId, { mini: false });
+      toolbarActions.appendChild(button);
+    }
 
     // NOTE: the old "floating mode" switcher pill used to live here. It
     // hid the whole main window when toggled to circle-first, which users
@@ -3885,8 +3876,7 @@ export class BrowserShell {
     const topActions = [
       { className: 'fb-mobile-tab-overview', icon: Icons.tabs, title: 'Show all tabs', action: () => this.openModal('tab-switcher') },
       { className: 'fb-mobile-tab-downloads', icon: Icons.download, title: 'Downloads', action: () => this.openInternalPage('yayra://downloads') },
-      { className: 'fb-mobile-tab-documents', icon: Icons.document, title: 'Documents', action: () => this.openInternalPage('yayra://documents') },
-      { className: 'fb-mobile-tab-dictionary', icon: Icons.dictionary, title: 'Offline Dictionary', action: () => this.openInternalPage('yayra://dictionary') },
+      { className: 'fb-mobile-tab-tools', icon: Icons.tools, title: 'Tools', action: () => { this.state.isToolsDropdownOpen = !this.state.isToolsDropdownOpen; this.render(); } },
       { className: 'fb-mobile-tab-bookmarks', icon: Icons.bookmark, title: 'Bookmarks', action: () => this.openInternalPage('yayra://bookmarks') },
       { className: 'fb-mobile-tab-privacy', icon: Icons.shield, title: 'Privacy and shields', action: () => this.openInternalPage('yayra://permissions') },
       { className: 'fb-mobile-tab-history', icon: Icons.history, title: 'History', action: () => this.openInternalPage('yayra://history') }
@@ -4152,6 +4142,8 @@ export class BrowserShell {
       this.renderNewTabPage(viewport, activeTab);
     } else if (url === 'yayra://settings') {
       this.renderInternalSettingsPage(viewport, activeTab);
+    } else if (url === 'yayra://calculator' || url === 'yayra://tools/calculator') {
+      this.renderInternalScientificCalculatorPage(viewport, activeTab);
     } else if (url === 'yayra://google-services') {
       this.renderGoogleServicesPage(viewport, activeTab);
     } else if (url === 'yayra://history') {
@@ -8646,7 +8638,6 @@ export class BrowserShell {
         .fb-dict-link{display:block;width:max-content;max-width:100%;margin-top:7px;color:#93c5fd;text-decoration:underline;overflow-wrap:anywhere}.fb-dict-pack-meta{font-size:.9rem;line-height:1.5;overflow-wrap:anywhere}.fb-dict-license{max-height:240px;overflow:auto;white-space:pre-wrap;font:inherit;font-size:.8rem;line-height:1.45;color:var(--fb-text-secondary,#cbd5e1)}
         .fb-dict-status{min-height:1.3em;margin:8px 0;color:var(--fb-text-secondary,#cbd5e1)}
         .fb-dictionary-brand-action{display:inline-flex;align-items:center;gap:8px}.fb-dictionary-brand-action svg{width:20px;height:20px}
-        .fb-toolbar-dictionary-btn svg{filter:drop-shadow(0 0 5px rgba(56,189,248,.3))}
         @media(max-width:700px){.fb-dictionary-page{padding:13px}.fb-dict-split,.fb-dict-filter-grid{grid-template-columns:1fr}.fb-dict-card{padding:13px}.fb-dict-nav{width:100%;overflow-x:auto}.fb-dict-search{grid-template-columns:minmax(0,1fr)}.fb-dict-search>.fb-dict-btn{justify-self:start}}
       </style>
       <div class="fb-dict-wrap">
@@ -9162,6 +9153,55 @@ export class BrowserShell {
     document.body.appendChild(anchor); anchor.click(); anchor.remove(); setTimeout(() => URL.revokeObjectURL(url), 0);
   }
 
+  renderInternalScientificCalculatorPage(viewport, activeTab = null) {
+    const privateMode = Boolean(activeTab?.isPrivate);
+    const calculatorRepo = privateMode ? this.privateScientificCalculatorRepo : this.scientificCalculatorRepo;
+    const writeQueueKey = privateMode ? '_privateScientificCalculatorWrite' : '_scientificCalculatorWrite';
+    const page = document.createElement('div');
+    page.className = 'fb-internal-page fb-scientific-calculator-page';
+    page.innerHTML = `<div class="sc-page-loading" role="status">Opening your local calculator workspace…</div>`;
+    viewport.appendChild(page);
+    const mountCalculator = async () => {
+      try {
+        const data = await calculatorRepo.load();
+        const stillMounted = typeof viewport.contains === 'function' ? viewport.contains(page) : page.parentElement === viewport;
+        if (page.isConnected === false || !stillMounted) return;
+        if (data.readOnlyFutureVersion) {
+          page.innerHTML = '<div class="sc-page-error" role="status"><h1>Calculator data needs a newer Yayra version</h1><p>Your existing calculator data was left untouched. Update Yayra to open this profile’s saved workspace.</p></div>';
+          return;
+        }
+        this.scientificCalculatorData = data;
+        const calculator = new ScientificCalculator({
+          container: page,
+          data,
+          privateMode,
+          onDataChange: (next) => {
+            this.scientificCalculatorData = next;
+            this[writeQueueKey] = (this[writeQueueKey] || Promise.resolve())
+              .catch(() => {})
+              .then(() => calculatorRepo.save(next));
+            return this[writeQueueKey];
+          },
+          onOpenSettings: () => {
+            this.state.settingsActiveCategory = 'calculator';
+            this.state.activeSettingsCategory = 'calculator';
+            this.openInternalPage('yayra://settings');
+          },
+          onPrompt: (title, placeholder) => this._textPromptDialog({ title, placeholder })
+        });
+        this._scientificCalculatorViews.set(page, calculator);
+      } catch (error) {
+        page.innerHTML = `<div class="sc-page-error" role="alert"><h1>Calculator workspace unavailable</h1><p>${escapeHtml(error?.message || 'Local calculator data could not be opened.')}</p><button type="button" class="fb-btn fb-btn-secondary">Retry</button></div>`;
+        page.querySelector('button')?.addEventListener('click', () => {
+          page.innerHTML = '<div class="sc-page-loading" role="status">Opening your local calculator workspace…</div>';
+          void mountCalculator();
+        });
+      }
+    };
+    void mountCalculator();
+    return page;
+  }
+
   renderInternalSettingsPage(viewport) {
     const page = document.createElement('div');
     page.className = 'fb-internal-page fb-settings-app fb-settings-inpage-layout';
@@ -9183,6 +9223,9 @@ export class BrowserShell {
         </button>
         <button class="fb-settings-nav-item ${activeCat === 'ai' ? 'active' : ''}" data-cat="ai" data-category="ai">
           ${Icons.sparkles} <span>Yayra AI</span>
+        </button>
+        <button class="fb-settings-nav-item ${activeCat === 'toolbar-actions' ? 'active' : ''}" data-cat="toolbar-actions" data-category="toolbar-actions">
+          ${Icons.tools} <span>Toolbar actions</span>
         </button>
         <button class="fb-settings-nav-item ${activeCat === 'appearance' ? 'active' : ''}" data-cat="appearance" data-category="appearance">
           ${Icons.moon} <span>Appearance</span>
@@ -9213,6 +9256,9 @@ export class BrowserShell {
         </button>
         <button class="fb-settings-nav-item ${activeCat === 'dictionary' ? 'active' : ''}" data-cat="dictionary" data-category="dictionary">
           ${Icons.dictionary} <span>Dictionary & Vocabulary</span>
+        </button>
+        <button class="fb-settings-nav-item ${activeCat === 'calculator' ? 'active' : ''}" data-cat="calculator" data-category="calculator">
+          ${Icons.calculator} <span>Calculator</span>
         </button>
         <button class="fb-settings-nav-item ${activeCat === 'downloads' ? 'active' : ''}" data-cat="downloads" data-category="downloads">
           ${Icons.download} <span>Downloads</span>
@@ -9434,6 +9480,17 @@ export class BrowserShell {
                 <option value="startpage" ${this.state.settings.searchEngine === 'startpage' ? 'selected' : ''}>Startpage</option>
               </select>
             </div>
+          </section>
+
+          <!-- Toolbar quick actions -->
+          <section class="fb-settings-group-card" id="sec-toolbar-actions" style="${activeCat === 'toolbar-actions' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
+            <h3 class="fb-settings-group-title">${Icons.tools} Toolbar quick actions</h3>
+            <p>Keep a compact row of four utility icons beside the address bar. Downloads and Tools stay available; choose the other two actions for this profile. Tools always contains the complete utility list.</p>
+            <div class="fb-setting-row"><label>Slot 1</label><span class="fb-toolbar-slot-fixed">${Icons.download} Downloads</span></div>
+            <div class="fb-setting-row"><label>Slot 2</label><span class="fb-toolbar-slot-fixed">${Icons.tools} Tools</span></div>
+            <div class="fb-setting-row"><label for="fb-in-toolbar-action-1">Slot 3</label><select id="fb-in-toolbar-action-1" class="fb-select"></select></div>
+            <div class="fb-setting-row"><label for="fb-in-toolbar-action-2">Slot 4</label><select id="fb-in-toolbar-action-2" class="fb-select"></select></div>
+            <p style="font-size:.75rem;color:var(--fb-text-secondary);margin:0;">Changes apply to the main browser and mini toolbar immediately. Your selection is saved only in this Yayra profile.</p>
           </section>
 
           <!-- Reading Mode preferences -->
@@ -9664,6 +9721,19 @@ export class BrowserShell {
               <div class="fb-shortcut-row"><span>Lock / unlock bubble position</span><kbd>Triple click</kbd></div>
               <div class="fb-shortcut-row"><span>Full bubble menu</span><kbd>Right-click</kbd></div>
               <div class="fb-shortcut-row"><span>Move the bubble</span><kbd>Drag</kbd></div>
+            </div>
+          </section>
+
+          <!-- Calculator -->
+          <section class="fb-settings-group-card" id="sec-calculator" style="${activeCat === 'calculator' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
+            <h3 class="fb-settings-group-title">${Icons.calculator} Scientific calculator</h3>
+            <p>Use an offline-first scientific calculator, dimension-aware unit conversions, transparent algebra and graphing, chemistry arithmetic, private calculation history, saved results, variables and notebooks. The expression engine uses an allow-listed parser, never JavaScript evaluation. Your calculations remain in this profile on this device; no cloud service, remote API, account or AI is needed.</p>
+            <div class="fb-documents-settings-privacy">
+              <strong>Scientific and clinical limits</strong>
+              <p>Pharmacy tools perform only the explicitly labelled arithmetic. They do not provide dosing recommendations or administration instructions. Chemistry outputs state their assumptions; verify results independently before relying on them.</p>
+            </div>
+            <div class="fb-tab-group-settings-toolbar">
+              <button type="button" class="fb-btn fb-btn-primary fb-in-open-calculator">${Icons.calculator} <span>Open Scientific Calculator</span></button>
             </div>
           </section>
 
@@ -9922,8 +9992,36 @@ export class BrowserShell {
         if (globalLookupStatus) globalLookupStatus.textContent = 'Could not register this system-wide shortcut. It may be unsupported or already in use.';
       }
     });
+    const toolbarActionOptions = [
+      ['documents', 'Documents'], ['dictionary', 'Dictionary'], ['extensions', 'Extensions & Shields'],
+      ['calculator', 'Scientific Calculator'], ['history', 'History'], ['bookmarks', 'Bookmarks'],
+      ['settings', 'Settings'], ['passwords', 'Passwords']
+    ];
+    const toolbarActions = this.getToolbarQuickActions();
+    const toolbarSelects = [page.querySelector('#fb-in-toolbar-action-1'), page.querySelector('#fb-in-toolbar-action-2')];
+    const refreshToolbarSelects = () => toolbarSelects.forEach((select, index) => {
+      if (!select) return;
+      const other = toolbarSelects[1 - index]?.value;
+      const current = toolbarActions[index + 2];
+      while (select.firstChild) select.removeChild(select.firstChild);
+      toolbarActionOptions.filter(([id]) => id === current || id !== other).forEach(([id, label]) => {
+        const option = document.createElement('option'); option.value = id; option.textContent = label; select.appendChild(option);
+      });
+      select.value = current;
+    });
+    refreshToolbarSelects();
+    toolbarSelects.forEach((select, index) => select?.addEventListener('change', () => {
+      const next = [toolbarSelects[0]?.value || toolbarActions[2], toolbarSelects[1]?.value || toolbarActions[3]];
+      if (next[0] === next[1]) { next[index] = toolbarActionOptions.find(([id]) => id !== next[1 - index])?.[0] || 'documents'; }
+      this.state.settings.toolbarQuickActions = ['downloads', 'tools', ...next];
+      this.persistSettings();
+      this.showTransientNotice('Toolbar quick actions saved to this profile.');
+      this.render();
+    }));
+
     page.querySelector('.fb-in-open-dictionary')?.addEventListener('click', () => this.openInternalPage('yayra://dictionary'));
     page.querySelector('.fb-in-open-vocabulary')?.addEventListener('click', () => this.openInternalPage('yayra://vocabulary'));
+    page.querySelector('.fb-in-open-calculator')?.addEventListener('click', () => this.openInternalPage('yayra://calculator'));
 
     // Section-specific controls are immediate-apply and profile-persisted.
     this.bindUpdatesSettingsActions(page);
@@ -15984,10 +16082,7 @@ export class BrowserShell {
           <button class="fb-omnibox-star fb-mini-star-btn" title="Bookmark" aria-label="Bookmark">${this.state.isBookmarked ? Icons.starFilled : Icons.star}</button>
         </div>
         <div class="fb-toolbar-actions">
-          <button class="fb-action-btn fb-toolbar-action-btn fb-mini-download-btn" title="Downloads" aria-label="Downloads">${Icons.download}</button>
-          <button class="fb-action-btn fb-toolbar-action-btn fb-mini-documents-btn" title="Documents" aria-label="Documents">${Icons.document}</button>
-          <button class="fb-action-btn fb-toolbar-action-btn fb-mini-dictionary-btn" title="Dictionary" aria-label="Dictionary">${Icons.dictionary}</button>
-          <button class="fb-action-btn fb-toolbar-action-btn fb-mini-extensions-btn" title="Extensions and Shields" aria-label="Extensions and Shields">${Icons.shield}</button>
+          ${this.getToolbarQuickActions().map((action) => this.toolbarQuickActionMarkup(action)).join('')}
           ${this.authBridge ? `<button class="fb-action-btn fb-toolbar-action-btn fb-account-btn fb-mini-account-btn" title="Yayra account" aria-label="Account">${this.renderAccountAvatarHtml(this.state.googleAccount?.signedIn ? this.state.googleAccount.profile : null, 22)}</button>` : ''}
           <button class="fb-action-btn fb-menu-btn fb-toolbar-action-btn fb-mini-drawer-btn" title="Customize and control Yayra" aria-label="Main menu">${Icons.moreVertical}</button>
         </div>
@@ -16040,20 +16135,9 @@ export class BrowserShell {
       this.render();
     });
 
-    win.querySelector('.fb-mini-download-btn')?.addEventListener('click', () => {
-      this.openInternalPage('yayra://downloads');
-    });
-
-    win.querySelector('.fb-mini-documents-btn')?.addEventListener('click', () => {
-      this.openInternalPage('yayra://documents');
-    });
-
-    win.querySelector('.fb-mini-dictionary-btn')?.addEventListener('click', () => {
-      this.openInternalPage('yayra://dictionary');
-    });
-
-    win.querySelector('.fb-mini-extensions-btn')?.addEventListener('click', () => {
-      this.openInternalPage('yayra://extensions');
+    win.querySelector('.fb-toolbar-actions')?.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-quick-action]');
+      if (button) this.handleToolbarQuickAction(button.dataset.quickAction, { mini: true });
     });
 
     win.querySelector('.fb-mini-group-btn')?.addEventListener('click', (event) => {
@@ -16134,6 +16218,8 @@ export class BrowserShell {
         this.renderNewTabPage(miniViewport, activeTab);
       } else if (url === 'yayra://settings') {
         this.renderInternalSettingsPage(miniViewport, activeTab);
+      } else if (url === 'yayra://calculator' || url === 'yayra://tools/calculator') {
+        this.renderInternalScientificCalculatorPage(miniViewport, activeTab);
       } else if (url === 'yayra://google-services') {
         this.renderGoogleServicesPage(miniViewport, activeTab);
       } else if (url === 'yayra://history') {
@@ -16161,6 +16247,7 @@ export class BrowserShell {
     }
 
     document.body.appendChild(win);
+    if (this.state.isToolsDropdownOpen) this.renderToolsDropdown(win);
   }
 
   /* -------------------------------------------------------------
@@ -21010,7 +21097,9 @@ export class BrowserShell {
     if (activeTab && activeTab.url === 'yayra://newtab') {
       this.navigateActiveTab(schemeUrl);
     } else {
-      this.createNewTab();
+      // Internal tools opened from a private tab stay in that private session
+      // rather than silently creating a regular profile tab.
+      this.createNewTab(Boolean(activeTab?.isPrivate));
       this.navigateActiveTab(schemeUrl);
     }
     // History/Bookmarks pages always show the CURRENT stored data, not
@@ -21883,6 +21972,89 @@ export class BrowserShell {
       const away = () => { dismiss(); document.removeEventListener('click', away, true); };
       document.addEventListener('click', away, true);
     }, 0);
+  }
+
+  getToolbarQuickActions() {
+    const available = ['documents', 'dictionary', 'extensions', 'calculator', 'history', 'bookmarks', 'settings', 'passwords'];
+    const stored = Array.isArray(this.state.settings.toolbarQuickActions) ? this.state.settings.toolbarQuickActions : ['downloads', 'tools', 'documents', 'dictionary'];
+    const extras = [...new Set(stored.filter((action) => available.includes(action)))].slice(0, 2);
+    for (const fallback of ['documents', 'dictionary']) if (extras.length < 2 && !extras.includes(fallback)) extras.push(fallback);
+    return ['downloads', 'tools', ...extras];
+  }
+
+  createToolbarQuickAction(action, { mini = false } = {}) {
+    const config = {
+      downloads: { label: 'Downloads', icon: Icons.download }, tools: { label: 'Open Tools', icon: Icons.tools },
+      documents: { label: 'Documents', icon: Icons.document }, dictionary: { label: 'Offline Dictionary', icon: Icons.dictionary },
+      extensions: { label: 'Extensions and Shields', icon: Icons.shield }, calculator: { label: 'Scientific Calculator', icon: Icons.calculator },
+      history: { label: 'History', icon: Icons.history }, bookmarks: { label: 'Bookmarks', icon: Icons.bookmark },
+      settings: { label: 'Settings', icon: Icons.settings }, passwords: { label: 'Passwords and Autofill', icon: Icons.lock }
+    }[action];
+    if (!config) return null;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `fb-action-btn fb-toolbar-action-btn fb-toolbar-quick-btn fb-quick-${action}-btn${action === 'downloads' ? ' fb-toolbar-downloads-btn fb-btn-downloads' : ''}${action === 'tools' ? ' fb-toolbar-tools-btn' : ''}${mini ? ` fb-mini-${action}-btn` : ''}`;
+    button.setAttribute('title', config.label);
+    button.setAttribute('aria-label', config.label);
+    button.dataset.quickAction = action;
+    if (action === 'tools') { button.setAttribute('aria-haspopup', 'menu'); button.setAttribute('aria-expanded', String(Boolean(this.state.isToolsDropdownOpen))); }
+    button.innerHTML = action === 'downloads' && !mini ? `${this.renderDownloadRingHtml()}${config.icon}` : config.icon;
+    button.addEventListener('click', (event) => { event.stopPropagation(); this.handleToolbarQuickAction(action, { mini }); });
+    return button;
+  }
+
+  toolbarQuickActionMarkup(action) {
+    const icons = { downloads: Icons.download, tools: Icons.tools, documents: Icons.document, dictionary: Icons.dictionary, extensions: Icons.shield, calculator: Icons.calculator, history: Icons.history, bookmarks: Icons.bookmark, settings: Icons.settings, passwords: Icons.lock };
+    const labels = { downloads: 'Downloads', tools: 'Open Tools', documents: 'Documents', dictionary: 'Offline Dictionary', extensions: 'Extensions and Shields', calculator: 'Scientific Calculator', history: 'History', bookmarks: 'Bookmarks', settings: 'Settings', passwords: 'Passwords and Autofill' };
+    const miniClass = action === 'downloads' ? ' fb-mini-download-btn fb-mini-downloads-btn' : ` fb-mini-${action}-btn`;
+    return `<button type="button" class="fb-action-btn fb-toolbar-action-btn fb-toolbar-quick-btn fb-quick-${action}-btn${miniClass}" title="${labels[action]}" aria-label="${labels[action]}" data-quick-action="${action}" ${action === 'tools' ? `aria-haspopup="menu" aria-expanded="${Boolean(this.state.isToolsDropdownOpen)}"` : ''}>${icons[action]}</button>`;
+  }
+
+  handleToolbarQuickAction(action, { mini = false } = {}) {
+    if (action === 'downloads') {
+      if (mini) { this.openInternalPage('yayra://downloads'); return; }
+      this.state.isDownloadsDropdownOpen = !this.state.isDownloadsDropdownOpen;
+      if (!this.state.isDownloadsDropdownOpen) this.state.isDownloadsDropdownExpanded = false;
+      this.render();
+      return;
+    }
+    if (action === 'tools') { this.state.isToolsDropdownOpen = !this.state.isToolsDropdownOpen; this.render(); return; }
+    const routes = { documents: 'yayra://documents', dictionary: 'yayra://dictionary', extensions: 'yayra://extensions', calculator: 'yayra://calculator', history: 'yayra://history', bookmarks: 'yayra://bookmarks', settings: 'yayra://settings', passwords: 'yayra://passwords' };
+    if (routes[action]) this.openInternalPage(routes[action]);
+  }
+
+  renderToolsDropdown(root) {
+    const scrim = document.createElement('button');
+    scrim.type = 'button';
+    scrim.className = 'fb-tools-dropdown-scrim';
+    scrim.setAttribute('aria-label', 'Close Tools menu');
+    scrim.addEventListener('click', () => {
+      this.state.isToolsDropdownOpen = false;
+      this.render();
+    });
+    root.appendChild(scrim);
+    const dropdown = document.createElement('div');
+    dropdown.className = 'fb-tools-dropdown';
+    dropdown.setAttribute('role', 'menu');
+    dropdown.setAttribute('aria-label', 'Yayra tools');
+    const tools = [
+      { id: 'calculator', label: 'Scientific Calculator', description: 'Offline calculations, units, science and graphing', icon: Icons.calculator, route: 'yayra://calculator' },
+      { id: 'documents', label: 'Documents', description: 'Open the local document library', icon: Icons.document, route: 'yayra://documents' },
+      { id: 'dictionary', label: 'Offline Dictionary', description: 'Look up words and saved vocabulary', icon: Icons.dictionary, route: 'yayra://dictionary' },
+      { id: 'extensions', label: 'Extensions & Shields', description: 'Manage privacy and site extensions', icon: Icons.shield, route: 'yayra://extensions' },
+      { id: 'settings', label: 'Settings', description: 'Browser and calculator preferences', icon: Icons.settings, route: 'yayra://settings' }
+    ];
+    dropdown.innerHTML = `<div class="fb-tools-dropdown-heading"><span>Tools</span><small>Quick access</small></div>${tools.map((tool) => `<button class="fb-tools-menu-item" type="button" role="menuitem" data-tool="${tool.id}"><span class="fb-tools-menu-icon">${tool.icon}</span><span class="fb-tools-menu-copy"><strong>${tool.label}</strong><small>${tool.description}</small></span>${Icons.chevronRight || ''}</button>`).join('')}`;
+    dropdown.querySelectorAll('[data-tool]').forEach((button) => button.addEventListener('click', () => {
+      const selected = tools.find((tool) => tool.id === button.dataset.tool);
+      this.state.isToolsDropdownOpen = false;
+      if (selected?.id === 'settings') {
+        this.state.settingsActiveCategory = 'calculator';
+        this.state.activeSettingsCategory = 'calculator';
+      }
+      if (selected?.route) this.openInternalPage(selected.route);
+    }));
+    root.appendChild(dropdown);
   }
 
   renderDownloadsDropdown(root) {
@@ -23289,6 +23461,7 @@ export class BrowserShell {
     if (tab.title && tab.title !== 'New Tab' && tab.title !== documentTitle) return tab.title;
     if (!tab.url || tab.url === 'yayra://newtab') return tab.isPrivate ? 'Incognito Tab' : 'New Tab';
     if (tab.url === 'yayra://settings') return 'Settings';
+    if (tab.url === 'yayra://calculator') return 'Scientific Calculator';
     if (tab.url === 'yayra://google-services') return 'Google services';
     if (tab.url === 'yayra://history') return 'History';
     if (tab.url === 'yayra://bookmarks') return 'Bookmarks';
@@ -25665,6 +25838,7 @@ export class BrowserShell {
     if (showLoading && tab.isLoading) return `<span class="fb-tab-loading-hourglass">${Icons.hourglass}</span>`;
     const url = tab.url || '';
     if (url.startsWith('yayra://settings')) return Icons.settings;
+    if (url.startsWith('yayra://calculator')) return Icons.calculator;
     if (url.startsWith('yayra://history')) return Icons.history;
     if (url.startsWith('yayra://bookmarks')) return Icons.bookmark;
     if (url.startsWith('yayra://downloads')) return Icons.download;
@@ -25849,6 +26023,7 @@ export class BrowserShell {
       s.isDownloadsDropdownExpanded = false;
       dismissed = true;
     }
+    if (s.isToolsDropdownOpen) { s.isToolsDropdownOpen = false; dismissed = true; }
     if (s.isRadialLauncherOpen) { try { this.closeRadialLauncher(); } catch { /* shim */ } dismissed = true; }
     if (s.findInPage && s.findInPage.isOpen) { s.findInPage.isOpen = false; dismissed = true; }
     if (s.isFloatingMiniOpen) { try { this.closeFloatingMini(); } catch { /* shim */ } dismissed = true; }

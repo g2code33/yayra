@@ -67,10 +67,10 @@ test('MINI DEFAULTS TO DESKTOP: no stored preference = the desktop view, exactly
   }
 });
 
-test('COMPACT MINI TOOLBAR: bookmark, Downloads, Documents, Dictionary and menu stay visible while the address field can shrink', async () => {
+test('COMPACT MINI TOOLBAR: bookmark, Downloads, Tools and menu stay visible while the address field can shrink', async () => {
   const { shell, container } = await bootMini();
   try {
-    for (const selector of ['.fb-omnibox-star', '.fb-toolbar-downloads-btn', '.fb-toolbar-documents-btn', '.fb-toolbar-dictionary-btn', '.fb-menu-btn']) {
+    for (const selector of ['.fb-omnibox-star', '.fb-toolbar-downloads-btn', '.fb-toolbar-tools-btn', '.fb-menu-btn']) {
       assert.ok(container.querySelector(selector), `${selector} remains rendered in mini chrome`);
     }
     assert.ok(container.querySelector('.fb-omnibox-input'), 'the address/search field remains available');

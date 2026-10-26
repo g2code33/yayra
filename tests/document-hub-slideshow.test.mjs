@@ -309,11 +309,13 @@ test('DOCUMENT HUB + SLIDESHOW SOURCE CONTRACT: toolbar placement, IPC privacy, 
   const main = readFileSync(new URL('../electron/main.cjs', import.meta.url), 'utf8');
   const css = readFileSync(new URL('../packages/shared-ui/src/theme/design-system.css', import.meta.url), 'utf8');
 
-  const downloads = shell.indexOf('toolbarActions.appendChild(dlBtn)');
-  const documents = shell.indexOf('toolbarActions.appendChild(documentsBtn)');
-  const extensions = shell.indexOf('toolbarActions.appendChild(extBtn)');
-  assert.ok(downloads > -1 && documents > downloads && extensions > documents,
-    'Documents is directly beside Downloads before Extensions');
+  const quickActions = shell.indexOf('for (const actionId of this.getToolbarQuickActions())');
+  const quickActionFactory = shell.indexOf('createToolbarQuickAction(actionId, { mini: false })', quickActions);
+  assert.ok(quickActions > -1 && quickActionFactory > quickActions,
+    'Downloads and Tools are always separate quick actions, followed by two profile-customizable slots');
+  assert.match(shell, /return \['downloads', 'tools', \.\.\.extras\]/);
+  assert.match(shell, /id: 'documents',[\s\S]*?route: 'yayra:\/\/documents'/);
+  assert.match(shell, /id: 'extensions',[\s\S]*?route: 'yayra:\/\/extensions'/);
   assert.match(shell, /yayra:\/\/documents/);
   assert.match(shell, /data-cat="documents"/);
   assert.match(shell, /documentsDefaultSort/);
