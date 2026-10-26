@@ -1051,18 +1051,31 @@ test('buildContextMenuTemplate: right-clicking an image offers Open/Save/Copy Im
   assert.deepEqual(written, ['https://example.com/cat.png']);
 });
 
-test('buildContextMenuTemplate: embedded video opens in a new tab and preserves its media type', () => {
+test('buildContextMenuTemplate: embedded media is captured in its source WebContents before opening a new tab', async () => {
   const sent = [];
-  const wc = { canGoBack: () => false, canGoForward: () => false, inspectElement: () => {} };
+  let captureScript = '';
+  const mediaBytes = new Uint8Array([0, 1, 2, 3]);
+  const wc = {
+    canGoBack: () => false, canGoForward: () => false, inspectElement: () => {},
+    async executeJavaScript(script, userGesture) {
+      captureScript = script;
+      assert.equal(userGesture, true, 'media capture retains the native menu user gesture');
+      return { mediaType: 'video/mp4', bytes: mediaBytes };
+    }
+  };
   const template = buildContextMenuTemplate({
     params: { mediaType: 'video', srcURL: 'blob:yayra://app/pptx-video' },
     wc, tabId: 'tab-video', send: (tabId, type, payload) => sent.push({ tabId, type, payload }),
     clipboard: { writeText: () => {} }
   });
-  findItem(template, 'Open Video in New Tab').click();
+  await findItem(template, 'Open Video in New Tab').click();
+  assert.match(captureScript, /fetch\(/, 'bytes are read by the WebContents that owns the blob URL');
   assert.deepEqual(sent[0], {
     tabId: 'tab-video', type: 'new-window-request',
-    payload: { url: 'blob:yayra://app/pptx-video', mediaType: 'video' }
+    payload: {
+      url: 'blob:yayra://app/pptx-video', mediaType: 'video',
+      mediaMimeType: 'video/mp4', mediaBytes
+    }
   });
 });
 

@@ -193,6 +193,32 @@ test('FORMAT ROUTING: signatures outrank spoofed names; OOXML and CFB siblings a
   assert.strictEqual(legacyStored.bytes, doc, 'the legacy original—not its viewing copy—belongs to the Documents library');
 });
 
+test('PPTX TITLES: title frames that extend beyond slide edges are brought fully into view', () => {
+  const host = mount(960, 540);
+  try {
+    const slide = {
+      slideNumber: 1,
+      background: '#ffffff',
+      shapes: [{
+        type: 'text', isTitle: true, x: 910, y: -18, w: 220, h: 80,
+        text: {
+          anchor: 'ctr', fontScale: 1, defaultSizePt: 32, levels: [],
+          paragraphs: [{ level: 0, runs: [{ text: 'Presynaptic modulation' }] }]
+        }
+      }]
+    };
+    renderPptxSlide(host, { slide, width: 960, height: 540 });
+    const title = host.querySelector('.fb-pptx-title');
+    assert.ok(title, 'title placeholders keep their title identity');
+    assert.equal(title.style.left, '740px', 'an off-slide right edge shifts the full-width title frame inward');
+    assert.equal(title.style.top, '0px', 'an off-slide top edge is clamped into the slide');
+    assert.equal(title.style.width, '220px', 'the original title width is retained when it fits');
+    assert.match(title.textContent, /Presynaptic modulation/, 'all heading text remains in the rendered title');
+  } finally {
+    removeMount(host);
+  }
+});
+
 test('PPTX PROJECTOR COLOURS: tables with automatic text never inherit the white slideshow chrome', () => {
   const host = mount(960, 540);
   host.style.color = '#f8fafc'; // projector chrome deliberately uses a light foreground

@@ -2064,7 +2064,12 @@ async function createProfileWindow(profileId, initialUrl = null, { isPrivate = f
       tabId: null,
       send: (_tabId, type, payload) => {
         if (type === 'new-window-request' && payload?.url) {
-          win.webContents.send(CONTEXT_MENU_ACTION_CHANNEL, { type, url: payload.url, ...(payload.mediaType ? { mediaType: payload.mediaType } : {}) });
+          win.webContents.send(CONTEXT_MENU_ACTION_CHANNEL, {
+            type, url: payload.url,
+            ...(payload.mediaType ? { mediaType: payload.mediaType } : {}),
+            ...(payload.mediaMimeType ? { mediaMimeType: payload.mediaMimeType } : {}),
+            ...(payload.mediaBytes ? { mediaBytes: payload.mediaBytes } : {})
+          });
         } else if (type === 'context-menu-navigation') {
           win.webContents.send(CONTEXT_MENU_ACTION_CHANNEL, { type, direction: payload?.direction });
         }
@@ -2155,7 +2160,12 @@ function createWindow() {
       tabId: null,
       send: (_tabId, type, payload) => {
         if (type === 'new-window-request' && payload?.url) {
-          win.webContents.send(CONTEXT_MENU_ACTION_CHANNEL, { type, url: payload.url, ...(payload.mediaType ? { mediaType: payload.mediaType } : {}) });
+          win.webContents.send(CONTEXT_MENU_ACTION_CHANNEL, {
+            type, url: payload.url,
+            ...(payload.mediaType ? { mediaType: payload.mediaType } : {}),
+            ...(payload.mediaMimeType ? { mediaMimeType: payload.mediaMimeType } : {}),
+            ...(payload.mediaBytes ? { mediaBytes: payload.mediaBytes } : {})
+          });
         } else if (type === 'context-menu-navigation') {
           win.webContents.send(CONTEXT_MENU_ACTION_CHANNEL, { type, direction: payload?.direction });
         }

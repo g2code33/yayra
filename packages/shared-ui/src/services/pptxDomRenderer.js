@@ -141,6 +141,26 @@ function renderParagraph(doc, paragraph, textModel, helpers) {
   return row;
 }
 
+function titleShapeWithinSlide(shape, width, height) {
+  if (!shape?.isTitle) return shape;
+  const slideWidth = Math.max(0, Number(width) || 0);
+  const slideHeight = Math.max(0, Number(height) || 0);
+  const boundedWidth = Math.min(slideWidth, Math.max(0, Number(shape.w) || 0));
+  const boundedHeight = Math.min(slideHeight, Math.max(0, Number(shape.h) || 0));
+  if (!slideWidth || !slideHeight || !boundedWidth || !boundedHeight) return shape;
+  // PowerPoint occasionally places a title placeholder partly beyond the
+  // slide edge (often after a layout/theme conversion). The canvas clips
+  // everything outside its bounds, so shift the whole title frame inward
+  // instead of silently losing the end of the heading.
+  return {
+    ...shape,
+    x: Math.max(0, Math.min(Number(shape.x) || 0, slideWidth - boundedWidth)),
+    y: Math.max(0, Math.min(Number(shape.y) || 0, slideHeight - boundedHeight)),
+    w: boundedWidth,
+    h: boundedHeight
+  };
+}
+
 function shapeBase(shape) {
   return [
     'position:absolute',
@@ -357,7 +377,7 @@ function renderShape(doc, shape, helpers, showImages, thumbnail) {
   frame.dataset.shape = shape.isTitle ? 'title' : 'text';
   frame.style.cssText = [
     shapeBase(shape),
-    'overflow:hidden',
+    shape.isTitle ? 'overflow:visible' : 'overflow:hidden',
     shape.fill ? `background:${shape.fill}` : '',
     shape.fill ? `color:${readableForeground(shape.fill)}` : '',
     shape.borderColor ? `border:${Math.max(1, shape.borderWidth || 1)}px solid ${shape.borderColor}` : '',
@@ -420,7 +440,9 @@ export function renderPptxSlide(container, {
     `font-family:${FONT_STACK}`,
     thumbnail ? 'pointer-events:none;user-select:none' : ''
   ].filter(Boolean).join(';');
-  for (const shape of slide.shapes || []) append(canvas, renderShape(doc, shape, helpers, showImages, thumbnail));
+  for (const shape of slide.shapes || []) {
+    append(canvas, renderShape(doc, titleShapeWithinSlide(shape, width, height), helpers, showImages, thumbnail));
+  }
   const diagnostics = Array.isArray(slide.diagnostics) ? slide.diagnostics.filter((item) => item?.message) : [];
   if (diagnostics.length) {
     const warning = doc.createElement('div');

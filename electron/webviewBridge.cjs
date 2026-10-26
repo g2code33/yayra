@@ -1346,6 +1346,26 @@ function safeSelectionSourceUrl(value) {
 
 function buildContextMenuTemplate({ params, wc, tabId, send, clipboard, navigationState = null, useTabNavigation = false }) {
   const template = [];
+  const captureBlobMedia = async (sourceUrl, mediaType) => {
+    if (typeof wc?.executeJavaScript !== 'function' || !/^blob:/i.test(String(sourceUrl || ''))) return null;
+    const expectedMime = mediaType === 'video' ? 'video/' : 'image/';
+    const script = `(async () => {
+      try {
+        const response = await fetch(${JSON.stringify(String(sourceUrl))});
+        if (!response.ok) return null;
+        const blob = await response.blob();
+        const mediaType = String(blob.type || '').toLowerCase() || ${JSON.stringify(expectedMime + 'octet-stream')};
+        if (!blob.size || blob.size > 104857600 || !mediaType.startsWith(${JSON.stringify(expectedMime)})) return null;
+        return { mediaType, bytes: new Uint8Array(await blob.arrayBuffer()) };
+      } catch { return null; }
+    })()`;
+    try {
+      const captured = await wc.executeJavaScript(script, true);
+      const bytes = captured?.bytes;
+      if (!bytes || !captured.mediaType?.startsWith(expectedMime) || bytes.byteLength > 104857600) return null;
+      return { mediaMimeType: captured.mediaType, mediaBytes: bytes };
+    } catch { return null; }
+  };
   const isLink = !!(params && params.linkURL);
   const isImage = !!(params && params.mediaType === 'image' && params.srcURL);
   const isVideo = !!(params && params.mediaType === 'video' && params.srcURL);
@@ -1364,7 +1384,20 @@ function buildContextMenuTemplate({ params, wc, tabId, send, clipboard, navigati
     const kind = isVideo ? 'video' : 'image';
     const label = isVideo ? 'Video' : 'Image';
     template.push(
-      { label: `Open ${label} in New Tab`, click: () => send(tabId, 'new-window-request', { url: params.srcURL, mediaType: kind }) },
+      {
+        label: `Open ${label} in New Tab`,
+        click: async () => {
+          // Blob URLs belong to the page WebContents that created them. Copy
+          // their bytes there, before routing the request to chrome's separate
+          // renderer where the original blob URL is not addressable.
+          const captured = await captureBlobMedia(params.srcURL, kind);
+          send(tabId, 'new-window-request', {
+            url: params.srcURL,
+            mediaType: kind,
+            ...(captured || {})
+          });
+        }
+      },
       ...(!isVideo ? [{ label: 'Save Image As\u2026', click: () => wc.downloadURL(params.srcURL) }] : []),
       { label: `Copy ${label} Address`, click: () => clipboard.writeText(params.srcURL) }
     );

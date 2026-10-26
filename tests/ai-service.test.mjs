@@ -236,10 +236,12 @@ test('Shell: local blob image addresses open in Yayra instead of becoming a Goog
 test('Shell: embedded blob media is copied into a durable new-tab URL and video opens with controls', async () => {
   const { shell, container } = makeShell();
   const priorFetch = globalThis.fetch;
+  const priorLocation = globalThis.location;
+  globalThis.location = { origin: 'file://' };
   globalThis.fetch = async () => ({ ok: true, blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }) });
   try {
     const source = shell.getActiveTab();
-    const opened = await shell.openBlobMediaInNewTab('blob:yayra://app/pptx-media', 'video', source);
+    const opened = await shell.openBlobMediaInNewTab('blob:https://presentation.example/pptx-media', 'video', source);
     assert.equal(opened, true);
     const tab = shell.getActiveTab();
     assert.match(tab.url, /^yayra:\/\/image\?kind=video&src=/);
@@ -254,6 +256,29 @@ test('Shell: embedded blob media is copied into a durable new-tab URL and video 
     assert.equal(shell._ownedMediaUrlsByTab.has(tab.id), false, 'closing the media tab releases its blob URL');
   } finally {
     globalThis.fetch = priorFetch;
+    if (priorLocation === undefined) delete globalThis.location;
+    else globalThis.location = priorLocation;
+    shell.destroy(); container.remove();
+  }
+});
+
+test('Shell: captured image media opens as a locally owned image tab', () => {
+  const { shell, container } = makeShell();
+  try {
+    const source = shell.getActiveTab();
+    const opened = shell.openCapturedMediaInNewTab({
+      mediaType: 'image',
+      mediaMimeType: 'image/png',
+      mediaBytes: new Uint8Array([137, 80, 78, 71])
+    }, source);
+    assert.equal(opened, true);
+    const tab = shell.getActiveTab();
+    assert.match(tab.url, /^yayra:\/\/image\?kind=image&src=/);
+    assert.ok(shell._ownedMediaUrlsByTab.has(tab.id), 'the shell owns a stable URL independent of the source document');
+    const viewport = document.createElement('div');
+    shell.renderInternalImagePage(viewport, tab);
+    assert.ok(viewport.querySelector('img'), 'the copied bytes render as a standalone image');
+  } finally {
     shell.destroy(); container.remove();
   }
 });

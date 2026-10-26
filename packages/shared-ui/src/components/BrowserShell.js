@@ -6170,15 +6170,41 @@ export class BrowserShell {
   }
 
   async openBlobMediaInNewTab(sourceUrl, mediaType = 'image', sourceTab = this.getActiveTab()) {
-    const expected = mediaType === 'video' ? 'video/' : 'image/';
     try {
       const parsed = new URL(sourceUrl);
-      const currentOrigin = typeof location !== 'undefined' ? location.origin : '';
-      if (parsed.protocol !== 'blob:' || (parsed.origin && currentOrigin && parsed.origin !== currentOrigin)) throw new Error('foreign blob origin');
+      // Blob URLs are origin-scoped by the browser and may be created by a
+      // custom app protocol whose serialized origin differs from location.origin.
+      // Let fetch enforce actual access instead of rejecting valid local media
+      // based on a scheme/serialization mismatch.
+      if (parsed.protocol !== 'blob:') throw new Error('not a blob URL');
       const response = await fetch(sourceUrl);
       if (!response.ok) throw new Error('media unavailable');
-      const blob = await response.blob();
-      if (!blob.size || blob.size > 100 * 1024 * 1024 || !String(blob.type || '').toLowerCase().startsWith(expected)) {
+      return this.openOwnedMediaBlob(await response.blob(), mediaType, sourceTab);
+    } catch {
+      this.showTransientNotice(`Could not open this ${mediaType} in a new tab. The original document may have released its media.`);
+      return false;
+    }
+  }
+
+  openCapturedMediaInNewTab(evt, sourceTab = this.getActiveTab()) {
+    const mediaType = evt?.mediaType === 'video' ? 'video' : 'image';
+    const expected = mediaType === 'video' ? 'video/' : 'image/';
+    try {
+      const bytes = evt?.mediaBytes;
+      const byteLength = Number(bytes?.byteLength ?? bytes?.length) || 0;
+      const mimeType = String(evt?.mediaMimeType || '').toLowerCase();
+      if (!byteLength || byteLength > 100 * 1024 * 1024 || !mimeType.startsWith(expected)) throw new Error('invalid captured media');
+      return this.openOwnedMediaBlob(new Blob([bytes], { type: mimeType }), mediaType, sourceTab);
+    } catch {
+      this.showTransientNotice(`Could not open this ${mediaType} in a new tab. The original document may have released its media.`);
+      return false;
+    }
+  }
+
+  openOwnedMediaBlob(blob, mediaType = 'image', sourceTab = this.getActiveTab()) {
+    const expected = mediaType === 'video' ? 'video/' : 'image/';
+    try {
+      if (!blob?.size || blob.size > 100 * 1024 * 1024 || !String(blob.type || '').toLowerCase().startsWith(expected)) {
         throw new Error('unsupported or oversized media');
       }
       const stableUrl = URL.createObjectURL(blob);
@@ -6207,7 +6233,8 @@ export class BrowserShell {
     if (evt?.type !== 'new-window-request' || typeof evt.url !== 'string' || !evt.url) return;
     const source = this.getActiveTab();
     if (/^blob:/i.test(evt.url) && ['image', 'video'].includes(evt.mediaType)) {
-      void this.openBlobMediaInNewTab(evt.url, evt.mediaType, source);
+      if (evt.mediaBytes) this.openCapturedMediaInNewTab(evt, source);
+      else void this.openBlobMediaInNewTab(evt.url, evt.mediaType, source);
       return;
     }
     if (this.handleDictionaryLookupRequest(evt.url, source)) return;
@@ -6555,6 +6582,11 @@ export class BrowserShell {
         break;
       case 'new-window-request':
         if (evt.url) {
+          if (/^blob:/i.test(evt.url) && ['image', 'video'].includes(evt.mediaType)) {
+            if (evt.mediaBytes) this.openCapturedMediaInNewTab(evt, tab);
+            else void this.openBlobMediaInNewTab(evt.url, evt.mediaType, tab);
+            break;
+          }
           if (this.handleDictionaryLookupRequest(evt.url, tab)) break;
           // Links and window.open requests belong beside the tab that
           // launched them, not at the end of the strip. Keep the source
