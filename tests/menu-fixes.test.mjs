@@ -989,7 +989,11 @@ test('KEYBOARD: every shortcut the menu ADVERTISES really fires its action', asy
     assert.equal(calls.filter((c) => c === 'devtools').length, 2, 'F12 also opens DevTools');
     key({ altKey: true, shiftKey: true, key: 'I' });
     assert.equal(shell.getActiveTab().url, 'https://github.com/g2code33/yayra/issues', 'Alt+Shift+I');
-    // Ctrl+W closes, Ctrl+Shift+T reopens
+    // Ctrl+Shift+T restores only non-private tabs. Earlier in this test we
+    // created an incognito tab, so select a regular website tab explicitly
+    // before checking the advertised close-and-reopen shortcut.
+    shell.createNewTab();
+    shell.navigateActiveTab('https://restore.example.com/');
     const before = shell.state.tabs.length;
     key({ ctrlKey: true, key: 'w' });
     assert.equal(shell.state.tabs.length, before - 1, 'Ctrl+W');
