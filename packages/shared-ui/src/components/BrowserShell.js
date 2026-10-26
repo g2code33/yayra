@@ -9485,7 +9485,7 @@ export class BrowserShell {
           <!-- Toolbar quick actions -->
           <section class="fb-settings-group-card" id="sec-toolbar-actions" style="${activeCat === 'toolbar-actions' || this.state.settingsSearchQuery ? 'display:flex;' : 'display:none;'}">
             <h3 class="fb-settings-group-title">${Icons.tools} Toolbar quick actions</h3>
-            <p>Keep a compact row of four utility icons beside the address bar. Downloads and Tools stay available; choose the other two actions for this profile. Tools always contains the complete utility list.</p>
+            <p>Downloads and Tools stay available. Star up to two tools in the Tools menu to show them beside the address bar, or choose them here. Use the star buttons on touch screens.</p>
             <div class="fb-setting-row"><label>Slot 1</label><span class="fb-toolbar-slot-fixed">${Icons.download} Downloads</span></div>
             <div class="fb-setting-row"><label>Slot 2</label><span class="fb-toolbar-slot-fixed">${Icons.tools} Tools</span></div>
             <div class="fb-setting-row"><label for="fb-in-toolbar-action-1">Slot 3</label><select id="fb-in-toolbar-action-1" class="fb-select"></select></div>
@@ -9993,7 +9993,7 @@ export class BrowserShell {
       }
     });
     const toolbarActionOptions = [
-      ['documents', 'Documents'], ['dictionary', 'Dictionary'], ['extensions', 'Extensions & Shields'],
+      ['', 'None'], ['documents', 'Documents'], ['dictionary', 'Dictionary'], ['extensions', 'Extensions & Shields'],
       ['calculator', 'Scientific Calculator'], ['history', 'History'], ['bookmarks', 'Bookmarks'],
       ['settings', 'Settings'], ['passwords', 'Passwords']
     ];
@@ -10001,19 +10001,19 @@ export class BrowserShell {
     const toolbarSelects = [page.querySelector('#fb-in-toolbar-action-1'), page.querySelector('#fb-in-toolbar-action-2')];
     const refreshToolbarSelects = () => toolbarSelects.forEach((select, index) => {
       if (!select) return;
-      const other = toolbarSelects[1 - index]?.value;
-      const current = toolbarActions[index + 2];
+      const other = toolbarActions[1 - index + 2] || '';
+      const current = toolbarActions[index + 2] || '';
       while (select.firstChild) select.removeChild(select.firstChild);
-      toolbarActionOptions.filter(([id]) => id === current || id !== other).forEach(([id, label]) => {
+      toolbarActionOptions.filter(([id]) => !id || id === current || id !== other).forEach(([id, label]) => {
         const option = document.createElement('option'); option.value = id; option.textContent = label; select.appendChild(option);
       });
       select.value = current;
     });
     refreshToolbarSelects();
     toolbarSelects.forEach((select, index) => select?.addEventListener('change', () => {
-      const next = [toolbarSelects[0]?.value || toolbarActions[2], toolbarSelects[1]?.value || toolbarActions[3]];
-      if (next[0] === next[1]) { next[index] = toolbarActionOptions.find(([id]) => id !== next[1 - index])?.[0] || 'documents'; }
-      this.state.settings.toolbarQuickActions = ['downloads', 'tools', ...next];
+      const next = [toolbarSelects[0]?.value ?? toolbarActions[2] ?? '', toolbarSelects[1]?.value ?? toolbarActions[3] ?? ''];
+      if (next[0] && next[0] === next[1]) next[index] = '';
+      this.state.settings.toolbarQuickActions = ['downloads', 'tools', ...next.filter(Boolean)];
       this.persistSettings();
       this.showTransientNotice('Toolbar quick actions saved to this profile.');
       this.render();
@@ -16135,10 +16135,10 @@ export class BrowserShell {
       this.render();
     });
 
-    win.querySelector('.fb-toolbar-actions')?.addEventListener('click', (event) => {
-      const button = event.target.closest('[data-quick-action]');
-      if (button) this.handleToolbarQuickAction(button.dataset.quickAction, { mini: true });
-    });
+    win.querySelectorAll('[data-quick-action]').forEach((button) => button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      this.handleToolbarQuickAction(button.dataset.quickAction, { mini: true });
+    }));
 
     win.querySelector('.fb-mini-group-btn')?.addEventListener('click', (event) => {
       event.stopPropagation();
@@ -21978,7 +21978,6 @@ export class BrowserShell {
     const available = ['documents', 'dictionary', 'extensions', 'calculator', 'history', 'bookmarks', 'settings', 'passwords'];
     const stored = Array.isArray(this.state.settings.toolbarQuickActions) ? this.state.settings.toolbarQuickActions : ['downloads', 'tools', 'documents', 'dictionary'];
     const extras = [...new Set(stored.filter((action) => available.includes(action)))].slice(0, 2);
-    for (const fallback of ['documents', 'dictionary']) if (extras.length < 2 && !extras.includes(fallback)) extras.push(fallback);
     return ['downloads', 'tools', ...extras];
   }
 
@@ -22023,6 +22022,19 @@ export class BrowserShell {
     if (routes[action]) this.openInternalPage(routes[action]);
   }
 
+  toggleToolbarQuickStar(action) {
+    const extras = this.getToolbarQuickActions().slice(2);
+    if (extras.includes(action)) {
+      this.state.settings.toolbarQuickActions = ['downloads', 'tools', ...extras.filter((item) => item !== action)];
+      this.persistSettings(); this.showTransientNotice('Removed from toolbar quick actions.'); this.render(); return true;
+    }
+    if (extras.length >= 2) { this.showTransientNotice('You can star at most two extra toolbar tools. Unstar one first.'); return false; }
+    const available = ['documents', 'dictionary', 'extensions', 'calculator', 'history', 'bookmarks', 'settings', 'passwords'];
+    if (!available.includes(action)) return false;
+    this.state.settings.toolbarQuickActions = ['downloads', 'tools', ...extras, action];
+    this.persistSettings(); this.showTransientNotice('Added to toolbar quick actions.'); this.render(); return true;
+  }
+
   renderToolsDropdown(root) {
     const scrim = document.createElement('button');
     scrim.type = 'button';
@@ -22042,17 +22054,27 @@ export class BrowserShell {
       { id: 'documents', label: 'Documents', description: 'Open the local document library', icon: Icons.document, route: 'yayra://documents' },
       { id: 'dictionary', label: 'Offline Dictionary', description: 'Look up words and saved vocabulary', icon: Icons.dictionary, route: 'yayra://dictionary' },
       { id: 'extensions', label: 'Extensions & Shields', description: 'Manage privacy and site extensions', icon: Icons.shield, route: 'yayra://extensions' },
+      { id: 'history', label: 'History', description: 'Reopen recent pages', icon: Icons.history, route: 'yayra://history' },
+      { id: 'bookmarks', label: 'Bookmarks', description: 'Open saved pages', icon: Icons.bookmark, route: 'yayra://bookmarks' },
+      { id: 'passwords', label: 'Passwords', description: 'Open passwords and autofill', icon: Icons.lock, route: 'yayra://passwords' },
       { id: 'settings', label: 'Settings', description: 'Browser and calculator preferences', icon: Icons.settings, route: 'yayra://settings' }
     ];
-    dropdown.innerHTML = `<div class="fb-tools-dropdown-heading"><span>Tools</span><small>Quick access</small></div>${tools.map((tool) => `<button class="fb-tools-menu-item" type="button" role="menuitem" data-tool="${tool.id}"><span class="fb-tools-menu-icon">${tool.icon}</span><span class="fb-tools-menu-copy"><strong>${tool.label}</strong><small>${tool.description}</small></span>${Icons.chevronRight || ''}</button>`).join('')}`;
-    dropdown.querySelectorAll('[data-tool]').forEach((button) => button.addEventListener('click', () => {
-      const selected = tools.find((tool) => tool.id === button.dataset.tool);
-      this.state.isToolsDropdownOpen = false;
-      if (selected?.id === 'settings') {
-        this.state.settingsActiveCategory = 'calculator';
-        this.state.activeSettingsCategory = 'calculator';
-      }
-      if (selected?.route) this.openInternalPage(selected.route);
+    const starred = this.getToolbarQuickActions().slice(2);
+    dropdown.innerHTML = `<div class="fb-tools-dropdown-heading"><span>Tools</span><small>Right-click or star up to two for the toolbar</small></div>${tools.map((tool) => `<div class="fb-tools-menu-row" role="none"><button class="fb-tools-menu-item" type="button" role="menuitem" data-tool="${tool.id}" aria-label="Open ${tool.label}; right-click to star"><span class="fb-tools-menu-icon">${tool.icon}</span><span class="fb-tools-menu-copy"><strong>${tool.label}</strong><small>${tool.description}</small></span>${Icons.chevronRight || ''}</button><button class="fb-tools-star-button${starred.includes(tool.id) ? ' is-starred' : ''}" type="button" data-star-action="${tool.id}" aria-label="${starred.includes(tool.id) ? 'Remove ' + tool.label + ' from' : 'Add ' + tool.label + ' to'} toolbar quick actions" aria-pressed="${starred.includes(tool.id)}" title="${starred.includes(tool.id) ? 'Unstar' : 'Star'} for toolbar">${starred.includes(tool.id) ? Icons.starFilled : Icons.star}</button></div>`).join('')}`;
+    dropdown.querySelectorAll('[data-tool]').forEach((button) => {
+      button.addEventListener('contextmenu', (event) => { event.preventDefault(); event.stopPropagation(); this.toggleToolbarQuickStar(button.dataset.tool); });
+      button.addEventListener('click', () => {
+        const selected = tools.find((tool) => tool.id === button.dataset.tool);
+        this.state.isToolsDropdownOpen = false;
+        if (selected?.id === 'settings') {
+          this.state.settingsActiveCategory = 'calculator';
+          this.state.activeSettingsCategory = 'calculator';
+        }
+        if (selected?.route) this.openInternalPage(selected.route);
+      });
+    });
+    dropdown.querySelectorAll('[data-star-action]').forEach((button) => button.addEventListener('click', (event) => {
+      event.preventDefault(); event.stopPropagation(); this.toggleToolbarQuickStar(button.dataset.starAction);
     }));
     root.appendChild(dropdown);
   }

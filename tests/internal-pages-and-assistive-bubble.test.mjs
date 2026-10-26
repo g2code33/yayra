@@ -894,6 +894,19 @@ test('Settings page: every toggle and dropdown applies IMMEDIATELY on change and
   const miniToolbar = document.getElementById('yayra-floating-popup-window');
   assert.ok(miniToolbar?.querySelector('.fb-mini-history-btn'), 'mini toolbar shares the selected profile action');
   assert.ok(miniToolbar?.querySelector('.fb-mini-dictionary-btn'), 'second customizable action remains in the mini toolbar');
+  miniToolbar.querySelector('.fb-mini-tools-btn').click();
+  assert.equal(shell.state.isToolsDropdownOpen, true, 'mini Tools opens its tools menu');
+  let toolsMenu = document.getElementById('yayra-floating-popup-window')?.querySelector('.fb-tools-dropdown');
+  toolsMenu.querySelector('[data-star-action="calculator"]').click();
+  assert.deepEqual(shell.state.settings.toolbarQuickActions, ['downloads', 'tools', 'history', 'dictionary'], 'a third star is refused');
+  toolsMenu.querySelector('[data-star-action="dictionary"]').click();
+  toolsMenu = document.getElementById('yayra-floating-popup-window')?.querySelector('.fb-tools-dropdown');
+  toolsMenu.querySelector('[data-tool="calculator"]').dispatchEvent({ type: 'contextmenu', preventDefault() {}, stopPropagation() {} });
+  assert.deepEqual(shell.state.settings.toolbarQuickActions, ['downloads', 'tools', 'history', 'calculator'], 'right-click stars the chosen utility');
+  const updatedMini = document.getElementById('yayra-floating-popup-window');
+  assert.ok(updatedMini.querySelector('.fb-mini-calculator-btn'), 'a starred tool appears in the mini toolbar immediately');
+  assert.equal(updatedMini.querySelector('.fb-mini-dictionary-btn'), null, 'unstarred tools leave the mini toolbar');
+  assert.ok(container.querySelector('.fb-quick-calculator-btn'), 'starred tool also appears in the main toolbar');
 
   // --- Privacy / behavior checkboxes ---
   const toggles = [
@@ -921,7 +934,7 @@ test('Settings page: every toggle and dropdown applies IMMEDIATELY on change and
   assert.equal(persisted.theme, 'light');
   assert.equal(persisted.colorTheme, 'purple');
   assert.equal(persisted.searchEngine, 'duckduckgo');
-  assert.deepEqual(persisted.toolbarQuickActions, ['downloads', 'tools', 'history', 'dictionary']);
+  assert.deepEqual(persisted.toolbarQuickActions, ['downloads', 'tools', 'history', 'calculator']);
   assert.equal(persisted.httpsFirst, true);
   assert.equal(persisted.adBlockEnabled, true);
   assert.equal(persisted.restoreSessionOnLaunch, true);

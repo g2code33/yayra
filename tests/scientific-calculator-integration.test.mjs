@@ -60,6 +60,9 @@ test('calculator styles use the design system and responsive graph/canvas presen
   assert.match(css, /@media \(max-width:700px\)/);
   assert.match(css, /prefers-reduced-motion/);
   assert.match(css, /sc-surface-canvas/);
+  assert.match(css, /grid-template-columns:repeat\(6,minmax\(0,1fr\)\)/);
+  assert.match(css, /grid-column:3 \/ span 2; grid-row:1 \/ span 2/);
+  assert.match(css, /sc-fraction-template/);
   assert.match(css, /sc-graph-curve/);
   assert.match(css, /@media print/);
 });

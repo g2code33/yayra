@@ -1,6 +1,7 @@
 const FUNCTION_NAMES = new Set([
   'sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'sinh', 'cosh', 'tanh', 'asinh', 'acosh', 'atanh', 'sec', 'csc', 'cot', 'asec', 'acsc', 'acot',
-  'sqrt', 'cbrt', 'abs', 'ln', 'log', 'log10', 'exp', 'floor', 'ceil', 'round', 'min', 'max', 'pow', 'hypot', 'sign', 'trunc', 'root'
+  'sqrt', 'cbrt', 'abs', 'ln', 'log', 'log10', 'exp', 'floor', 'ceil', 'round', 'min', 'max', 'pow', 'hypot', 'sign', 'trunc', 'root',
+  'dms', 'npr', 'ncr', 'mean', 'median', 'variance', 'stdev', 'sum', 'product'
 ]);
 const CONSTANTS = Object.freeze({ pi: Math.PI, e: Math.E, tau: Math.PI * 2, phi: (1 + Math.sqrt(5)) / 2, c: 299792458, g: 9.80665, r: 8.31446261815324, na: 6.02214076e23, kb: 1.380649e-23 });
 const RESERVED = new Set([...FUNCTION_NAMES, ...Object.keys(CONSTANTS), 'ans', 'constructor', 'prototype', '__proto__', 'tostring', 'valueof', 'hasownproperty']);
@@ -175,6 +176,37 @@ function callFunction(name, args, angleMode) {
     case 'max': if (!args.length) throw new Error('max expects at least one argument.'); return Math.max(...args);
     case 'pow': return two(Math.pow);
     case 'hypot': if (args.length < 2) throw new Error('hypot expects at least two arguments.'); return Math.hypot(...args);
+    case 'dms': {
+      if (args.length !== 3) throw new Error('dms expects degrees, minutes and seconds.');
+      const [degrees, minutes, seconds] = args;
+      if (minutes < 0 || minutes >= 60 || seconds < 0 || seconds >= 60) throw new Error('DMS minutes and seconds must be from 0 up to (but not including) 60.');
+      const sign = degrees < 0 ? -1 : 1;
+      return sign * (Math.abs(degrees) + minutes / 60 + seconds / 3600);
+    }
+    case 'npr':
+    case 'ncr': {
+      if (args.length !== 2 || args.some((value) => !Number.isInteger(value)) || args[0] < 0 || args[1] < 0 || args[1] > args[0] || args[0] > MAX_FACTORIAL) throw new Error(`${name} expects whole numbers n and r with 0 ≤ r ≤ n ≤ ${MAX_FACTORIAL}.`);
+      const n = args[0]; const r = args[1];
+      if (name === 'npr') { let result = 1; for (let value = n - r + 1; value <= n; value += 1) result *= value; return result; }
+      let result = 1; const choose = Math.min(r, n - r);
+      for (let index = 1; index <= choose; index += 1) result = result * (n - choose + index) / index;
+      return result;
+    }
+    case 'sum': if (!args.length) throw new Error('sum expects at least one value.'); return args.reduce((total, value) => total + value, 0);
+    case 'product': if (!args.length) throw new Error('product expects at least one value.'); return args.reduce((total, value) => total * value, 1);
+    case 'mean': if (!args.length) throw new Error('mean expects at least one value.'); return args.reduce((total, value) => total + value, 0) / args.length;
+    case 'median': {
+      if (!args.length) throw new Error('median expects at least one value.');
+      const sorted = [...args].sort((a, b) => a - b); const middle = Math.floor(sorted.length / 2);
+      return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+    }
+    case 'variance':
+    case 'stdev': {
+      if (!args.length) throw new Error(`${name} expects at least one value.`);
+      const mean = args.reduce((total, value) => total + value, 0) / args.length;
+      const variance = args.reduce((total, value) => total + (value - mean) ** 2, 0) / args.length;
+      return name === 'stdev' ? Math.sqrt(variance) : variance;
+    }
     default: throw new Error(`Unsupported function “${name}”.`);
   }
 }

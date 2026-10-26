@@ -76,6 +76,18 @@ test('calculator functions, angle modes, variables, and numeric bounds are expli
   assert.throws(() => validateCalculatorVariableName('x y'), /beginning/);
 });
 
+test('calculator keypad scientific functions cover DMS, combinations and descriptive statistics', () => {
+  assert.equal(evaluateExpression('dms(30, 15, 30)').value, 30.258333333333333);
+  assert.equal(evaluateExpression('npr(5, 2)').value, 20);
+  assert.equal(evaluateExpression('ncr(5, 2)').value, 10);
+  assert.equal(evaluateExpression('mean(2, 4, 6)').value, 4);
+  assert.equal(evaluateExpression('median(8, 2, 5, 3)').value, 4);
+  assert.equal(evaluateExpression('variance(2, 4, 6)').value, 8 / 3);
+  assert.equal(evaluateExpression('stdev(2, 4, 6)').value, Math.sqrt(8 / 3));
+  assert.throws(() => evaluateExpression('dms(12, 60, 0)'), /minutes and seconds/);
+  assert.throws(() => evaluateExpression('ncr(4, 5)'), /0 ≤ r ≤ n/);
+});
+
 test('result formatting is bounded and normalizes floating-point display noise', () => {
   assert.equal(formatNumber(0.1 + 0.2), '0.3');
   assert.equal(formatNumber(-0), '0');

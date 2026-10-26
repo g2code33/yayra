@@ -54,7 +54,7 @@ export class ScientificCalculator {
     this.onOpenSettings = onOpenSettings;
     this.onPrompt = onPrompt;
     this.privateMode = Boolean(privateMode);
-    this.mode = [...NAV_ITEMS.map(([key]) => key), 'solve', 'chemistry', 'pharmacy'].includes(this.data.settings.defaultMode) ? this.data.settings.defaultMode : 'calculator';
+    this.mode = 'calculator';
     this.expression = '';
     this.lastResult = this.data.history[0]?.result !== null && this.data.history[0]?.result !== undefined && Number.isFinite(Number(this.data.history[0].result)) ? Number(this.data.history[0].result) : null;
     this.lastEntryId = null;
@@ -63,6 +63,10 @@ export class ScientificCalculator {
     this.shiftActive = false;
     this.alphaActive = false;
     this.hyperbolicActive = false;
+    this.displayOn = true;
+    this.insertMode = true;
+    this.historyCursor = -1;
+    this.historyDraft = '';
     this.fractionDisplay = Boolean(this.data.settings.fractionDisplay);
     this.pointerDrag = null;
     this.surfaceRotation = { yaw: -0.62, pitch: 0.58, zoom: 1 };
@@ -104,7 +108,7 @@ export class ScientificCalculator {
 
   render() {
     this.container.innerHTML = `
-      <section class="sc-workspace" aria-label="Scientific calculator and science workspace">
+      <section class="sc-workspace" data-mode="${this.mode}" aria-label="Scientific calculator and science workspace">
         <header class="sc-header">
           <div class="sc-heading"><span class="sc-brand-icon">${Icons.calculator}</span><div><p class="sc-eyebrow">${this.privateMode ? 'PRIVATE SESSION · MEMORY ONLY' : 'OFFLINE-FIRST · ON THIS DEVICE'}</p><h1>Scientific calculator</h1><p class="sc-subtitle">${this.privateMode ? 'Nothing here is saved to your profile.' : 'A complete local science desk. Your work stays in this Yayra profile.'}</p></div></div>
           <div class="sc-header-actions">
@@ -121,7 +125,7 @@ export class ScientificCalculator {
             <div class="sc-calculator-device">
               <div class="sc-device-brand"><strong>YAYRA</strong><span>SCIENTIFIC · LOCAL ENGINE</span></div>
               <div class="sc-display">
-                <div class="sc-display-status"><span class="sc-display-angle">DEG</span><span class="sc-display-format">NORM</span><span class="sc-display-mode">COMP</span><span class="sc-display-memory">${this.data.memory === null ? '' : 'M'}</span></div>
+                <div class="sc-display-status"><span class="sc-display-angle">DEG</span><span class="sc-display-format">NORM1</span><span class="sc-display-mode">COMP</span><span class="sc-display-memory">${this.data.memory === null ? '' : 'M'}</span></div>
                 <label class="sc-visually-hidden" for="${this.instanceId}-expression">Calculator expression. Fractions can be typed as numerator/denominator.</label>
                 <textarea id="${this.instanceId}-expression" class="sc-expression" rows="2" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Type an expression or fraction, e.g. 3/4 + 1/2" aria-describedby="${this.instanceId}-expression-help"></textarea>
                 <output class="sc-screen-result" aria-live="polite">0</output>
@@ -129,7 +133,7 @@ export class ScientificCalculator {
               <div class="sc-device-status" aria-label="Calculator display modes">
                 <button class="sc-status-key sc-drg-key" type="button" title="Cycle Degrees, Radians and Gradians">DEG</button>
                 <button class="sc-status-key sc-frac-key" type="button" aria-pressed="false" title="Toggle fractional answer display">FRAC</button>
-                <button class="sc-status-key sc-norm-key" type="button" title="Cycle normal, scientific and engineering notation">NORM</button>
+                <button class="sc-status-key sc-norm-key" type="button" title="Cycle normal, scientific and engineering notation">NORM1</button>
                 <span class="sc-device-status-spacer"></span><span class="sc-device-battery">ON</span>
               </div>
               <div class="sc-keypad" aria-label="Scientific calculator keypad">${this.keypadMarkup()}</div>
@@ -168,6 +172,7 @@ export class ScientificCalculator {
     expressionInput.addEventListener('input', () => { this.expression = expressionInput.value; });
     expressionInput.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); this.evaluateCurrent(); } });
     this.container.querySelectorAll('.sc-key').forEach((button) => button.addEventListener('click', () => this.handleKey(button.dataset.key, button.dataset.action, expressionInput, button)));
+    this.container.querySelectorAll('.sc-navigation-pad [data-nav]').forEach((button) => button.addEventListener('click', () => this.moveNavigation(button.dataset.nav, expressionInput)));
     this.container.querySelectorAll('.sc-memory-keys [data-memory]').forEach((button) => button.addEventListener('click', () => this.handleMemory(button.dataset.memory, expressionInput)));
     this.container.querySelectorAll('.sc-mode-button').forEach((button) => button.addEventListener('click', () => this.setMode(button.dataset.mode)));
     this.container.querySelectorAll('.sc-side-tabs [data-panel]').forEach((button) => button.addEventListener('click', () => this.setSidePanel(button.dataset.panel)));
@@ -190,19 +195,55 @@ export class ScientificCalculator {
 
   keypadMarkup() {
     const rows = [
-      [['SHIFT', 'shift', '2nd', ''], ['ALPHA', 'alpha', 'VARIABLE', ''], ['MODE', 'mode', 'SETUP', ''], ['HYP', 'hyp', 'INV', ''], ['ON', 'on', 'ON', '']],
-      [['a/b', 'fraction', 'n/d', ''], ['√', 'sqrt', '∛', 'cbrt'], ['x²', 'square', '√x', 'sqrt'], ['xʸ', 'power', 'ʸ√x', 'root('], ['log', 'log', '10ˣ', 'exp(']],
-      [['(−)', 'negative', '(-)', ''], ['(', 'insert', 'A', 'a'], [')', 'insert', 'B', 'b'], ['sin', 'trig', 'sin⁻¹', 'asin'], ['cos', 'trig', 'cos⁻¹', 'acos']],
-      [['tan', 'trig', 'tan⁻¹', 'atan'], ['ln', 'ln', 'eˣ', 'exp('], ['hyp', 'hyp', 'sinh', 'sinh'], ['DRG', 'drg', 'π', 'pi'], ['DEL', 'delete', 'DEL', '']],
-      [['7', 'insert', 'abs(', 'x'], ['8', 'insert', 'min(', 'y'], ['9', 'insert', 'AC', 'z'], ['÷', 'insert', '!', 'ans'], ['×', 'insert', '%', '']],
-      [['4', 'insert', 'max(', 'm'], ['5', 'insert', 'floor(', 'd'], ['6', 'insert', 'ceil(', 'f'], ['−', 'insert', '−', ''], ['+', 'insert', '+', '']],
-      [['1', 'insert', 'round(', 'p'], ['2', 'insert', 'trunc(', 'q'], ['3', 'insert', 'sign(', 'h'], ['π', 'insert', 'τ', 'tau'], ['^', 'insert', '10ˣ', '*10^(']],
-      [['0', 'insert', 'cbrt(', 'i'], ['.', 'insert', 'ln(', 'j'], ['%', 'insert', 'sqrt(', 'k'], ['Ans', 'answer', 'STO', 'ans'], ['=', 'evaluate', 'EXE', '']]
+      [
+        ['SHIFT', 'shift', '', '', ''], ['ALPHA', 'alpha', '', '', ''], null, null,
+        ['MODE', 'mode', '', '', 'SETUP'], ['ON', 'on', '', '', '']
+      ],
+      [
+        ['CALC', 'evaluate', '', '', 'SOLVE ='], ['∫dx', 'integral', '', '', '∫ f(x)'], null, null,
+        ['x^□', 'power', '!', '', 'x!'], ['loga', 'logbase', 'log()', '', '']
+      ],
+      [
+        ['a/b', 'fraction', '', '', ''], ['√', 'sqrt', 'cbrt(', '', '∛'], ['x²', 'square', 'sqrt(', '', '√x'],
+        ['xʸ', 'power', 'root(,)', '', 'ʸ√x'], ['log', 'log', '10^(', '', '10ˣ'], ['ln', 'ln', 'exp()', '', 'eˣ']
+      ],
+      [
+        ['(−)', 'negative', '', '', ''], ['° ′ ″', 'dms', '', '', ''], ['hyp', 'hyp', '', '', ''],
+        ['sin', 'trig', 'asin', 'sec', 'sin⁻¹'], ['cos', 'trig', 'acos', 'csc', 'cos⁻¹'], ['tan', 'trig', 'atan', 'cot', 'tan⁻¹']
+      ],
+      [
+        ['RCL', 'memory-recall', 'store', '', 'STO'], ['ENG', 'eng', 'scientific', '', 'SCI'], ['(', 'insert', '', 'a', ''],
+        [')', 'insert', '', 'b', ''], ['S↔D', 'fraction-display', '', '', ''], ['M+', 'memory-add', 'memory-subtract', '', 'M−']
+      ],
+      [
+        ['7', 'insert', 'pi', 'x', 'CONST'], ['8', 'insert', 'units', 'y', 'CONV'], ['9', 'insert', 'clear', 'z', 'CLR'],
+        ['DEL', 'delete', 'insert-mode', '', 'INS'], ['AC', 'clear', 'off', '', 'OFF'], null
+      ],
+      [
+        ['4', 'insert', 'npr(,)', 'm', 'max('], ['5', 'insert', 'ncr(,)', 'd', 'min('], ['6', 'insert', '!', 'f', 'FACT'],
+        ['×', 'insert', 'npr(,)', '', 'nPr'], ['÷', 'insert', 'ncr(,)', '', 'nCr'], null
+      ],
+      [
+        ['1', 'insert', 'mean()', 'p', 'STAT'], ['2', 'insert', 'median()', 'q', 'MED'], ['3', 'insert', 'stdev()', 'h', 'σ'],
+        ['+', 'insert', '', '', ''], ['−', 'insert', '', '', ''], null
+      ],
+      [
+        ['0', 'insert', 'cbrt()', 'i', 'cbrt'], ['.', 'insert', 'exp()', 'j', 'exp'], ['×10ˣ', 'insert', '*10^(', '', ''],
+        ['Ans', 'answer', '', '', ''], ['=', 'evaluate', '', '', 'EXE'], null
+      ]
     ];
-    return rows.flatMap((row) => row.map(([label, action, shift, alpha]) => {
-      const cls = ['=', 'evaluate'].includes(label) ? 'sc-key-equals' : ['÷', '×', '−', '+', '^'].includes(label) ? 'sc-key-operator' : ['SHIFT', 'ALPHA', 'MODE', 'HYP'].includes(label) ? 'sc-key-function' : /^\d$/.test(label) || label === '.' ? 'sc-key-number' : '';
-      return `<button type="button" class="sc-key ${cls} sc-key-${action}" data-key="${ESCAPE(label)}" data-action="${action}" data-shift="${ESCAPE(shift)}" data-alpha="${ESCAPE(alpha)}" aria-label="${ESCAPE(label === '=' ? 'Evaluate expression' : label === 'a/b' ? 'Insert fraction template' : label)}"><small>${ESCAPE(shift || '')}</small><strong>${ESCAPE(label)}</strong><small>${ESCAPE(alpha || '')}</small></button>`;
-    })).join('');
+    const navPad = `<div class="sc-navigation-pad" role="group" aria-label="Expression cursor and history controls"><button type="button" data-nav="up" aria-label="Previous history item">▲</button><button type="button" data-nav="left" aria-label="Move cursor left">◀</button><button type="button" class="sc-navigation-center" data-nav="center" aria-label="Calculate">●</button><button type="button" data-nav="right" aria-label="Move cursor right">▶</button><button type="button" data-nav="down" aria-label="Next history item">▼</button></div>`;
+    let markup = '';
+    rows.forEach((row, rowIndex) => row.forEach((item, colIndex) => {
+      if (!item) return;
+      const rowNumber = rowIndex + 1; const columnNumber = colIndex + 1;
+      if ((rowNumber === 1 || rowNumber === 2) && (columnNumber === 3 || columnNumber === 4)) return;
+      const [label, action, shift, alpha, shiftCaption] = item;
+      const keyClass = ['=', 'evaluate'].includes(label) ? 'sc-key-equals' : ['×', '÷', '−', '+', 'x^□'].includes(label) ? 'sc-key-operator' : ['SHIFT', 'ALPHA', 'MODE', 'HYP'].includes(label) ? 'sc-key-function' : /^\d$/.test(label) || label === '.' ? 'sc-key-number' : '';
+      const small = shiftCaption || shift;
+      markup += `<button type="button" class="sc-key ${keyClass} sc-key-${action}" data-key="${ESCAPE(label)}" data-action="${action}" data-shift="${ESCAPE(shift)}" data-alpha="${ESCAPE(alpha)}" style="grid-column:${columnNumber};grid-row:${rowNumber}" aria-label="${ESCAPE(label === '=' ? 'Evaluate expression' : label === 'a/b' ? 'Insert a stacked fraction' : label)}"><small>${ESCAPE(small || '')}</small><strong>${ESCAPE(label)}</strong><small>${ESCAPE(alpha || '')}</small></button>`;
+    }));
+    return `${markup}${navPad}`;
   }
 
   setMode(mode) {
@@ -210,7 +251,7 @@ export class ScientificCalculator {
     if (!allowed.includes(mode)) return;
     this.mode = mode;
     if (mode === 'history') this.sidePanel = 'history';
-    this.data.settings.defaultMode = mode;
+    this.data.settings.defaultMode = 'calculator';
     this.persist();
     this.container.querySelectorAll('.sc-mode-button').forEach((button) => button.setAttribute('aria-pressed', button.dataset.mode === mode ? 'true' : 'false'));
     this.renderMode();
@@ -227,8 +268,10 @@ export class ScientificCalculator {
   renderMode() {
     const target = this.container.querySelector('.sc-mode-content');
     if (!target) return;
+    this.container.querySelector('.sc-workspace')?.setAttribute('data-mode', this.mode);
     this.container.querySelector('.sc-workspace-column')?.classList.toggle('sc-mode-library', ['history'].includes(this.mode));
-    if (this.mode === 'calculator' || this.mode === 'graph') target.innerHTML = this.graphMarkup(this.mode === 'calculator');
+    if (this.mode === 'calculator') target.innerHTML = '';
+    else if (this.mode === 'graph') target.innerHTML = this.graphMarkup(false);
     else if (this.mode === '3d') target.innerHTML = this.surfaceMarkup();
     else if (this.mode === 'integrals') target.innerHTML = this.integralMarkup();
     else if (this.mode === 'units') target.innerHTML = this.unitsMarkup();
@@ -239,7 +282,7 @@ export class ScientificCalculator {
     else if (this.mode === 'all-tools') target.innerHTML = this.allToolsMarkup();
     this.bindModeEvents();
     this.container.querySelectorAll('[data-open-mode]').forEach((button) => button.addEventListener('click', () => this.setMode(button.dataset.openMode)));
-    if (this.mode === 'calculator' || this.mode === 'graph') this.drawGraph();
+    if (this.mode === 'graph') this.drawGraph();
     if (this.mode === '3d') this.drawSurface();
   }
 
@@ -347,21 +390,47 @@ export class ScientificCalculator {
   }
 
   handleKey(key, action, input, button) {
+    if (!this.displayOn && action !== 'on') return;
     if (action === 'shift') { this.shiftActive = !this.shiftActive; this.alphaActive = false; this.updateKeyLayers(); return; }
     if (action === 'alpha') { this.alphaActive = !this.alphaActive; this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'hyp') { this.hyperbolicActive = !this.hyperbolicActive; this.showNotice(`Hyperbolic functions ${this.hyperbolicActive ? 'enabled' : 'disabled'}.`); return; }
     if (action === 'mode') { this.openModeDialog(); return; }
-    if (action === 'on') { input.focus(); return; }
+    if (action === 'on') { this.displayOn = true; this.container.querySelector('.sc-display')?.classList.remove('sc-display-off'); input.focus(); return; }
     if (action === 'drg') { this.cycleAngleMode(); return; }
-    if (action === 'fraction') { this.insertAtCursor('()/()', input, 1); return; }
-    if (action === 'delete') { this.deleteAtCursor(input); return; }
-    if (action === 'evaluate') { this.evaluateCurrent(); return; }
+    if (action === 'integral') { this.setMode('integrals'); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'fraction') { this.openFractionDialog(input); return; }
+    if (action === 'delete') {
+      if (this.shiftActive && button?.dataset.shift === 'insert-mode') {
+        this.insertMode = !this.insertMode; this.showNotice(`${this.insertMode ? 'Insert' : 'Overwrite'} mode.`);
+      } else this.deleteAtCursor(input);
+      this.shiftActive = false; this.updateKeyLayers(); return;
+    }
+    if (action === 'evaluate') { this.evaluateCurrent(); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'clear') {
+      if (this.shiftActive && button?.dataset.shift === 'off') {
+        this.displayOn = false; this.container.querySelector('.sc-display')?.classList.add('sc-display-off');
+      } else { this.expression = ''; input.value = ''; this.calculationOutput = null; this.lastEntryId = null; this.lastResult = null; this.updateAnswer(null); this.showNotice('Expression and current answer cleared.'); }
+      this.shiftActive = false; this.updateKeyLayers(); return;
+    }
     if (action === 'negative') { this.insertAtCursor('(-', input); return; }
     if (action === 'answer') { if (this.lastResult === null) { this.showNotice('Calculate a result before using Ans.', 'error'); return; } this.insertAtCursor('ans', input); return; }
-    if (action === 'square') { if (this.shiftActive) this.insertAtCursor('sqrt()', input, 5); else this.insertAtCursor('^2', input); this.shiftActive = false; this.updateKeyLayers(); return; }
-    if (action === 'power') { if (this.shiftActive) this.insertAtCursor('root(,)', input, 5); else this.insertAtCursor('^', input); this.shiftActive = false; this.updateKeyLayers(); return; }
-    if (action === 'sqrt') { this.insertAtCursor(this.shiftActive ? 'cbrt()' : 'sqrt()', input, this.shiftActive ? 5 : 5); this.shiftActive = false; this.updateKeyLayers(); return; }
-    if (action === 'root') { this.insertAtCursor('root(,)', input, 5); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'memory-recall') { this.handleMemory(this.shiftActive ? 'store' : 'recall', input); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'memory-add') { this.handleMemory(this.shiftActive ? 'subtract' : 'add', input); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'fraction-display') { this.toggleFractionDisplay(); return; }
+    if (action === 'eng') {
+      this.data.settings.notation = this.shiftActive ? 'scientific' : 'engineering';
+      this.persist(); this.updateDeviceStatus(); if (this.calculationOutput) this.updateAnswer(this.calculationOutput);
+      this.showNotice(`Display format: ${this.data.settings.notation.toUpperCase()}.`); this.shiftActive = false; this.updateKeyLayers(); return;
+    }
+    if (action === 'logbase') { this.insertAtCursor(this.shiftActive ? 'log()' : 'log(,)', input, 4); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'dms') { this.insertAtCursor('dms(,,)', input, 4); return; }
+    if (action === 'square') { this.insertAtCursor(this.shiftActive ? 'sqrt()' : '^2', input, this.shiftActive ? 5 : 2); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'power') {
+      const shifted = button?.dataset.shift;
+      this.insertAtCursor(this.shiftActive ? (shifted === '!' ? '!' : shifted || '!') : '^', input, this.shiftActive ? (shifted?.length || 1) : 1);
+      this.shiftActive = false; this.updateKeyLayers(); return;
+    }
+    if (action === 'sqrt') { this.insertAtCursor(this.shiftActive ? 'cbrt()' : 'sqrt()', input, 5); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'log') { this.insertAtCursor(this.shiftActive ? '10^(' : 'log()', input, this.shiftActive ? 4 : 4); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'ln') { this.insertAtCursor(this.shiftActive ? 'exp()' : 'ln()', input, this.shiftActive ? 4 : 3); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'trig') {
@@ -369,14 +438,56 @@ export class ScientificCalculator {
       if (this.hyperbolicActive) name = this.shiftActive ? (key === 'sin' ? 'asinh' : key === 'cos' ? 'acosh' : 'atanh') : (key === 'sin' ? 'sinh' : key === 'cos' ? 'cosh' : 'tanh');
       this.insertAtCursor(`${name}()`, input, name.length + 1); this.shiftActive = false; this.alphaActive = false; this.updateKeyLayers(); return;
     }
-    const alpha = button?.dataset.alpha;
     const shifted = button?.dataset.shift;
+    const alpha = button?.dataset.alpha;
+    if (this.shiftActive && shifted === 'clear') { this.expression = ''; input.value = ''; this.calculationOutput = null; this.lastEntryId = null; this.lastResult = null; this.updateAnswer(null); this.showNotice('Expression and current answer cleared.'); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (this.shiftActive && shifted === 'units') { this.setMode('units'); this.shiftActive = false; this.updateKeyLayers(); return; }
     let insertion = key;
     if (this.alphaActive && alpha) insertion = alpha;
     else if (this.shiftActive && shifted) insertion = shifted;
-    if (insertion === 'AC') { this.expression = ''; input.value = ''; input.focus(); this.showNotice('Expression cleared.'); this.shiftActive = false; this.alphaActive = false; this.updateKeyLayers(); return; }
-    this.insertAtCursor(insertion, input);
+    const useOverwrite = !this.insertMode;
+    const openParen = String(insertion).indexOf('(');
+    const cursorOffset = this.shiftActive && openParen >= 0 ? openParen + 1 : String(insertion).length;
+    this.insertAtCursor(insertion, input, cursorOffset, useOverwrite);
     if (this.shiftActive || this.alphaActive) { this.shiftActive = false; this.alphaActive = false; this.updateKeyLayers(); }
+  }
+
+  moveNavigation(direction, input) {
+    if (direction === 'center') { this.evaluateCurrent(); return; }
+    if (direction === 'left' || direction === 'right') {
+      const position = input.selectionStart ?? input.value.length;
+      const next = Math.max(0, Math.min(input.value.length, position + (direction === 'left' ? -1 : 1)));
+      input.focus(); input.setSelectionRange?.(next, next); return;
+    }
+    const entries = this.data.history;
+    if (!entries.length) { this.showNotice('No calculation history to browse.'); return; }
+    if (this.historyCursor < 0) { this.historyDraft = input.value; this.historyCursor = 0; }
+    else if (direction === 'up') this.historyCursor = Math.min(entries.length - 1, this.historyCursor + 1);
+    else if (direction === 'down') this.historyCursor -= 1;
+    if (this.historyCursor < 0) { input.value = this.historyDraft; this.expression = input.value; }
+    else { input.value = entries[this.historyCursor].expression; this.expression = input.value; }
+    input.focus(); input.setSelectionRange?.(input.value.length, input.value.length);
+  }
+
+  openFractionDialog(input) {
+    const host = this.container.querySelector('.sc-dialog-host');
+    const start = input.selectionStart ?? input.value.length;
+    const end = input.selectionEnd ?? start;
+    host.innerHTML = `<div class="sc-mode-scrim sc-fraction-scrim"><form class="sc-fraction-dialog" role="dialog" aria-modal="true" aria-labelledby="${this.instanceId}-fraction-title"><div class="sc-dialog-header"><h2 id="${this.instanceId}-fraction-title">Enter a fraction</h2><button type="button" class="sc-dialog-close" data-fraction-cancel aria-label="Cancel">×</button></div><p>Enter the numerator above the fraction bar and the denominator below.</p><div class="sc-fraction-template"><input name="numerator" aria-label="Numerator" inputmode="decimal" autocomplete="off" required><span class="sc-fraction-rule" aria-hidden="true"></span><input name="denominator" aria-label="Denominator" inputmode="decimal" autocomplete="off" required></div><div class="sc-fraction-dialog-actions"><button type="button" class="sc-secondary-button" data-fraction-cancel>Cancel</button><button type="submit" class="sc-primary-button">Insert fraction</button></div></form></div>`;
+    const form = host.querySelector('.sc-fraction-dialog');
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const numeratorInput = form.querySelector('[name="numerator"]'); const denominatorInput = form.querySelector('[name="denominator"]');
+      const numerator = numeratorInput.value.trim(); const denominator = denominatorInput.value.trim();
+      if (!numerator || !denominator) return;
+      const token = `((${numerator})/(${denominator}))`;
+      this.expression = `${input.value.slice(0, start)}${token}${input.value.slice(end)}`;
+      input.value = this.expression; host.replaceChildren(); input.focus();
+      const cursor = start + token.length; input.setSelectionRange?.(cursor, cursor);
+      this.showNotice('Stacked fraction inserted into the expression.');
+    });
+    host.querySelectorAll('[data-fraction-cancel]').forEach((button) => button.addEventListener('click', () => { host.replaceChildren(); input.focus(); }));
+    form.querySelector('[name="numerator"]')?.focus();
   }
 
   updateKeyLayers() {
@@ -390,8 +501,10 @@ export class ScientificCalculator {
     });
   }
 
-  insertAtCursor(text, input, offset = String(text).length) {
-    const start = input.selectionStart ?? input.value.length; const end = input.selectionEnd ?? start;
+  insertAtCursor(text, input, offset = String(text).length, overwrite = false) {
+    const start = input.selectionStart ?? input.value.length;
+    const selectedEnd = input.selectionEnd ?? start;
+    const end = overwrite && start === selectedEnd ? Math.min(input.value.length, start + String(text).length) : selectedEnd;
     this.expression = `${input.value.slice(0, start)}${text}${input.value.slice(end)}`;
     input.value = this.expression;
     const cursor = start + Math.min(String(text).length, Math.max(0, offset));
@@ -428,7 +541,7 @@ export class ScientificCalculator {
     const angle = this.data.settings.angleMode;
     const angleKey = this.container.querySelector('.sc-drg-key'); if (angleKey) angleKey.textContent = angle;
     const angleReadout = this.container.querySelector('.sc-display-angle'); if (angleReadout) angleReadout.textContent = angle;
-    const format = this.data.settings.notation === 'auto' ? 'NORM' : this.data.settings.notation === 'scientific' ? 'SCI' : 'ENG';
+    const format = this.data.settings.notation === 'auto' ? 'NORM1' : this.data.settings.notation === 'scientific' ? 'SCI' : 'ENG';
     const norm = this.container.querySelector('.sc-norm-key'); if (norm) norm.textContent = format;
     const formatReadout = this.container.querySelector('.sc-display-format'); if (formatReadout) formatReadout.textContent = format;
     const memory = this.container.querySelector('.sc-display-memory'); if (memory) memory.textContent = this.data.memory === null ? '' : 'M';
@@ -446,7 +559,10 @@ export class ScientificCalculator {
 
   handleMemory(action, input) {
     if (action === 'clear') this.data.memory = null;
-    else if (action === 'recall') {
+    else if (action === 'store') {
+      if (!Number.isFinite(this.lastResult)) { this.showNotice('Calculate a numeric result before storing it.', 'error'); return; }
+      this.data.memory = this.lastResult;
+    } else if (action === 'recall') {
       if (this.data.memory === null) { this.showNotice('Calculator memory is empty.'); return; }
       const insertion = formatNumber(this.data.memory, { precision: this.data.settings.precision, notation: this.data.settings.notation }); this.insertAtCursor(insertion, input); return;
     } else if (!Number.isFinite(this.lastResult)) { this.showNotice('Calculate a numeric result before using M+ or M−.', 'error'); return; }
@@ -474,15 +590,35 @@ export class ScientificCalculator {
     this.recordHistory(this.calculationOutput);
   }
 
+  renderStackedFraction(node, fraction, approximate = false) {
+    node.replaceChildren();
+    node.setAttribute('aria-label', `${approximate ? 'Approximately ' : ''}${fraction.numerator} over ${fraction.denominator}`);
+    if (approximate) {
+      const marker = document.createElement('span'); marker.className = 'sc-fraction-approx-marker'; marker.textContent = '≈'; node.appendChild(marker);
+    }
+    const stack = document.createElement('span'); stack.className = 'sc-stacked-fraction';
+    const numerator = document.createElement('span'); numerator.className = 'sc-fraction-numerator'; numerator.textContent = String(fraction.numerator);
+    const bar = document.createElement('span'); bar.className = 'sc-fraction-bar'; bar.setAttribute('aria-hidden', 'true');
+    const denominator = document.createElement('span'); denominator.className = 'sc-fraction-denominator'; denominator.textContent = String(fraction.denominator);
+    stack.append(numerator, bar, denominator); node.appendChild(stack);
+  }
+
   updateAnswer(output) {
     const resultNode = this.container.querySelector('.sc-answer-value'); const unitNode = this.container.querySelector('.sc-answer-unit');
     const screen = this.container.querySelector('.sc-screen-result'); const steps = this.container.querySelector('.sc-answer-steps'); const disclosure = this.container.querySelector('.sc-answer-disclosure');
     const copy = this.container.querySelector('.sc-copy-result'); const save = this.container.querySelector('.sc-save-result'); const sendFraction = this.container.querySelector('.sc-send-fraction');
-    if (!output) { if (resultNode) resultNode.textContent = 'Ready'; if (unitNode) unitNode.textContent = ''; if (screen) screen.textContent = this.lastResult === null ? '0' : formatNumber(this.lastResult, { precision: this.data.settings.precision, notation: this.data.settings.notation }); steps?.setAttribute('hidden', ''); disclosure?.setAttribute('hidden', ''); if (copy) copy.disabled = true; if (save) save.disabled = true; if (sendFraction) sendFraction.disabled = true; return; }
+    if (!output) { if (resultNode) { resultNode.textContent = 'Ready'; resultNode.removeAttribute('aria-label'); } if (unitNode) unitNode.textContent = ''; if (screen) { screen.textContent = this.lastResult === null ? '0' : formatNumber(this.lastResult, { precision: this.data.settings.precision, notation: this.data.settings.notation }); screen.removeAttribute('aria-label'); } steps?.setAttribute('hidden', ''); disclosure?.setAttribute('hidden', ''); if (copy) copy.disabled = true; if (save) save.disabled = true; if (sendFraction) sendFraction.disabled = true; return; }
     const fraction = Number.isFinite(output.value) ? formatFraction(output.value) : null;
     const shown = this.fractionDisplay && fraction ? `${fraction.exact ? '' : '≈ '}${fraction.text}` : output.formatted;
-    if (resultNode) { resultNode.textContent = shown; resultNode.classList.remove('sc-answer-error'); }
-    if (screen) screen.textContent = shown;
+    if (resultNode) {
+      if (this.fractionDisplay && fraction && fraction.denominator !== 1) this.renderStackedFraction(resultNode, fraction, !fraction.exact);
+      else { resultNode.textContent = shown; resultNode.removeAttribute('aria-label'); }
+      resultNode.classList.remove('sc-answer-error');
+    }
+    if (screen) {
+      if (this.fractionDisplay && fraction && fraction.denominator !== 1) this.renderStackedFraction(screen, fraction, !fraction.exact);
+      else { screen.textContent = shown; screen.removeAttribute('aria-label'); }
+    }
     if (unitNode) unitNode.textContent = output.unit || '';
     const fractionNote = this.container.querySelector('.sc-fraction-approximation');
     if (fractionNote && this.fractionDisplay && fraction && !fraction.exact) { fractionNote.textContent = `Best rational approximation (denominator ≤ 1,000,000); not an exact identity. Error ${formatNumber(fraction.error)}.`; fractionNote.hidden = false; }
