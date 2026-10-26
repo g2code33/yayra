@@ -1869,7 +1869,6 @@ button.fb-site-passkey-indicator {
 }
 
 @media (max-width: 720px) {
-  .fb-google-connected-banner-note,
   .fb-gmail-sidebar {
     display: none;
   }
@@ -11151,4 +11150,37 @@ button.fb-site-passkey-indicator {
   .fb-google-services-header { flex-direction: column; }
   .fb-google-services-actions { justify-content: flex-start; }
   .fb-google-services-grid { grid-template-columns: repeat(auto-fill, minmax(135px, 1fr)); }
+}
+
+/* Keep the verified-account chip as the explicit collapse/restore handle. */
+.fb-google-connected-banner-content {
+  display:flex;
+  flex:1 1 auto;
+  align-items:center;
+  gap:16px;
+  min-width:0;
+}
+.fb-google-connected-banner-content[hidden] { display:none !important; }
+.fb-google-connected-banner-note {
+  padding:0 10px;
+  border-color:rgba(52,211,153,.28);
+  cursor:pointer;
+  font:600 11px/1 system-ui,sans-serif;
+}
+.fb-google-connected-banner-note:hover,
+.fb-google-connected-banner-note:focus-visible {
+  border-color:rgba(52,211,153,.65);
+  background:rgba(16,185,129,.2);
+  outline:2px solid rgba(52,211,153,.35);
+  outline-offset:2px;
+}
+.fb-google-connected-banner[data-collapsed="true"] {
+  justify-content:flex-end;
+  gap:0;
+  min-height:38px;
+  padding:4px 14px;
+}
+@media (max-width:720px) {
+  .fb-google-connected-banner-content { gap:8px; }
+  .fb-google-connected-banner[data-collapsed="true"] { min-height:36px; }
 }

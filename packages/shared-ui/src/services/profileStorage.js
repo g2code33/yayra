@@ -548,6 +548,26 @@ function sanitizeSessionDocument(value) {
   };
 }
 
+const SAFE_INTERNAL_SESSION_HOSTS = new Set([
+  'about', 'ai', 'bookmarks', 'calculator', 'dictionary', 'documents', 'downloads',
+  'extensions', 'google-services', 'history', 'passwords', 'permissions',
+  'settings', 'tools', 'vocabulary'
+]);
+
+export function isSafeInternalSessionUrl(value) {
+  const url = String(value || '');
+  if (!url.startsWith('yayra://') || url.length > 8192) return false;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'yayra:' || !SAFE_INTERNAL_SESSION_HOSTS.has(parsed.hostname.toLowerCase())
+      || parsed.username || parsed.password || parsed.port || parsed.hash) return false;
+    const host = parsed.hostname.toLowerCase();
+    if (parsed.search && !['ai', 'dictionary', 'vocabulary'].includes(host)) return false;
+    if (host === 'tools') return parsed.pathname === '/calculator';
+    return parsed.pathname === '' || parsed.pathname === '/';
+  } catch { return false; }
+}
+
 export function createSessionRepo(storage) {
   const sanitize = (tabs) => (Array.isArray(tabs) ? tabs : [])
     .map(({ url, title, group, groupMemberId, document, isPrivate } = {}) => {
@@ -561,6 +581,14 @@ export function createSessionRepo(storage) {
           url: `yayra://recover-document/${encodeURIComponent(id)}`,
           title: safeDocument.name,
           document: safeDocument,
+          ...(safeGroup ? { group: safeGroup } : {}),
+          ...(safeGroup && safeMemberId ? { groupMemberId: safeMemberId } : {})
+        };
+      }
+      if (isSafeInternalSessionUrl(url)) {
+        return {
+          url,
+          title: String(title || url).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 120),
           ...(safeGroup ? { group: safeGroup } : {}),
           ...(safeGroup && safeMemberId ? { groupMemberId: safeMemberId } : {})
         };

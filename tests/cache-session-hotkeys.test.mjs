@@ -161,6 +161,12 @@ test('session repo: snapshot keeps safe websites and opaque local-file recovery 
       groupMemberId: 'tgm-deck'
     },
     { url: 'yayra://newtab', title: 'New Tab' },
+    { url: 'yayra://calculator', title: 'Scientific Calculator' },
+    { url: 'yayra://dictionary?q=ghana', title: 'Dictionary search' },
+    { url: 'yayra://documents', title: 'Documents' },
+    { url: 'yayra://tools/calculator', title: 'Calculator tools alias' },
+    { url: 'yayra://calculator.evil/path', title: 'unsafe internal host' },
+    { url: 'yayra://doc/runtime-id', title: 'unverified document route' },
     { url: 'not a url', title: 'junk' },
     { url: 'https://user:password@example.com/', title: 'credential URL' },
     { url: 'https://private.example/', title: 'private', isPrivate: true },
@@ -168,7 +174,7 @@ test('session repo: snapshot keeps safe websites and opaque local-file recovery 
     { document: { recoveryId: '../../etc/passwd', name: 'bad' } }
   ]);
   const { tabs, savedAt } = await repo.getLastSession();
-  assert.equal(tabs.length, 2, 'only the website and valid opaque file capability survive');
+  assert.equal(tabs.length, 6, 'websites, safe internal app pages and valid opaque file capabilities survive; new-tab/unsafe routes do not');
   assert.deepEqual(tabs[0], { url: 'https://docs.rs/x', title: 'docs', group: { name: 'Research', color: '#3b82f6' } });
   assert.deepEqual(tabs[1], {
     url: 'yayra://recover-document/docrec-abcdefgh-12345678',
@@ -182,6 +188,9 @@ test('session repo: snapshot keeps safe websites and opaque local-file recovery 
     group: { id: 'tg-research', name: 'Research', color: '#3b82f6' },
     groupMemberId: 'tgm-deck'
   }, 'file order/group metadata survives, while arbitrary source paths are stripped');
+  assert.deepEqual(tabs.slice(2).map((entry) => entry.url), [
+    'yayra://calculator', 'yayra://dictionary?q=ghana', 'yayra://documents', 'yayra://tools/calculator'
+  ]);
   assert.equal(JSON.stringify(tabs).includes('/home/user/secret'), false, 'session metadata never contains a filesystem path');
   assert.ok(savedAt > 0);
 });

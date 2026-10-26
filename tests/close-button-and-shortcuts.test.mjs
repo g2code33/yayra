@@ -9,10 +9,9 @@
  *     WebContentsView kept painting OVER the "Close all tabs / Just
  *     close / Keep all tabs" modal. Clicking X looked completely dead.
  *     On yayra://newtab (pure HTML) it worked - hence "sometimes".
- *  2. INTERNAL TABS COUNTED AS REAL: requestAppClose and
- *     closeWithSessionMode treated any non-newtab URL (Settings,
- *     History, ...) as a session worth interrogating the user about -
- *     and could persist yayra:// URLs into the saved session.
+ *  2. Internal calculator/dictionary/document hub routes now participate in
+ *     restore snapshots through a strict safe-route allowlist; private pages
+ *     and arbitrary yayra:// URLs remain excluded.
  */
 
 import test from 'node:test';
@@ -64,22 +63,26 @@ test('close prompt is a BLOCKING overlay (native view must hide so the modal is 
   shell.state.closePrompt = false;
 });
 
-test('close with only internal pages (Settings/History) closes immediately - no pointless prompt', async () => {
+test('close with internal tools open offers to restore the safe calculator and dictionary pages', async () => {
   disk.clear();
   const { shell } = await boot();
   const calls = [];
   wireWindowControls(calls);
   shell.state.tabs = [
-    { id: 't-s', title: 'Settings', url: 'yayra://settings', isLoading: false, isPrivate: false, favicon: null },
-    { id: 't-h', title: 'History', url: 'yayra://history', isLoading: false, isPrivate: false, favicon: null }
+    { id: 't-c', title: 'Scientific Calculator', url: 'yayra://calculator', isLoading: false, isPrivate: false, favicon: null },
+    { id: 't-d', title: 'Dictionary', url: 'yayra://dictionary?q=ghana', isLoading: false, isPrivate: false, favicon: null }
   ];
-  shell.state.activeTabId = 't-s';
+  shell.state.activeTabId = 't-c';
   shell.requestAppClose();
-  assert.equal(shell.state.closePrompt, false, 'no session prompt for internal-only tabs');
-  assert.deepEqual(calls, ['close'], 'window closed right away');
+  assert.equal(shell.state.closePrompt, true, 'safe internal workspaces participate in recovery');
+  shell.closeWithSessionMode('keep');
+  const closeKey = [...disk.keys()].find((key) => key.startsWith('yayra:close-session:'));
+  const saved = JSON.parse(disk.get(closeKey) || 'null');
+  assert.deepEqual(saved.tabs.map((tab) => tab.url), ['yayra://calculator', 'yayra://dictionary?q=ghana']);
+  assert.deepEqual(calls, ['close'], 'window closes after the recovery choice');
 });
 
-test('close with real websites open prompts; "keep" saves ONLY http(s) URLs', async () => {
+test('close with real websites open prompts; "keep" saves websites and safe internal tabs', async () => {
   disk.clear();
   const { shell } = await boot();
   const calls = [];
@@ -97,8 +100,8 @@ test('close with real websites open prompts; "keep" saves ONLY http(s) URLs', as
   const closeKey = [...disk.keys()].find((key) => key.startsWith('yayra:close-session:'));
   const saved = JSON.parse(disk.get(closeKey) || 'null');
   assert.ok(saved, 'session persisted');
-  assert.deepEqual(saved.tabs.map((t) => t.url), ['https://www.youtube.com/'],
-    'yayra:// internal pages never persisted as session tabs');
+  assert.deepEqual(saved.tabs.map((t) => t.url), ['https://www.youtube.com/', 'yayra://settings'],
+    'safe internal pages are restored alongside the website');
   assert.deepEqual(calls, ['close'], 'window closes after the choice');
 });
 
@@ -129,7 +132,7 @@ test('Settings -> Shortcuts lists EVERY shortcut: in-app keys, system-wide hotke
   // In-browser keys (every binding from handleGlobalKeyDown).
   for (const k of ['Ctrl+T', 'Ctrl+W', 'Ctrl+Shift+T', 'Ctrl+Shift+N', 'Ctrl+L', 'Alt+D',
     'Ctrl+D', 'Ctrl+Shift+D', 'Ctrl+Shift+B', 'Ctrl+R', 'F5', 'Ctrl+Shift+R', 'Ctrl+F5',
-    'Ctrl+H', 'Ctrl+J', 'Ctrl+F', 'Esc']) {
+    'Ctrl+H', 'Ctrl+J', 'Ctrl+F', 'Ctrl+Alt+Shift+C', 'Esc']) {
     assert.ok(text.includes(k), `in-app shortcut listed: ${k}`);
   }
   // System-wide hotkeys.
@@ -140,4 +143,49 @@ test('Settings -> Shortcuts lists EVERY shortcut: in-app keys, system-wide hotke
   for (const k of ['Single click', 'Double click', 'Triple click', 'Right-click', 'Drag']) {
     assert.ok(text.includes(k), `bubble gesture listed: ${k}`);
   }
+});
+
+test('calculator launch preference supports the desktop mini window, new tab, and Ctrl+Alt+Shift+C', async () => {
+  disk.clear();
+  const { shell } = await boot();
+  const calls = [];
+  shell.state.tabs = [{ id: 't-web', title: 'Example', url: 'https://example.com/', isLoading: false, isPrivate: false, favicon: null }];
+  shell.state.activeTabId = 't-web';
+  window.yayra = { ...(window.yayra || {}), overlay: { openPageInMini: async (url) => { calls.push(url); return true; } } };
+  shell.state.settings.calculatorOpenDestination = 'mini';
+  shell.openCalculatorFromPreference();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(calls, ['yayra://calculator']);
+  assert.equal(shell.getActiveTab().url, 'https://example.com/', 'mini launch leaves the main tab where it was');
+
+  shell.state.settings.calculatorOpenDestination = 'new-tab';
+  shell.openCalculatorFromPreference();
+  assert.equal(shell.getActiveTab().url, 'yayra://calculator', 'new-tab destination opens the calculator immediately');
+  assert.equal(shell.state.tabs.length, 2);
+
+  let prevented = false;
+  shell.state.settings.calculatorOpenDestination = 'mini';
+  shell.handleGlobalKeyDown({ ctrlKey: true, metaKey: false, altKey: true, shiftKey: true, key: 'c', preventDefault() { prevented = true; } });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(prevented, true);
+  assert.deepEqual(calls, ['yayra://calculator', 'yayra://calculator'], 'keyboard shortcut follows the same destination');
+});
+
+test('Calculator settings toggle persists and its Open button follows the selected destination', async () => {
+  disk.clear();
+  const { shell, container } = await boot();
+  const launches = [];
+  window.yayra = { ...(window.yayra || {}), overlay: { openPageInMini: async (url) => { launches.push(url); return true; } } };
+  shell.state.settingsActiveCategory = 'calculator';
+  shell.navigateActiveTab('yayra://settings');
+  const toggle = container.querySelector('#fb-in-calculator-open-mini');
+  assert.ok(toggle && !toggle.disabled, 'desktop mini mode is available when the overlay bridge exists');
+  toggle.checked = true;
+  toggle.dispatchEvent({ type: 'change', target: toggle, preventDefault() {} });
+  assert.equal(shell.state.settings.calculatorOpenDestination, 'mini');
+  assert.equal(JSON.parse(disk.get('yayra:settings')).calculatorOpenDestination, 'mini');
+  container.querySelector('.fb-in-open-calculator').click();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(launches, ['yayra://calculator']);
+  assert.equal(shell.getActiveTab().url, 'yayra://settings', 'mini launch keeps the settings tab intact');
 });

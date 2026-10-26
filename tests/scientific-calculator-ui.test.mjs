@@ -141,3 +141,107 @@ test('private calculator clearly states that history is memory-only for the priv
   assert.match(container.querySelector('.sc-subtitle').textContent, /not saved to your profile|Nothing here is saved to your profile/);
   assert.match(container.querySelector('.sc-local-note').textContent, /remain in memory/);
 });
+
+test('MODE, SHIFT setup, CLR, constants and ON work as a local scientific calculator', () => {
+  const { document, window } = newDOM();
+  const container = document.createElement('div');
+  const view = new ScientificCalculator({ container, data: defaultScientificCalculatorData() });
+  const key = (name) => container.querySelector(`.sc-key[data-key="${name}"]`);
+  key('MODE').click();
+  assert.deepEqual([...container.querySelectorAll('[data-mode-choice]')].map((button) => button.dataset.modeChoice), ['COMP','CMPLX','STAT','BASE-N','EQN','MATRIX','TABLE','VECTOR']);
+  container.querySelector('[data-mode-choice="CMPLX"]').click();
+  assert.equal(view.calculationMode, 'CMPLX');
+  const complexForm = container.querySelector('[data-calc-mode="CMPLX"]');
+  complexForm.querySelector('[name="op"]').value = 'multiply';
+  complexForm.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  assert.match(container.querySelector('.sc-calc-mode-result').textContent, /-5 \+ 10i/);
+
+  key('SHIFT').click(); key('MODE').click();
+  assert.ok(container.querySelector('[data-setup-angle="DEG"]'));
+  assert.ok(container.querySelector('[data-setup-angle="RAD"]'));
+  assert.ok(container.querySelector('[data-setup-angle="GRAD"]'));
+  container.querySelector('[data-setup-format="FIX"]').click();
+  const digits = container.querySelector('[data-fixed-digits]'); digits.value = '4'; digits.dispatchEvent(new window.Event('change', { bubbles: true }));
+  assert.equal(view.data.settings.notation, 'fixed');
+  assert.equal(view.data.settings.fixedDigits, 4);
+  assert.equal(container.querySelector('.sc-display-format').textContent, 'FIX4');
+  container.querySelector('.sc-dialog-close').click();
+
+  view.data.memory = 15; view.data.variables.x = { value: 2, unit: '', updatedAt: Date.now() };
+  key('SHIFT').click(); key('9').click();
+  assert.ok(container.querySelector('[data-clear-choice="all"]'));
+  container.querySelector('[data-clear-choice="memory"]').click();
+  assert.equal(view.data.memory, null);
+  assert.equal(view.data.variables.x, undefined);
+
+  key('SHIFT').click(); key('7').click();
+  const constants = container.querySelectorAll('.sc-constant-item');
+  assert.ok(constants.length >= 40);
+  const speedOfLight = [...constants].find((button) => button.querySelector('strong').textContent === 'Speed of light in vacuum');
+  assert.ok(speedOfLight);
+  speedOfLight.click();
+  assert.equal(container.querySelector('.sc-expression').value, '299792458');
+
+  view.data.memory = 8;
+  key('ON').click();
+  assert.equal(container.querySelector('.sc-expression').value, '');
+  assert.equal(view.lastResult, null);
+  assert.equal(view.data.memory, 8, 'ON clears the expression/result but not stored calculator memory');
+});
+
+test('calculation mode workspaces compute statistics, base conversions, tables and vectors', () => {
+  const { document, window } = newDOM();
+  const container = document.createElement('div');
+  const view = new ScientificCalculator({ container, data: defaultScientificCalculatorData() });
+  const choose = (mode) => { view.setCalculationMode(mode); return container.querySelector('[data-calc-mode]'); };
+  let form = choose('STAT');
+  form.querySelector('[name="values"]').value = '2, 4, 6';
+  form.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  assert.match(container.querySelector('.sc-calc-mode-result').textContent, /Mean = 4/);
+  form = choose('BASE-N'); form.querySelector('[name="value"]').value = '101101'; form.querySelector('[name="base"]').value = '2';
+  form.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  assert.match(container.querySelector('.sc-calc-mode-result').textContent, /Decimal: 45/);
+  form = choose('TABLE'); form.querySelector('[name="expression"]').value = 'x^2'; form.querySelector('[name="start"]').value = '0'; form.querySelector('[name="end"]').value = '2'; form.querySelector('[name="step"]').value = '1';
+  form.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  assert.match(container.querySelector('.sc-calc-mode-result').textContent, /x = 2\s+→\s+4/);
+  form = choose('VECTOR'); form.querySelector('[name="u"]').value = '1,2,3'; form.querySelector('[name="v"]').value = '4,5,6'; form.querySelector('[name="op"]').value = 'cross';
+  form.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  assert.match(container.querySelector('.sc-calc-mode-result').textContent, /-3, 6, -3/);
+});
+
+test('SHIFT plus/minus convert between rectangular and polar coordinates', () => {
+  const { document, window } = newDOM();
+  const container = document.createElement('div');
+  const view = new ScientificCalculator({ container, data: defaultScientificCalculatorData() });
+  const input = container.querySelector('.sc-expression');
+  container.querySelector('.sc-key[data-key="SHIFT"]').click();
+  container.querySelector('.sc-key[data-key="+"]').click();
+  let form = container.querySelector('.sc-coordinate-form');
+  form.querySelector('[name="first"]').value = '3'; form.querySelector('[name="second"]').value = '4';
+  form.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  assert.match(container.querySelector('.sc-coordinate-result').textContent, /r = 5/);
+  container.querySelector('.sc-coordinate-result button').click();
+  assert.equal(input.value, '5');
+
+  container.querySelector('.sc-key[data-key="SHIFT"]').click();
+  container.querySelector('.sc-key[data-key="−"]').click();
+  form = container.querySelector('.sc-coordinate-form');
+  form.querySelector('[name="first"]').value = '2'; form.querySelector('[name="second"]').value = '90';
+  form.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  assert.match(container.querySelector('.sc-coordinate-result').textContent, /y = 2/);
+  assert.equal(view.data.settings.angleMode, 'DEG');
+});
+
+test('Setup formatting immediately refreshes the displayed numeric answer', () => {
+  const { document, window } = newDOM();
+  const container = document.createElement('div');
+  new ScientificCalculator({ container, data: defaultScientificCalculatorData() });
+  const expression = container.querySelector('.sc-expression'); expression.value = '4/3';
+  container.querySelector('.sc-key[data-action="evaluate"]').click();
+  container.querySelector('.sc-key[data-key="SHIFT"]').click();
+  container.querySelector('.sc-key[data-key="MODE"]').click();
+  container.querySelector('[data-setup-format="FIX"]').click();
+  const digits = container.querySelector('[data-fixed-digits]'); digits.value = '2'; digits.dispatchEvent(new window.Event('change', { bubbles: true }));
+  assert.equal(container.querySelector('.sc-screen-result').textContent, '1.33');
+  assert.equal(container.querySelector('.sc-answer-value').textContent, '1.33');
+});

@@ -11,7 +11,7 @@ const id = (prefix) => `${prefix}-${Date.now().toString(36)}-${Math.random().toS
 export function defaultScientificCalculatorData() {
   return {
     schemaVersion: SCIENTIFIC_CALCULATOR_SCHEMA,
-    settings: { angleMode: 'DEG', precision: 12, notation: 'auto', fractionDisplay: false, defaultMode: 'calculator', historyLimit: SCIENTIFIC_CALCULATOR_HISTORY_LIMIT },
+    settings: { angleMode: 'DEG', precision: 12, notation: 'auto', fixedDigits: 2, calculationMode: 'COMP', fractionDisplay: false, defaultMode: 'calculator', historyLimit: SCIENTIFIC_CALCULATOR_HISTORY_LIMIT },
     graphFunctions: [
       { id: 'graph-sin', expression: 'sin(x)', color: '#2563eb', visible: true },
       { id: 'graph-parabola', expression: 'x^2/4', color: '#dc2626', visible: true }
@@ -117,7 +117,9 @@ export function sanitizeScientificCalculatorData(input) {
     settings: {
       angleMode: ['DEG', 'RAD', 'GRAD'].includes(rawSettings.angleMode) ? rawSettings.angleMode : 'DEG',
       precision: Number.isInteger(precision) ? Math.max(3, Math.min(15, precision)) : defaults.settings.precision,
-      notation: ['auto', 'scientific', 'engineering'].includes(rawSettings.notation) ? rawSettings.notation : 'auto',
+      notation: ['auto', 'scientific', 'engineering', 'norm1', 'norm2', 'fixed'].includes(rawSettings.notation) ? rawSettings.notation : 'auto',
+      fixedDigits: Number.isInteger(Number(rawSettings.fixedDigits)) ? Math.max(0, Math.min(9, Number(rawSettings.fixedDigits))) : defaults.settings.fixedDigits,
+      calculationMode: ['COMP', 'CMPLX', 'STAT', 'BASE-N', 'EQN', 'MATRIX', 'TABLE', 'VECTOR'].includes(rawSettings.calculationMode) ? rawSettings.calculationMode : 'COMP',
       fractionDisplay: rawSettings.fractionDisplay === true,
       defaultMode: ['calculator', 'pharmacy', 'chemistry', 'units', 'solve', 'graph', '3d', 'integrals', 'history', 'all-tools'].includes(rawSettings.defaultMode) ? rawSettings.defaultMode : 'calculator',
       historyLimit: Number.isInteger(historyLimit) ? Math.max(50, Math.min(SCIENTIFIC_CALCULATOR_HISTORY_LIMIT, historyLimit)) : defaults.settings.historyLimit

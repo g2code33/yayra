@@ -50,7 +50,8 @@ import {
   createWheelRepo,
   createShortcutsRepo,
   createSessionRepo,
-  createTabGroupsRepo
+  createTabGroupsRepo,
+  isSafeInternalSessionUrl
 } from '../services/profileStorage.js';
 import { YayraAiService, AI_DEFAULTS, describeAiReason } from '../services/aiService.js';
 import {
@@ -513,6 +514,8 @@ export class BrowserShell {
         searchEngine: 'google', // Requirement 13: Default search engine is Google
         toolbarQuickActions: ['downloads', 'tools', 'documents', 'dictionary'],
         dictionaryLookupDestination: 'new-tab',
+        calculatorOpenDestination: 'new-tab',
+        googleConnectedBannerCollapsed: false,
         dictionaryGlobalLookupEnabled: false,
         dictionaryGlobalLookupShortcut: 'CommandOrControl+Alt+D',
         tabSwitcherView: 'grid', // 'grid' keeps the existing preview cards; 'list' is the compact Chrome-style tab search
@@ -1894,6 +1897,7 @@ export class BrowserShell {
     }
     // Stored settings are user-editable local data. Normalize every privacy
     // choice before it can reach native network/session policy.
+    this.state.settings.calculatorOpenDestination = this.state.settings.calculatorOpenDestination === 'mini' ? 'mini' : 'new-tab';
     this.normalizePrivacySettings();
     await this.syncPrivacySettings({ notify: false });
     // Chrome profile availability is refreshed lazily when a view that shows
@@ -4446,7 +4450,7 @@ export class BrowserShell {
     const profile = this.state.googleAccount?.profile || {};
     const banner = document.createElement('div');
     banner.className = 'fb-google-connected-banner';
-    banner.setAttribute('role', 'status');
+    banner.setAttribute('role', 'region');
     banner.setAttribute('aria-label', `Google connected in Yayra as ${profile.email || profile.name || 'Google account'}`);
     const badge = document.createElement('span');
     badge.className = 'fb-google-connected-banner-badge';
@@ -4471,7 +4475,10 @@ export class BrowserShell {
     identity.className = 'fb-google-connected-banner-identity';
     identity.appendChild(badge);
     identity.appendChild(copy);
-    banner.appendChild(identity);
+    const content = document.createElement('div');
+    content.className = 'fb-google-connected-banner-content';
+    content.id = `fb-google-connected-content-${String(activeTab?.id || 'active').replace(/[^A-Za-z0-9_-]/g, '')}`;
+    content.appendChild(identity);
 
     const actions = document.createElement('div');
     actions.className = 'fb-google-connected-banner-actions';
@@ -4491,12 +4498,28 @@ export class BrowserShell {
     hub.textContent = 'Google services';
     hub.addEventListener('click', () => this.openInternalPage('yayra://google-services'));
     actions.appendChild(hub);
-    banner.appendChild(actions);
+    content.appendChild(actions);
+    banner.appendChild(content);
 
-    const explanation = document.createElement('span');
+    const collapsed = this.state.settings.googleConnectedBannerCollapsed === true;
+    const explanation = document.createElement('button');
+    explanation.type = 'button';
     explanation.className = 'fb-google-connected-banner-note';
     explanation.textContent = this.state.googleServices?.signedIn ? 'Verified Google account' : 'Verified app account';
-    explanation.title = 'Yayra reflects the exact Google account selected in your secure system browser. Google web pages use their own cookie session; Yayra never copies browser cookies.';
+    explanation.title = collapsed ? 'Show the connected-account banner' : 'Hide the connected-account banner';
+    explanation.setAttribute('aria-controls', content.id);
+    explanation.setAttribute('aria-expanded', String(!collapsed));
+    content.hidden = collapsed;
+    banner.dataset.collapsed = String(collapsed);
+    explanation.addEventListener('click', () => {
+      const next = banner.dataset.collapsed !== 'true';
+      banner.dataset.collapsed = String(next);
+      content.hidden = next;
+      explanation.setAttribute('aria-expanded', String(!next));
+      explanation.title = next ? 'Show the connected-account banner' : 'Hide the connected-account banner';
+      this.state.settings.googleConnectedBannerCollapsed = next;
+      this.persistSettings();
+    });
     banner.appendChild(explanation);
     return banner;
   }
@@ -9704,6 +9727,7 @@ export class BrowserShell {
               <div class="fb-shortcut-row"><span>Downloads</span><kbd>Ctrl+J</kbd></div>
               <div class="fb-shortcut-row"><span>Open a local file</span><kbd>Ctrl+O</kbd></div>
               <div class="fb-shortcut-row"><span>Find in page</span><kbd>Ctrl+F</kbd></div>
+              <div class="fb-shortcut-row"><span>Open scientific calculator (uses Calculator settings destination)</span><kbd>Ctrl+Alt+Shift+C</kbd></div>
               <div class="fb-shortcut-row"><span>Open tab groups</span><kbd>Ctrl+Shift+G</kbd></div>
               <div class="fb-shortcut-row"><span>Stop loading / close menus &amp; overlays</span><kbd>Esc</kbd></div>
             </div>
@@ -9731,6 +9755,10 @@ export class BrowserShell {
             <div class="fb-documents-settings-privacy">
               <strong>Scientific and clinical limits</strong>
               <p>Pharmacy tools perform only the explicitly labelled arithmetic. They do not provide dosing recommendations or administration instructions. Chemistry outputs state their assumptions; verify results independently before relying on them.</p>
+            </div>
+            <div class="fb-setting-toggle-row">
+              <div><strong>Open in mini Yayra</strong><p>On opens the calculator in the mini window; off opens it in a new browser tab. The setting is used by both this button and the calculator shortcut.${this.overlayBridge?.openPageInMini ? '' : ' Mini-window launch requires the desktop app.'}</p></div>
+              <input type="checkbox" id="fb-in-calculator-open-mini" ${this.state.settings.calculatorOpenDestination === 'mini' ? 'checked' : ''} ${this.overlayBridge?.openPageInMini ? '' : 'disabled'} aria-label="Open calculator in mini Yayra" />
             </div>
             <div class="fb-tab-group-settings-toolbar">
               <button type="button" class="fb-btn fb-btn-primary fb-in-open-calculator">${Icons.calculator} <span>Open Scientific Calculator</span></button>
@@ -10021,7 +10049,7 @@ export class BrowserShell {
 
     page.querySelector('.fb-in-open-dictionary')?.addEventListener('click', () => this.openInternalPage('yayra://dictionary'));
     page.querySelector('.fb-in-open-vocabulary')?.addEventListener('click', () => this.openInternalPage('yayra://vocabulary'));
-    page.querySelector('.fb-in-open-calculator')?.addEventListener('click', () => this.openInternalPage('yayra://calculator'));
+    page.querySelector('.fb-in-open-calculator')?.addEventListener('click', () => this.openCalculatorFromPreference());
 
     // Section-specific controls are immediate-apply and profile-persisted.
     this.bindUpdatesSettingsActions(page);
@@ -10193,6 +10221,7 @@ export class BrowserShell {
     bindToggle('#fb-in-set-https', (on) => { this.state.settings.httpsFirst = on; });
     bindToggle('#fb-in-set-adblock', (on) => { this.state.settings.adBlockEnabled = on; });
     bindToggle('#fb-in-set-restore-session', (on) => { this.state.settings.restoreSessionOnLaunch = on; });
+    bindToggle('#fb-in-calculator-open-mini', (on) => { this.state.settings.calculatorOpenDestination = on ? 'mini' : 'new-tab'; });
     bindToggle('#fb-in-documents-show-missing', (on) => { this.state.settings.documentsShowMissing = on; });
     bindToggle('#fb-in-documents-remember-position', (on) => { this.state.settings.documentsRememberReadingPosition = on; });
     bindToggle('#fb-in-documents-night-default', (on) => { this.state.settings.documentsDefaultNightMode = on; });
@@ -16772,10 +16801,11 @@ export class BrowserShell {
         ...(group && tab.groupMemberId ? { groupMemberId: tab.groupMemberId } : {})
       };
     }
-    if (!/^https?:\/\//i.test(String(tab.url || ''))) return null;
+    const url = String(tab.url || '');
+    if (!/^https?:\/\//i.test(url) && !isSafeInternalSessionUrl(url)) return null;
     return {
-      url: tab.url,
-      title: tab.title || tab.url,
+      url,
+      title: tab.title || url,
       ...(group ? { group } : {}),
       ...(group && tab.groupMemberId ? { groupMemberId: tab.groupMemberId } : {})
     };
@@ -16798,6 +16828,14 @@ export class BrowserShell {
       };
     }
     const url = String(value.url || '');
+    if (isSafeInternalSessionUrl(url)) {
+      return {
+        url,
+        title: String(value.title || url).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 120) || url,
+        ...(group ? { group } : {}),
+        ...(group && groupMemberId ? { groupMemberId } : {})
+      };
+    }
     if (!/^https?:\/\//i.test(url) || url.length > 8192) return null;
     try {
       const parsed = new URL(url);
@@ -17100,8 +17138,8 @@ export class BrowserShell {
   }
 
   requestAppClose({ exitWholeApp = false } = {}) {
-    // Only recoverable web pages and local files warrant the session prompt.
-    // Internal pages (Settings, History, ...) are never serialized.
+    // Recoverable websites, safe internal tools/pages, and local documents
+    // all warrant the session prompt. Private tabs remain excluded.
     const realTabs = this.state.tabs.map((tab) => this.sessionEntryForTab(tab)).filter(Boolean);
     const controls = this.windowControls;
     const canQuitWholeApp = exitWholeApp && controls && typeof controls.quit === 'function';
@@ -21090,6 +21128,28 @@ export class BrowserShell {
     if (engine === 'bing') return `https://www.bing.com/search?q=${encoded}`;
     if (engine === 'startpage') return `https://www.startpage.com/do/dsearch?query=${encoded}`;
     return `https://www.google.com/search?q=${encoded}`;
+  }
+
+  openCalculatorFromPreference() {
+    if (this.state.settings.calculatorOpenDestination === 'mini' && typeof this.overlayBridge?.openPageInMini === 'function') {
+      let request;
+      try { request = this.overlayBridge.openPageInMini('yayra://calculator'); }
+      catch { request = Promise.resolve(false); }
+      Promise.resolve(request)
+        .then((opened) => {
+          if (opened === false) {
+            this.showTransientNotice('Could not open the mini window; opening the calculator in a new tab instead.');
+            this.openInternalPage('yayra://calculator');
+          }
+        })
+        .catch(() => {
+          this.showTransientNotice('Could not open the mini window; opening the calculator in a new tab instead.');
+          this.openInternalPage('yayra://calculator');
+        });
+      return true;
+    }
+    this.openInternalPage('yayra://calculator');
+    return true;
   }
 
   openInternalPage(schemeUrl) {
@@ -26135,6 +26195,12 @@ export class BrowserShell {
       e.preventDefault();
       this.omniboxInput?.focus();
       this.omniboxInput?.select();
+    }
+    // Ctrl/Command+Alt+Shift+C opens the calculator at its configured
+    // destination (new tab or the desktop mini window).
+    else if ((e.ctrlKey || e.metaKey) && e.altKey && e.shiftKey && e.key.toLowerCase() === 'c') {
+      e.preventDefault();
+      this.openCalculatorFromPreference();
     }
     // Ctrl/Command+Alt+Shift+D: look up the current Yayra selection without
     // touching the clipboard. Native website views receive the same combo in

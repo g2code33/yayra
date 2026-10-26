@@ -218,3 +218,26 @@ test('mini shell keeps a separate profile-scoped snapshot and does not consume m
   assert.match(mainJs, /isMiniShell,/, 'main.js passes the mini flag into the shell');
   assert.match(mainJs, /onOpenPage\?\.\(\(\{ url \} = \{\}\) => browserShell\.openUrlHandoff/, 'mini listens for main-tab handoffs');
 });
+
+test('calculator, dictionary, document hub and website tabs all reappear from the saved session', async () => {
+  disk.clear();
+  const originalUrls = [
+    'yayra://calculator', 'yayra://dictionary?q=ghana', 'yayra://documents', 'https://example.com/active'
+  ];
+  {
+    const { shell } = await boot();
+    shell.state.tabs = originalUrls.map((url, index) => ({
+      id: `restore-${index}`, title: `Open ${index}`, url, isLoading: false, isPrivate: false, favicon: null
+    }));
+    shell.state.activeTabId = 'restore-0';
+    shell.render();
+    await sleep(900);
+    assert.deepEqual(diskTabs(), originalUrls, 'rolling recovery snapshot contains safe Yayra tool routes in order');
+  }
+  {
+    const { shell } = await boot();
+    assert.deepEqual((shell.state.continueTabs || []).map((tab) => tab.url), originalUrls);
+    await shell.restoreContinueTabs(shell.state.continueTabs);
+    assert.deepEqual(shell.state.tabs.map((tab) => tab.url), originalUrls, 'restore recreates calculator, dictionary, documents and websites');
+  }
+});

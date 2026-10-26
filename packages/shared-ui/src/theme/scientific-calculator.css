@@ -315,3 +315,33 @@
   body.sc-print-graph-mode .sc-graph-print-area { margin-top:20px; }
   body.sc-print-graph-mode .sc-graph-output { border:0!important; }
 }
+
+/* Added calculator mode, setup and constant-list workspaces. */
+.sc-keypad { grid-auto-rows:minmax(39px,auto); gap:4px; }
+.sc-key { min-height:39px; }
+.sc-mode-dialog h3 { margin:9px 0 2px; color:var(--sc-muted); font-size:.68rem; text-transform:uppercase; letter-spacing:.08em; }
+.sc-mode-dialog > button[data-mode-choice][aria-pressed="true"] { border-color:rgba(56,189,248,.48); background:rgba(8,145,178,.2); }
+.sc-setup-fix { display:none; gap:8px; align-items:center; justify-content:space-between; padding:8px; border:1px solid var(--sc-line); border-radius:8px; color:var(--sc-muted); font-size:.72rem; }
+.sc-setup-fix.is-visible { display:flex; }
+.sc-setup-fix select { min-width:76px; }
+.sc-constant-search { display:grid; gap:5px; color:var(--sc-muted); font-size:.72rem; }
+.sc-constant-list { display:grid; max-height:min(52vh,440px); overflow:auto; gap:5px; padding-right:2px; }
+.sc-constant-item { display:flex; align-items:center; justify-content:space-between; gap:12px; min-width:0; padding:8px; border:1px solid var(--sc-line); border-radius:8px; color:var(--fb-text-primary,#f8fafc); background:rgba(30,41,59,.42); text-align:left; cursor:pointer; }
+.sc-constant-item:hover { border-color:rgba(56,189,248,.55); background:rgba(8,145,178,.15); }
+.sc-constant-item span { display:grid; min-width:0; gap:3px; }
+.sc-constant-item strong { font-size:.72rem; }
+.sc-constant-item small { overflow-wrap:anywhere; color:var(--sc-muted); font-size:.63rem; }
+.sc-constant-item code { color:#7dd3fc; font-size:.66rem; text-align:right; overflow-wrap:anywhere; }
+.sc-calc-mode-card { display:grid; gap:10px; }
+.sc-calc-mode-card .sc-tool-title { align-items:center; }
+.sc-four-fields { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; }
+.sc-calc-mode-result { min-height:28px; padding:8px; border-radius:8px; color:#dbeafe; background:rgba(15,23,42,.42); font: .75rem/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; overflow-wrap:anywhere; }
+.sc-calc-mode-result:empty { display:none; }
+.sc-calc-mode-result ul { display:grid; gap:4px; margin:0; padding-left:18px; }
+.sc-coordinate-result { display:grid; gap:6px; margin-top:8px; }
+.sc-coordinate-result button { display:flex; justify-content:space-between; padding:8px; border:1px solid var(--sc-line); border-radius:8px; color:var(--fb-text-primary,#f8fafc); background:rgba(30,41,59,.5); cursor:pointer; }
+.sc-coordinate-result small { color:#7dd3fc; }
+@media (max-width:420px) { .sc-four-fields { gap:5px; } .sc-keypad { grid-auto-rows:minmax(36px,auto); } .sc-key { min-height:36px; } .sc-key small { font-size:.39rem; } }
+[data-theme="light"] .sc-calc-mode-result { color:#0f172a; background:#f1f5f9; }
+[data-theme="light"] .sc-constant-item,[data-theme="light"] .sc-coordinate-result button { color:#0f172a; background:#f8fafc; }
+@media (max-width:420px) { .sc-four-fields { grid-template-columns:repeat(2,minmax(0,1fr)); } }

@@ -1,9 +1,37 @@
 const FUNCTION_NAMES = new Set([
-  'sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'sinh', 'cosh', 'tanh', 'asinh', 'acosh', 'atanh', 'sec', 'csc', 'cot', 'asec', 'acsc', 'acot',
+  'sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'atan2', 'sinh', 'cosh', 'tanh', 'asinh', 'acosh', 'atanh', 'sec', 'csc', 'cot', 'asec', 'acsc', 'acot',
   'sqrt', 'cbrt', 'abs', 'ln', 'log', 'log10', 'exp', 'floor', 'ceil', 'round', 'min', 'max', 'pow', 'hypot', 'sign', 'trunc', 'root',
-  'dms', 'npr', 'ncr', 'mean', 'median', 'variance', 'stdev', 'sum', 'product'
+  'dms', 'npr', 'ncr', 'mean', 'median', 'variance', 'stdev', 'sum', 'product', 'rand', 'randint'
 ]);
-const CONSTANTS = Object.freeze({ pi: Math.PI, e: Math.E, tau: Math.PI * 2, phi: (1 + Math.sqrt(5)) / 2, c: 299792458, g: 9.80665, r: 8.31446261815324, na: 6.02214076e23, kb: 1.380649e-23 });
+const CONSTANTS = Object.freeze({
+  pi: Math.PI, e: Math.E, tau: Math.PI * 2, phi: (1 + Math.sqrt(5)) / 2,
+  mp: 1.672621898e-27, mn: 1.674927471e-27, me: 9.10938356e-31, mmu: 1.883531594e-28,
+  a0: 5.2917721067e-11, h: 6.62607004e-34, mun: 5.050783699e-27, mub: 9.274009994e-24,
+  hbar: 1.054571817e-34, alpha: 0.0072973525693, re: 2.8179403227e-15, lambdac: 2.42631023867e-12,
+  gammap: 267522187.44, lambdacp: 1.32140985396e-15, lambdacn: 1.31959090481e-15, rinf: 10973731.568508,
+  u: 1.6605390666e-27, mup: 1.4106067873e-26, mue: -9.2847644825e-24, mun0: -9.6623651e-27,
+  mumu: -4.4904483e-26, faraday: 96485.33212, kb: 1.380649e-23, vm: 0.02271095464,
+  r: 8.31446261815324, c: 299792458, c1: 3.741771852e-16, c2: 0.01438776877,
+  sigma: 5.670374419e-8, epsilon0: 8.8541878128e-12, mu0: 1.2566370612e-6, phi0: 2.067833848e-15,
+  g: 9.80665, g0: 0.00007748091729, z0: 376.730313668, t0: 273.15, grav: 6.6743e-11, atm: 101325,
+  na: 6.02214076e23
+});
+export const SCIENTIFIC_CONSTANTS = Object.freeze([
+  ['pi', 'Pi', Math.PI, ''], ['e', 'Euler’s number', Math.E, ''], ['tau', 'Tau', Math.PI * 2, ''], ['phi', 'Golden ratio', (1 + Math.sqrt(5)) / 2, ''],
+  ['mp', 'Proton mass', 1.672621898e-27, 'kg'], ['mn', 'Neutron mass', 1.674927471e-27, 'kg'], ['me', 'Electron mass', 9.10938356e-31, 'kg'],
+  ['mmu', 'Muon mass', 1.883531594e-28, 'kg'], ['a0', 'Bohr radius', 5.2917721067e-11, 'm'], ['h', 'Planck constant', 6.62607004e-34, 'J·s'],
+  ['mun', 'Nuclear magneton', 5.050783699e-27, 'J/T'], ['mub', 'Bohr magneton', 9.274009994e-24, 'J/T'], ['hbar', 'Reduced Planck constant', 1.054571817e-34, 'J·s'],
+  ['alpha', 'Fine-structure constant', 7.2973525693e-3, ''], ['re', 'Classical electron radius', 2.8179403227e-15, 'm'], ['lambdac', 'Compton wavelength', 2.42631023867e-12, 'm'],
+  ['gammap', 'Proton gyromagnetic ratio', 267522187.44, 'rad·s⁻¹·T⁻¹'], ['lambdacp', 'Proton Compton wavelength', 1.32140985396e-15, 'm'], ['lambdacn', 'Neutron Compton wavelength', 1.31959090481e-15, 'm'],
+  ['rinf', 'Rydberg constant', 10973731.568508, 'm⁻¹'], ['u', 'Atomic mass constant', 1.6605390666e-27, 'kg'], ['mup', 'Proton magnetic moment', 1.4106067873e-26, 'J/T'],
+  ['mue', 'Electron magnetic moment', -9.2847644825e-24, 'J/T'], ['mun0', 'Neutron magnetic moment', -9.6623651e-27, 'J/T'], ['mumu', 'Muon magnetic moment', -4.4904483e-26, 'J/T'],
+  ['faraday', 'Faraday constant', 96485.33212, 'C/mol'], ['kb', 'Boltzmann constant', 1.380649e-23, 'J/K'], ['vm', 'Molar volume of ideal gas', 0.02271095464, 'm³/mol'],
+  ['r', 'Molar gas constant', 8.31446261815324, 'J/(mol·K)'], ['c', 'Speed of light in vacuum', 299792458, 'm/s'], ['c1', 'First radiation constant', 3.741771852e-16, 'W·m²'],
+  ['c2', 'Second radiation constant', 0.01438776877, 'm·K'], ['sigma', 'Stefan–Boltzmann constant', 5.670374419e-8, 'W/(m²·K⁴)'], ['epsilon0', 'Vacuum electric permittivity', 8.8541878128e-12, 'F/m'],
+  ['mu0', 'Vacuum magnetic permeability', 1.2566370612e-6, 'N/A²'], ['phi0', 'Magnetic flux quantum', 2.067833848e-15, 'Wb'], ['g', 'Standard acceleration of gravity', 9.80665, 'm/s²'],
+  ['g0', 'Conductance quantum', 7.748091729e-5, 'S'], ['z0', 'Characteristic impedance of vacuum', 376.730313668, 'Ω'], ['t0', 'Celsius zero point', 273.15, 'K'],
+  ['grav', 'Newtonian constant of gravitation', 6.6743e-11, 'm³/(kg·s²)'], ['atm', 'Standard atmosphere', 101325, 'Pa'], ['na', 'Avogadro constant', 6.02214076e23, 'mol⁻¹']
+].map(([name, label, value, unit]) => Object.freeze({ name, label, value, unit })));
 const RESERVED = new Set([...FUNCTION_NAMES, ...Object.keys(CONSTANTS), 'ans', 'constructor', 'prototype', '__proto__', 'tostring', 'valueof', 'hasownproperty']);
 const MAX_TOKENS = 512;
 const MAX_FACTORIAL = 170;
@@ -150,6 +178,7 @@ function callFunction(name, args, angleMode) {
     case 'asin': return one((x) => fromRadians(Math.asin(x)));
     case 'acos': return one((x) => fromRadians(Math.acos(x)));
     case 'atan': return one((x) => fromRadians(Math.atan(x)));
+    case 'atan2': return two((y, x) => fromRadians(Math.atan2(y, x)));
     case 'asec': return one((x) => fromRadians(Math.acos(1 / x)));
     case 'acsc': return one((x) => fromRadians(Math.asin(1 / x)));
     case 'acot': return one((x) => fromRadians(Math.atan2(1, x)));
@@ -176,6 +205,11 @@ function callFunction(name, args, angleMode) {
     case 'max': if (!args.length) throw new Error('max expects at least one argument.'); return Math.max(...args);
     case 'pow': return two(Math.pow);
     case 'hypot': if (args.length < 2) throw new Error('hypot expects at least two arguments.'); return Math.hypot(...args);
+    case 'rand': if (args.length !== 0) throw new Error('rand expects no arguments.'); return Math.random();
+    case 'randint': {
+      if (args.length !== 2 || args.some((value) => !Number.isSafeInteger(value)) || args[0] > args[1] || args[1] - args[0] > 1e9) throw new Error('randint expects safe integer bounds a,b with a ≤ b and a range no larger than 1,000,000,000.');
+      return args[0] + Math.floor(Math.random() * (args[1] - args[0] + 1));
+    }
     case 'dms': {
       if (args.length !== 3) throw new Error('dms expects degrees, minutes and seconds.');
       const [degrees, minutes, seconds] = args;
@@ -267,13 +301,18 @@ export function evaluateExpression(expression, { variables = {}, angleMode = 'DE
   return { value, formatted: formatNumber(value), steps, ast };
 }
 
-export function formatNumber(value, { precision = 12, notation = 'auto' } = {}) {
+export function formatNumber(value, { precision = 12, notation = 'auto', fixedDigits = 2 } = {}) {
   const number = Number(value);
   if (!Number.isFinite(number)) return '—';
-  if (Object.is(number, -0) || number === 0) return '0';
+  if (Object.is(number, -0) || number === 0) return notation === 'fixed' ? (0).toFixed(Math.max(0, Math.min(9, Math.trunc(Number(fixedDigits) || 0)))) : '0';
   const significant = Math.max(1, Math.min(15, Math.trunc(Number(precision) || 12)));
   const abs = Math.abs(number);
-  if (notation === 'scientific' || notation === 'engineering' || (notation === 'auto' && (abs >= 1e12 || abs < 1e-9))) {
+  if (notation === 'fixed') return number.toFixed(Math.max(0, Math.min(9, Math.trunc(Number(fixedDigits) || 0))));
+  const scientificRequested = notation === 'scientific' || notation === 'engineering'
+    || (notation === 'norm1' && (abs >= 1e10 || abs < 1e-2))
+    || (notation === 'norm2' && (abs >= 1e10 || abs < 1e-9))
+    || (notation === 'auto' && (abs >= 1e10 || abs < 1e-2));
+  if (scientificRequested) {
     if (notation === 'engineering') {
       const exponent = Math.floor(Math.log10(abs) / 3) * 3;
       const mantissa = number / (10 ** exponent);

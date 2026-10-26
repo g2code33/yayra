@@ -260,6 +260,15 @@ test('Google services: external-browser consent reflects the exact account and e
     assert.match(banner.textContent, /selected\.user@example\.com/);
     assert.match(banner.textContent, /Google services connected in Yayra/);
     assert.ok(banner.querySelector('.fb-google-services-hub-btn'), 'Google services hub button is present');
+    const bannerToggle = banner.querySelector('.fb-google-connected-banner-note');
+    assert.ok(bannerToggle && bannerToggle.tagName === 'BUTTON', 'the verified-account chip is an accessible toggle');
+    const bannerContent = banner.querySelector('.fb-google-connected-banner-content');
+    assert.equal(bannerToggle.getAttribute('aria-expanded'), 'true');
+    bannerToggle.click();
+    assert.equal(bannerContent.hidden, true, 'the account ribbon collapses when its verification chip is clicked');
+    assert.equal(bannerToggle.getAttribute('aria-expanded'), 'false');
+    bannerToggle.click();
+    assert.equal(bannerContent.hidden, false, 'clicking the same chip restores the ribbon');
   } finally {
     cleanup(shell);
   }

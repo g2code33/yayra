@@ -1,4 +1,5 @@
 import {
+  SCIENTIFIC_CONSTANTS,
   SCIENTIFIC_FORMULAS,
   SCIENTIFIC_UNIT_GROUPS,
   computeDilution,
@@ -55,6 +56,7 @@ export class ScientificCalculator {
     this.onPrompt = onPrompt;
     this.privateMode = Boolean(privateMode);
     this.mode = 'calculator';
+    this.calculationMode = this.data.settings.calculationMode || 'COMP';
     this.expression = '';
     this.lastResult = this.data.history[0]?.result !== null && this.data.history[0]?.result !== undefined && Number.isFinite(Number(this.data.history[0].result)) ? Number(this.data.history[0].result) : null;
     this.lastEntryId = null;
@@ -114,7 +116,7 @@ export class ScientificCalculator {
           <div class="sc-header-actions">
             <label class="sc-angle-control"><span>Angle</span><select class="sc-angle-mode" aria-label="Angle unit"><option value="DEG">DEG</option><option value="RAD">RAD</option><option value="GRAD">GRAD</option></select></label>
             <label class="sc-angle-control"><span>Digits</span><select class="sc-precision-mode" aria-label="Significant digits"><option value="6">6</option><option value="9">9</option><option value="12">12</option><option value="15">15</option></select></label>
-            <label class="sc-angle-control"><span>Format</span><select class="sc-notation-mode" aria-label="Number format"><option value="auto">NORM</option><option value="scientific">SCI</option><option value="engineering">ENG</option></select></label>
+            <label class="sc-angle-control"><span>Format</span><select class="sc-notation-mode" aria-label="Number format"><option value="auto">NORM</option><option value="norm1">NORM1</option><option value="norm2">NORM2</option><option value="fixed">FIX</option><option value="scientific">SCI</option><option value="engineering">ENG</option></select></label>
             <button class="sc-icon-button sc-open-settings" type="button" title="Calculator settings" aria-label="Calculator settings">${Icons.settings}</button>
           </div>
         </header>
@@ -166,7 +168,7 @@ export class ScientificCalculator {
       this.persist(); this.updateDeviceStatus(); this.showNotice(`Angle mode set to ${angleModeLabel(this.data.settings.angleMode)}.`);
     });
     this.container.querySelector('.sc-precision-mode').addEventListener('change', (event) => { this.data.settings.precision = Math.max(3, Math.min(15, Number(event.target.value) || 12)); this.persist(); this.showNotice(`Results use ${this.data.settings.precision} significant digits.`); });
-    this.container.querySelector('.sc-notation-mode').addEventListener('change', (event) => { this.data.settings.notation = ['scientific', 'engineering'].includes(event.target.value) ? event.target.value : 'auto'; this.persist(); this.updateDeviceStatus(); this.showNotice(`Number format set to ${this.data.settings.notation}.`); });
+    this.container.querySelector('.sc-notation-mode').addEventListener('change', (event) => { this.data.settings.notation = ['scientific', 'engineering', 'norm1', 'norm2', 'fixed'].includes(event.target.value) ? event.target.value : 'auto'; this.persist(); this.updateDeviceStatus(); this.refreshFormattedAnswer(); this.showNotice(`Number format set to ${this.data.settings.notation}.`); });
     this.container.querySelector('.sc-open-settings').addEventListener('click', () => this.onOpenSettings());
     const expressionInput = this.container.querySelector('.sc-expression');
     expressionInput.addEventListener('input', () => { this.expression = expressionInput.value; });
@@ -216,7 +218,7 @@ export class ScientificCalculator {
         [')', 'insert', '', 'b', ''], ['S↔D', 'fraction-display', '', '', ''], ['M+', 'memory-add', 'memory-subtract', '', 'M−']
       ],
       [
-        ['7', 'insert', 'pi', 'x', 'CONST'], ['8', 'insert', 'units', 'y', 'CONV'], ['9', 'insert', 'clear', 'z', 'CLR'],
+        ['7', 'insert', 'constants', 'x', 'CONST'], ['8', 'insert', 'units', 'y', 'CONV'], ['9', 'insert', 'clear', 'z', 'CLR'],
         ['DEL', 'delete', 'insert-mode', '', 'INS'], ['AC', 'clear', 'off', '', 'OFF'], null
       ],
       [
@@ -229,7 +231,7 @@ export class ScientificCalculator {
       ],
       [
         ['0', 'insert', 'cbrt()', 'i', 'cbrt'], ['.', 'insert', 'exp()', 'j', 'exp'], ['×10ˣ', 'insert', '*10^(', '', ''],
-        ['Ans', 'answer', '', '', ''], ['=', 'evaluate', '', '', 'EXE'], null
+        ['Ans', 'answer', 'rand()', 'randint(,)', 'RAN#'], ['=', 'evaluate', '', '', 'EXE'], null
       ]
     ];
     const navPad = `<div class="sc-navigation-pad" role="group" aria-label="Expression cursor and history controls"><button type="button" data-nav="up" aria-label="Previous history item">▲</button><button type="button" data-nav="left" aria-label="Move cursor left">◀</button><button type="button" class="sc-navigation-center" data-nav="center" aria-label="Calculate">●</button><button type="button" data-nav="right" aria-label="Move cursor right">▶</button><button type="button" data-nav="down" aria-label="Next history item">▼</button></div>`;
@@ -270,7 +272,7 @@ export class ScientificCalculator {
     if (!target) return;
     this.container.querySelector('.sc-workspace')?.setAttribute('data-mode', this.mode);
     this.container.querySelector('.sc-workspace-column')?.classList.toggle('sc-mode-library', ['history'].includes(this.mode));
-    if (this.mode === 'calculator') target.innerHTML = '';
+    if (this.mode === 'calculator') { target.innerHTML = this.calculationMode === 'COMP' ? '' : this.calculationModeMarkup(); }
     else if (this.mode === 'graph') target.innerHTML = this.graphMarkup(false);
     else if (this.mode === '3d') target.innerHTML = this.surfaceMarkup();
     else if (this.mode === 'integrals') target.innerHTML = this.integralMarkup();
@@ -281,9 +283,86 @@ export class ScientificCalculator {
     else if (this.mode === 'history') target.innerHTML = '<div class="sc-history-prompt"><p class="sc-eyebrow">CALCULATION HISTORY</p><h2>Pick up where you left off</h2><p>Use the history cards below to restore an expression without calculating it again.</p></div>';
     else if (this.mode === 'all-tools') target.innerHTML = this.allToolsMarkup();
     this.bindModeEvents();
+    if (this.mode === 'calculator' && this.calculationMode !== 'COMP') this.bindCalculationMode();
     this.container.querySelectorAll('[data-open-mode]').forEach((button) => button.addEventListener('click', () => this.setMode(button.dataset.openMode)));
     if (this.mode === 'graph') this.drawGraph();
     if (this.mode === '3d') this.drawSurface();
+  }
+
+  calculationModeMarkup() {
+    const common = '<div class="sc-calc-mode-result" aria-live="polite"></div>';
+    const wrap = (eyebrow, title, form, note = '') => `<section class="sc-tool-card sc-calc-mode-card"><div class="sc-tool-title"><div><p class="sc-eyebrow">${eyebrow}</p><h2>${title}</h2></div><button type="button" class="sc-mode-switch">MODE</button></div>${form}${common}${note ? `<p class="sc-field-help">${note}</p>` : ''}</section>`;
+    if (this.calculationMode === 'CMPLX') return wrap('COMPLEX NUMBER WORKSPACE', 'Complex arithmetic', `<form class="sc-form sc-calc-mode-form" data-calc-mode="CMPLX"><div class="sc-form-grid sc-four-fields"><label>z₁ real<input name="a" type="number" step="any" value="1"></label><label>z₁ imag<input name="b" type="number" step="any" value="2"></label><label>z₂ real<input name="c" type="number" step="any" value="3"></label><label>z₂ imag<input name="d" type="number" step="any" value="4"></label></div><label>Operation<select name="op"><option value="add">z₁ + z₂</option><option value="subtract">z₁ − z₂</option><option value="multiply">z₁ × z₂</option><option value="divide">z₁ ÷ z₂</option></select></label><button class="sc-primary-button">Calculate</button></form>`, 'Complex arithmetic is handled locally for addition, subtraction, multiplication and division.');
+    if (this.calculationMode === 'STAT') return wrap('STATISTICS WORKSPACE', 'One-variable statistics', `<form class="sc-form sc-calc-mode-form" data-calc-mode="STAT"><label>Data values, separated by commas or spaces<textarea name="values" rows="3" placeholder="2, 4, 6, 8">2, 4, 6, 8</textarea></label><label>Standard deviation<select name="sample"><option value="population">Population</option><option value="sample">Sample</option></select></label><button class="sc-primary-button">Calculate statistics</button></form>`, 'Reports count, sum, mean, median, range, variance and standard deviation.');
+    if (this.calculationMode === 'BASE-N') return wrap('BASE-N WORKSPACE', 'Number base conversion', `<form class="sc-form sc-calc-mode-form" data-calc-mode="BASE-N"><label>Integer value<input name="value" value="101101" inputmode="text" required></label><label>Input base<select name="base"><option value="2">Binary</option><option value="8">Octal</option><option value="10">Decimal</option><option value="16">Hexadecimal</option></select></label><button class="sc-primary-button">Convert bases</button></form>`, 'Supports signed safe integers in binary, octal, decimal and hexadecimal.');
+    if (this.calculationMode === 'EQN') return wrap('EQUATION WORKSPACE', 'Linear & quadratic equations', `<form class="sc-form sc-calc-mode-form" data-calc-mode="EQN"><label>Equation type<select name="kind"><option value="quadratic">ax² + bx + c = 0</option><option value="linear">ax + b = c</option></select></label><div class="sc-form-grid sc-three-fields"><label>a<input name="a" type="number" step="any" value="1"></label><label>b<input name="b" type="number" step="any" value="-3"></label><label>c<input name="c" type="number" step="any" value="2"></label></div><button class="sc-primary-button">Solve equation</button></form>`);
+    if (this.calculationMode === 'MATRIX') return wrap('MATRIX WORKSPACE', '2 × 2 matrix', `<form class="sc-form sc-calc-mode-form" data-calc-mode="MATRIX"><div class="sc-form-grid sc-four-fields">${['a','b','c','d'].map((n, i) => `<label>${n.toUpperCase()}<input name="${n}" type="number" step="any" value="${[1,2,3,4][i]}"></label>`).join('')}</div><label>Operation<select name="op"><option value="det">Determinant</option><option value="inverse">Inverse</option></select></label><button class="sc-primary-button">Calculate matrix</button></form>`, 'For matrix [[a,b],[c,d]], calculate its determinant or inverse when nonsingular.');
+    if (this.calculationMode === 'TABLE') return wrap('TABLE WORKSPACE', 'Function value table', `<form class="sc-form sc-calc-mode-form" data-calc-mode="TABLE"><label>f(x)<input name="expression" value="x^2" required></label><div class="sc-form-grid sc-three-fields"><label>Start<input name="start" type="number" step="any" value="-3"></label><label>End<input name="end" type="number" step="any" value="3"></label><label>Step<input name="step" type="number" step="any" value="1"></label></div><button class="sc-primary-button">Generate table</button></form>`, 'Evaluates a local expression at up to 101 evenly stepped x-values.');
+    if (this.calculationMode === 'VECTOR') return wrap('VECTOR WORKSPACE', '2D & 3D vector operations', `<form class="sc-form sc-calc-mode-form" data-calc-mode="VECTOR"><label>Vector u (2 or 3 components)<input name="u" value="1, 2, 3" required></label><label>Vector v<input name="v" value="4, 5, 6" required></label><label>Operation<select name="op"><option value="dot">Dot product</option><option value="cross">Cross product (3D)</option><option value="add">u + v</option><option value="magnitude">Magnitude of u</option></select></label><button class="sc-primary-button">Calculate vectors</button></form>`, 'Vectors are comma-separated finite real components.');
+    return '';
+  }
+
+  setCalculationMode(mode) {
+    const choices = ['COMP', 'CMPLX', 'STAT', 'BASE-N', 'EQN', 'MATRIX', 'TABLE', 'VECTOR'];
+    if (!choices.includes(mode)) return;
+    this.calculationMode = mode;
+    this.data.settings.calculationMode = mode;
+    this.persist();
+    const readout = this.container.querySelector('.sc-display-mode'); if (readout) readout.textContent = mode;
+    this.renderMode();
+    this.showNotice(`${mode} mode selected.`);
+  }
+
+  bindCalculationMode() {
+    this.container.querySelector('.sc-mode-switch')?.addEventListener('click', () => this.openModeDialog());
+    this.container.querySelector('.sc-calc-mode-form')?.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const field = (name) => form.querySelector(`[name="${name}"]`)?.value;
+      const result = this.container.querySelector('.sc-calc-mode-result');
+      try {
+        let lines = [];
+        if (this.calculationMode === 'CMPLX') {
+          const a = Number(field('a')); const b = Number(field('b')); const c = Number(field('c')); const d = Number(field('d')); let re; let im;
+          if (![a,b,c,d].every(Number.isFinite)) throw new Error('Enter finite real and imaginary parts.');
+          const op = field('op');
+          if (op === 'add') { re = a+c; im = b+d; } else if (op === 'subtract') { re = a-c; im = b-d; } else if (op === 'multiply') { re = a*c-b*d; im = a*d+b*c; }
+          else { const denominator = c*c+d*d; if (!denominator) throw new Error('Cannot divide by zero complex number.'); re = (a*c+b*d)/denominator; im = (b*c-a*d)/denominator; }
+          lines = [`Result: ${formatNumber(re)} ${im < 0 ? '−' : '+'} ${formatNumber(Math.abs(im))}i`, `Real part: ${formatNumber(re)} · Imaginary part: ${formatNumber(im)}`];
+        } else if (this.calculationMode === 'STAT') {
+          const values = field('values').trim().split(/[\s,;]+/).filter(Boolean).map(Number);
+          if (!values.length || values.length > 1000 || values.some((x) => !Number.isFinite(x))) throw new Error('Enter 1–1000 finite numbers separated by commas or spaces.');
+          const sorted = [...values].sort((a,b) => a-b); const mean = values.reduce((a,b) => a+b,0)/values.length; const denominator = field('sample') === 'sample' ? values.length-1 : values.length;
+          if (denominator <= 0) throw new Error('Sample standard deviation needs at least two values.');
+          const variance = values.reduce((sum,x) => sum+(x-mean)**2,0)/denominator; const median = sorted.length % 2 ? sorted[(sorted.length-1)/2] : (sorted[sorted.length/2-1]+sorted[sorted.length/2])/2;
+          lines = [`n = ${values.length} · Σx = ${formatNumber(values.reduce((a,b)=>a+b,0))}`, `Mean = ${formatNumber(mean)} · Median = ${formatNumber(median)}`, `Variance = ${formatNumber(variance)} · Standard deviation = ${formatNumber(Math.sqrt(variance))}`, `Minimum = ${formatNumber(sorted[0])} · Maximum = ${formatNumber(sorted.at(-1))} · Range = ${formatNumber(sorted.at(-1)-sorted[0])}`];
+        } else if (this.calculationMode === 'BASE-N') {
+          const base = Number(field('base')); const text = field('value').trim();
+          if (!/^[+-]?(?:[0-9a-f]+)$/i.test(text)) throw new Error('Enter a signed integer using digits valid for the selected base.');
+          const value = Number.parseInt(text, base); if (!Number.isSafeInteger(value)) throw new Error('Value is not a safe integer for this calculator.');
+          const valid = base === 2 ? /^[+-]?[01]+$/ : base === 8 ? /^[+-]?[0-7]+$/ : base === 10 ? /^[+-]?\d+$/ : /^[+-]?[0-9a-f]+$/i;
+          if (!valid.test(text)) throw new Error('The value contains a digit that is invalid for the selected base.');
+          lines = [`Decimal: ${value}`, `Binary: ${value.toString(2)}`, `Octal: ${value.toString(8)}`, `Hexadecimal: ${value.toString(16).toUpperCase()}`];
+        } else if (this.calculationMode === 'EQN') {
+          const output = field('kind') === 'linear' ? solveLinearEquation({a:field('a'), b:field('b'), c:field('c')}) : solveQuadratic({a:field('a'), b:field('b'), c:field('c')});
+          lines = output.roots ? (output.roots.length ? output.roots.map((x,i) => `x${output.roots.length > 1 ? i+1 : ''} = ${formatNumber(x)}`) : ['No real roots.']) : [`x = ${formatNumber(output.value)}`];
+        } else if (this.calculationMode === 'MATRIX') {
+          const [a,b,c,d] = ['a','b','c','d'].map((n) => Number(field(n))); if (![a,b,c,d].every(Number.isFinite)) throw new Error('Enter four finite matrix entries.'); const det = a*d-b*c;
+          lines = field('op') === 'det' ? [`det(A) = ad − bc = ${formatNumber(det)}`] : Math.abs(det) < 1e-14 ? ['Matrix is singular; inverse does not exist.'] : [`A⁻¹ = [[${formatNumber(d/det)}, ${formatNumber(-b/det)}], [${formatNumber(-c/det)}, ${formatNumber(a/det)}]]`];
+        } else if (this.calculationMode === 'TABLE') {
+          const start = Number(field('start')); const end = Number(field('end')); const step = Number(field('step')); if (![start,end,step].every(Number.isFinite) || step <= 0 || end < start || (end-start)/step > 100) throw new Error('Choose a positive step and a range containing at most 101 values.');
+          for (let x=start; x <= end+step*1e-9; x+=step) lines.push(`x = ${formatNumber(x)}  →  ${formatNumber(evaluateExpression(field('expression'), {variables:{...this.data.variables,x}, angleMode:this.data.settings.angleMode}).value)}`);
+        } else if (this.calculationMode === 'VECTOR') {
+          const parseVector = (text) => text.split(/[\s,;]+/).filter(Boolean).map(Number); const u=parseVector(field('u')); const v=parseVector(field('v'));
+          if (![u,v].every((vec) => vec.length >= 2 && vec.length <= 3 && vec.every(Number.isFinite)) || (field('op') !== 'magnitude' && u.length !== v.length)) throw new Error('Vectors need two or three finite components; u and v must have equal lengths.');
+          if (field('op') === 'magnitude') lines=[`|u| = ${formatNumber(Math.hypot(...u))}`];
+          else if (field('op') === 'dot') lines=[`u · v = ${formatNumber(u.reduce((sum,x,i)=>sum+x*v[i],0))}`];
+          else if (field('op') === 'add') lines=[`u + v = (${u.map((x,i)=>formatNumber(x+v[i])).join(', ')})`];
+          else { if (u.length!==3) throw new Error('Cross product requires three-dimensional vectors.'); lines=[`u × v = (${formatNumber(u[1]*v[2]-u[2]*v[1])}, ${formatNumber(u[2]*v[0]-u[0]*v[2])}, ${formatNumber(u[0]*v[1]-u[1]*v[0])})`]; }
+        }
+        result.innerHTML = `<ul>${lines.map((line) => `<li>${ESCAPE(line)}</li>`).join('')}</ul>`;
+      } catch (error) { result.textContent = error.message; }
+    });
   }
 
   calculatorMarkup() { return ''; }
@@ -394,18 +473,21 @@ export class ScientificCalculator {
     if (action === 'shift') { this.shiftActive = !this.shiftActive; this.alphaActive = false; this.updateKeyLayers(); return; }
     if (action === 'alpha') { this.alphaActive = !this.alphaActive; this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'hyp') { this.hyperbolicActive = !this.hyperbolicActive; this.showNotice(`Hyperbolic functions ${this.hyperbolicActive ? 'enabled' : 'disabled'}.`); return; }
-    if (action === 'mode') { this.openModeDialog(); return; }
-    if (action === 'on') { this.displayOn = true; this.container.querySelector('.sc-display')?.classList.remove('sc-display-off'); input.focus(); return; }
+    if (action === 'mode') { if (this.shiftActive) this.openSetupDialog(); else this.openModeDialog(); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'on') { this.displayOn = true; this.container.querySelector('.sc-display')?.classList.remove('sc-display-off'); this.expression = ''; input.value = ''; this.calculationOutput = null; this.lastEntryId = null; this.lastResult = null; this.updateAnswer(null); this.showNotice('Calculator cleared.'); this.shiftActive = false; this.alphaActive = false; this.updateKeyLayers(); input.focus(); return; }
     if (action === 'drg') { this.cycleAngleMode(); return; }
     if (action === 'integral') { this.setMode('integrals'); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'fraction') { this.openFractionDialog(input); return; }
+    if (action === 'insert' && this.shiftActive && button?.dataset.shift === 'constants') { this.openConstantsDialog(input); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'insert' && this.shiftActive && button?.dataset.shift === 'clear') { this.openClearDialog(input); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'insert' && this.shiftActive && ['+', '−'].includes(key)) { this.openCoordinateDialog(key === '+' ? 'polar' : 'rectangular', input); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'delete') {
       if (this.shiftActive && button?.dataset.shift === 'insert-mode') {
         this.insertMode = !this.insertMode; this.showNotice(`${this.insertMode ? 'Insert' : 'Overwrite'} mode.`);
       } else this.deleteAtCursor(input);
       this.shiftActive = false; this.updateKeyLayers(); return;
     }
-    if (action === 'evaluate') { this.evaluateCurrent(); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'evaluate') { if (this.shiftActive && button?.dataset.shift === 'SOLVE =') this.setCalculationMode('EQN'); else this.evaluateCurrent(); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'clear') {
       if (this.shiftActive && button?.dataset.shift === 'off') {
         this.displayOn = false; this.container.querySelector('.sc-display')?.classList.add('sc-display-off');
@@ -413,17 +495,17 @@ export class ScientificCalculator {
       this.shiftActive = false; this.updateKeyLayers(); return;
     }
     if (action === 'negative') { this.insertAtCursor('(-', input); return; }
-    if (action === 'answer') { if (this.lastResult === null) { this.showNotice('Calculate a result before using Ans.', 'error'); return; } this.insertAtCursor('ans', input); return; }
+    if (action === 'answer') { if (this.shiftActive || this.alphaActive) { const token = this.alphaActive ? 'randint(,)' : 'rand()'; this.insertAtCursor(token, input, this.alphaActive ? 9 : token.length - 1); this.shiftActive = false; this.alphaActive = false; this.updateKeyLayers(); return; } if (this.lastResult === null) { this.showNotice('Calculate a result before using Ans.', 'error'); return; } this.insertAtCursor('ans', input); return; }
     if (action === 'memory-recall') { this.handleMemory(this.shiftActive ? 'store' : 'recall', input); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'memory-add') { this.handleMemory(this.shiftActive ? 'subtract' : 'add', input); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'fraction-display') { this.toggleFractionDisplay(); return; }
     if (action === 'eng') {
       this.data.settings.notation = this.shiftActive ? 'scientific' : 'engineering';
-      this.persist(); this.updateDeviceStatus(); if (this.calculationOutput) this.updateAnswer(this.calculationOutput);
+      this.persist(); this.updateDeviceStatus(); this.refreshFormattedAnswer();
       this.showNotice(`Display format: ${this.data.settings.notation.toUpperCase()}.`); this.shiftActive = false; this.updateKeyLayers(); return;
     }
     if (action === 'logbase') { this.insertAtCursor(this.shiftActive ? 'log()' : 'log(,)', input, 4); this.shiftActive = false; this.updateKeyLayers(); return; }
-    if (action === 'dms') { this.insertAtCursor('dms(,,)', input, 4); return; }
+    if (action === 'dms') { if (this.shiftActive) this.cycleAngleMode(); else this.insertAtCursor('dms(,,)', input, 4); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'square') { this.insertAtCursor(this.shiftActive ? 'sqrt()' : '^2', input, this.shiftActive ? 5 : 2); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'power') {
       const shifted = button?.dataset.shift;
@@ -440,11 +522,14 @@ export class ScientificCalculator {
     }
     const shifted = button?.dataset.shift;
     const alpha = button?.dataset.alpha;
-    if (this.shiftActive && shifted === 'clear') { this.expression = ''; input.value = ''; this.calculationOutput = null; this.lastEntryId = null; this.lastResult = null; this.updateAnswer(null); this.showNotice('Expression and current answer cleared.'); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (this.shiftActive && shifted === 'clear') { this.openClearDialog(input); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (this.shiftActive && shifted === 'units') { this.setMode('units'); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (this.shiftActive && shifted === 'STAT') { this.setCalculationMode('STAT'); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (this.shiftActive && shifted === 'MED') { this.insertAtCursor('median()', input, 7); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (this.shiftActive && shifted === 'σ') { this.insertAtCursor('stdev()', input, 6); this.shiftActive = false; this.updateKeyLayers(); return; }
     let insertion = key;
     if (this.alphaActive && alpha) insertion = alpha;
-    else if (this.shiftActive && shifted) insertion = shifted;
+    else if (this.shiftActive && shifted) insertion = shifted === 'FACT' ? '!' : shifted;
     const useOverwrite = !this.insertMode;
     const openParen = String(insertion).indexOf('(');
     const cursorOffset = this.shiftActive && openParen >= 0 ? openParen + 1 : String(insertion).length;
@@ -524,7 +609,7 @@ export class ScientificCalculator {
 
   cycleNotation() {
     const modes = ['auto', 'scientific', 'engineering']; const current = modes.indexOf(this.data.settings.notation); this.data.settings.notation = modes[(current + 1) % modes.length];
-    this.persist(); this.updateDeviceStatus(); if (this.calculationOutput) this.updateAnswer(this.calculationOutput); this.showNotice(`Display format: ${this.data.settings.notation.toUpperCase()}.`);
+    this.persist(); this.updateDeviceStatus(); this.refreshFormattedAnswer(); this.showNotice(`Display format: ${this.data.settings.notation.toUpperCase()}.`);
   }
 
   toggleFractionDisplay() {
@@ -537,24 +622,109 @@ export class ScientificCalculator {
     this.showNotice(this.fractionDisplay ? 'Fraction display enabled. Irrational values use an approximate rational.' : 'Decimal display enabled.');
   }
 
+  refreshFormattedAnswer() {
+    if (!this.calculationOutput) return;
+    if (Number.isFinite(this.calculationOutput.value)) {
+      this.calculationOutput = {...this.calculationOutput, formatted:formatNumber(this.calculationOutput.value, {precision:this.data.settings.precision, notation:this.data.settings.notation, fixedDigits:this.data.settings.fixedDigits})};
+    }
+    this.updateAnswer(this.calculationOutput);
+  }
+
   updateDeviceStatus() {
     const angle = this.data.settings.angleMode;
     const angleKey = this.container.querySelector('.sc-drg-key'); if (angleKey) angleKey.textContent = angle;
     const angleReadout = this.container.querySelector('.sc-display-angle'); if (angleReadout) angleReadout.textContent = angle;
-    const format = this.data.settings.notation === 'auto' ? 'NORM1' : this.data.settings.notation === 'scientific' ? 'SCI' : 'ENG';
+    const angleSelect = this.container.querySelector('.sc-angle-mode'); if (angleSelect) angleSelect.value = angle;
+    const notationSelect = this.container.querySelector('.sc-notation-mode'); if (notationSelect) notationSelect.value = this.data.settings.notation;
+    const format = ({auto:'NORM1', norm1:'NORM1', norm2:'NORM2', fixed:`FIX${this.data.settings.fixedDigits}`, scientific:'SCI', engineering:'ENG'})[this.data.settings.notation] || 'NORM1';
     const norm = this.container.querySelector('.sc-norm-key'); if (norm) norm.textContent = format;
     const formatReadout = this.container.querySelector('.sc-display-format'); if (formatReadout) formatReadout.textContent = format;
+    const calcMode = this.container.querySelector('.sc-display-mode'); if (calcMode) calcMode.textContent = this.calculationMode || 'COMP';
     const memory = this.container.querySelector('.sc-display-memory'); if (memory) memory.textContent = this.data.memory === null ? '' : 'M';
   }
 
-  openModeDialog() {
+  openDialog(content, titleId, onOpen = () => {}) {
     const host = this.container.querySelector('.sc-dialog-host');
-    host.innerHTML = `<div class="sc-mode-scrim"><section class="sc-mode-dialog" role="dialog" aria-modal="true" aria-labelledby="${this.instanceId}-mode-title"><div class="sc-dialog-header"><h2 id="${this.instanceId}-mode-title">Calculation mode</h2><button type="button" class="sc-dialog-close" aria-label="Close">×</button></div><p>Choose a supported mode. Yayra never advertises unsupported complex, matrix or statistics calculations as complete.</p><button type="button" data-mode-choice="calculator"><strong>1 · COMP</strong><small>Real-number scientific calculations</small></button><button type="button" data-mode-choice="graph"><strong>2 · GRAPH</strong><small>Local 2D function plotting and numerical analysis</small></button><button type="button" data-mode-choice="3d"><strong>3 · 3D</strong><small>Sampled z = f(x,y) surface</small></button><button type="button" data-mode-choice="integrals"><strong>4 · CALC</strong><small>Numerical integration with convergence checks</small></button><button type="button" data-mode-choice="units"><strong>5 · UNITS</strong><small>Scientific units and dimensional conversion</small></button><div class="sc-mode-angle"><span>Angle unit</span><button type="button" data-angle-choice="DEG">DEG</button><button type="button" data-angle-choice="RAD">RAD</button><button type="button" data-angle-choice="GRAD">GRAD</button></div></section></div>`;
-    host.querySelector('.sc-dialog-close')?.addEventListener('click', () => { host.replaceChildren(); });
-    host.querySelector('.sc-mode-scrim')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) host.replaceChildren(); });
-    host.querySelectorAll('[data-mode-choice]').forEach((button) => button.addEventListener('click', () => { const mode = button.dataset.modeChoice; host.replaceChildren(); this.setMode(mode); }));
-    host.querySelectorAll('[data-angle-choice]').forEach((button) => button.addEventListener('click', () => { this.data.settings.angleMode = button.dataset.angleChoice; this.persist(); this.updateDeviceStatus(); host.replaceChildren(); }));
-    host.querySelector('[data-mode-choice]')?.focus();
+    host.innerHTML = `<div class="sc-mode-scrim"><section class="sc-mode-dialog" role="dialog" aria-modal="true" aria-labelledby="${titleId}">${content}</section></div>`;
+    const close = () => host.replaceChildren();
+    host.querySelectorAll('[data-dialog-close]').forEach((button) => button.addEventListener('click', close));
+    host.querySelector('.sc-mode-scrim')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) close(); });
+    onOpen(host, close);
+    host.querySelector('button, input, select')?.focus();
+    return { host, close };
+  }
+
+  openSetupDialog() {
+    const id = `${this.instanceId}-setup-title`;
+    const choices = [['FIX','Fix'], ['scientific','Sci'], ['norm1','Norm 1'], ['norm2','Norm 2']];
+    const currentFormat = this.data.settings.notation === 'auto' ? 'norm1' : this.data.settings.notation;
+    const content = `<div class="sc-dialog-header"><h2 id="${id}">Setup</h2><button type="button" class="sc-dialog-close" data-dialog-close aria-label="Close">×</button></div><h3>Angle</h3><div class="sc-mode-angle">${[['DEG','Deg'],['RAD','Rad'],['GRAD','Gra']].map(([value,label]) => `<button type="button" data-setup-angle="${value}" aria-pressed="${this.data.settings.angleMode === value}">${label}</button>`).join('')}</div><h3>Display</h3><div class="sc-mode-angle">${choices.map(([value,label]) => `<button type="button" data-setup-format="${value}" aria-pressed="${currentFormat === value}">${label}</button>`).join('')}</div><label class="sc-setup-fix">Fix decimal places<select data-fixed-digits>${Array.from({length:10},(_,n)=>`<option value="${n}" ${n===this.data.settings.fixedDigits?'selected':''}>${n}</option>`).join('')}</select></label><p>Norm 1 uses scientific notation below 0.01; Norm 2 uses it below 10⁻⁹. Large values switch to scientific notation.</p>`;
+    const {host} = this.openDialog(content, id);
+    host.querySelectorAll('[data-setup-angle]').forEach((button) => button.addEventListener('click', () => { this.data.settings.angleMode = button.dataset.setupAngle; this.persist(); this.updateDeviceStatus(); host.querySelectorAll('[data-setup-angle]').forEach((node) => node.setAttribute('aria-pressed', String(node === button))); }));
+    host.querySelectorAll('[data-setup-format]').forEach((button) => button.addEventListener('click', () => {
+      const format = button.dataset.setupFormat; this.data.settings.notation = format === 'FIX' ? 'fixed' : format; this.persist(); this.updateDeviceStatus(); this.refreshFormattedAnswer();
+      host.querySelectorAll('[data-setup-format]').forEach((node) => node.setAttribute('aria-pressed', String(node === button)));
+      host.querySelector('.sc-setup-fix')?.classList.toggle('is-visible', format === 'FIX');
+    }));
+    host.querySelector('.sc-setup-fix')?.classList.toggle('is-visible', this.data.settings.notation === 'fixed');
+    host.querySelector('[data-fixed-digits]')?.addEventListener('change', (event) => { this.data.settings.fixedDigits = Number(event.target.value); this.persist(); this.updateDeviceStatus(); this.refreshFormattedAnswer(); });
+  }
+
+  openClearDialog(input) {
+    const id = `${this.instanceId}-clear-title`;
+    const content = `<div class="sc-dialog-header"><h2 id="${id}">Clear</h2><button type="button" class="sc-dialog-close" data-dialog-close aria-label="Close">×</button></div><p>Choose what to reset. Calculation history, saved results, formulas and notes are kept.</p><button type="button" data-clear-choice="setup"><strong>1 · Setup</strong><small>Restore angle and display-format settings.</small></button><button type="button" data-clear-choice="memory"><strong>2 · Memory</strong><small>Clear calculator memory and user variables.</small></button><button type="button" data-clear-choice="all"><strong>3 · All</strong><small>Reset setup, memory and calculation mode.</small></button>`;
+    const {host, close} = this.openDialog(content, id);
+    host.querySelectorAll('[data-clear-choice]').forEach((button) => button.addEventListener('click', () => {
+      const choice = button.dataset.clearChoice;
+      if (choice === 'setup' || choice === 'all') {
+        const defaults = defaultScientificCalculatorData().settings;
+        this.data.settings = choice === 'all'
+          ? {...defaults, historyLimit:this.data.settings.historyLimit}
+          : {...this.data.settings, angleMode:defaults.angleMode, precision:defaults.precision, notation:defaults.notation, fixedDigits:defaults.fixedDigits, fractionDisplay:defaults.fractionDisplay};
+        this.fractionDisplay = Boolean(this.data.settings.fractionDisplay);
+      }
+      if (choice === 'memory' || choice === 'all') { this.data.memory = null; this.data.variables = {}; if (choice === 'all') this.setCalculationMode('COMP'); }
+      this.persist(); this.updateDeviceStatus(); this.container.querySelector('.sc-frac-key')?.setAttribute('aria-pressed', String(this.fractionDisplay)); this.container.querySelector('.sc-frac-key')?.classList.toggle('is-active', this.fractionDisplay); this.renderSidePanel(); close();
+      this.refreshFormattedAnswer();
+      this.showNotice(choice === 'setup' ? 'Setup reset.' : choice === 'memory' ? 'Calculator memory and variables cleared.' : 'Setup and memory reset. Your saved work and history were kept.');
+      input.focus();
+    }));
+  }
+
+  openConstantsDialog(input) {
+    const id = `${this.instanceId}-constants-title`;
+    const content = `<div class="sc-dialog-header"><h2 id="${id}">Scientific constants</h2><button type="button" class="sc-dialog-close" data-dialog-close aria-label="Close">×</button></div><p>Tap a value to insert it into the current expression. Values are local reference constants.</p><label class="sc-constant-search">Search constants<input type="search" placeholder="Name, symbol or unit" aria-label="Search scientific constants"></label><div class="sc-constant-list" role="list">${SCIENTIFIC_CONSTANTS.map(({name,label,value,unit})=>`<button type="button" class="sc-constant-item" data-constant="${ESCAPE(value)}" data-search="${ESCAPE(`${name} ${label} ${unit}`.toLowerCase())}"><span><strong>${ESCAPE(label)}</strong><small>${ESCAPE(name)}${unit ? ` · ${ESCAPE(unit)}` : ''}</small></span><code>${ESCAPE(value)}</code></button>`).join('')}</div>`;
+    const {host, close} = this.openDialog(content, id);
+    const search = host.querySelector('.sc-constant-search input');
+    search.addEventListener('input', () => host.querySelectorAll('.sc-constant-item').forEach((row) => { row.hidden = !row.dataset.search.includes(search.value.toLowerCase()); }));
+    host.querySelectorAll('.sc-constant-item').forEach((button) => button.addEventListener('click', () => { this.insertAtCursor(button.dataset.constant, input); close(); this.showNotice(`Inserted ${button.querySelector('strong').textContent}.`); }));
+  }
+
+  openCoordinateDialog(kind, input) {
+    const id = `${this.instanceId}-coordinate-title`; const polar = kind === 'polar';
+    const content = `<div class="sc-dialog-header"><h2 id="${id}">${polar ? 'Rectangular → polar' : 'Polar → rectangular'}</h2><button type="button" class="sc-dialog-close" data-dialog-close aria-label="Close">×</button></div><p>${polar ? 'Convert x and y to radius r and angle θ.' : 'Convert radius r and angle θ to x and y.'} Angle uses ${angleModeLabel(this.data.settings.angleMode)}.</p><form class="sc-form sc-coordinate-form"><div class="sc-form-grid sc-two-fields"><label>${polar ? 'x' : 'r'}<input name="first" type="number" step="any" required></label><label>${polar ? 'y' : 'θ'}${polar ? '' : ` (${this.data.settings.angleMode})`}<input name="second" type="number" step="any" required></label></div><button class="sc-primary-button">Convert</button></form><div class="sc-coordinate-result" aria-live="polite"></div>`;
+    const {host, close} = this.openDialog(content, id);
+    host.querySelector('.sc-coordinate-form').addEventListener('submit', (event) => {
+      event.preventDefault(); const a = Number(event.currentTarget.querySelector('[name="first"]').value); const b = Number(event.currentTarget.querySelector('[name="second"]').value); if (![a,b].every(Number.isFinite)) return;
+      let outputs;
+      if (polar) { let angle = Math.atan2(b,a); if (this.data.settings.angleMode === 'DEG') angle *= 180/Math.PI; if (this.data.settings.angleMode === 'GRAD') angle *= 200/Math.PI; outputs = [['r',Math.hypot(a,b)],['θ',angle]]; }
+      else { let angle=b; if (this.data.settings.angleMode === 'DEG') angle *= Math.PI/180; if (this.data.settings.angleMode === 'GRAD') angle *= Math.PI/200; outputs = [['x',a*Math.cos(angle)],['y',a*Math.sin(angle)]]; }
+      host.querySelector('.sc-coordinate-result').innerHTML = outputs.map(([label,value])=>`<button type="button" data-coordinate-value="${ESCAPE(value)}">${label} = ${ESCAPE(formatNumber(value))} <small>Insert</small></button>`).join('');
+      host.querySelectorAll('[data-coordinate-value]').forEach((button)=>button.addEventListener('click',()=>{this.insertAtCursor(button.dataset.coordinateValue,input);close();}));
+    });
+  }
+
+  openModeDialog() {
+    const id = `${this.instanceId}-mode-title`;
+    const choices = [
+      ['COMP','1 · COMP','General scientific calculations'], ['CMPLX','2 · CMPLX','Complex arithmetic'],
+      ['STAT','3 · STAT','One-variable descriptive statistics'], ['BASE-N','4 · BASE-N','Binary, octal, decimal and hexadecimal'],
+      ['EQN','5 · EQN','Linear and quadratic equations'], ['MATRIX','6 · MATRIX','2 × 2 determinants and inverses'],
+      ['TABLE','7 · TABLE','Function value table'], ['VECTOR','8 · VECTOR','2D and 3D vector operations']
+    ];
+    const content = `<div class="sc-dialog-header"><h2 id="${id}">Calculation mode</h2><button type="button" class="sc-dialog-close" data-dialog-close aria-label="Close">×</button></div><p>Select one of the available local calculation workspaces.</p>${choices.map(([mode,label,description])=>`<button type="button" data-mode-choice="${mode}" aria-pressed="${this.calculationMode===mode}"><strong>${label}</strong><small>${description}</small></button>`).join('')}`;
+    const {host, close} = this.openDialog(content, id);
+    host.querySelectorAll('[data-mode-choice]').forEach((button) => button.addEventListener('click', () => { const mode = button.dataset.modeChoice; close(); this.setCalculationMode(mode); }));
   }
 
   handleMemory(action, input) {
@@ -564,7 +734,7 @@ export class ScientificCalculator {
       this.data.memory = this.lastResult;
     } else if (action === 'recall') {
       if (this.data.memory === null) { this.showNotice('Calculator memory is empty.'); return; }
-      const insertion = formatNumber(this.data.memory, { precision: this.data.settings.precision, notation: this.data.settings.notation }); this.insertAtCursor(insertion, input); return;
+      const insertion = formatNumber(this.data.memory, { precision: this.data.settings.precision, notation: this.data.settings.notation, fixedDigits: this.data.settings.fixedDigits }); this.insertAtCursor(insertion, input); return;
     } else if (!Number.isFinite(this.lastResult)) { this.showNotice('Calculate a numeric result before using M+ or M−.', 'error'); return; }
     else this.data.memory = (this.data.memory ?? 0) + (action === 'subtract' ? -1 : 1) * this.lastResult;
     this.persist(); const status = this.container.querySelector('.sc-memory-status'); if (status) status.textContent = this.data.memory === null ? 'M —' : `M ${formatNumber(this.data.memory)}`; this.updateDeviceStatus();
@@ -575,7 +745,7 @@ export class ScientificCalculator {
     this.expression = input.value;
     try {
       const result = evaluateExpression(this.expression, { variables: { ...this.variableValues(), ans: this.lastResult }, angleMode: this.data.settings.angleMode });
-      const output = { ...result, formatted: formatNumber(result.value, { precision: this.data.settings.precision, notation: this.data.settings.notation }), expression: this.expression, unit: '', steps: result.steps, mode: 'calculator', angleMode: this.data.settings.angleMode };
+      const output = { ...result, formatted: formatNumber(result.value, { precision: this.data.settings.precision, notation: this.data.settings.notation, fixedDigits: this.data.settings.fixedDigits }), expression: this.expression, unit: '', steps: result.steps, mode: 'calculator', angleMode: this.data.settings.angleMode };
       this.showOutput(output, 'calculator');
     } catch (error) { this.showCalculationError(error); }
   }
@@ -583,7 +753,7 @@ export class ScientificCalculator {
   showOutput(output, mode = this.mode) {
     if (!output || (!Number.isFinite(output.value) && typeof output.formatted !== 'string')) { this.showCalculationError(new Error('No finite result is available.')); return; }
     const value = Number.isFinite(output.value) ? output.value : null;
-    const formatted = output.formatted ?? formatNumber(value, { precision: this.data.settings.precision, notation: this.data.settings.notation });
+    const formatted = output.formatted ?? formatNumber(value, { precision: this.data.settings.precision, notation: this.data.settings.notation, fixedDigits: this.data.settings.fixedDigits });
     this.calculationOutput = { ...output, value, formatted, mode };
     if (Number.isFinite(value)) this.lastResult = value;
     this.updateAnswer(this.calculationOutput);
@@ -607,7 +777,7 @@ export class ScientificCalculator {
     const resultNode = this.container.querySelector('.sc-answer-value'); const unitNode = this.container.querySelector('.sc-answer-unit');
     const screen = this.container.querySelector('.sc-screen-result'); const steps = this.container.querySelector('.sc-answer-steps'); const disclosure = this.container.querySelector('.sc-answer-disclosure');
     const copy = this.container.querySelector('.sc-copy-result'); const save = this.container.querySelector('.sc-save-result'); const sendFraction = this.container.querySelector('.sc-send-fraction');
-    if (!output) { if (resultNode) { resultNode.textContent = 'Ready'; resultNode.removeAttribute('aria-label'); } if (unitNode) unitNode.textContent = ''; if (screen) { screen.textContent = this.lastResult === null ? '0' : formatNumber(this.lastResult, { precision: this.data.settings.precision, notation: this.data.settings.notation }); screen.removeAttribute('aria-label'); } steps?.setAttribute('hidden', ''); disclosure?.setAttribute('hidden', ''); if (copy) copy.disabled = true; if (save) save.disabled = true; if (sendFraction) sendFraction.disabled = true; return; }
+    if (!output) { if (resultNode) { resultNode.textContent = 'Ready'; resultNode.removeAttribute('aria-label'); } if (unitNode) unitNode.textContent = ''; if (screen) { screen.textContent = this.lastResult === null ? '0' : formatNumber(this.lastResult, { precision: this.data.settings.precision, notation: this.data.settings.notation, fixedDigits: this.data.settings.fixedDigits }); screen.removeAttribute('aria-label'); } steps?.setAttribute('hidden', ''); disclosure?.setAttribute('hidden', ''); if (copy) copy.disabled = true; if (save) save.disabled = true; if (sendFraction) sendFraction.disabled = true; return; }
     const fraction = Number.isFinite(output.value) ? formatFraction(output.value) : null;
     const shown = this.fractionDisplay && fraction ? `${fraction.exact ? '' : '≈ '}${fraction.text}` : output.formatted;
     if (resultNode) {

@@ -38,6 +38,12 @@ test('Settings exposes Calculator and keeps Downloads as a distinct category', (
   assert.match(shell, /data-cat="calculator" data-category="calculator"/);
   assert.match(shell, /id="sec-calculator"/);
   assert.match(shell, /fb-in-open-calculator/);
+  assert.match(shell, /calculatorOpenDestination/);
+  assert.match(shell, /fb-in-calculator-open-mini/);
+  assert.match(shell, /openCalculatorFromPreference\(\)/);
+  assert.match(shell, /Ctrl\+Alt\+Shift\+C/);
+  assert.match(shell, /openCalculatorFromPreference\(\);/);
+  assert.match(shell, /isSafeInternalSessionUrl\(url\)/, 'safe internal calculator, dictionary and tool pages are included in restore snapshots');
   assert.match(shell, /id="sec-downloads"/);
 });
 

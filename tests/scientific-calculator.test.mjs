@@ -19,6 +19,7 @@ import {
   sampleSurface,
   solveLinearEquation,
   solveQuadratic,
+  SCIENTIFIC_CONSTANTS,
   validateCalculatorVariableName
 } from '../packages/shared-ui/src/services/scientificCalculator.js';
 import {
@@ -88,12 +89,28 @@ test('calculator keypad scientific functions cover DMS, combinations and descrip
   assert.throws(() => evaluateExpression('ncr(4, 5)'), /0 ≤ r ≤ n/);
 });
 
+test('scientific calculator supports random functions, atan2 and searchable physical constants', () => {
+  assert.equal(evaluateExpression('atan2(1, 0)', { angleMode: 'RAD' }).value, Math.PI / 2);
+  const random = evaluateExpression('rand()').value;
+  assert.ok(random >= 0 && random < 1);
+  const integer = evaluateExpression('randint(-4, 6)').value;
+  assert.ok(Number.isInteger(integer) && integer >= -4 && integer <= 6);
+  assert.equal(evaluateExpression('c').value, 299792458);
+  assert.equal(evaluateExpression('faraday').value, 96485.33212);
+  assert.ok(SCIENTIFIC_CONSTANTS.length >= 40);
+  assert.ok(SCIENTIFIC_CONSTANTS.some(({ name }) => name === 'pi'));
+  assert.throws(() => evaluateExpression('randint(1.5, 3)'), /safe integer bounds/);
+});
+
 test('result formatting is bounded and normalizes floating-point display noise', () => {
   assert.equal(formatNumber(0.1 + 0.2), '0.3');
   assert.equal(formatNumber(-0), '0');
   assert.equal(formatNumber(Number.NaN), '—');
   assert.match(formatNumber(1e-12), /e-12/);
   assert.match(formatNumber(12000, { notation: 'engineering' }), /e\+3/);
+  assert.equal(formatNumber(12.345, { notation: 'fixed', fixedDigits: 2 }), '12.35');
+  assert.match(formatNumber(0.001, { notation: 'norm1' }), /e-3/);
+  assert.equal(formatNumber(0.001, { notation: 'norm2' }), '0.001');
   assert.deepEqual(formatFraction(0.5), { numerator: 1, denominator: 2, text: '1/2', exact: true, error: 0 });
   assert.equal(formatFraction(1 / 3).text, '1/3');
   assert.equal(formatFraction(Math.PI).exact, false);
@@ -191,6 +208,16 @@ test('chemical formula parser calculates common nested molar masses and rejects 
   closeTo(calculateMolarMass('Al2(SO4)3').value, 342.131, .001);
   assert.throws(() => calculateMolarMass('Xx2'), /not in the built-in offline table/);
   assert.throws(() => calculateMolarMass('Ca(OH2'), /not closed/);
+});
+
+test('calculator settings sanitize added modes and FIX precision', () => {
+  const data = sanitizeScientificCalculatorData({ settings:{calculationMode:'VECTOR', notation:'fixed', fixedDigits:9} });
+  assert.equal(data.settings.calculationMode, 'VECTOR');
+  assert.equal(data.settings.notation, 'fixed');
+  assert.equal(data.settings.fixedDigits, 9);
+  const invalid = sanitizeScientificCalculatorData({ settings:{calculationMode:'NOT-A-MODE', fixedDigits:99} });
+  assert.equal(invalid.settings.calculationMode, 'COMP');
+  assert.equal(invalid.settings.fixedDigits, 9);
 });
 
 test('profile-scoped calculator repository persists bounded, sanitized local data', async () => {
