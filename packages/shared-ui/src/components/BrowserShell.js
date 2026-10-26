@@ -20644,14 +20644,20 @@ export class BrowserShell {
         pressedPointer = null;
         suppressNextClick = true;
         if (suppressionTimer) clearTimeout(suppressionTimer);
-        suppressionTimer = setTimeout(() => { suppressNextClick = false; }, 0);
+        // The compatibility click is dispatched in a later browser task, so
+        // a zero-delay timer expires before it arrives and lets submenu
+        // toggles run twice (open on pointerup, then immediately close on
+        // click). Keep the one-shot guard long enough for that paired click.
+        suppressionTimer = setTimeout(() => { suppressNextClick = false; suppressionTimer = null; }, 500);
         suppressionTimer?.unref?.();
         event?.preventDefault?.();
         event?.stopPropagation?.();
         handler(event);
       });
       button.addEventListener('click', (event) => {
-        if (suppressNextClick) {
+        // detail > 0 identifies the browser's pointer-generated click. A
+        // keyboard/assistive click has detail === 0 and must stay actionable.
+        if (suppressNextClick && Number(event?.detail) > 0) {
           suppressNextClick = false;
           if (suppressionTimer) clearTimeout(suppressionTimer);
           suppressionTimer = null;

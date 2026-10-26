@@ -603,28 +603,53 @@ test('TAB GROUP DURABILITY: navigation, closure, clearing site data, restart, an
   }
 });
 
-test('TAB RIGHT-CLICK: group, move, open, and remove actions work for the tab under the pointer', async () => {
-  const { shell } = await makeShell();
+test('TAB RIGHT-CLICK: pointer activation moves the tab into a durable group', async () => {
+  const storage = makeStorage();
+  let shell = (await makeShell({ storage })).shell;
   try {
-    const target = shell.getActiveTab();
+    let target = shell.getActiveTab();
     target.url = 'https://target.example/';
     const grouped = shell.createNewTab();
     grouped.url = 'https://grouped.example/';
-    grouped.group = { name: 'Work', color: '#10b981' };
-    shell.render();
+    shell._textPromptDialog = async () => 'Work';
+    await shell.groupTabWithPrompt(grouped.id, {
+      title: 'Create tab group', description: 'Create a test group', placeholder: 'Work'
+    });
+    const durableId = shell.getTabGroups().find((group) => group.name === 'Work')?.catalogId;
+    assert.ok(durableId, 'the existing group is stored in the durable catalog');
 
+    const dispatchPointer = (button, type) => button.dispatchEvent({
+      type, pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0,
+      preventDefault() {}, stopPropagation() {}
+    });
     shell.renderTabContextMenu(40, 40, target);
     let buttons = [...document.body.querySelectorAll('.fb-tab-context-menu-item')];
     const addTo = buttons.find((button) => button.textContent === 'Add to…');
     assert.ok(addTo, 'the context menu keeps group actions concise behind Add to…');
     const submenu = document.body.querySelector('.fb-tab-context-submenu');
     assert.equal(submenu.style.display, 'none', 'the group list is collapsed until requested');
-    addTo.click();
-    assert.equal(submenu.style.display, 'flex', 'selecting Add to… reveals the available tab groups');
+    dispatchPointer(addTo, 'pointerdown');
+    dispatchPointer(addTo, 'pointerup');
+    await flush(); // click is a later task than pointerup in real browsers
+    addTo.dispatchEvent({ type: 'click', detail: 1, preventDefault() {}, stopPropagation() {} });
+    assert.equal(submenu.style.display, 'flex', 'the paired click does not immediately collapse the pointer-opened submenu');
     const addToWork = submenu.querySelectorAll('.fb-tab-context-submenu-item').find((button) => button.textContent === 'Work');
     assert.ok(addToWork, 'the submenu lists the existing group');
-    addToWork.click();
+    dispatchPointer(addToWork, 'pointerdown');
+    dispatchPointer(addToWork, 'pointerup');
+    await flush();
+    addToWork.dispatchEvent({ type: 'click', detail: 1, preventDefault() {}, stopPropagation() {} });
     assert.equal(target.group?.name, 'Work', 'the right-clicked tab, not only the active tab, joins the selected group');
+    assert.equal(target.group?.id, durableId, 'the move attaches the stable catalog identity');
+
+    shell.destroy();
+    shell = (await makeShell({ storage })).shell;
+    let restored = shell.getTabGroups().find((group) => group.catalogId === durableId);
+    assert.ok(restored, 'adding a tab does not make its group transient');
+    assert.ok(restored.tabs.some((tab) => tab.url === 'https://target.example/'), 'the new member is persisted across restart');
+    assert.equal(shell.openTabGroup(restored.id), true);
+    target = shell.state.tabs.find((tab) => tab.url === 'https://target.example/');
+    assert.equal(target?.group?.id, durableId, 'the group assignment is restored when reopening the group');
 
     shell.renderTabContextMenu(40, 40, target);
     buttons = [...document.body.querySelectorAll('.fb-tab-context-menu-item')];
@@ -634,8 +659,7 @@ test('TAB RIGHT-CLICK: group, move, open, and remove actions work for the tab un
     remove.click();
     assert.equal(target.group, null, 'remove action ungroups the selected tab');
 
-    // The Yayra drawer also exposes the saved/live group as a one-click
-    // entry instead of requiring the user to open Settings or the picker.
+    // The Yayra drawer also exposes the saved group as a one-click entry.
     shell.state.isSideDrawerOpen = true;
     shell.render();
     const drawerEntry = shell.rootElement.querySelector('.fb-dr-tg-open');
