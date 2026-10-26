@@ -241,9 +241,11 @@ export class ScientificCalculator {
       const rowNumber = rowIndex + 1; const columnNumber = colIndex + 1;
       if ((rowNumber === 1 || rowNumber === 2) && (columnNumber === 3 || columnNumber === 4)) return;
       const [label, action, shift, alpha, shiftCaption] = item;
+      const trackSpan = rowNumber >= 6 && row.filter(Boolean).length === 5 ? 6 : 5;
+      const gridColumn = ((columnNumber - 1) * trackSpan) + 1;
       const keyClass = ['=', 'evaluate'].includes(label) ? 'sc-key-equals' : ['×', '÷', '−', '+', 'x^□'].includes(label) ? 'sc-key-operator' : ['SHIFT', 'ALPHA', 'MODE', 'HYP'].includes(label) ? 'sc-key-function' : /^\d$/.test(label) || label === '.' ? 'sc-key-number' : '';
       const small = shiftCaption || shift;
-      markup += `<button type="button" class="sc-key ${keyClass} sc-key-${action}" data-key="${ESCAPE(label)}" data-action="${action}" data-shift="${ESCAPE(shift)}" data-alpha="${ESCAPE(alpha)}" style="grid-column:${columnNumber};grid-row:${rowNumber}" aria-label="${ESCAPE(label === '=' ? 'Evaluate expression' : label === 'a/b' ? 'Insert a stacked fraction' : label)}"><small>${ESCAPE(small || '')}</small><strong>${ESCAPE(label)}</strong><small>${ESCAPE(alpha || '')}</small></button>`;
+      markup += `<button type="button" class="sc-key ${keyClass} sc-key-${action}" data-key="${ESCAPE(label)}" data-action="${action}" data-shift="${ESCAPE(shift)}" data-alpha="${ESCAPE(alpha)}" style="grid-column:${gridColumn} / span ${trackSpan};grid-row:${rowNumber}" aria-label="${ESCAPE(label === '=' ? 'Evaluate expression' : label === 'a/b' ? 'Insert a stacked fraction' : label)}"><small>${ESCAPE(small || '')}</small><strong>${ESCAPE(label)}</strong><small>${ESCAPE(alpha || '')}</small></button>`;
     }));
     return `${markup}${navPad}`;
   }

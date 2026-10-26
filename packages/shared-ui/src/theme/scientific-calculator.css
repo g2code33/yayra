@@ -317,8 +317,9 @@
 }
 
 /* Added calculator mode, setup and constant-list workspaces. */
-.sc-keypad { grid-auto-rows:minmax(39px,auto); gap:4px; }
-.sc-key { min-height:39px; }
+.sc-keypad { grid-template-columns:repeat(30,minmax(0,1fr)); grid-auto-rows:minmax(39px,auto); column-gap:0; row-gap:4px; }
+.sc-key { min-height:39px; margin-inline:2px; }
+.sc-navigation-pad { grid-column:11 / span 10; }
 .sc-mode-dialog h3 { margin:9px 0 2px; color:var(--sc-muted); font-size:.68rem; text-transform:uppercase; letter-spacing:.08em; }
 .sc-mode-dialog > button[data-mode-choice][aria-pressed="true"] { border-color:rgba(56,189,248,.48); background:rgba(8,145,178,.2); }
 .sc-setup-fix { display:none; gap:8px; align-items:center; justify-content:space-between; padding:8px; border:1px solid var(--sc-line); border-radius:8px; color:var(--sc-muted); font-size:.72rem; }
