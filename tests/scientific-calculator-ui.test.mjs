@@ -88,6 +88,53 @@ test('keypad clicks after a result update the expression at its caret without re
   view.destroy();
 });
 
+test('the first arithmetic operation after a result continues from Ans and positions subsequent keys after it', () => {
+  const { document, window } = newDOM();
+  const container = document.createElement('div');
+  const view = new ScientificCalculator({ container, data: defaultScientificCalculatorData() });
+  const input = container.querySelector('.sc-expression');
+  Object.defineProperties(input, {
+    selectionStart: { configurable: true, writable: true, value: 3 },
+    selectionEnd: { configurable: true, writable: true, value: 3 }
+  });
+  input.setSelectionRange = (start, end) => { input.selectionStart = start; input.selectionEnd = end; };
+  const press = (selector) => {
+    const button = container.querySelector(selector);
+    const down = new window.Event('mousedown', { bubbles: true, cancelable: true });
+    button.dispatchEvent(down);
+    button.click();
+  };
+  input.value = '2+2';
+  input.dispatchEvent(new window.Event('input', { bubbles: true }));
+  press('.sc-key[data-action="evaluate"]');
+  assert.equal(view.lastAnswer, 4);
+
+  press('.sc-key[data-key="+"]');
+  assert.equal(input.value, 'Ans+', 'the first operation replaces the old question with Ans and appends the operation');
+  assert.equal(input.selectionStart, input.value.length, 'the cursor lands to the right of the inserted operator');
+  press('.sc-key[data-key="3"]');
+  assert.equal(input.value, 'Ans+3', 'the next key is inserted after Ans and the operation');
+  assert.equal(input.selectionStart, input.value.length);
+  press('.sc-key[data-action="evaluate"]');
+  assert.equal(container.querySelector('.sc-screen-result').textContent, '7', 'Ans uses the previous calculated answer');
+
+  press('.sc-key[data-key="×"]');
+  assert.equal(input.value, 'Ans×', 'multiplication also continues from Ans rather than the previous question');
+  press('.sc-key[data-key="2"]');
+  assert.equal(input.value, 'Ans×2');
+  assert.equal(input.selectionStart, input.value.length);
+  press('.sc-key[data-action="evaluate"]');
+  assert.equal(container.querySelector('.sc-screen-result').textContent, '14');
+
+  const keyboardOperator = new window.Event('keydown', { bubbles: true, cancelable: true });
+  Object.defineProperty(keyboardOperator, 'key', { value: '-' });
+  input.dispatchEvent(keyboardOperator);
+  assert.equal(keyboardOperator.defaultPrevented, true);
+  assert.equal(input.value, 'Ans−', 'typing an operator after an answer uses the same Ans continuation behavior');
+  assert.equal(input.selectionStart, input.value.length);
+  view.destroy();
+});
+
 test('keypad insertions use the remembered caret and leave it after the complete clicked token', () => {
   const { document, window } = newDOM();
   const container = document.createElement('div');

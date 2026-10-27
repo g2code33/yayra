@@ -238,7 +238,7 @@ export class ScientificCalculator {
     this.container.querySelector('.sc-open-settings').addEventListener('click', () => this.onOpenSettings());
     const expressionInput = this.container.querySelector('.sc-expression');
     expressionInput.addEventListener('input', () => { this.expression = expressionInput.value; this.historyCursor = -1; this.historyDraft = ''; this.awaitingNewExpression = false; this.rememberExpressionSelection(expressionInput); this.refreshExpressionPreview(); });
-    expressionInput.addEventListener('focus', () => { this.awaitingNewExpression = false; this.expressionIsEditing = true; this.refreshExpressionPreview(); });
+    expressionInput.addEventListener('focus', () => { this.expressionIsEditing = true; this.refreshExpressionPreview(); });
     expressionInput.addEventListener('blur', () => { this.rememberExpressionSelection(expressionInput); this.expressionIsEditing = false; this.refreshExpressionPreview(); });
     expressionInput.addEventListener('click', () => this.rememberExpressionSelection(expressionInput));
     expressionInput.addEventListener('keyup', () => this.rememberExpressionSelection(expressionInput));
@@ -255,7 +255,15 @@ export class ScientificCalculator {
     this.container.querySelector('.sc-expression-preview')?.addEventListener('keydown', (event) => {
       if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); editExpression(); }
     });
-    expressionInput.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); this.evaluateCurrent(); } });
+    expressionInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); this.evaluateCurrent(); return; }
+      const keyboardOperators = new Map([['+', '+'], ['-', '−'], ['−', '−'], ['*', '×'], ['×', '×'], ['/', '÷'], ['÷', '÷'], ['^', '^']]);
+      if (this.awaitingNewExpression && keyboardOperators.has(event.key)) {
+        event.preventDefault();
+        this.beginAnswerContinuation(expressionInput);
+        this.insertAtCursor(keyboardOperators.get(event.key), expressionInput);
+      }
+    });
     this.container.querySelectorAll('.sc-key, .sc-device-status button, .sc-navigation-pad button, .sc-memory-keys button').forEach((button) => button.addEventListener('mousedown', (event) => event.preventDefault()));
     this.container.querySelectorAll('.sc-key').forEach((button) => button.addEventListener('click', () => this.handleKey(button.dataset.key, button.dataset.action, expressionInput, button)));
     this.container.querySelectorAll('.sc-navigation-pad [data-nav]').forEach((button) => button.addEventListener('click', () => this.moveNavigation(button.dataset.nav, expressionInput)));
@@ -776,7 +784,24 @@ export class ScientificCalculator {
     return { start: input.value.length, end: input.value.length };
   }
 
+  beginAnswerContinuation(input) {
+    if (!this.awaitingNewExpression) return false;
+    this.expression = 'Ans';
+    input.value = this.expression;
+    this.awaitingNewExpression = false;
+    this.historyCursor = -1;
+    this.historyDraft = '';
+    input.focus();
+    input.setSelectionRange?.(this.expression.length, this.expression.length);
+    this.rememberExpressionSelection(input);
+    this.expressionIsEditing = true;
+    this.refreshExpressionPreview();
+    return true;
+  }
+
   insertAtCursor(text, input, overwrite = false) {
+    const insertion = String(text);
+    if (this.awaitingNewExpression && ['+', '−', '×', '÷', '*', '/', '^', '!'].some((token) => insertion.startsWith(token))) this.beginAnswerContinuation(input);
     const { start, end: selectedEnd } = this.selectionForExpression(input);
     const end = overwrite && start === selectedEnd ? Math.min(input.value.length, start + String(text).length) : selectedEnd;
     this.expression = `${input.value.slice(0, start)}${text}${input.value.slice(end)}`;
