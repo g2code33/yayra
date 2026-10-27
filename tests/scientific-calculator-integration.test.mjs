@@ -61,6 +61,17 @@ test('calculator workspace includes numerical graph analysis, local calculus and
   assert.match(engine, /export function findFunctionRoots/);
 });
 
+test('desktop keeps calculator and answer visible while only the right workspace scrolls', () => {
+  const desktop = css.slice(css.lastIndexOf('@media (min-width:1051px)'));
+  assert.notEqual(desktop, css, 'desktop viewport rules are present');
+  assert.match(desktop, /fb-internal-page\.fb-scientific-calculator-page \{ overflow:hidden; \}/);
+  assert.match(desktop, /\.sc-workspace-column \{[^}]*overflow-y:auto/);
+  assert.match(desktop, /\.sc-calculator-column \{[^}]*position:sticky/);
+  assert.match(desktop, /grid-auto-rows:minmax\(35px,auto\)/);
+  const mobileReflow = desktop.slice(desktop.indexOf('@media (max-width:1050px)'));
+  assert.match(mobileReflow, /overflow-y:auto/);
+});
+
 test('calculator styles use the design system and responsive graph/canvas presentation', () => {
   assert.match(designCss, /scientific-calculator\.css/);
   assert.match(css, /@media \(max-width:700px\)/);

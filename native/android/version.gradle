@@ -1,5 +1,5 @@
 ext {
     applicationId = "com.yayra.app"
-    appVersionName = "1.0.96"
-    appVersionCode = 1000096
+    appVersionName = "1.0.97"
+    appVersionCode = 1000097
 }
