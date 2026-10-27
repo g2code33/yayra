@@ -48,11 +48,6 @@
 .sc-expression-preview { display:none; width:100%; min-height:44px; max-height:90px; align-items:center; gap:6px; overflow:auto; padding:4px 0; border:0; border-radius:0; color:#101711; background:transparent; font:1.02rem/1.35 ui-monospace,SFMono-Regular,Menlo,monospace; text-align:left; cursor:text; }
 .sc-expression-stage.is-rendered .sc-expression { display:none; }
 .sc-expression-stage.is-rendered .sc-expression-preview { display:flex; }
-.sc-expression-stage.is-editing-rendered .sc-expression { display:block; position:absolute; inset:0; z-index:2; width:100%; height:100%; min-height:44px; max-height:none; resize:none; color:transparent!important; -webkit-text-fill-color:transparent; caret-color:#101914!important; background:transparent!important; }
-.sc-expression-stage.is-editing-rendered.has-stacked-fractions { outline:2px solid rgba(22,101,52,.24); outline-offset:-1px; }
-.sc-expression-stage.is-editing-rendered.has-stacked-fractions .sc-expression { caret-color:transparent!important; }
-.sc-expression-stage.is-editing-rendered .sc-expression-preview { pointer-events:none; }
-.sc-expression-stage.is-editing-rendered .sc-expression-edit-icon { color:#166534; }
 .sc-expression-preview:focus-visible { outline:2px solid rgba(22,101,52,.62); outline-offset:-2px; }
 .sc-expression-preview-value { display:inline-flex; min-width:0; min-height:34px; flex:1; align-items:center; white-space:pre-wrap; overflow-wrap:anywhere; }
 .sc-expression-edit-icon { align-self:flex-start; margin-left:auto; padding:0 2px; color:#56614f; font-size:.72rem; line-height:1; }
@@ -392,7 +387,7 @@
   .sc-workspace-nav { margin-bottom:8px; padding:3px; }
   .sc-mode-button { min-height:35px; padding:5px 7px; }
   .sc-layout { flex:1; min-height:0; align-items:stretch; gap:10px; }
-  .sc-calculator-column { position:sticky; top:0; align-self:stretch; gap:8px; height:100%; max-height:100%; overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin; scrollbar-gutter:stable; }
+  .sc-calculator-column { position:sticky; top:0; align-self:stretch; gap:8px; height:100%; max-height:100%; min-height:0; overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin; scrollbar-gutter:stable; }
   .sc-workspace-column { display:flex; height:100%; min-height:0; flex-direction:column; gap:9px; overflow:hidden; }
   .sc-workspace-fixed { display:grid; flex:none; align-content:start; gap:7px; }
   .sc-workspace-scroll { display:grid; flex:1; min-height:0; align-content:start; gap:9px; overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin; scrollbar-color:rgba(100,116,139,.85) rgba(15,23,42,.5); scrollbar-gutter:stable; padding-right:4px; }
@@ -418,6 +413,19 @@
   .sc-workspace-fixed > .sc-answer-card .sc-answer-actions button { padding:4px 6px; font-size:.58rem; }
   .sc-workspace-fixed > .sc-answer-card .sc-answer-value { margin-top:3px; font-size:clamp(1rem,1.7vw,1.4rem); }
   .sc-workspace-fixed > .sc-answer-card .sc-answer-steps { max-height:65px; margin-top:5px; padding-top:5px; }
+}
+@media (max-height:700px) and (min-width:1051px) {
+  .sc-calculator-device { padding:10px; }
+  .sc-device-brand { margin-bottom:4px; }
+  .sc-display { min-height:80px; padding:5px 8px; }
+  .sc-device-status { margin:4px 2px 1px; }
+  .sc-keypad { grid-auto-rows:minmax(25px,auto); row-gap:2px; margin-top:2px; }
+  .sc-key { min-height:25px; grid-template-rows:5px 1fr 5px; padding:1px; }
+  .sc-key strong { font-size:.68rem; }
+  .sc-key small { font-size:.36rem; }
+  .sc-navigation-pad { width:72px; height:54px; padding:2px; }
+  .sc-memory-keys { margin-top:4px; }
+  .sc-shortcut-hint { display:none; }
 }
 @media (max-width:1050px) {
   .fb-internal-page.fb-scientific-calculator-page { overflow-x:hidden; overflow-y:auto; }

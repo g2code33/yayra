@@ -122,14 +122,13 @@ export class ScientificCalculator {
     const source = input.value.trim();
     preview.replaceChildren();
     if (!source) {
-      stage.classList.remove('is-rendered', 'is-editing-rendered', 'has-stacked-fractions');
+      stage.classList.remove('is-rendered');
       preview.removeAttribute('title');
       return;
     }
     const value = document.createElement('span');
     value.className = 'sc-expression-preview-value';
     const tokens = this.fractionTokensForExpression(input.value);
-    stage.classList.toggle('has-stacked-fractions', tokens.length > 0);
     let cursor = 0;
     for (const token of tokens) {
       if (token.index < cursor) continue;
@@ -147,8 +146,7 @@ export class ScientificCalculator {
     preview.append(value, edit);
     preview.setAttribute('aria-label', `Edit expression: ${source}`);
     preview.title = `Click to edit expression: ${source.slice(0, 160)}`;
-    stage.classList.add('is-rendered');
-    stage.classList.toggle('is-editing-rendered', this.expressionIsEditing);
+    stage.classList.toggle('is-rendered', !this.expressionIsEditing);
   }
 
   showCalculationError(error) {
@@ -636,9 +634,13 @@ export class ScientificCalculator {
     }
     const entries = this.data.history;
     if (!entries.length) { this.showNotice('No calculation history to browse.'); return; }
-    if (this.historyCursor < 0) { this.historyDraft = input.value; this.historyCursor = 0; }
-    else if (direction === 'up') this.historyCursor = Math.min(entries.length - 1, this.historyCursor + 1);
-    else if (direction === 'down') this.historyCursor -= 1;
+    if (direction === 'up') {
+      if (this.historyCursor < 0) { this.historyDraft = input.value; this.historyCursor = 0; }
+      else this.historyCursor = Math.min(entries.length - 1, this.historyCursor + 1);
+    } else if (direction === 'down') {
+      if (this.historyCursor < 0) return;
+      this.historyCursor -= 1;
+    }
     if (this.historyCursor < 0) { input.value = this.historyDraft; this.expression = input.value; }
     else { input.value = entries[this.historyCursor].expression; this.expression = input.value; }
     input.focus(); input.setSelectionRange?.(input.value.length, input.value.length);

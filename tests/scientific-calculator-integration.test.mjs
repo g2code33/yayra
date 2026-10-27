@@ -70,12 +70,16 @@ test('desktop pins the calculator and result area while the right-side science w
     'the right-side work area has its own vertical scrollbar');
   assert.match(desktop, /\.sc-workspace-fixed \{[^}]*flex:none/,
     'the header, tabs and result occupy permanent space beside the calculator');
-  assert.match(desktop, /\.sc-calculator-column \{[^}]*position:sticky[^}]*height:100%; max-height:100%; overflow-y:auto/,
+  assert.match(desktop, /\.sc-calculator-column \{[^}]*position:sticky[^}]*height:100%; max-height:100%; min-height:0; overflow-y:auto/,
     'the calculator remains pinned and its lower controls can scroll into view if needed');
   assert.match(desktop, /\.sc-workspace-fixed > \.sc-answer-card \{[^}]*padding:6px 9px/,
     'the answer card stays compact in its own permanent area');
   assert.match(desktop, /grid-auto-rows:minmax\(clamp\(31px,calc\(13px \+ 3vh\),40px\),auto\)/,
     'calculator key size scales with viewport height to use available space');
+  const shortViewport = css.slice(css.indexOf('@media (max-height:700px)'));
+  assert.match(shortViewport, /\.sc-keypad \{ grid-auto-rows:minmax\(25px,auto\)/,
+    'short screens compact the keypad so its bottom controls remain visible');
+  assert.match(shortViewport, /\.sc-shortcut-hint \{ display:none/);
   assert.match(css, /grid-template-columns:minmax\(340px,min\(34vw,440px\)\)/,
     'the calculator column is wider on desktop');
   const calculatorColumn = calculator.slice(calculator.indexOf('<main class="sc-calculator-column">'), calculator.indexOf('</main>'));

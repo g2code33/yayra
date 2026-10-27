@@ -38,6 +38,40 @@ test('the calculator and result/header area stay fixed while the right-side work
   assert.ok(scrollArea.querySelector('.sc-side-column'), 'the rest of the right workspace lives in its vertical scroll area');
 });
 
+test('the directional pad keeps cursor movement and calculation-history browsing on separate controls', () => {
+  const { document } = newDOM();
+  const container = document.createElement('div');
+  const view = new ScientificCalculator({ container, data: defaultScientificCalculatorData() });
+  const input = container.querySelector('.sc-expression');
+  input.value = 'draft';
+  Object.defineProperties(input, {
+    selectionStart: { configurable: true, writable: true, value: 2 },
+    selectionEnd: { configurable: true, writable: true, value: 2 }
+  });
+  input.setSelectionRange = (start, end) => { input.selectionStart = start; input.selectionEnd = end; };
+  view.data.history = [{ expression: '2+2' }, { expression: '3/4' }];
+  const press = (direction) => container.querySelector(`.sc-navigation-pad [data-nav="${direction}"]`).click();
+  for (const direction of ['left', 'right', 'up', 'down']) {
+    assert.equal(container.querySelector(`.sc-navigation-pad [data-nav="${direction}"]`).disabled, false,
+      `${direction} navigation remains available`);
+  }
+  press('left');
+  assert.equal(input.selectionStart, 1, 'left moves the expression cursor backward');
+  press('right');
+  assert.equal(input.selectionStart, 2, 'right moves the expression cursor forward');
+  press('down');
+  assert.equal(input.value, 'draft', 'down at the live expression does not unexpectedly load history');
+  press('up');
+  assert.equal(input.value, '2+2', 'up recalls the most recent calculation');
+  press('up');
+  assert.equal(input.value, '3/4', 'up again moves farther back through calculations');
+  press('down');
+  assert.equal(input.value, '2+2', 'down moves forward toward newer calculations');
+  press('down');
+  assert.equal(input.value, 'draft', 'down past the newest item restores the draft');
+  view.destroy();
+});
+
 test('fraction expressions render as a stacked calculator-screen fraction with a click-to-edit affordance', () => {
   const { document, window } = newDOM();
   const container = document.createElement('div');
@@ -55,11 +89,14 @@ test('fraction expressions render as a stacked calculator-screen fraction with a
   assert.ok(preview.querySelector('.sc-expression-edit-icon'));
   preview.click();
   assert.equal(input.value, expression, 'the original safe expression remains editable');
-  assert.equal(stage.classList.contains('is-rendered'), true, 'editing keeps the stacked fraction visible');
-  assert.equal(stage.classList.contains('is-editing-rendered'), true, 'a transparent input remains active above the formatted display');
+  assert.equal(stage.classList.contains('is-rendered'), false, 'editing returns to the raw bracket expression so its cursor and edits stay aligned');
+  assert.equal(stage.classList.contains('is-editing-rendered'), false);
   input.value = '((3)/(5))';
   input.dispatchEvent(new window.Event('input', { bubbles: true }));
-  assert.equal(preview.querySelector('.sc-fraction-numerator').textContent, '3', 'the formatted display updates as the expression is edited');
+  assert.equal(input.value, '((3)/(5))', 'the editable expression retains explicit parentheses and division');
+  input.blur();
+  assert.equal(stage.classList.contains('is-rendered'), true, 'the stacked display returns when editing is complete');
+  assert.equal(preview.querySelector('.sc-fraction-numerator').textContent, '3');
   assert.equal(preview.querySelector('.sc-fraction-denominator').textContent, '5');
   input.value = '3((3)/(5))8×8';
   input.dispatchEvent(new window.Event('input', { bubbles: true }));
@@ -67,7 +104,6 @@ test('fraction expressions render as a stacked calculator-screen fraction with a
   assert.equal(preview.querySelectorAll('.sc-stacked-fraction').length, 1, 'a stacked fraction remains formatted inside a larger expression');
   assert.equal(formattedValue.firstChild.textContent, '3');
   assert.equal(formattedValue.lastChild.textContent, '8×8');
-  assert.equal(stage.classList.contains('has-stacked-fractions'), true);
   view.destroy();
 });
 
