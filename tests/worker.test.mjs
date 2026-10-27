@@ -888,6 +888,7 @@ test('Google services delegation reflects the exact account, keeps tokens encryp
     'https://www.googleapis.com/auth/calendar.readonly'
   ].join(' ');
   const upstream = [];
+  let driveApiStatus = 200;
   globalThis.fetch = async (target, options = {}) => {
     const url = String(target);
     upstream.push({ url, options });
@@ -901,6 +902,7 @@ test('Google services delegation reflects the exact account, keeps tokens encryp
       return new Response(JSON.stringify({ sub: 'services-user', name: 'Selected User', email: 'selected@example.com' }), { status: 200 });
     }
     if (url.includes('/drive/v3/files?')) {
+      if (driveApiStatus !== 200) return new Response(JSON.stringify({ error: { code: driveApiStatus } }), { status: driveApiStatus });
       return new Response(JSON.stringify({ files: [
         { id: 'file-1', name: 'Private proposal.docx', modifiedTime: '2026-10-25T00:00:00Z', webViewLink: 'https://docs.google.com/document/d/file-1' },
         { id: 'file-2', name: '<script>unsafe</script>', modifiedTime: '2026-10-24T00:00:00Z', webViewLink: 'javascript:alert(1)' }
@@ -937,6 +939,15 @@ test('Google services delegation reflects the exact account, keeps tokens encryp
     assert.equal(listed.items[1].url, '', 'unsafe upstream URL is discarded');
     assert.equal(JSON.stringify(listed).includes('ya29.'), false);
     assert.ok(upstream.some((call) => call.url.includes('/drive/v3/files?') && call.options.headers.Authorization === 'Bearer ya29.services-private'));
+
+    driveApiStatus = 403;
+    const denied = await worker.fetch(new Request(serviceUrl, {
+      headers: { Origin: 'https://yayra.pages.dev', Authorization: authorization, 'cf-connecting-ip': '203.0.113.266' }
+    }), env);
+    assert.equal(denied.status, 403);
+    assert.deepEqual(await denied.json(), { error: 'google_service_permission_denied' },
+      'a Google API permission/API-enable failure is distinguished from an expired session');
+    driveApiStatus = 200;
 
     const foreign = await worker.fetch(new Request(serviceUrl, {
       headers: { Origin: 'https://attacker.example', Authorization: authorization, 'cf-connecting-ip': '203.0.113.263' }

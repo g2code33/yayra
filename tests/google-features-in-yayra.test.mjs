@@ -17,6 +17,17 @@ async function makeShell() {
   return { shell, container };
 }
 
+test('Google service preview errors explain how to repair missing scopes and disabled APIs', async () => {
+  const { shell } = await makeShell();
+  try {
+    assert.match(shell.formatGoogleServiceError('drive', 'service_scope_required'), /read-only Drive permission/);
+    assert.match(shell.formatGoogleServiceError('drive', 'google_services_reconnect_required'), /Reconnect Google services/);
+    assert.match(shell.formatGoogleServiceError('drive', 'google_service_permission_denied'), /enable Google Drive API/);
+  } finally {
+    shell.destroy();
+  }
+});
+
 test('Voice Search fallback and results stay in the active Yayra tab without window.open', async () => {
   const previousOpen = window.open;
   const previousRecognition = window.SpeechRecognition;

@@ -531,7 +531,8 @@ function createAuthBridge({
       const response = await fetchImpl(apiUrl, {
         headers: { Authorization: `Bearer ${session.tokens.access_token}`, Accept: 'application/json' }
       });
-      if (response.status === 401 || response.status === 403) throw new Error('google_services_reconnect_required');
+      if (response.status === 401) throw new Error('google_services_reconnect_required');
+      if (response.status === 403) return { ok: false, error: 'google_service_permission_denied' };
       if (!response.ok) return { ok: false, error: 'google_service_upstream_failed' };
       const payload = await readBoundedJson(response, 1024 * 1024, 'google_service_response_too_large');
       const normalized = catalog.normalizeGoogleServiceItems(serviceId, payload);

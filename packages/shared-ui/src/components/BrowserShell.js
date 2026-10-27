@@ -5060,7 +5060,7 @@ export class BrowserShell {
         panel.appendChild(loading);
       } else if (preview.status === 'error' || preview.status === 'unavailable') {
         const error = document.createElement('p');
-        error.textContent = this.formatGoogleSignInError(preview.error);
+        error.textContent = this.formatGoogleServiceError(preview.serviceId, preview.error);
         panel.appendChild(error);
       } else if (!preview.items.length) {
         const empty = document.createElement('p');
@@ -8593,6 +8593,37 @@ export class BrowserShell {
     if (code.includes('gmail_list_failed') || code.includes('gmail_message_failed')) return 'Gmail could not load this request. Please try again.';
     if (/fetch failed|network/i.test(code)) return 'Yayra could not reach Google. Check your connection and try again.';
     return 'Please try again.';
+  }
+
+  formatGoogleServiceError(serviceId, error) {
+    const code = String(error || '');
+    const service = googleServiceById(serviceId);
+    const name = service?.title || 'Google service';
+    if (code.includes('service_scope_required') || code.includes('scope_not_granted')) {
+      return `Google has not granted Yayra the read-only ${name} permission. Reconnect Google services and approve that scope.`;
+    }
+    if (code.includes('google_services_reconnect_required') || code.includes('google_services_session_required')) {
+      return `The Google services session expired or is missing. Reconnect Google services, then retry the ${name} preview.`;
+    }
+    if (code.includes('google_service_permission_denied') || code.includes('google_service_upstream_failed')
+      || /google_service_failed:(?:403|400)/.test(code)) {
+      const apiNames = {
+        drive: 'Google Drive API',
+        gmail: 'Gmail API',
+        calendar: 'Google Calendar API',
+        contacts: 'People API',
+        photos: 'Google Photos Library API',
+        tasks: 'Google Tasks API',
+        classroom: 'Google Classroom API',
+        youtube: 'YouTube Data API'
+      };
+      const apiName = apiNames[serviceId] || `${name} API`;
+      return `Google rejected the ${name} preview. In the same Cloud project as Yayra’s OAuth client, enable ${apiName}, confirm the read-only scope is approved, then reconnect Google services.`;
+    }
+    if (code.includes('google_service_upstream_unavailable') || /fetch failed|network/i.test(code)) {
+      return `Yayra could not reach Google to load ${name}. Check your connection and retry.`;
+    }
+    return this.formatGoogleSignInError(code);
   }
 
   renderGoogleAccountSectionHtml() {
@@ -20831,12 +20862,11 @@ export class BrowserShell {
       menu.style.top = `${top}px`;
     };
 
-    // Electron/Linux can occasionally deliver pointer-up while dropping the
-    // compatibility click as focus moves from the native site view to this
-    // renderer. Activate on primary pointer-up, retain click for keyboard and
-    // assistive technology, and suppress only the synthetic click belonging
-    // to the pointer-up we already handled. Commands are exactly-once even if
-    // both events arrive.
+    // Electron/Linux can drop pointerup/click while focus moves from the
+    // native site view to this renderer. Prefer primary pointerup, fall back
+    // to the paired mouseup if Electron drops the pointer event, and retain
+    // click for keyboard/assistive technology. Suppress the synthetic click
+    // after either pointer path so commands remain exactly-once.
     const pinMenuHitTarget = (button) => {
       // Chromium/Electron can treat descendants of frameless chrome as drag
       // regions even when their body-mounted menu is interactive. Pin each
@@ -20852,30 +20882,51 @@ export class BrowserShell {
       let suppressNextClick = false;
       let suppressionTimer = null;
       let pressedPointer = null;
+      let pressedMouse = false;
       const pointerToken = (event) => event?.pointerId ?? 'primary';
       const isPrimaryActivation = (event) => {
         if (event?.isPrimary === false) return false;
         const pointerButton = event?.button == null ? 0 : Number(event.button);
         return pointerButton === 0 || pointerButton === -1;
       };
-      button.addEventListener('pointerdown', (event) => {
-        if (isPrimaryActivation(event)) pressedPointer = pointerToken(event);
-      });
-      button.addEventListener('pointercancel', () => { pressedPointer = null; });
-      button.addEventListener('pointerup', (event) => {
-        if (!isPrimaryActivation(event) || pressedPointer !== pointerToken(event)) return;
-        pressedPointer = null;
+      const activatePress = (event) => {
         suppressNextClick = true;
         if (suppressionTimer) clearTimeout(suppressionTimer);
         // The compatibility click is dispatched in a later browser task, so
         // a zero-delay timer expires before it arrives and lets submenu
-        // toggles run twice (open on pointerup, then immediately close on
-        // click). Keep the one-shot guard long enough for that paired click.
+        // toggles run twice. Keep the one-shot guard long enough for that
+        // paired click.
         suppressionTimer = setTimeout(() => { suppressNextClick = false; suppressionTimer = null; }, 500);
         suppressionTimer?.unref?.();
         event?.preventDefault?.();
         event?.stopPropagation?.();
         handler(event);
+      };
+      button.addEventListener('pointerdown', (event) => {
+        if (isPrimaryActivation(event)) pressedPointer = pointerToken(event);
+      });
+      button.addEventListener('mousedown', (event) => {
+        if (Number(event?.button ?? 0) === 0) pressedMouse = true;
+      });
+      button.addEventListener('pointercancel', () => {
+        pressedPointer = null;
+        pressedMouse = false;
+      });
+      button.addEventListener('pointerup', (event) => {
+        if (!isPrimaryActivation(event) || pressedPointer !== pointerToken(event)) return;
+        pressedPointer = null;
+        pressedMouse = false;
+        activatePress(event);
+      });
+      // Some frameless Electron/Linux combinations lose pointerup/click while
+      // still delivering the compatibility mouseup. Treat that paired mouse
+      // release as a one-shot fallback; a normal pointerup clears pressedMouse
+      // first, so it cannot run the command twice.
+      button.addEventListener('mouseup', (event) => {
+        if (Number(event?.button ?? 0) !== 0 || !pressedMouse) return;
+        pressedMouse = false;
+        pressedPointer = null;
+        activatePress(event);
       });
       button.addEventListener('click', (event) => {
         // detail > 0 identifies the browser's pointer-generated click. A

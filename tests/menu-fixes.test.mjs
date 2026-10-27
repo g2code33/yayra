@@ -677,6 +677,52 @@ test('TAB RIGHT-CLICK: pointer activation moves the tab into a durable group', a
   }
 });
 
+test('TAB RIGHT-CLICK: mouseup fallback still adds to a group when Electron drops pointerup', async () => {
+  const { shell } = await makeShell();
+  try {
+    const target = shell.getActiveTab();
+    target.url = 'https://fallback-target.example/';
+    const grouped = shell.createNewTab();
+    grouped.url = 'https://fallback-group.example/';
+    shell._textPromptDialog = async () => 'Fallback';
+    await shell.groupTabWithPrompt(grouped.id, {
+      title: 'Create tab group', description: 'Create a test group', placeholder: 'Fallback'
+    });
+    const groupId = shell.getTabGroups().find((group) => group.name === 'Fallback')?.id;
+    const durableId = shell.getTabGroups().find((group) => group.name === 'Fallback')?.catalogId;
+    assert.ok(groupId);
+    assert.ok(durableId);
+
+    const dispatch = (button, type) => button.dispatchEvent({
+      type, pointerId: 7, pointerType: 'mouse', isPrimary: true, button: 0,
+      detail: type === 'click' ? 1 : 0,
+      preventDefault() {}, stopPropagation() {}
+    });
+    shell.renderTabContextMenu(40, 40, target);
+    const toggle = [...document.body.querySelectorAll('.fb-tab-context-menu-item')]
+      .find((button) => button.textContent === 'Add to…');
+    dispatch(toggle, 'pointerdown');
+    dispatch(toggle, 'mousedown');
+    // Deliberately omit pointerup: this is the Electron/Linux lost-event path.
+    dispatch(toggle, 'mouseup');
+    dispatch(toggle, 'click');
+    const submenu = document.body.querySelector('.fb-tab-context-submenu');
+    assert.equal(submenu.style.display, 'flex', 'mouseup opens the submenu exactly once');
+
+    const groupChoice = submenu.querySelectorAll('.fb-tab-context-submenu-item')
+      .find((button) => button.textContent === 'Fallback');
+    dispatch(groupChoice, 'pointerdown');
+    dispatch(groupChoice, 'mousedown');
+    dispatch(groupChoice, 'mouseup');
+    dispatch(groupChoice, 'click');
+    assert.equal(target.group?.name, 'Fallback', 'the mouseup fallback moves the right-clicked tab');
+    assert.equal(target.group?.id, durableId, 'the fallback preserves the selected durable group identity');
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
 test('TAB RIGHT-CLICK: opens an eligible non-private tab in mini and hides the action for private tabs', async () => {
   const previousBridge = window.yayra;
   const handoffs = [];

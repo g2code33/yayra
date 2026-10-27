@@ -1005,8 +1005,12 @@ async function getDelegatedGoogleServiceItems(request, url, headers, env, author
     return new Response(JSON.stringify({ error: 'google_service_upstream_unavailable' }), { status: 502, headers });
   }
   if (!response.ok) {
-    return new Response(JSON.stringify({ error: response.status === 401 ? 'google_services_reconnect_required' : 'google_service_upstream_failed' }), {
-      status: response.status === 401 ? 401 : 502,
+    const authExpired = response.status === 401;
+    const permissionDenied = response.status === 403;
+    return new Response(JSON.stringify({ error: authExpired
+      ? 'google_services_reconnect_required'
+      : (permissionDenied ? 'google_service_permission_denied' : 'google_service_upstream_failed') }), {
+      status: authExpired ? 401 : (permissionDenied ? 403 : 502),
       headers
     });
   }
