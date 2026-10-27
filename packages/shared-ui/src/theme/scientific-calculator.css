@@ -20,6 +20,9 @@
 .sc-icon-button { display:grid; place-items:center; width:35px; height:35px; border:1px solid var(--sc-line); border-radius:10px; color:var(--sc-muted); background:rgba(15,23,42,.75); cursor:pointer; }
 .sc-icon-button svg { width:18px; height:18px; }
 .sc-icon-button:hover { color:#fff; background:rgba(56,189,248,.13); }
+.sc-open-settings { display:flex; width:auto; min-width:35px; align-items:center; justify-content:center; gap:7px; padding:0 10px; border-color:rgba(56,189,248,.38); color:#bae6fd; background:rgba(8,47,73,.62); font-size:.68rem; font-weight:750; }
+.sc-open-settings:hover,.sc-open-settings:focus-visible { outline:2px solid rgba(56,189,248,.45); outline-offset:2px; color:#fff; background:rgba(8,145,178,.28); }
+.sc-settings-label { white-space:nowrap; }
 .sc-notice { margin:0 0 11px; padding:8px 11px; border:1px solid rgba(56,189,248,.2); border-radius:9px; color:#bae6fd; background:rgba(8,145,178,.09); font-size:.76rem; }
 .sc-notice[data-kind="error"] { border-color:rgba(248,113,113,.32); color:#fecaca; background:rgba(127,29,29,.2); }
 .sc-notice[hidden] { display:none; }
@@ -307,6 +310,26 @@
 [data-theme="light"] .sc-safety-note { background:#fffbeb; }
 [data-theme="light"] .fb-tools-dropdown { color:#0f172a; background:rgba(255,255,255,.98); }
 [data-theme="light"] .fb-tools-menu-item { color:#0f172a; }
+
+/* Keep every label and control readable when the calculator sits on a light page. */
+[data-theme="light"] .sc-workspace { --sc-line:rgba(51,65,85,.2); --sc-muted:#475569; }
+[data-theme="light"] .sc-tool-launch { border-color:#cbd5e1; color:#0f172a; background:linear-gradient(145deg,#fff,#f1f5f9); box-shadow:0 2px 7px rgba(15,23,42,.06); }
+[data-theme="light"] .sc-tool-launch:hover,[data-theme="light"] .sc-tool-launch:focus-visible { outline:2px solid rgba(8,145,178,.28); outline-offset:1px; border-color:#0891b2; background:#ecfeff; }
+[data-theme="light"] .sc-tool-launch small,[data-theme="light"] .sc-field-help,[data-theme="light"] .sc-local-note,[data-theme="light"] .sc-empty-state,[data-theme="light"] .sc-answer-steps { color:#475569; }
+[data-theme="light"] .sc-tool-launch b { color:#0e7490; }
+[data-theme="light"] .sc-eyebrow,[data-theme="light"] .sc-answer-label { color:#0e7490; }
+[data-theme="light"] .sc-side-tabs button { color:#475569; }
+[data-theme="light"] .sc-side-tabs button[aria-selected="true"] { color:#075985; }
+[data-theme="light"] .sc-local-indicator { color:#15803d; }
+[data-theme="light"] .sc-entry-expression,[data-theme="light"] .sc-entry-result,[data-theme="light"] .sc-entry-card small { color:#334155; }
+[data-theme="light"] .sc-answer-actions button,[data-theme="light"] .sc-entry-actions button,[data-theme="light"] .sc-formula-card button,[data-theme="light"] .sc-variable-row button,[data-theme="light"] .sc-notebook-toolbar button,[data-theme="light"] .sc-data-actions button,[data-theme="light"] .sc-import-button,[data-theme="light"] .sc-formula-actions button { border-color:#cbd5e1; color:#334155; background:#e2e8f0; }
+[data-theme="light"] .sc-answer-actions button:hover,[data-theme="light"] .sc-entry-actions button:hover,[data-theme="light"] .sc-formula-card button:hover,[data-theme="light"] .sc-variable-row button:hover,[data-theme="light"] .sc-notebook-toolbar button:hover,[data-theme="light"] .sc-data-actions button:hover,[data-theme="light"] .sc-import-button:hover,[data-theme="light"] .sc-formula-actions button:hover { border-color:#0891b2; color:#0c4a6e; background:#cffafe; }
+[data-theme="light"] .sc-answer-actions button:disabled { opacity:1; color:#64748b; background:#e2e8f0; }
+[data-theme="light"] .sc-open-settings { border-color:#0891b2; color:#075985; background:#e0f2fe; }
+[data-theme="light"] .sc-open-settings:hover,[data-theme="light"] .sc-open-settings:focus-visible { color:#fff; background:#0369a1; }
+[data-theme="light"] .sc-entry-card small { color:#475569; }
+@media (max-width:420px) { .sc-settings-label { display:none; } .sc-open-settings { width:35px; padding:0; } }
+
 @media print {
   body.sc-print-graph-mode * { visibility:hidden!important; }
   body.sc-print-graph-mode .sc-printing-graph,body.sc-print-graph-mode .sc-printing-graph * { visibility:visible!important; }

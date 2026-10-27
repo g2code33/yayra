@@ -58,7 +58,9 @@ export class ScientificCalculator {
     this.mode = 'calculator';
     this.calculationMode = this.data.settings.calculationMode || 'COMP';
     this.expression = '';
-    this.lastResult = this.data.history[0]?.result !== null && this.data.history[0]?.result !== undefined && Number.isFinite(Number(this.data.history[0].result)) ? Number(this.data.history[0].result) : null;
+    const latestNumericAnswer = this.data.history.find((entry) => entry.result !== null && entry.result !== undefined && Number.isFinite(Number(entry.result)));
+    this.lastAnswer = latestNumericAnswer ? Number(latestNumericAnswer.result) : null;
+    this.lastResult = this.lastAnswer;
     this.lastEntryId = null;
     this.sidePanel = 'history';
     this.calculationOutput = null;
@@ -117,7 +119,7 @@ export class ScientificCalculator {
             <label class="sc-angle-control"><span>Angle</span><select class="sc-angle-mode" aria-label="Angle unit"><option value="DEG">DEG</option><option value="RAD">RAD</option><option value="GRAD">GRAD</option></select></label>
             <label class="sc-angle-control"><span>Digits</span><select class="sc-precision-mode" aria-label="Significant digits"><option value="6">6</option><option value="9">9</option><option value="12">12</option><option value="15">15</option></select></label>
             <label class="sc-angle-control"><span>Format</span><select class="sc-notation-mode" aria-label="Number format"><option value="auto">NORM</option><option value="norm1">NORM1</option><option value="norm2">NORM2</option><option value="fixed">FIX</option><option value="scientific">SCI</option><option value="engineering">ENG</option></select></label>
-            <button class="sc-icon-button sc-open-settings" type="button" title="Calculator settings" aria-label="Calculator settings">${Icons.settings}</button>
+            <button class="sc-icon-button sc-open-settings" type="button" title="Calculator settings" aria-label="Calculator settings">${Icons.settings}<span class="sc-settings-label">Settings</span></button>
           </div>
         </header>
         <div class="sc-notice" role="status" aria-live="polite" hidden></div>
@@ -476,7 +478,7 @@ export class ScientificCalculator {
     if (action === 'alpha') { this.alphaActive = !this.alphaActive; this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'hyp') { this.hyperbolicActive = !this.hyperbolicActive; this.showNotice(`Hyperbolic functions ${this.hyperbolicActive ? 'enabled' : 'disabled'}.`); return; }
     if (action === 'mode') { if (this.shiftActive) this.openSetupDialog(); else this.openModeDialog(); this.shiftActive = false; this.updateKeyLayers(); return; }
-    if (action === 'on') { this.displayOn = true; this.container.querySelector('.sc-display')?.classList.remove('sc-display-off'); this.expression = ''; input.value = ''; this.calculationOutput = null; this.lastEntryId = null; this.lastResult = null; this.updateAnswer(null); this.showNotice('Calculator cleared.'); this.shiftActive = false; this.alphaActive = false; this.updateKeyLayers(); input.focus(); return; }
+    if (action === 'on') { this.displayOn = true; this.container.querySelector('.sc-display')?.classList.remove('sc-display-off'); this.expression = ''; input.value = ''; this.calculationOutput = null; this.lastEntryId = null; this.lastResult = null; this.updateAnswer(null); this.showNotice('Display cleared. Ans keeps the last calculated value.'); this.shiftActive = false; this.alphaActive = false; this.updateKeyLayers(); input.focus(); return; }
     if (action === 'drg') { this.cycleAngleMode(); return; }
     if (action === 'integral') { this.setMode('integrals'); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'fraction') { this.openFractionDialog(input); return; }
@@ -493,11 +495,27 @@ export class ScientificCalculator {
     if (action === 'clear') {
       if (this.shiftActive && button?.dataset.shift === 'off') {
         this.displayOn = false; this.container.querySelector('.sc-display')?.classList.add('sc-display-off');
-      } else { this.expression = ''; input.value = ''; this.calculationOutput = null; this.lastEntryId = null; this.lastResult = null; this.updateAnswer(null); this.showNotice('Expression and current answer cleared.'); }
+      } else { this.expression = ''; input.value = ''; this.calculationOutput = null; this.lastEntryId = null; this.lastResult = null; this.updateAnswer(null); this.showNotice('Expression and display cleared. Ans keeps the last calculated value.'); }
       this.shiftActive = false; this.updateKeyLayers(); return;
     }
     if (action === 'negative') { this.insertAtCursor('(-', input); return; }
-    if (action === 'answer') { if (this.shiftActive || this.alphaActive) { const token = this.alphaActive ? 'randint(,)' : 'rand()'; this.insertAtCursor(token, input, this.alphaActive ? 9 : token.length - 1); this.shiftActive = false; this.alphaActive = false; this.updateKeyLayers(); return; } if (this.lastResult === null) { this.showNotice('Calculate a result before using Ans.', 'error'); return; } this.insertAtCursor('ans', input); return; }
+    if (action === 'answer') {
+      if (this.shiftActive || this.alphaActive) {
+        const token = this.alphaActive ? 'randint(,)' : 'rand()';
+        this.insertAtCursor(token, input, this.alphaActive ? 9 : token.length - 1);
+        this.shiftActive = false; this.alphaActive = false; this.updateKeyLayers(); return;
+      }
+      if (this.lastAnswer === null) { this.showNotice('Calculate a result before using Ans.', 'error'); return; }
+      if (!input.value.trim()) {
+        const formatted = formatNumber(this.lastAnswer, { precision: this.data.settings.precision, notation: this.data.settings.notation, fixedDigits: this.data.settings.fixedDigits });
+        this.expression = formatted; input.value = formatted; input.focus();
+        this.lastResult = this.lastAnswer;
+        this.calculationOutput = { value: this.lastAnswer, formatted, expression: 'Ans', unit: '', steps: [], mode: 'calculator', angleMode: this.data.settings.angleMode };
+        this.updateAnswer(this.calculationOutput);
+        return;
+      }
+      this.insertAtCursor('ans', input); return;
+    }
     if (action === 'memory-recall') { this.handleMemory(this.shiftActive ? 'store' : 'recall', input); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'memory-add') { this.handleMemory(this.shiftActive ? 'subtract' : 'add', input); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'fraction-display') { this.toggleFractionDisplay(); return; }
@@ -746,7 +764,7 @@ export class ScientificCalculator {
     const input = this.container.querySelector('.sc-expression'); if (!input) return;
     this.expression = input.value;
     try {
-      const result = evaluateExpression(this.expression, { variables: { ...this.variableValues(), ans: this.lastResult }, angleMode: this.data.settings.angleMode });
+      const result = evaluateExpression(this.expression, { variables: { ...this.variableValues(), ans: this.lastAnswer }, angleMode: this.data.settings.angleMode });
       const output = { ...result, formatted: formatNumber(result.value, { precision: this.data.settings.precision, notation: this.data.settings.notation, fixedDigits: this.data.settings.fixedDigits }), expression: this.expression, unit: '', steps: result.steps, mode: 'calculator', angleMode: this.data.settings.angleMode };
       this.showOutput(output, 'calculator');
     } catch (error) { this.showCalculationError(error); }
@@ -757,7 +775,7 @@ export class ScientificCalculator {
     const value = Number.isFinite(output.value) ? output.value : null;
     const formatted = output.formatted ?? formatNumber(value, { precision: this.data.settings.precision, notation: this.data.settings.notation, fixedDigits: this.data.settings.fixedDigits });
     this.calculationOutput = { ...output, value, formatted, mode };
-    if (Number.isFinite(value)) this.lastResult = value;
+    if (Number.isFinite(value)) { this.lastResult = value; this.lastAnswer = value; }
     this.updateAnswer(this.calculationOutput);
     this.recordHistory(this.calculationOutput);
   }

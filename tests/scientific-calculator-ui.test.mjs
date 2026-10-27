@@ -48,6 +48,47 @@ test('interactive calculator evaluates locally, presents steps, records history 
   assert.equal(view.data.history.length, 1, 'failed expressions do not enter calculation history');
 });
 
+test('Ans recalls the last numeric answer immediately, including after AC, and feeds later expressions', () => {
+  const { document, window } = newDOM();
+  const container = document.createElement('div');
+  const view = new ScientificCalculator({ container, data: defaultScientificCalculatorData() });
+  const expression = container.querySelector('.sc-expression');
+  expression.value = '6 * 7';
+  expression.dispatchEvent(new window.Event('input', { bubbles: true }));
+  container.querySelector('.sc-key[data-action="evaluate"]').click();
+  assert.equal(view.lastAnswer, 42);
+
+  const historyLength = view.data.history.length;
+  container.querySelector('.sc-key[data-action="clear"]').click();
+  assert.equal(view.lastResult, null, 'AC clears the current display result');
+  assert.equal(view.lastAnswer, 42, 'AC keeps the answer memory');
+  assert.equal(container.querySelector('.sc-screen-result').textContent, '0');
+
+  container.querySelector('.sc-key[data-action="answer"]').click();
+  assert.equal(expression.value, '42', 'Ans on a blank expression recalls the numeric answer directly');
+  assert.equal(container.querySelector('.sc-screen-result').textContent, '42');
+  assert.equal(container.querySelector('.sc-answer-value').textContent, '42');
+  assert.equal(view.data.history.length, historyLength, 'recalling Ans does not create a duplicate calculation');
+
+  expression.value = 'ans + 1';
+  expression.dispatchEvent(new window.Event('input', { bubbles: true }));
+  container.querySelector('.sc-key[data-action="evaluate"]').click();
+  assert.equal(container.querySelector('.sc-answer-value').textContent, '43');
+  assert.equal(view.lastAnswer, 43, 'each new calculation immediately becomes the next Ans value');
+});
+
+test('settings control is visibly labeled and opens calculator settings', () => {
+  const { document } = newDOM();
+  const container = document.createElement('div');
+  let opened = 0;
+  new ScientificCalculator({ container, data: defaultScientificCalculatorData(), onOpenSettings: () => { opened += 1; } });
+  const button = container.querySelector('.sc-open-settings');
+  assert.equal(button.querySelector('.sc-settings-label').textContent, 'Settings');
+  assert.equal(button.getAttribute('aria-label'), 'Calculator settings');
+  button.click();
+  assert.equal(opened, 1);
+});
+
 test('calculator angle preference persists and old history is loaded without automatic evaluation', () => {
   const { document, window } = newDOM();
   const container = document.createElement('div');
