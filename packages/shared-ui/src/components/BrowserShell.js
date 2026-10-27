@@ -1494,9 +1494,45 @@ export class BrowserShell {
         this.handleAccountSignal(evt.profile?.email, { source: 'yayra-account' });
         this.showTransientNotice(`Google connected to Yayra${evt.profile?.email ? ` as ${evt.profile.email}` : ''}.`);
         break;
-      case 'gmail-connected':
-        this.showTransientNotice(`Gmail is ready inside Yayra${evt.profile?.email ? ` for ${evt.profile.email}` : ''}.`);
+      case 'gmail-connected': {
+        const profile = evt.profile || this.state.googleAccount?.profile || null;
+        if (profile) {
+          this.state.googleAccount = {
+            status: 'signed-in',
+            signedIn: true,
+            profile,
+            error: null,
+            savedAt: evt.savedAt || this.state.googleAccount?.savedAt || new Date().toISOString()
+          };
+          for (const record of this._googleAccountConnections.values()) {
+            record.status = 'connected';
+            record.error = null;
+            record.autoStart = false;
+          }
+          this.handleAccountSignal(profile.email, { source: 'yayra-account' });
+        }
+        this.showTransientNotice(`Gmail is ready inside Yayra${profile?.email ? ` for ${profile.email}` : ''}.`);
+
+        // A Gmail view may have rendered its reconnect card before the
+        // external OAuth handoff completed. The signed-in event updates the
+        // account header, but that does not change the view's `reconnect`
+        // state. Retry every open Gmail tab now that the scoped credential
+        // has been stored, so the successful grant is visible immediately.
+        let needsRender = false;
+        for (const tab of this.state.tabs || []) {
+          if (!this.isGmailProductUrl(tab?.url)) continue;
+          const view = this._gmailViews.get(tab.id);
+          if (!view) {
+            needsRender = true;
+          } else if (['reconnect', 'error', 'loading', 'loading-more'].includes(view.status)) {
+            // Supersede a request that may have raced the credential save; the
+            // generation guard discards its stale response if it arrives later.
+            this._loadGmailMessages(tab.id).catch(() => {});
+          }
+        }
+        if (needsRender) this.render();
         break;
+      }
       case 'google-services-connected':
         this.state.googleServices = {
           status: 'signed-in',

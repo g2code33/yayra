@@ -523,12 +523,13 @@ test('Native engine: connected Google continuation keeps the full destination in
 test('Native engine: Gmail login resumes the exact destination inside Yayra with the selected account', async () => {
   const listeners = new Set();
   let gmailConnectCalls = 0;
+  let gmailListCalls = 0;
   const auth = {
     getSession: async () => ({ signedIn: false }),
     onEvent: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
     signIn: async () => ({ ok: true, pending: true }),
     connectGmail: async () => { gmailConnectCalls += 1; return { ok: true, pending: true }; },
-    listGmailMessages: async () => ({ ok: true, messages: [], nextPageToken: null }),
+    listGmailMessages: async () => { gmailListCalls += 1; return { ok: true, messages: [], nextPageToken: null }; },
     signOut: async () => ({ ok: true }),
     openAccountPage: async () => ({ ok: true })
   };
@@ -563,6 +564,24 @@ test('Native engine: Gmail login resumes the exact destination inside Yayra with
     assert.ok(shell.rootElement.querySelector('.fb-gmail-page'), 'Gmail resumes automatically inside Yayra');
     assert.match(shell.rootElement.querySelector('.fb-gmail-account')?.textContent || '', /person@example\.com/,
       'the account selected in Chrome is visibly reflected in the resumed Gmail tab');
+
+    // Reproduce the stale reconnect card seen when the OAuth callback reports
+    // Gmail success after the signed-in event already rendered this view.
+    const gmailView = shell._gmailView(tab.id);
+    gmailView.status = 'reconnect';
+    shell.render();
+    assert.ok(shell.rootElement.querySelector('.fb-gmail-empty')?.textContent.includes('Allow Gmail access'),
+      'a previously rendered mailbox can be waiting on the scoped Gmail grant');
+    for (const listener of listeners) listener({
+      type: 'gmail-connected',
+      profileId: shell.currentProfileId(),
+      profile: { sub: 'g-product', email: 'person@example.com' }
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(gmailView.status, 'ready', 'the Gmail success event reloads a stale reconnect view');
+    assert.ok(gmailListCalls >= 2, 'the authorized mailbox is fetched again after consent');
+    assert.doesNotMatch(shell.rootElement.querySelector('.fb-gmail-main')?.textContent || '', /Allow Gmail access/,
+      'the reconnect prompt is replaced by the mailbox state');
     assert.ok(fake, 'native event source remains alive for other tabs');
   } finally {
     uninstall();
