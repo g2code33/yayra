@@ -24158,6 +24158,16 @@ export class BrowserShell {
     return null;
   }
 
+  documentViewingZoomBounds(state) {
+    switch (state?.viewer) {
+      case 'pdf': return { min: 0.1, max: 4 };
+      case 'ppt':
+      case 'pptx': return { min: 0.25, max: 6 };
+      case 'image': return { min: 0.1, max: 10 };
+      default: return { min: 0.5, max: 3 };
+    }
+  }
+
   applyDocumentViewingDefaults(tab, state) {
     const settings = this.state.settings || {};
     const mode = settings.documentsDefaultZoom || 'fit-width';
@@ -24173,7 +24183,10 @@ export class BrowserShell {
     const saved = key && settings.documentViewingProgress?.[key];
     if (!saved || typeof saved !== 'object') return state;
     if (Number.isFinite(Number(saved.page)) && Number(saved.page) >= 1) state.page = Math.round(Number(saved.page));
-    if (Number.isFinite(Number(saved.zoom))) state.zoom = Math.max(0.5, Math.min(3, Number(saved.zoom)));
+    if (Number.isFinite(Number(saved.zoom))) {
+      const { min, max } = this.documentViewingZoomBounds(state);
+      state.zoom = Math.max(min, Math.min(max, Number(saved.zoom)));
+    }
     if (['custom', 'fit-width', 'fit-page'].includes(saved.zoomMode)) state.zoomMode = saved.zoomMode;
     if ([0, 90, 180, 270].includes(Number(saved.rotation))) state.rotation = Number(saved.rotation);
     if (typeof saved.night === 'boolean') state.night = saved.night;
@@ -24181,6 +24194,7 @@ export class BrowserShell {
     if (['outline', 'thumbnails'].includes(saved.sidebarTab)) state.sidebarTab = saved.sidebarTab;
     if (typeof saved.showNotes === 'boolean') state.showNotes = saved.showNotes;
     if (Number.isFinite(Number(saved.scrollProgress))) state.scrollProgress = Math.max(0, Math.min(1, Number(saved.scrollProgress)));
+    if (Number.isFinite(Number(saved.rowPage)) && Number(saved.rowPage) >= 1) state.rowPage = Math.round(Number(saved.rowPage));
     return state;
   }
 
@@ -24190,9 +24204,11 @@ export class BrowserShell {
     const key = this.documentViewingProgressKey(tab);
     const state = tab.docState;
     if (!key || !state) return false;
+    const { min: minZoom, max: maxZoom } = this.documentViewingZoomBounds(state);
     const progress = {
       page: Math.max(1, Math.round(Number(state.page) || 1)),
-      zoom: Math.max(0.5, Math.min(3, Number(state.zoom) || 1)),
+      rowPage: Math.max(1, Math.round(Number(state.rowPage) || 1)),
+      zoom: Math.max(minZoom, Math.min(maxZoom, Number(state.zoom) || 1)),
       zoomMode: ['custom', 'fit-width', 'fit-page'].includes(state.zoomMode) ? state.zoomMode : 'custom',
       rotation: [0, 90, 180, 270].includes(Number(state.rotation)) ? Number(state.rotation) : 0,
       night: Boolean(state.night),

@@ -378,7 +378,13 @@ test('DOCUMENT RESUME: per-file viewing position persists in profile settings an
     getSettings: async () => stored.value || null,
     updateSettings: async (partial) => { stored.value = { ...(stored.value || {}), ...partial }; return stored.value; }
   };
-  const { shell } = await bootShell({ settingsRepo });
+  const recoveryBytes = new Uint8Array([37, 80, 68, 70]);
+  const documentRecoveryRepo = {
+    load: async (id) => id === 'docrec-progress-fixture-123'
+      ? { name: 'Report.pdf', mime: 'application/pdf', data: recoveryBytes }
+      : null
+  };
+  const { shell } = await bootShell({ settingsRepo, documentRecoveryRepo });
   try {
     const descriptor = { recoveryId: 'docrec-progress-fixture-123', name: 'Report.pdf', mime: 'application/pdf', size: 42 };
     const original = {
@@ -389,7 +395,7 @@ test('DOCUMENT RESUME: per-file viewing position persists in profile settings an
     assert.equal(shell.persistDocumentViewingProgress(original, { immediate: true }), true);
     await new Promise((resolve) => setTimeout(resolve, 0));
     const key = 'recovery:docrec-progress-fixture-123';
-    assert.equal(stored.value.documentViewingProgress[key].page, 13, 'the last page is saved independently of the tab session');
+    assert.equal(stored.value.documentViewingProgress[key].page, 13, 'the last PDF page or presentation slide is saved independently of the tab session');
     assert.equal(stored.value.documentViewingProgress[key].scrollProgress, 0.42, 'long-document scroll position is also persisted');
 
     const reopened = { isPrivate: false, documentRecovery: descriptor };
@@ -400,6 +406,30 @@ test('DOCUMENT RESUME: per-file viewing position persists in profile settings an
     assert.equal(state.night, true);
     assert.equal(state.sidebarTab, 'thumbnails');
     assert.equal(state.scrollProgress, 0.42);
+
+    const actuallyRecovered = await shell.createRecoveredDocumentTab({ document: descriptor }, { tabId: 'restored-doc' });
+    assert.equal(actuallyRecovered.docState.page, 13, 'the real session recovery path reapplies the saved page');
+    assert.equal(actuallyRecovered.docState.scrollProgress, 0.42, 'the real session recovery path reapplies long-document position');
+
+    const imageTab = {
+      isPrivate: false,
+      documentRecovery: { recoveryId: 'docrec-image-progress-123', name: 'Photo.png', mime: 'image/png', size: 10 },
+      docState: { status: 'ready', viewer: 'image', page: 1, zoom: 7.5, rotation: 90 }
+    };
+    shell.persistDocumentViewingProgress(imageTab, { immediate: true });
+    const imageState = shell.applyDocumentViewingDefaults(imageTab, createDocumentViewerState('image'));
+    assert.equal(imageState.zoom, 7.5, 'image zoom values above the text-document range survive a reopen');
+    assert.equal(imageState.rotation, 90);
+
+    const sheetTab = {
+      isPrivate: false,
+      documentRecovery: { recoveryId: 'docrec-sheet-progress-123', name: 'Book.xlsx', mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', size: 10 },
+      docState: { status: 'ready', viewer: 'xlsx', page: 2, rowPage: 8, zoom: 1 }
+    };
+    shell.persistDocumentViewingProgress(sheetTab, { immediate: true });
+    const sheetState = shell.applyDocumentViewingDefaults(sheetTab, createDocumentViewerState('xlsx'));
+    assert.equal(sheetState.page, 2, 'the active worksheet resumes');
+    assert.equal(sheetState.rowPage, 8, 'the visible range within that worksheet resumes');
 
     shell.state.settings.documentsRememberReadingPosition = false;
     const fresh = shell.applyDocumentViewingDefaults(reopened, createDocumentViewerState('pdf'));
