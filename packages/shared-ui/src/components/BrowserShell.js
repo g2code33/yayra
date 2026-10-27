@@ -20862,11 +20862,12 @@ export class BrowserShell {
       menu.style.top = `${top}px`;
     };
 
-    // Electron/Linux can drop pointerup/click while focus moves from the
-    // native site view to this renderer. Prefer primary pointerup, fall back
-    // to the paired mouseup if Electron drops the pointer event, and retain
-    // click for keyboard/assistive technology. Suppress the synthetic click
-    // after either pointer path so commands remain exactly-once.
+    // Electron/Linux can drop pointerup, mouseup, and click while focus moves
+    // from the native site view to this renderer. These menu commands are
+    // deliberately committed on primary pointerdown, before that focus change
+    // can discard the rest of the physical click. Use mousedown as the mouse
+    // fallback, then click only for keyboard/assistive activation. Suppress the
+    // paired compatibility events so a submenu never toggles twice.
     const pinMenuHitTarget = (button) => {
       // Chromium/Electron can treat descendants of frameless chrome as drag
       // regions even when their body-mounted menu is interactive. Pin each
@@ -20881,9 +20882,7 @@ export class BrowserShell {
       pinMenuHitTarget(button);
       let suppressNextClick = false;
       let suppressionTimer = null;
-      let pressedPointer = null;
-      let pressedMouse = false;
-      const pointerToken = (event) => event?.pointerId ?? 'primary';
+      let ignoreMouseDownUntil = 0;
       const isPrimaryActivation = (event) => {
         if (event?.isPrimary === false) return false;
         const pointerButton = event?.button == null ? 0 : Number(event.button);
@@ -20903,29 +20902,15 @@ export class BrowserShell {
         handler(event);
       };
       button.addEventListener('pointerdown', (event) => {
-        if (isPrimaryActivation(event)) pressedPointer = pointerToken(event);
-      });
-      button.addEventListener('mousedown', (event) => {
-        if (Number(event?.button ?? 0) === 0) pressedMouse = true;
-      });
-      button.addEventListener('pointercancel', () => {
-        pressedPointer = null;
-        pressedMouse = false;
-      });
-      button.addEventListener('pointerup', (event) => {
-        if (!isPrimaryActivation(event) || pressedPointer !== pointerToken(event)) return;
-        pressedPointer = null;
-        pressedMouse = false;
+        if (!isPrimaryActivation(event)) return;
+        // Chromium emits a compatibility mousedown immediately after a mouse
+        // pointerdown. Ignore that duplicate, but let a later mouse-only press
+        // activate normally if the pointer event was absent.
+        ignoreMouseDownUntil = Date.now() + 250;
         activatePress(event);
       });
-      // Some frameless Electron/Linux combinations lose pointerup/click while
-      // still delivering the compatibility mouseup. Treat that paired mouse
-      // release as a one-shot fallback; a normal pointerup clears pressedMouse
-      // first, so it cannot run the command twice.
-      button.addEventListener('mouseup', (event) => {
-        if (Number(event?.button ?? 0) !== 0 || !pressedMouse) return;
-        pressedMouse = false;
-        pressedPointer = null;
+      button.addEventListener('mousedown', (event) => {
+        if (Number(event?.button ?? 0) !== 0 || Date.now() < ignoreMouseDownUntil) return;
         activatePress(event);
       });
       button.addEventListener('click', (event) => {

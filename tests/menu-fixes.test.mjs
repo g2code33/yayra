@@ -677,7 +677,7 @@ test('TAB RIGHT-CLICK: pointer activation moves the tab into a durable group', a
   }
 });
 
-test('TAB RIGHT-CLICK: mouseup fallback still adds to a group when Electron drops pointerup', async () => {
+test('TAB RIGHT-CLICK: mousedown-only fallback adds to a group when Electron drops pointer events', async () => {
   const { shell } = await makeShell();
   try {
     const target = shell.getActiveTab();
@@ -701,22 +701,55 @@ test('TAB RIGHT-CLICK: mouseup fallback still adds to a group when Electron drop
     shell.renderTabContextMenu(40, 40, target);
     const toggle = [...document.body.querySelectorAll('.fb-tab-context-menu-item')]
       .find((button) => button.textContent === 'Add to…');
-    dispatch(toggle, 'pointerdown');
+    // Deliberately omit pointer events, mouseup, and click: the compatibility
+    // mousedown is the only input delivered to this menu row.
     dispatch(toggle, 'mousedown');
-    // Deliberately omit pointerup: this is the Electron/Linux lost-event path.
-    dispatch(toggle, 'mouseup');
-    dispatch(toggle, 'click');
     const submenu = document.body.querySelector('.fb-tab-context-submenu');
-    assert.equal(submenu.style.display, 'flex', 'mouseup opens the submenu exactly once');
+    assert.equal(submenu.style.display, 'flex', 'mousedown alone opens the submenu');
 
     const groupChoice = submenu.querySelectorAll('.fb-tab-context-submenu-item')
       .find((button) => button.textContent === 'Fallback');
-    dispatch(groupChoice, 'pointerdown');
     dispatch(groupChoice, 'mousedown');
-    dispatch(groupChoice, 'mouseup');
-    dispatch(groupChoice, 'click');
-    assert.equal(target.group?.name, 'Fallback', 'the mouseup fallback moves the right-clicked tab');
+    assert.equal(target.group?.name, 'Fallback', 'mousedown alone moves the right-clicked tab');
     assert.equal(target.group?.id, durableId, 'the fallback preserves the selected durable group identity');
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('TAB RIGHT-CLICK: pointerdown alone opens Add to and assigns the selected group', async () => {
+  const { shell } = await makeShell();
+  try {
+    const target = shell.getActiveTab();
+    target.url = 'https://pointerdown-target.example/';
+    const grouped = shell.createNewTab();
+    grouped.url = 'https://pointerdown-group.example/';
+    shell._textPromptDialog = async () => 'Pointerdown';
+    await shell.groupTabWithPrompt(grouped.id, {
+      title: 'Create tab group', description: 'Create a test group', placeholder: 'Pointerdown'
+    });
+    const durableId = shell.getTabGroups().find((group) => group.name === 'Pointerdown')?.catalogId;
+    assert.ok(durableId);
+
+    const dispatchPointerDown = (button) => button.dispatchEvent({
+      type: 'pointerdown', pointerId: 11, pointerType: 'mouse', isPrimary: true, button: 0,
+      preventDefault() {}, stopPropagation() {}
+    });
+    shell.renderTabContextMenu(40, 40, target);
+    const toggle = [...document.body.querySelectorAll('.fb-tab-context-menu-item')]
+      .find((button) => button.textContent === 'Add to…');
+    assert.ok(toggle);
+    dispatchPointerDown(toggle);
+    const submenu = document.body.querySelector('.fb-tab-context-submenu');
+    assert.equal(submenu.style.display, 'flex', 'submenu opens before release events are needed');
+
+    const groupChoice = submenu.querySelectorAll('.fb-tab-context-submenu-item')
+      .find((button) => button.textContent === 'Pointerdown');
+    assert.ok(groupChoice);
+    dispatchPointerDown(groupChoice);
+    assert.equal(target.group?.name, 'Pointerdown', 'the selected tab joins the group on pointerdown');
+    assert.equal(target.group?.id, durableId, 'the selected group durable identity is preserved');
   } finally {
     shell.destroy();
     delete globalThis.localStorage;
