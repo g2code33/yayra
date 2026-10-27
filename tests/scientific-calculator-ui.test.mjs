@@ -51,7 +51,12 @@ test('fraction expressions render as a stacked calculator-screen fraction with a
   assert.ok(preview.querySelector('.sc-expression-edit-icon'));
   preview.click();
   assert.equal(input.value, expression, 'the original safe expression remains editable');
-  assert.equal(stage.classList.contains('is-rendered'), false, 'clicking the formatted expression returns to text editing');
+  assert.equal(stage.classList.contains('is-rendered'), true, 'editing keeps the stacked fraction visible');
+  assert.equal(stage.classList.contains('is-editing-rendered'), true, 'a transparent input remains active above the formatted display');
+  input.value = '((3)/(5))';
+  input.dispatchEvent(new window.Event('input', { bubbles: true }));
+  assert.equal(preview.querySelector('.sc-fraction-numerator').textContent, '3', 'the formatted display updates as the expression is edited');
+  assert.equal(preview.querySelector('.sc-fraction-denominator').textContent, '5');
   view.destroy();
 });
 

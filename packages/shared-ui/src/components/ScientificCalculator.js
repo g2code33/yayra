@@ -145,7 +145,7 @@ export class ScientificCalculator {
     const source = input.value.trim();
     preview.replaceChildren();
     if (!source) {
-      stage.classList.remove('is-rendered');
+      stage.classList.remove('is-rendered', 'is-editing-rendered');
       preview.removeAttribute('title');
       return;
     }
@@ -161,7 +161,8 @@ export class ScientificCalculator {
     preview.append(value, edit);
     preview.setAttribute('aria-label', `Edit expression: ${source}`);
     preview.title = `Click to edit expression: ${source.slice(0, 160)}`;
-    stage.classList.toggle('is-rendered', !this.expressionIsEditing);
+    stage.classList.add('is-rendered');
+    stage.classList.toggle('is-editing-rendered', this.expressionIsEditing);
   }
 
   showCalculationError(error) {
@@ -246,8 +247,8 @@ export class ScientificCalculator {
     expressionInput.addEventListener('blur', () => { this.expressionIsEditing = false; this.refreshExpressionPreview(); });
     const editExpression = () => {
       this.expressionIsEditing = true;
-      this.container.querySelector('.sc-expression-stage')?.classList.remove('is-rendered');
       expressionInput.focus();
+      this.refreshExpressionPreview();
     };
     this.container.querySelector('.sc-expression-preview')?.addEventListener('click', editExpression);
     this.container.querySelector('.sc-expression-preview')?.addEventListener('keydown', (event) => {

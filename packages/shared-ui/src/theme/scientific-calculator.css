@@ -32,7 +32,7 @@
 .sc-mode-button:hover { color:#fff; background:rgba(148,163,184,.1); }
 .sc-mode-button[aria-pressed="true"] { border-color:rgba(56,189,248,.23); color:#ecfeff; background:linear-gradient(130deg,rgba(8,145,178,.26),rgba(79,70,229,.2)); box-shadow:0 0 16px rgba(56,189,248,.09); }
 .sc-mode-button[aria-pressed="true"] > span:first-child { color:#67e8f9; }
-.sc-layout { display:grid; grid-template-columns:minmax(315px,370px) minmax(0,1fr); align-items:start; gap:14px; }
+.sc-layout { display:grid; grid-template-columns:minmax(340px,min(34vw,440px)) minmax(0,1fr); align-items:start; gap:14px; }
 .sc-calculator-column,.sc-workspace-column { display:grid; align-content:start; gap:12px; min-width:0; }
 .sc-calculator-device { position:relative; overflow:hidden; padding:15px; border:1px solid rgba(226,232,240,.14); border-radius:16px; background:linear-gradient(145deg,#22262d 0%,#101318 49%,#23262b 100%); box-shadow:inset 1px 1px 1px rgba(255,255,255,.1),inset -1px -1px 1px rgba(0,0,0,.8),0 17px 40px rgba(0,0,0,.33); }
 .sc-device-brand { display:flex; align-items:baseline; justify-content:space-between; gap:8px; margin:0 3px 11px; color:#e5e7eb; }
@@ -48,6 +48,8 @@
 .sc-expression-preview { display:none; width:100%; min-height:44px; max-height:90px; align-items:center; gap:6px; overflow:auto; padding:4px 0; border:0; border-radius:0; color:#101711; background:transparent; font:1.02rem/1.35 ui-monospace,SFMono-Regular,Menlo,monospace; text-align:left; cursor:text; }
 .sc-expression-stage.is-rendered .sc-expression { display:none; }
 .sc-expression-stage.is-rendered .sc-expression-preview { display:flex; }
+.sc-expression-stage.is-editing-rendered .sc-expression { display:block; position:absolute; inset:0; z-index:2; width:100%; height:100%; min-height:44px; max-height:none; resize:none; color:transparent!important; -webkit-text-fill-color:transparent; caret-color:#101914!important; background:transparent!important; }
+.sc-expression-stage.is-editing-rendered .sc-expression-preview { pointer-events:none; }
 .sc-expression-preview:focus-visible { outline:2px solid rgba(22,101,52,.62); outline-offset:-2px; }
 .sc-expression-preview-value { display:inline-flex; min-width:0; min-height:34px; flex:1; align-items:center; white-space:pre-wrap; overflow-wrap:anywhere; }
 .sc-expression-edit-icon { align-self:flex-start; margin-left:auto; padding:0 2px; color:#56614f; font-size:.72rem; line-height:1; }
@@ -387,19 +389,20 @@
   .sc-workspace-nav { margin-bottom:8px; padding:3px; }
   .sc-mode-button { min-height:35px; padding:5px 7px; }
   .sc-layout { flex:1; min-height:0; align-items:stretch; gap:10px; }
-  .sc-calculator-column { position:sticky; top:0; align-self:start; gap:8px; }
+  .sc-calculator-column { position:sticky; top:0; align-self:stretch; gap:8px; height:100%; max-height:100%; overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin; scrollbar-gutter:stable; }
   .sc-workspace-column { height:100%; min-height:0; overflow-y:auto; overscroll-behavior:contain; scrollbar-gutter:stable; padding-right:4px; }
-  .sc-calculator-device { padding:10px 11px; }
+  .sc-calculator-device { padding:clamp(12px,1.1vw,16px); }
   .sc-device-brand { margin-bottom:7px; }
-  .sc-display { min-height:96px; padding:6px 9px; }
-  .sc-expression { min-height:34px; max-height:58px; font-size:.92rem!important; }
-  .sc-screen-result { min-height:24px; font-size:1.28rem; }
+  .sc-display { min-height:clamp(90px,12vh,112px); padding:7px 10px; }
+  .sc-expression { min-height:38px; max-height:68px; font-size:.96rem!important; }
+  .sc-expression-preview { font-size:.96rem; }
+  .sc-screen-result { min-height:25px; font-size:1.35rem; }
   .sc-device-status { margin:6px 2px 2px; }
-  .sc-keypad { grid-auto-rows:minmax(35px,auto); row-gap:2px; margin-top:3px; }
-  .sc-key { min-height:35px; grid-template-rows:7px 1fr 7px; padding:2px 1px; }
-  .sc-key strong { font-size:.72rem; }
-  .sc-key small { font-size:.4rem; }
-  .sc-navigation-pad { height:70px; padding:3px; }
+  .sc-keypad { grid-auto-rows:minmax(clamp(31px,calc(13px + 3vh),40px),auto); row-gap:3px; margin-top:4px; }
+  .sc-key { min-height:clamp(31px,calc(13px + 3vh),40px); grid-template-rows:7px 1fr 7px; padding:2px 1px; }
+  .sc-key strong { font-size:.76rem; }
+  .sc-key small { font-size:.42rem; }
+  .sc-navigation-pad { height:clamp(64px,8vh,78px); padding:3px; }
   .sc-shortcut-hint { margin-top:5px; font-size:.58rem; }
   .sc-workspace-column { gap:9px; }
   .sc-workspace-column > .sc-answer-card { margin:0; padding:6px 9px; border-radius:10px; }

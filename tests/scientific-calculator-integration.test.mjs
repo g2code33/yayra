@@ -66,10 +66,14 @@ test('desktop pins only the calculator while the result and entire science works
   assert.notEqual(desktop, css, 'desktop viewport rules are present');
   assert.match(desktop, /fb-internal-page\.fb-scientific-calculator-page \{ overflow:hidden; \}/);
   assert.match(desktop, /\.sc-workspace-column \{[^}]*overflow-y:auto/);
-  assert.match(desktop, /\.sc-calculator-column \{[^}]*position:sticky/);
+  assert.match(desktop, /\.sc-calculator-column \{[^}]*position:sticky[^}]*height:100%; max-height:100%; overflow-y:auto/,
+    'the calculator remains pinned and its lower controls can scroll into view if needed');
   assert.match(desktop, /\.sc-workspace-column > \.sc-answer-card \{[^}]*padding:6px 9px/,
     'the answer card stays compact in the right scroll pane');
-  assert.match(desktop, /grid-auto-rows:minmax\(35px,auto\)/);
+  assert.match(desktop, /grid-auto-rows:minmax\(clamp\(31px,calc\(13px \+ 3vh\),40px\),auto\)/,
+    'calculator key size scales with viewport height to use available space');
+  assert.match(css, /grid-template-columns:minmax\(340px,min\(34vw,440px\)\)/,
+    'the calculator column is wider on desktop');
   const calculatorColumn = calculator.slice(calculator.indexOf('<main class="sc-calculator-column">'), calculator.indexOf('</main>'));
   assert.match(calculatorColumn, /sc-calculator-device/);
   assert.doesNotMatch(calculatorColumn, /sc-answer-card/, 'the answer is no longer hidden below the fixed calculator');
