@@ -26,7 +26,7 @@ publishing error (local/machine config remains supported for development).
 | `GOOGLE_WEB_CLIENT_ID` / `GOOGLE_WEB_CLIENT_SECRET` | **Worker secrets** (`wrangler secret put`) | `worker/update-worker.mjs` (`/auth/google/exchange`) | The web client's secret lives ONLY here — Google requires it for Web-application clients even with PKCE; it must never appear in web-delivered files. |
 | `YAYRA_GOOGLE_ANDROID_CLIENT_ID` / `YAYRA_GOOGLE_IOS_CLIENT_ID` | env vars (build time) or `google-auth.web.config.json` fields `androidClientId`/`iosClientId` | `scripts/build-web.mjs` → `<meta>` → `src/config/googleAuthCapacitor.js` | "Android"/"iOS" OAuth clients have **no secret** (verified by package name + SHA-1 / bundle ID); the IDs ship in the app bundle by design. |
 | `GOOGLE_ANDROID_CLIENT_ID` / `GOOGLE_IOS_CLIENT_ID` | Worker bindings | `worker/update-worker.mjs` (`/auth/google/exchange`, `platform: android\|ios`) | Same endpoint as web; secretless exchange for native client types. |
-| `GOOGLE_WEB_ALLOWED_ORIGINS` | Worker var | `worker/update-worker.mjs` auth CORS + redirect validation | Exact comma-separated web origins; each must register its exact `/auth/callback`. Never use `*`. |
+| `GOOGLE_WEB_ALLOWED_ORIGINS` | Worker var | `worker/update-worker.mjs` auth CORS + redirect validation | Exact comma-separated web origins; production includes `https://yayra.app`, Pages fallback is `https://yayra.pages.dev`, and each must register its exact `/auth/callback`. Never use `*`. |
 | `GOOGLE_NATIVE_ALLOWED_ORIGINS` | Worker var | `worker/update-worker.mjs` auth CORS | Exact Capacitor WebView origins (production defaults: `https://localhost,http://localhost,capacitor://localhost`). Never use `*`. |
 
 ## 2. Update worker (Cloudflare Worker: `yayra-updates-api`)

@@ -14,7 +14,7 @@ workers_dev = true
 NVIDIA_MODEL = "moonshotai/kimi-k3"
 # Exact web OAuth callback origins. Add any custom Yayra web origin here and
 # register its matching /auth/callback URI with the Google Web OAuth client.
-GOOGLE_WEB_ALLOWED_ORIGINS = "https://yayra.pages.dev,http://localhost:4173"
+GOOGLE_WEB_ALLOWED_ORIGINS = "https://yayra.app,https://yayra.pages.dev,http://localhost:4173"
 # Exact Capacitor WebView origins permitted to call profile exchange and the
 # origin-bound delegated Drive routes. Keep this list narrow; requests with an
 # Origin are never answered with `*`.
