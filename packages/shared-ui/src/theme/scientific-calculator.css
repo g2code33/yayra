@@ -49,7 +49,10 @@
 .sc-expression-stage.is-rendered .sc-expression { display:none; }
 .sc-expression-stage.is-rendered .sc-expression-preview { display:flex; }
 .sc-expression-stage.is-editing-rendered .sc-expression { display:block; position:absolute; inset:0; z-index:2; width:100%; height:100%; min-height:44px; max-height:none; resize:none; color:transparent!important; -webkit-text-fill-color:transparent; caret-color:#101914!important; background:transparent!important; }
+.sc-expression-stage.is-editing-rendered.has-stacked-fractions { outline:2px solid rgba(22,101,52,.24); outline-offset:-1px; }
+.sc-expression-stage.is-editing-rendered.has-stacked-fractions .sc-expression { caret-color:transparent!important; }
 .sc-expression-stage.is-editing-rendered .sc-expression-preview { pointer-events:none; }
+.sc-expression-stage.is-editing-rendered .sc-expression-edit-icon { color:#166534; }
 .sc-expression-preview:focus-visible { outline:2px solid rgba(22,101,52,.62); outline-offset:-2px; }
 .sc-expression-preview-value { display:inline-flex; min-width:0; min-height:34px; flex:1; align-items:center; white-space:pre-wrap; overflow-wrap:anywhere; }
 .sc-expression-edit-icon { align-self:flex-start; margin-left:auto; padding:0 2px; color:#56614f; font-size:.72rem; line-height:1; }
@@ -60,12 +63,12 @@
 .sc-device-status-spacer { flex:1; }
 .sc-device-battery { color:#77806f; font-size:.48rem; font-weight:800; }
 .sc-keypad { display:grid; position:relative; grid-template-columns:repeat(6,minmax(0,1fr)); grid-auto-rows:minmax(43px,auto); gap:6px; margin-top:6px; }
-.sc-navigation-pad { z-index:2; display:grid; grid-column:3 / span 2; grid-row:1 / span 2; grid-template-columns:repeat(3,1fr); grid-template-rows:repeat(3,1fr); align-items:center; justify-items:center; width:min(100%,112px); height:78px; align-self:center; justify-self:center; padding:5px; border:1px solid rgba(255,255,255,.12); border-radius:50px; background:linear-gradient(145deg,#333941,#1a1e24); box-shadow:0 3px 5px #080a0d,inset 0 1px rgba(255,255,255,.09); }
-.sc-navigation-pad button { display:grid; place-items:center; width:27px; height:22px; padding:0; border:0; border-radius:50%; color:#cbd5e1; background:transparent; font-size:.67rem; cursor:pointer; }
-.sc-navigation-pad button:hover { color:#fff; background:rgba(255,255,255,.12); }
+.sc-navigation-pad { z-index:2; display:grid; grid-column:11 / span 10; grid-row:1 / span 2; grid-template-columns:repeat(3,1fr); grid-template-rows:repeat(3,1fr); align-items:center; justify-items:center; width:min(100%,86px); height:70px; align-self:center; justify-self:center; padding:4px; border:1px solid rgba(255,255,255,.14); border-radius:17px; background:linear-gradient(145deg,#333941,#1a1e24); box-shadow:0 3px 5px #080a0d,inset 0 1px rgba(255,255,255,.09); }
+.sc-navigation-pad button { display:grid; place-items:center; width:24px; height:21px; padding:0; border:1px solid rgba(255,255,255,.08); border-radius:7px; color:#cbd5e1; background:linear-gradient(#343a43,#191d23); font-size:.7rem; cursor:pointer; }
+.sc-navigation-pad button:hover { color:#fff; border-color:rgba(125,211,252,.45); background:rgba(56,189,248,.2); }
 .sc-navigation-pad [data-nav="up"] { grid-column:2; grid-row:1; }
 .sc-navigation-pad [data-nav="left"] { grid-column:1; grid-row:2; }
-.sc-navigation-pad [data-nav="center"] { grid-column:2; grid-row:2; width:29px; height:29px; border:4px solid #11151a; color:transparent; background:#252a30; box-shadow:0 0 0 1px rgba(255,255,255,.07); }
+.sc-navigation-pad [data-nav="center"] { grid-column:2; grid-row:2; width:21px; height:21px; border:3px solid #11151a; border-radius:50%; color:transparent; background:#252a30; box-shadow:0 0 0 1px rgba(255,255,255,.07); }
 .sc-navigation-pad [data-nav="right"] { grid-column:3; grid-row:2; }
 .sc-navigation-pad [data-nav="down"] { grid-column:2; grid-row:3; }
 .sc-display-off { border-color:#252a2d; background:linear-gradient(145deg,#38403a,#242b27); box-shadow:inset 0 2px 9px rgba(0,0,0,.4); }
@@ -379,7 +382,7 @@
 [data-theme="light"] .sc-constant-item,[data-theme="light"] .sc-coordinate-result button { color:#0f172a; background:#f8fafc; }
 @media (max-width:420px) { .sc-four-fields { grid-template-columns:repeat(2,minmax(0,1fr)); } }
 
-/* On desktop, keep the calculator and answer anchored in view; only the science workspace scrolls. */
+/* On desktop, keep the calculator and right-side controls/result fixed; scroll only the remaining science workspace. */
 @media (min-width:1051px) {
   .fb-internal-page.fb-scientific-calculator-page { overflow:hidden; }
   .sc-workspace { display:flex; height:100%; min-height:0; flex-direction:column; overflow:hidden; padding:clamp(8px,1.15vw,18px); }
@@ -390,7 +393,13 @@
   .sc-mode-button { min-height:35px; padding:5px 7px; }
   .sc-layout { flex:1; min-height:0; align-items:stretch; gap:10px; }
   .sc-calculator-column { position:sticky; top:0; align-self:stretch; gap:8px; height:100%; max-height:100%; overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin; scrollbar-gutter:stable; }
-  .sc-workspace-column { height:100%; min-height:0; overflow-y:auto; overscroll-behavior:contain; scrollbar-gutter:stable; padding-right:4px; }
+  .sc-workspace-column { display:flex; height:100%; min-height:0; flex-direction:column; gap:9px; overflow:hidden; }
+  .sc-workspace-fixed { display:grid; flex:none; align-content:start; gap:7px; }
+  .sc-workspace-scroll { display:grid; flex:1; min-height:0; align-content:start; gap:9px; overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin; scrollbar-color:rgba(100,116,139,.85) rgba(15,23,42,.5); scrollbar-gutter:stable; padding-right:4px; }
+  .sc-workspace-scroll::-webkit-scrollbar { width:10px; }
+  .sc-workspace-scroll::-webkit-scrollbar-track { border-radius:8px; background:rgba(15,23,42,.5); }
+  .sc-workspace-scroll::-webkit-scrollbar-thumb { border:2px solid rgba(15,23,42,.5); border-radius:8px; background:rgba(100,116,139,.85); }
+  .sc-calculator-column { scrollbar-color:rgba(100,116,139,.75) rgba(15,23,42,.4); }
   .sc-calculator-device { padding:clamp(12px,1.1vw,16px); }
   .sc-device-brand { margin-bottom:7px; }
   .sc-display { min-height:clamp(90px,12vh,112px); padding:7px 10px; }
@@ -402,21 +411,20 @@
   .sc-key { min-height:clamp(31px,calc(13px + 3vh),40px); grid-template-rows:7px 1fr 7px; padding:2px 1px; }
   .sc-key strong { font-size:.76rem; }
   .sc-key small { font-size:.42rem; }
-  .sc-navigation-pad { height:clamp(64px,8vh,78px); padding:3px; }
+  .sc-navigation-pad { width:min(100%,82px); height:clamp(64px,8vh,72px); padding:3px; }
   .sc-shortcut-hint { margin-top:5px; font-size:.58rem; }
-  .sc-workspace-column { gap:9px; }
-  .sc-workspace-column > .sc-answer-card { margin:0; padding:6px 9px; border-radius:10px; }
-  .sc-workspace-column > .sc-answer-card .sc-answer-actions { gap:4px; }
-  .sc-workspace-column > .sc-answer-card .sc-answer-actions button { padding:4px 6px; font-size:.58rem; }
-  .sc-workspace-column > .sc-answer-card .sc-answer-value { margin-top:3px; font-size:clamp(1rem,1.7vw,1.4rem); }
-  .sc-workspace-column > .sc-answer-card .sc-answer-steps { max-height:65px; margin-top:5px; padding-top:5px; }
+  .sc-workspace-fixed > .sc-answer-card { margin:0; padding:6px 9px; border-radius:10px; }
+  .sc-workspace-fixed > .sc-answer-card .sc-answer-actions { gap:4px; }
+  .sc-workspace-fixed > .sc-answer-card .sc-answer-actions button { padding:4px 6px; font-size:.58rem; }
+  .sc-workspace-fixed > .sc-answer-card .sc-answer-value { margin-top:3px; font-size:clamp(1rem,1.7vw,1.4rem); }
+  .sc-workspace-fixed > .sc-answer-card .sc-answer-steps { max-height:65px; margin-top:5px; padding-top:5px; }
 }
 @media (max-width:1050px) {
   .fb-internal-page.fb-scientific-calculator-page { overflow-x:hidden; overflow-y:auto; }
   .sc-workspace { display:block; height:auto; min-height:100%; overflow:visible; }
   .sc-layout { flex:initial; min-height:auto; align-items:start; }
   .sc-calculator-column { position:static; order:3; }
-  .sc-workspace-column { display:contents; height:auto; max-height:none; overflow:visible; padding-right:0; }
+  .sc-workspace-column,.sc-workspace-fixed,.sc-workspace-scroll { display:contents; height:auto; max-height:none; overflow:visible; padding-right:0; }
   .sc-header { order:0; }
   .sc-notice { order:1; }
   .sc-workspace-nav { order:2; }

@@ -19,19 +19,23 @@ function newDOM() {
   return dom;
 }
 
-test('the answer, heading and workspace tabs scroll alongside the science tools, not below the static calculator', () => {
+test('the calculator and result/header area stay fixed while the right-side work area scrolls independently', () => {
   const { document } = newDOM();
   const container = document.createElement('div');
   new ScientificCalculator({ container, data: defaultScientificCalculatorData() });
   const calculatorColumn = container.querySelector('.sc-calculator-column');
   const workspaceColumn = container.querySelector('.sc-workspace-column');
+  const fixedArea = workspaceColumn.querySelector('.sc-workspace-fixed');
+  const scrollArea = workspaceColumn.querySelector('.sc-workspace-scroll');
   assert.ok(calculatorColumn.querySelector('.sc-calculator-device'));
   assert.equal(calculatorColumn.querySelector('.sc-answer-card'), null,
-    'the result is no longer clipped below the left-side calculator');
-  assert.equal(workspaceColumn.querySelector('.sc-answer-card').parentElement, workspaceColumn,
-    'the result is in the scrollable right side');
-  assert.ok(workspaceColumn.querySelector('.sc-header'));
-  assert.ok(workspaceColumn.querySelector('.sc-workspace-nav'));
+    'the result has its own unclipped position on the right');
+  assert.equal(workspaceColumn.querySelector('.sc-answer-card').parentElement, fixedArea,
+    'the result has a dedicated permanent area beside the fixed calculator');
+  assert.ok(fixedArea.querySelector('.sc-header'));
+  assert.ok(fixedArea.querySelector('.sc-workspace-nav'));
+  assert.ok(scrollArea.querySelector('.sc-mode-content'));
+  assert.ok(scrollArea.querySelector('.sc-side-column'), 'the rest of the right workspace lives in its vertical scroll area');
 });
 
 test('fraction expressions render as a stacked calculator-screen fraction with a click-to-edit affordance', () => {
@@ -57,6 +61,13 @@ test('fraction expressions render as a stacked calculator-screen fraction with a
   input.dispatchEvent(new window.Event('input', { bubbles: true }));
   assert.equal(preview.querySelector('.sc-fraction-numerator').textContent, '3', 'the formatted display updates as the expression is edited');
   assert.equal(preview.querySelector('.sc-fraction-denominator').textContent, '5');
+  input.value = '3((3)/(5))8×8';
+  input.dispatchEvent(new window.Event('input', { bubbles: true }));
+  const formattedValue = preview.querySelector('.sc-expression-preview-value');
+  assert.equal(preview.querySelectorAll('.sc-stacked-fraction').length, 1, 'a stacked fraction remains formatted inside a larger expression');
+  assert.equal(formattedValue.firstChild.textContent, '3');
+  assert.equal(formattedValue.lastChild.textContent, '8×8');
+  assert.equal(stage.classList.contains('has-stacked-fractions'), true);
   view.destroy();
 });
 

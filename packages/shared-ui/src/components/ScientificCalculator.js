@@ -100,41 +100,18 @@ export class ScientificCalculator {
     node.hidden = !message;
   }
 
-  fractionPartsForExpression(expression) {
-    const unwrap = (value) => {
-      let source = String(value || '').trim();
-      while (source.startsWith('(') && source.endsWith(')')) {
-        let depth = 0;
-        let closesAtEnd = true;
-        for (let index = 0; index < source.length; index += 1) {
-          if (source[index] === '(') depth += 1;
-          else if (source[index] === ')') depth -= 1;
-          if (depth === 0 && index < source.length - 1) { closesAtEnd = false; break; }
-        }
-        if (!closesAtEnd || depth !== 0) break;
-        source = source.slice(1, -1).trim();
-      }
-      return source;
-    };
-    const source = unwrap(expression);
-    let depth = 0;
-    let slash = -1;
-    for (let index = 0; index < source.length; index += 1) {
-      const character = source[index];
-      if (character === '(') depth += 1;
-      else if (character === ')') depth -= 1;
-      else if (depth === 0 && character === '/') {
-        if (slash >= 0) return null;
-        slash = index;
-      } else if (depth === 0 && '+−-*×÷^'.includes(character)
-        && index !== 0 && source[index - 1] !== '/') return null;
+  fractionTokensForExpression(expression) {
+    const pattern = /\(\(\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*\)\s*\/\s*\(\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*\)\)|(?<![\d.])((?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*\/\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)(?![\d.])/g;
+    const tokens = [];
+    for (const match of String(expression ?? '').matchAll(pattern)) {
+      tokens.push({
+        index: match.index,
+        length: match[0].length,
+        numerator: match[1] ?? match[3],
+        denominator: match[2] ?? match[4]
+      });
     }
-    if (slash <= 0 || slash >= source.length - 1 || depth !== 0) return null;
-    const numerator = unwrap(source.slice(0, slash));
-    const denominator = unwrap(source.slice(slash + 1));
-    const numeric = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
-    if (!numeric.test(numerator) || !numeric.test(denominator)) return null;
-    return { numerator, denominator };
+    return tokens;
   }
 
   refreshExpressionPreview() {
@@ -145,15 +122,24 @@ export class ScientificCalculator {
     const source = input.value.trim();
     preview.replaceChildren();
     if (!source) {
-      stage.classList.remove('is-rendered', 'is-editing-rendered');
+      stage.classList.remove('is-rendered', 'is-editing-rendered', 'has-stacked-fractions');
       preview.removeAttribute('title');
       return;
     }
     const value = document.createElement('span');
     value.className = 'sc-expression-preview-value';
-    const fraction = this.fractionPartsForExpression(source);
-    if (fraction) this.renderStackedFraction(value, fraction);
-    else value.textContent = input.value;
+    const tokens = this.fractionTokensForExpression(input.value);
+    stage.classList.toggle('has-stacked-fractions', tokens.length > 0);
+    let cursor = 0;
+    for (const token of tokens) {
+      if (token.index < cursor) continue;
+      if (token.index > cursor) value.appendChild(document.createTextNode(input.value.slice(cursor, token.index)));
+      const fraction = document.createElement('span');
+      this.renderStackedFraction(fraction, token);
+      value.appendChild(fraction);
+      cursor = token.index + token.length;
+    }
+    if (cursor < input.value.length || !tokens.length) value.appendChild(document.createTextNode(input.value.slice(cursor)));
     const edit = document.createElement('span');
     edit.className = 'sc-expression-edit-icon';
     edit.setAttribute('aria-hidden', 'true');
@@ -204,6 +190,7 @@ export class ScientificCalculator {
             </div>
           </main>
           <section class="sc-workspace-column" aria-label="Science workspace">
+            <div class="sc-workspace-fixed">
             <header class="sc-header">
               <div class="sc-heading"><span class="sc-brand-icon">${Icons.calculator}</span><div><p class="sc-eyebrow">${this.privateMode ? 'PRIVATE SESSION · MEMORY ONLY' : 'OFFLINE-FIRST · ON THIS DEVICE'}</p><h1>Scientific calculator</h1><p class="sc-subtitle">${this.privateMode ? 'Nothing here is saved to your profile.' : 'A complete local science desk. Your work stays in this Yayra profile.'}</p></div></div>
               <div class="sc-header-actions">
@@ -219,6 +206,8 @@ export class ScientificCalculator {
               <div class="sc-answer-heading"><span class="sc-answer-label">RESULT · ${this.privateMode ? 'PRIVATE MEMORY' : 'LOCAL'}</span><div class="sc-answer-actions"><button type="button" class="sc-copy-result" disabled>Copy</button><button type="button" class="sc-send-fraction" disabled title="Insert the result as a numerator/denominator expression">Send fraction</button><button type="button" class="sc-save-result" disabled>Save</button></div></div>
               <output class="sc-answer-value">Ready</output><div class="sc-answer-unit"></div><p class="sc-fraction-approximation" hidden></p><ol class="sc-answer-steps" hidden></ol><p class="sc-answer-disclosure" hidden></p>
             </section>
+            </div>
+            <div class="sc-workspace-scroll">
             <div class="sc-mode-content"></div>
             <aside class="sc-side-column" aria-label="History, saved work, formulas, variables and notes">
               <div class="sc-side-heading"><div><p class="sc-eyebrow">YOUR LOCAL WORK</p><h2>Library &amp; notes</h2></div><span class="sc-local-indicator" title="Stored locally">● LOCAL</span></div>
@@ -227,6 +216,7 @@ export class ScientificCalculator {
               <div class="sc-data-actions"><button type="button" class="sc-export">Export backup</button><label class="sc-import-button">Import backup<input class="sc-import-file" type="file" accept="application/json,.json" hidden></label></div>
               <p class="sc-local-note">No account, network, cloud service or AI is needed. The expression parser never executes JavaScript. ${this.privateMode ? 'Private-session history, saved results, variables and notes remain in memory only.' : 'History, formulas, variables and notes are stored on this device in this profile.'}</p>
             </aside>
+            </div>
           </section>
         </div>
         <div class="sc-dialog-host"></div>

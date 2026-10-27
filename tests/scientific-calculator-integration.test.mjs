@@ -61,15 +61,19 @@ test('calculator workspace includes numerical graph analysis, local calculus and
   assert.match(engine, /export function findFunctionRoots/);
 });
 
-test('desktop pins only the calculator while the result and entire science workspace scroll on the right', () => {
+test('desktop pins the calculator and result area while the right-side science workspace scrolls', () => {
   const desktop = css.slice(css.lastIndexOf('@media (min-width:1051px)'));
   assert.notEqual(desktop, css, 'desktop viewport rules are present');
   assert.match(desktop, /fb-internal-page\.fb-scientific-calculator-page \{ overflow:hidden; \}/);
-  assert.match(desktop, /\.sc-workspace-column \{[^}]*overflow-y:auto/);
+  assert.match(desktop, /\.sc-workspace-column \{[^}]*overflow:hidden/);
+  assert.match(desktop, /\.sc-workspace-scroll \{[^}]*overflow-y:auto/,
+    'the right-side work area has its own vertical scrollbar');
+  assert.match(desktop, /\.sc-workspace-fixed \{[^}]*flex:none/,
+    'the header, tabs and result occupy permanent space beside the calculator');
   assert.match(desktop, /\.sc-calculator-column \{[^}]*position:sticky[^}]*height:100%; max-height:100%; overflow-y:auto/,
     'the calculator remains pinned and its lower controls can scroll into view if needed');
-  assert.match(desktop, /\.sc-workspace-column > \.sc-answer-card \{[^}]*padding:6px 9px/,
-    'the answer card stays compact in the right scroll pane');
+  assert.match(desktop, /\.sc-workspace-fixed > \.sc-answer-card \{[^}]*padding:6px 9px/,
+    'the answer card stays compact in its own permanent area');
   assert.match(desktop, /grid-auto-rows:minmax\(clamp\(31px,calc\(13px \+ 3vh\),40px\),auto\)/,
     'calculator key size scales with viewport height to use available space');
   assert.match(css, /grid-template-columns:minmax\(340px,min\(34vw,440px\)\)/,
@@ -78,15 +82,16 @@ test('desktop pins only the calculator while the result and entire science works
   assert.match(calculatorColumn, /sc-calculator-device/);
   assert.doesNotMatch(calculatorColumn, /sc-answer-card/, 'the answer is no longer hidden below the fixed calculator');
   const workspaceStart = calculator.indexOf('<section class="sc-workspace-column"');
-  assert.ok(calculator.indexOf('<header class="sc-header">') > workspaceStart,
-    'the page heading and settings scroll with the right workspace');
-  assert.ok(calculator.indexOf('<nav class="sc-workspace-nav"') > workspaceStart,
-    'the workspace tabs scroll with the right workspace');
-  assert.ok(calculator.indexOf('sc-answer-card') > workspaceStart,
-    'the result card lives in the independently scrollable right column');
+  assert.ok(calculator.indexOf('<div class="sc-workspace-fixed">') > workspaceStart,
+    'the heading, notice, tabs and result are grouped into the permanent right-side area');
+  assert.ok(calculator.indexOf('<div class="sc-workspace-scroll">') > workspaceStart,
+    'the remaining science tools live in a separate right-side scroll area');
+  assert.ok(calculator.indexOf('<header class="sc-header">') > workspaceStart);
+  assert.ok(calculator.indexOf('<nav class="sc-workspace-nav"') > workspaceStart);
+  assert.ok(calculator.indexOf('sc-answer-card') > workspaceStart);
   const mobileReflow = desktop.slice(desktop.indexOf('@media (max-width:1050px)'));
   assert.match(mobileReflow, /overflow-y:auto/);
-  assert.match(mobileReflow, /\.sc-workspace-column \{ display:contents/,
+  assert.match(mobileReflow, /\.sc-workspace-column,\.sc-workspace-fixed,\.sc-workspace-scroll \{ display:contents/,
     'mobile reflow preserves heading and navigation above the calculator');
 });
 
