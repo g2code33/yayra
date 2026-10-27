@@ -48,6 +48,9 @@
 .sc-expression-preview { display:none; width:100%; min-height:44px; max-height:90px; align-items:center; gap:6px; overflow:auto; padding:4px 0; border:0; border-radius:0; color:#101711; background:transparent; font:1.02rem/1.35 ui-monospace,SFMono-Regular,Menlo,monospace; text-align:left; cursor:text; }
 .sc-expression-stage.is-rendered .sc-expression { display:none; }
 .sc-expression-stage.is-rendered .sc-expression-preview { display:flex; }
+.sc-expression:focus { caret-color:#101711!important; }
+.sc-expression-stage:focus-within { outline:2px solid rgba(22,101,52,.34); outline-offset:-2px; }
+.sc-expression::selection { color:#101711; background:rgba(22,101,52,.2); }
 .sc-expression-preview:focus-visible { outline:2px solid rgba(22,101,52,.62); outline-offset:-2px; }
 .sc-expression-preview-value { display:inline-flex; min-width:0; min-height:34px; flex:1; align-items:center; white-space:pre-wrap; overflow-wrap:anywhere; }
 .sc-expression-edit-icon { align-self:flex-start; margin-left:auto; padding:0 2px; color:#56614f; font-size:.72rem; line-height:1; }

@@ -38,6 +38,25 @@ test('the calculator and result/header area stay fixed while the right-side work
   assert.ok(scrollArea.querySelector('.sc-side-column'), 'the rest of the right workspace lives in its vertical scroll area');
 });
 
+test('a keypad entry after a result starts a fresh expression and visibly shows operators', () => {
+  const { document, window } = newDOM();
+  const container = document.createElement('div');
+  const view = new ScientificCalculator({ container, data: defaultScientificCalculatorData() });
+  const input = container.querySelector('.sc-expression');
+  input.value = '2+2';
+  input.dispatchEvent(new window.Event('input', { bubbles: true }));
+  container.querySelector('.sc-key[data-action="evaluate"]').click();
+  assert.equal(view.lastResult, 4);
+  container.querySelector('.sc-key[data-key="7"]').click();
+  assert.equal(input.value, '7', 'the first keypad entry replaces the previous expression like AC');
+  assert.equal(view.lastResult, null, 'the old on-screen result is cleared for the new entry');
+  container.querySelector('.sc-key[data-key="+"]').click();
+  assert.equal(input.value, '7+', 'operator presses are immediately visible in the expression field');
+  assert.equal(container.querySelector('.sc-expression-stage').classList.contains('is-rendered'), false,
+    'the editable expression is shown instead of the formatted preview while entering keys');
+  view.destroy();
+});
+
 test('the directional pad keeps cursor movement and calculation-history browsing on separate controls', () => {
   const { document } = newDOM();
   const container = document.createElement('div');
@@ -57,6 +76,8 @@ test('the directional pad keeps cursor movement and calculation-history browsing
   }
   press('left');
   assert.equal(input.selectionStart, 1, 'left moves the expression cursor backward');
+  assert.equal(container.querySelector('.sc-expression-stage').classList.contains('is-rendered'), false,
+    'cursor movement keeps the raw editable field visible');
   press('right');
   assert.equal(input.selectionStart, 2, 'right moves the expression cursor forward');
   press('down');

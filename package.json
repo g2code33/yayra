@@ -1,7 +1,7 @@
 {
   "name": "yayra",
   "productName": "yayra",
-  "version": "1.0.105",
+  "version": "1.0.106",
   "description": "Yayra cross-platform floating browser for Android, Windows, and Linux.",
   "type": "module",
   "main": "electron/main.cjs",
