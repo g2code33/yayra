@@ -52,22 +52,39 @@ test('history renders fraction expressions with the same stacked numerator/bar/d
   assert.equal(input.value, '((2)/(4))', 'selecting the history item still loads the editable bracket expression');
 });
 
-test('a keypad entry after a result starts a fresh expression and visibly shows operators', () => {
+test('keypad clicks after a result update the expression at its caret without refreshing or resetting it', () => {
   const { document, window } = newDOM();
   const container = document.createElement('div');
   const view = new ScientificCalculator({ container, data: defaultScientificCalculatorData() });
   const input = container.querySelector('.sc-expression');
+  Object.defineProperties(input, {
+    selectionStart: { configurable: true, writable: true, value: 3 },
+    selectionEnd: { configurable: true, writable: true, value: 3 }
+  });
+  input.setSelectionRange = (start, end) => { input.selectionStart = start; input.selectionEnd = end; };
   input.value = '2+2';
   input.dispatchEvent(new window.Event('input', { bubbles: true }));
-  container.querySelector('.sc-key[data-action="evaluate"]').click();
+  const press = (selector) => {
+    const button = container.querySelector(selector);
+    const down = new window.Event('mousedown', { bubbles: true, cancelable: true });
+    button.dispatchEvent(down);
+    assert.equal(down.defaultPrevented, true, 'calculator controls do not steal focus from the expression field');
+    button.click();
+  };
+  press('.sc-key[data-action="evaluate"]');
   assert.equal(view.lastResult, 4);
-  container.querySelector('.sc-key[data-key="7"]').click();
-  assert.equal(input.value, '7', 'the first keypad entry replaces the previous expression like AC');
-  assert.equal(view.lastResult, null, 'the old on-screen result is cleared for the new entry');
-  container.querySelector('.sc-key[data-key="+"]').click();
-  assert.equal(input.value, '7+', 'operator presses are immediately visible in the expression field');
+  press('.sc-key[data-key="7"]');
+  assert.equal(input.value, '2+27', 'the first key inserts at the existing caret rather than clearing the calculation');
+  assert.equal(input.selectionStart, input.value.length, 'the insertion caret is preserved for the next key');
+  assert.equal(container.querySelector('.sc-screen-result').textContent, '4', 'the displayed answer is not cleared or refreshed before recalculation');
+  press('.sc-key[data-key="+"]');
+  press('.sc-key[data-key="1"]');
+  assert.equal(input.value, '2+27+1', 'consecutive keypad presses extend the same expression');
+  assert.equal(input.selectionStart, input.value.length, 'each click leaves the caret after the inserted token');
   assert.equal(container.querySelector('.sc-expression-stage').classList.contains('is-rendered'), false,
-    'the editable expression is shown instead of the formatted preview while entering keys');
+    'keypad entry stays in the editable expression rather than flashing the formatted preview');
+  press('.sc-key[data-action="evaluate"]');
+  assert.equal(container.querySelector('.sc-screen-result').textContent, '30');
   view.destroy();
 });
 

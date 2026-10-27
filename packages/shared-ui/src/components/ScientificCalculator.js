@@ -256,6 +256,7 @@ export class ScientificCalculator {
       if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); editExpression(); }
     });
     expressionInput.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); this.evaluateCurrent(); } });
+    this.container.querySelectorAll('.sc-key, .sc-device-status button, .sc-navigation-pad button, .sc-memory-keys button').forEach((button) => button.addEventListener('mousedown', (event) => event.preventDefault()));
     this.container.querySelectorAll('.sc-key').forEach((button) => button.addEventListener('click', () => this.handleKey(button.dataset.key, button.dataset.action, expressionInput, button)));
     this.container.querySelectorAll('.sc-navigation-pad [data-nav]').forEach((button) => button.addEventListener('click', () => this.moveNavigation(button.dataset.nav, expressionInput)));
     this.container.querySelectorAll('.sc-memory-keys [data-memory]').forEach((button) => button.addEventListener('click', () => this.handleMemory(button.dataset.memory, expressionInput)));
@@ -716,7 +717,6 @@ export class ScientificCalculator {
   }
 
   openFractionDialog(input) {
-    this.prepareForNewEntry(input);
     const host = this.container.querySelector('.sc-dialog-host');
     const { start, end } = this.selectionForExpression(input);
     host.innerHTML = `<div class="sc-mode-scrim sc-fraction-scrim"><form class="sc-fraction-dialog" role="dialog" aria-modal="true" aria-labelledby="${this.instanceId}-fraction-title"><div class="sc-dialog-header"><h2 id="${this.instanceId}-fraction-title">Enter a fraction</h2><button type="button" class="sc-dialog-close" data-fraction-cancel aria-label="Cancel">×</button></div><p>Enter the numerator above the fraction bar and the denominator below.</p><div class="sc-fraction-template"><input name="numerator" aria-label="Numerator" inputmode="decimal" autocomplete="off" required><span class="sc-fraction-rule" aria-hidden="true"></span><input name="denominator" aria-label="Denominator" inputmode="decimal" autocomplete="off" required></div><div class="sc-fraction-dialog-actions"><button type="button" class="sc-secondary-button" data-fraction-cancel>Cancel</button><button type="submit" class="sc-primary-button">Insert fraction</button></div></form></div>`;
@@ -776,24 +776,7 @@ export class ScientificCalculator {
     return { start: input.value.length, end: input.value.length };
   }
 
-  prepareForNewEntry(input) {
-    if (!this.awaitingNewExpression) return false;
-    this.awaitingNewExpression = false;
-    this.expression = '';
-    input.value = '';
-    input.setSelectionRange?.(0, 0);
-    this.rememberExpressionSelection(input);
-    this.calculationOutput = null;
-    this.lastEntryId = null;
-    this.lastResult = null;
-    this.historyCursor = -1;
-    this.historyDraft = '';
-    this.updateAnswer(null);
-    return true;
-  }
-
   insertAtCursor(text, input, overwrite = false) {
-    this.prepareForNewEntry(input);
     const { start, end: selectedEnd } = this.selectionForExpression(input);
     const end = overwrite && start === selectedEnd ? Math.min(input.value.length, start + String(text).length) : selectedEnd;
     this.expression = `${input.value.slice(0, start)}${text}${input.value.slice(end)}`;
@@ -810,7 +793,6 @@ export class ScientificCalculator {
   }
 
   deleteAtCursor(input) {
-    if (this.prepareForNewEntry(input)) { input.focus(); this.refreshExpressionPreview(); return; }
     const { start, end } = this.selectionForExpression(input);
     const from = start === end ? Math.max(0, start - 1) : start;
     this.expression = `${input.value.slice(0, from)}${input.value.slice(end)}`; input.value = this.expression;
