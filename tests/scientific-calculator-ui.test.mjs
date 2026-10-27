@@ -34,6 +34,48 @@ test('the answer, heading and workspace tabs scroll alongside the science tools,
   assert.ok(workspaceColumn.querySelector('.sc-workspace-nav'));
 });
 
+test('fraction expressions render as a stacked calculator-screen fraction with a click-to-edit affordance', () => {
+  const { document, window } = newDOM();
+  const container = document.createElement('div');
+  const view = new ScientificCalculator({ container, data: defaultScientificCalculatorData() });
+  const input = container.querySelector('.sc-expression');
+  const expression = '((2)/(5))';
+  input.value = expression;
+  input.dispatchEvent(new window.Event('input', { bubbles: true }));
+  input.blur();
+  const stage = container.querySelector('.sc-expression-stage');
+  const preview = container.querySelector('.sc-expression-preview');
+  assert.equal(stage.classList.contains('is-rendered'), true);
+  assert.equal(preview.querySelector('.sc-fraction-numerator').textContent, '2');
+  assert.equal(preview.querySelector('.sc-fraction-denominator').textContent, '5');
+  assert.ok(preview.querySelector('.sc-expression-edit-icon'));
+  preview.click();
+  assert.equal(input.value, expression, 'the original safe expression remains editable');
+  assert.equal(stage.classList.contains('is-rendered'), false, 'clicking the formatted expression returns to text editing');
+  view.destroy();
+});
+
+test('Escape closes calculation-mode and fraction-entry dialogs and restores calculator focus', () => {
+  const { document, window } = newDOM();
+  const container = document.createElement('div');
+  new ScientificCalculator({ container, data: defaultScientificCalculatorData() });
+  const escape = () => {
+    const event = new window.Event('keydown', { bubbles: true, cancelable: true });
+    event.key = 'Escape';
+    return event;
+  };
+  const modeKey = container.querySelector('.sc-key-mode');
+  modeKey.click();
+  assert.ok(container.querySelector('.sc-mode-dialog'));
+  container.querySelector('.sc-mode-dialog [data-mode-choice]').dispatchEvent(escape());
+  assert.equal(container.querySelector('.sc-mode-dialog'), null, 'Escape closes the Calculation mode dialog');
+
+  container.querySelector('.sc-key[data-action="fraction"]').click();
+  assert.ok(container.querySelector('.sc-fraction-dialog'));
+  container.querySelector('.sc-fraction-dialog [name="numerator"]').dispatchEvent(escape());
+  assert.equal(container.querySelector('.sc-fraction-dialog'), null, 'Escape also closes the fraction-entry dialog');
+});
+
 test('interactive calculator evaluates locally, presents steps, records history and marks saved results', () => {
   const { document, window } = newDOM();
   const container = document.createElement('div');
@@ -145,6 +187,9 @@ test('hardware-style keypad supports fraction templates, SHIFT/ALPHA layers, fra
   fractionForm.querySelector('[name="denominator"]').value = '8';
   fractionForm.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
   assert.equal(expression.value, '((2)/(8))');
+  assert.equal(container.querySelector('.sc-expression-preview .sc-fraction-numerator').textContent, '2',
+    'the entered numerator is rendered vertically on the calculator LCD');
+  assert.equal(container.querySelector('.sc-expression-preview .sc-fraction-denominator').textContent, '8');
   container.querySelector('.sc-key[data-action="evaluate"]').click();
   assert.equal(view.lastResult, 0.25);
   expression.value = '1/2';

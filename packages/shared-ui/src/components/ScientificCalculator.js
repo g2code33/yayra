@@ -58,6 +58,7 @@ export class ScientificCalculator {
     this.mode = 'calculator';
     this.calculationMode = this.data.settings.calculationMode || 'COMP';
     this.expression = '';
+    this.expressionIsEditing = false;
     const latestNumericAnswer = this.data.history.find((entry) => entry.result !== null && entry.result !== undefined && Number.isFinite(Number(entry.result)));
     this.lastAnswer = latestNumericAnswer ? Number(latestNumericAnswer.result) : null;
     this.lastResult = this.lastAnswer;
@@ -99,6 +100,70 @@ export class ScientificCalculator {
     node.hidden = !message;
   }
 
+  fractionPartsForExpression(expression) {
+    const unwrap = (value) => {
+      let source = String(value || '').trim();
+      while (source.startsWith('(') && source.endsWith(')')) {
+        let depth = 0;
+        let closesAtEnd = true;
+        for (let index = 0; index < source.length; index += 1) {
+          if (source[index] === '(') depth += 1;
+          else if (source[index] === ')') depth -= 1;
+          if (depth === 0 && index < source.length - 1) { closesAtEnd = false; break; }
+        }
+        if (!closesAtEnd || depth !== 0) break;
+        source = source.slice(1, -1).trim();
+      }
+      return source;
+    };
+    const source = unwrap(expression);
+    let depth = 0;
+    let slash = -1;
+    for (let index = 0; index < source.length; index += 1) {
+      const character = source[index];
+      if (character === '(') depth += 1;
+      else if (character === ')') depth -= 1;
+      else if (depth === 0 && character === '/') {
+        if (slash >= 0) return null;
+        slash = index;
+      } else if (depth === 0 && '+−-*×÷^'.includes(character)
+        && index !== 0 && source[index - 1] !== '/') return null;
+    }
+    if (slash <= 0 || slash >= source.length - 1 || depth !== 0) return null;
+    const numerator = unwrap(source.slice(0, slash));
+    const denominator = unwrap(source.slice(slash + 1));
+    const numeric = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+    if (!numeric.test(numerator) || !numeric.test(denominator)) return null;
+    return { numerator, denominator };
+  }
+
+  refreshExpressionPreview() {
+    const input = this.container.querySelector('.sc-expression');
+    const stage = this.container.querySelector('.sc-expression-stage');
+    const preview = this.container.querySelector('.sc-expression-preview');
+    if (!input || !stage || !preview) return;
+    const source = input.value.trim();
+    preview.replaceChildren();
+    if (!source) {
+      stage.classList.remove('is-rendered');
+      preview.removeAttribute('title');
+      return;
+    }
+    const value = document.createElement('span');
+    value.className = 'sc-expression-preview-value';
+    const fraction = this.fractionPartsForExpression(source);
+    if (fraction) this.renderStackedFraction(value, fraction);
+    else value.textContent = input.value;
+    const edit = document.createElement('span');
+    edit.className = 'sc-expression-edit-icon';
+    edit.setAttribute('aria-hidden', 'true');
+    edit.textContent = '✎';
+    preview.append(value, edit);
+    preview.setAttribute('aria-label', `Edit expression: ${source}`);
+    preview.title = `Click to edit expression: ${source.slice(0, 160)}`;
+    stage.classList.toggle('is-rendered', !this.expressionIsEditing);
+  }
+
   showCalculationError(error) {
     this.calculationOutput = null;
     this.lastEntryId = null;
@@ -120,7 +185,10 @@ export class ScientificCalculator {
               <div class="sc-display">
                 <div class="sc-display-status"><span class="sc-display-angle">DEG</span><span class="sc-display-format">NORM1</span><span class="sc-display-mode">COMP</span><span class="sc-display-memory">${this.data.memory === null ? '' : 'M'}</span></div>
                 <label class="sc-visually-hidden" for="${this.instanceId}-expression">Calculator expression. Fractions can be typed as numerator/denominator.</label>
-                <textarea id="${this.instanceId}-expression" class="sc-expression" rows="2" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Type an expression or fraction, e.g. 3/4 + 1/2" aria-describedby="${this.instanceId}-expression-help"></textarea>
+                <div class="sc-expression-stage">
+                  <textarea id="${this.instanceId}-expression" class="sc-expression" rows="2" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Type an expression or fraction, e.g. 3/4 + 1/2" aria-describedby="${this.instanceId}-expression-help"></textarea>
+                  <button type="button" class="sc-expression-preview" aria-label="Edit expression" title="Click to edit expression"></button>
+                </div>
                 <output class="sc-screen-result" aria-live="polite">0</output>
               </div>
               <div class="sc-device-status" aria-label="Calculator display modes">
@@ -173,7 +241,18 @@ export class ScientificCalculator {
     this.container.querySelector('.sc-notation-mode').addEventListener('change', (event) => { this.data.settings.notation = ['scientific', 'engineering', 'norm1', 'norm2', 'fixed'].includes(event.target.value) ? event.target.value : 'auto'; this.persist(); this.updateDeviceStatus(); this.refreshFormattedAnswer(); this.showNotice(`Number format set to ${this.data.settings.notation}.`); });
     this.container.querySelector('.sc-open-settings').addEventListener('click', () => this.onOpenSettings());
     const expressionInput = this.container.querySelector('.sc-expression');
-    expressionInput.addEventListener('input', () => { this.expression = expressionInput.value; });
+    expressionInput.addEventListener('input', () => { this.expression = expressionInput.value; this.refreshExpressionPreview(); });
+    expressionInput.addEventListener('focus', () => { this.expressionIsEditing = true; this.refreshExpressionPreview(); });
+    expressionInput.addEventListener('blur', () => { this.expressionIsEditing = false; this.refreshExpressionPreview(); });
+    const editExpression = () => {
+      this.expressionIsEditing = true;
+      this.container.querySelector('.sc-expression-stage')?.classList.remove('is-rendered');
+      expressionInput.focus();
+    };
+    this.container.querySelector('.sc-expression-preview')?.addEventListener('click', editExpression);
+    this.container.querySelector('.sc-expression-preview')?.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); editExpression(); }
+    });
     expressionInput.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); this.evaluateCurrent(); } });
     this.container.querySelectorAll('.sc-key').forEach((button) => button.addEventListener('click', () => this.handleKey(button.dataset.key, button.dataset.action, expressionInput, button)));
     this.container.querySelectorAll('.sc-navigation-pad [data-nav]').forEach((button) => button.addEventListener('click', () => this.moveNavigation(button.dataset.nav, expressionInput)));
@@ -580,6 +659,18 @@ export class ScientificCalculator {
     const end = input.selectionEnd ?? start;
     host.innerHTML = `<div class="sc-mode-scrim sc-fraction-scrim"><form class="sc-fraction-dialog" role="dialog" aria-modal="true" aria-labelledby="${this.instanceId}-fraction-title"><div class="sc-dialog-header"><h2 id="${this.instanceId}-fraction-title">Enter a fraction</h2><button type="button" class="sc-dialog-close" data-fraction-cancel aria-label="Cancel">×</button></div><p>Enter the numerator above the fraction bar and the denominator below.</p><div class="sc-fraction-template"><input name="numerator" aria-label="Numerator" inputmode="decimal" autocomplete="off" required><span class="sc-fraction-rule" aria-hidden="true"></span><input name="denominator" aria-label="Denominator" inputmode="decimal" autocomplete="off" required></div><div class="sc-fraction-dialog-actions"><button type="button" class="sc-secondary-button" data-fraction-cancel>Cancel</button><button type="submit" class="sc-primary-button">Insert fraction</button></div></form></div>`;
     const form = host.querySelector('.sc-fraction-dialog');
+    const close = () => {
+      host.removeEventListener('keydown', onDialogKeydown);
+      host.replaceChildren();
+      input.focus();
+    };
+    const onDialogKeydown = (event) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation?.();
+      close();
+    };
+    host.addEventListener('keydown', onDialogKeydown);
     form.addEventListener('submit', (event) => {
       event.preventDefault();
       const numeratorInput = form.querySelector('[name="numerator"]'); const denominatorInput = form.querySelector('[name="denominator"]');
@@ -587,11 +678,12 @@ export class ScientificCalculator {
       if (!numerator || !denominator) return;
       const token = `((${numerator})/(${denominator}))`;
       this.expression = `${input.value.slice(0, start)}${token}${input.value.slice(end)}`;
-      input.value = this.expression; host.replaceChildren(); input.focus();
+      input.value = this.expression; close();
       const cursor = start + token.length; input.setSelectionRange?.(cursor, cursor);
+      input.blur?.();
       this.showNotice('Stacked fraction inserted into the expression.');
     });
-    host.querySelectorAll('[data-fraction-cancel]').forEach((button) => button.addEventListener('click', () => { host.replaceChildren(); input.focus(); }));
+    host.querySelectorAll('[data-fraction-cancel]').forEach((button) => button.addEventListener('click', close));
     form.querySelector('[name="numerator"]')?.focus();
   }
 
@@ -665,8 +757,20 @@ export class ScientificCalculator {
 
   openDialog(content, titleId, onOpen = () => {}) {
     const host = this.container.querySelector('.sc-dialog-host');
+    const returnFocus = host.ownerDocument?.activeElement || this.container.querySelector('.sc-key-mode');
     host.innerHTML = `<div class="sc-mode-scrim"><section class="sc-mode-dialog" role="dialog" aria-modal="true" aria-labelledby="${titleId}">${content}</section></div>`;
-    const close = () => host.replaceChildren();
+    const close = () => {
+      host.removeEventListener('keydown', onDialogKeydown);
+      host.replaceChildren();
+      if (returnFocus?.isConnected !== false) returnFocus?.focus?.();
+    };
+    const onDialogKeydown = (event) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation?.();
+      close();
+    };
+    host.addEventListener('keydown', onDialogKeydown);
     host.querySelectorAll('[data-dialog-close]').forEach((button) => button.addEventListener('click', close));
     host.querySelector('.sc-mode-scrim')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) close(); });
     onOpen(host, close);
@@ -768,6 +872,7 @@ export class ScientificCalculator {
       const output = { ...result, formatted: formatNumber(result.value, { precision: this.data.settings.precision, notation: this.data.settings.notation, fixedDigits: this.data.settings.fixedDigits }), expression: this.expression, unit: '', steps: result.steps, mode: 'calculator', angleMode: this.data.settings.angleMode };
       this.showOutput(output, 'calculator');
     } catch (error) { this.showCalculationError(error); }
+    finally { input.blur?.(); this.refreshExpressionPreview(); }
   }
 
   showOutput(output, mode = this.mode) {
@@ -797,7 +902,7 @@ export class ScientificCalculator {
     const resultNode = this.container.querySelector('.sc-answer-value'); const unitNode = this.container.querySelector('.sc-answer-unit');
     const screen = this.container.querySelector('.sc-screen-result'); const steps = this.container.querySelector('.sc-answer-steps'); const disclosure = this.container.querySelector('.sc-answer-disclosure');
     const copy = this.container.querySelector('.sc-copy-result'); const save = this.container.querySelector('.sc-save-result'); const sendFraction = this.container.querySelector('.sc-send-fraction');
-    if (!output) { if (resultNode) { resultNode.textContent = 'Ready'; resultNode.removeAttribute('aria-label'); } if (unitNode) unitNode.textContent = ''; if (screen) { screen.textContent = this.lastResult === null ? '0' : formatNumber(this.lastResult, { precision: this.data.settings.precision, notation: this.data.settings.notation, fixedDigits: this.data.settings.fixedDigits }); screen.removeAttribute('aria-label'); } steps?.setAttribute('hidden', ''); disclosure?.setAttribute('hidden', ''); if (copy) copy.disabled = true; if (save) save.disabled = true; if (sendFraction) sendFraction.disabled = true; return; }
+    if (!output) { if (resultNode) { resultNode.textContent = 'Ready'; resultNode.removeAttribute('aria-label'); } if (unitNode) unitNode.textContent = ''; if (screen) { screen.textContent = this.lastResult === null ? '0' : formatNumber(this.lastResult, { precision: this.data.settings.precision, notation: this.data.settings.notation, fixedDigits: this.data.settings.fixedDigits }); screen.removeAttribute('aria-label'); } steps?.setAttribute('hidden', ''); disclosure?.setAttribute('hidden', ''); if (copy) copy.disabled = true; if (save) save.disabled = true; if (sendFraction) sendFraction.disabled = true; this.refreshExpressionPreview(); return; }
     const fraction = Number.isFinite(output.value) ? formatFraction(output.value) : null;
     const shown = this.fractionDisplay && fraction ? `${fraction.exact ? '' : '≈ '}${fraction.text}` : output.formatted;
     if (resultNode) {
@@ -817,6 +922,7 @@ export class ScientificCalculator {
     if (disclosure) { disclosure.textContent = output.disclosure || output.assumptions || ''; disclosure.hidden = !disclosure.textContent; }
     if (copy) copy.disabled = false; if (save) save.disabled = !this.lastEntryId; if (sendFraction) sendFraction.disabled = !fraction;
     const screenExpression = this.container.querySelector('.sc-expression'); if (screenExpression && output.expression && output.mode !== 'calculator') screenExpression.value = output.expression;
+    this.refreshExpressionPreview();
     this.updateDeviceStatus();
   }
 
