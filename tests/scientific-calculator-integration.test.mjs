@@ -108,8 +108,8 @@ test('calculator styles use the design system and responsive graph/canvas presen
   assert.match(css, /grid-column:11 \/ span 10/);
   assert.match(css, /\.sc-expression:focus \{ caret-color:#101711!important; \}/,
     'cursor position stays visible in the calculator LCD');
-  assert.match(css, /\.sc-expression-stage:focus-within \{ outline:/,
-    'the active expression editor is visibly focused');
+  assert.doesNotMatch(css, /\.sc-expression-stage:focus-within \{ outline:/,
+    'the expression editor has no obstructive focus rectangle');
   assert.match(calculator, /rowNumber >= 6 && row\.filter\(Boolean\)\.length === 5 \? 6 : 5/, 'five-key rows expand to fill the final track span');
   assert.match(css, /sc-fraction-template/);
   assert.match(css, /sc-graph-curve/);

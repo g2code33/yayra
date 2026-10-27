@@ -38,6 +38,20 @@ test('the calculator and result/header area stay fixed while the right-side work
   assert.ok(scrollArea.querySelector('.sc-side-column'), 'the rest of the right workspace lives in its vertical scroll area');
 });
 
+test('history renders fraction expressions with the same stacked numerator/bar/denominator display', () => {
+  const { document } = newDOM();
+  const container = document.createElement('div');
+  const data = defaultScientificCalculatorData();
+  data.history = [{ id: 'history-fraction', expression: '((2)/(4))', result: 0.5, formatted: '0.5', createdAt: 1 }];
+  new ScientificCalculator({ container, data });
+  const historyExpression = container.querySelector('.sc-entry-expression');
+  assert.equal(historyExpression.querySelector('.sc-fraction-numerator').textContent, '2');
+  assert.equal(historyExpression.querySelector('.sc-fraction-denominator').textContent, '4');
+  historyExpression.click();
+  const input = container.querySelector('.sc-expression');
+  assert.equal(input.value, '((2)/(4))', 'selecting the history item still loads the editable bracket expression');
+});
+
 test('a keypad entry after a result starts a fresh expression and visibly shows operators', () => {
   const { document, window } = newDOM();
   const container = document.createElement('div');
@@ -57,6 +71,27 @@ test('a keypad entry after a result starts a fresh expression and visibly shows 
   view.destroy();
 });
 
+test('keypad insertions use the remembered caret and leave it after the complete clicked token', () => {
+  const { document, window } = newDOM();
+  const container = document.createElement('div');
+  const view = new ScientificCalculator({ container, data: defaultScientificCalculatorData() });
+  const input = container.querySelector('.sc-expression');
+  input.value = '12';
+  Object.defineProperties(input, {
+    selectionStart: { configurable: true, writable: true, value: 2 },
+    selectionEnd: { configurable: true, writable: true, value: 2 }
+  });
+  input.setSelectionRange = (start, end) => { input.selectionStart = start; input.selectionEnd = end; };
+  input.dispatchEvent(new window.Event('input', { bubbles: true }));
+  container.querySelector('.sc-key[data-key="+"]').click();
+  assert.equal(input.value, '12+');
+  assert.equal(input.selectionStart, input.value.length, 'the operation leaves the caret to its right');
+  container.querySelector('.sc-key[data-action="sqrt"]').click();
+  assert.equal(input.value, '12+sqrt()');
+  assert.equal(input.selectionStart, input.value.length, 'function keys leave the caret after the whole inserted token');
+  view.destroy();
+});
+
 test('the directional pad keeps cursor movement and calculation-history browsing on separate controls', () => {
   const { document } = newDOM();
   const container = document.createElement('div');
@@ -68,6 +103,7 @@ test('the directional pad keeps cursor movement and calculation-history browsing
     selectionEnd: { configurable: true, writable: true, value: 2 }
   });
   input.setSelectionRange = (start, end) => { input.selectionStart = start; input.selectionEnd = end; };
+  view.rememberExpressionSelection(input);
   view.data.history = [{ expression: '2+2' }, { expression: '3/4' }];
   const press = (direction) => container.querySelector(`.sc-navigation-pad [data-nav="${direction}"]`).click();
   for (const direction of ['left', 'right', 'up', 'down']) {

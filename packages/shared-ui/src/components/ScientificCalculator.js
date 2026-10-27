@@ -60,6 +60,7 @@ export class ScientificCalculator {
     this.expression = '';
     this.expressionIsEditing = false;
     this.awaitingNewExpression = false;
+    this.expressionSelection = null;
     const latestNumericAnswer = this.data.history.find((entry) => entry.result !== null && entry.result !== undefined && Number.isFinite(Number(entry.result)));
     this.lastAnswer = latestNumericAnswer ? Number(latestNumericAnswer.result) : null;
     this.lastResult = this.lastAnswer;
@@ -115,6 +116,23 @@ export class ScientificCalculator {
     return tokens;
   }
 
+  renderFractionExpression(node, expression) {
+    node.replaceChildren();
+    const source = String(expression ?? '');
+    const tokens = this.fractionTokensForExpression(source);
+    let cursor = 0;
+    for (const token of tokens) {
+      if (token.index < cursor) continue;
+      if (token.index > cursor) node.appendChild(document.createTextNode(source.slice(cursor, token.index)));
+      const fraction = document.createElement('span');
+      this.renderStackedFraction(fraction, token);
+      node.appendChild(fraction);
+      cursor = token.index + token.length;
+    }
+    if (cursor < source.length || !tokens.length) node.appendChild(document.createTextNode(source.slice(cursor)));
+    return tokens.length;
+  }
+
   refreshExpressionPreview() {
     const input = this.container.querySelector('.sc-expression');
     const stage = this.container.querySelector('.sc-expression-stage');
@@ -129,17 +147,7 @@ export class ScientificCalculator {
     }
     const value = document.createElement('span');
     value.className = 'sc-expression-preview-value';
-    const tokens = this.fractionTokensForExpression(input.value);
-    let cursor = 0;
-    for (const token of tokens) {
-      if (token.index < cursor) continue;
-      if (token.index > cursor) value.appendChild(document.createTextNode(input.value.slice(cursor, token.index)));
-      const fraction = document.createElement('span');
-      this.renderStackedFraction(fraction, token);
-      value.appendChild(fraction);
-      cursor = token.index + token.length;
-    }
-    if (cursor < input.value.length || !tokens.length) value.appendChild(document.createTextNode(input.value.slice(cursor)));
+    this.renderFractionExpression(value, input.value);
     const edit = document.createElement('span');
     edit.className = 'sc-expression-edit-icon';
     edit.setAttribute('aria-hidden', 'true');
@@ -232,10 +240,16 @@ export class ScientificCalculator {
     this.container.querySelector('.sc-notation-mode').addEventListener('change', (event) => { this.data.settings.notation = ['scientific', 'engineering', 'norm1', 'norm2', 'fixed'].includes(event.target.value) ? event.target.value : 'auto'; this.persist(); this.updateDeviceStatus(); this.refreshFormattedAnswer(); this.showNotice(`Number format set to ${this.data.settings.notation}.`); });
     this.container.querySelector('.sc-open-settings').addEventListener('click', () => this.onOpenSettings());
     const expressionInput = this.container.querySelector('.sc-expression');
-    expressionInput.addEventListener('input', () => { this.expression = expressionInput.value; this.historyCursor = -1; this.historyDraft = ''; this.awaitingNewExpression = false; this.refreshExpressionPreview(); });
+    expressionInput.addEventListener('input', () => { this.expression = expressionInput.value; this.historyCursor = -1; this.historyDraft = ''; this.awaitingNewExpression = false; this.rememberExpressionSelection(expressionInput); this.refreshExpressionPreview(); });
     expressionInput.addEventListener('focus', () => { this.awaitingNewExpression = false; this.expressionIsEditing = true; this.refreshExpressionPreview(); });
-    expressionInput.addEventListener('blur', () => { this.expressionIsEditing = false; this.refreshExpressionPreview(); });
+    expressionInput.addEventListener('blur', () => { this.rememberExpressionSelection(expressionInput); this.expressionIsEditing = false; this.refreshExpressionPreview(); });
+    expressionInput.addEventListener('click', () => this.rememberExpressionSelection(expressionInput));
+    expressionInput.addEventListener('keyup', () => this.rememberExpressionSelection(expressionInput));
+    expressionInput.addEventListener('select', () => this.rememberExpressionSelection(expressionInput));
     const editExpression = () => {
+      const end = expressionInput.value.length;
+      expressionInput.setSelectionRange?.(end, end);
+      this.rememberExpressionSelection(expressionInput);
       this.expressionIsEditing = true;
       expressionInput.focus();
       this.refreshExpressionPreview();
@@ -572,13 +586,14 @@ export class ScientificCalculator {
     if (action === 'answer') {
       if (this.shiftActive || this.alphaActive) {
         const token = this.alphaActive ? 'randint(,)' : 'rand()';
-        this.insertAtCursor(token, input, this.alphaActive ? 9 : token.length - 1);
+        this.insertAtCursor(token, input);
         this.shiftActive = false; this.alphaActive = false; this.updateKeyLayers(); return;
       }
       if (this.lastAnswer === null) { this.showNotice('Calculate a result before using Ans.', 'error'); return; }
       if (!input.value.trim()) {
         const formatted = formatNumber(this.lastAnswer, { precision: this.data.settings.precision, notation: this.data.settings.notation, fixedDigits: this.data.settings.fixedDigits });
         this.expression = formatted; input.value = formatted; input.focus();
+        input.setSelectionRange?.(formatted.length, formatted.length); this.rememberExpressionSelection(input); this.expressionIsEditing = true; this.refreshExpressionPreview();
         this.lastResult = this.lastAnswer;
         this.calculationOutput = { value: this.lastAnswer, formatted, expression: 'Ans', unit: '', steps: [], mode: 'calculator', angleMode: this.data.settings.angleMode };
         this.updateAnswer(this.calculationOutput);
@@ -594,51 +609,49 @@ export class ScientificCalculator {
       this.persist(); this.updateDeviceStatus(); this.refreshFormattedAnswer();
       this.showNotice(`Display format: ${this.data.settings.notation.toUpperCase()}.`); this.shiftActive = false; this.updateKeyLayers(); return;
     }
-    if (action === 'logbase') { this.insertAtCursor(this.shiftActive ? 'log()' : 'log(,)', input, 4); this.shiftActive = false; this.updateKeyLayers(); return; }
-    if (action === 'dms') { if (this.shiftActive) this.cycleAngleMode(); else this.insertAtCursor('dms(,,)', input, 4); this.shiftActive = false; this.updateKeyLayers(); return; }
-    if (action === 'square') { this.insertAtCursor(this.shiftActive ? 'sqrt()' : '^2', input, this.shiftActive ? 5 : 2); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'logbase') { this.insertAtCursor(this.shiftActive ? 'log()' : 'log(,)', input); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'dms') { if (this.shiftActive) this.cycleAngleMode(); else this.insertAtCursor('dms(,,)', input); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'square') { this.insertAtCursor(this.shiftActive ? 'sqrt()' : '^2', input); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'power') {
       const shifted = button?.dataset.shift;
-      this.insertAtCursor(this.shiftActive ? (shifted === '!' ? '!' : shifted || '!') : '^', input, this.shiftActive ? (shifted?.length || 1) : 1);
+      this.insertAtCursor(this.shiftActive ? (shifted === '!' ? '!' : shifted || '!') : '^', input);
       this.shiftActive = false; this.updateKeyLayers(); return;
     }
-    if (action === 'sqrt') { this.insertAtCursor(this.shiftActive ? 'cbrt()' : 'sqrt()', input, 5); this.shiftActive = false; this.updateKeyLayers(); return; }
-    if (action === 'log') { this.insertAtCursor(this.shiftActive ? '10^(' : 'log()', input, this.shiftActive ? 4 : 4); this.shiftActive = false; this.updateKeyLayers(); return; }
-    if (action === 'ln') { this.insertAtCursor(this.shiftActive ? 'exp()' : 'ln()', input, this.shiftActive ? 4 : 3); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'sqrt') { this.insertAtCursor(this.shiftActive ? 'cbrt()' : 'sqrt()', input); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'log') { this.insertAtCursor(this.shiftActive ? '10^(' : 'log()', input); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'ln') { this.insertAtCursor(this.shiftActive ? 'exp()' : 'ln()', input); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'trig') {
       let name = this.alphaActive ? (key === 'sin' ? 'sec' : key === 'cos' ? 'csc' : 'cot') : this.shiftActive ? (key === 'sin' ? 'asin' : key === 'cos' ? 'acos' : 'atan') : key;
       if (this.hyperbolicActive) name = this.shiftActive ? (key === 'sin' ? 'asinh' : key === 'cos' ? 'acosh' : 'atanh') : (key === 'sin' ? 'sinh' : key === 'cos' ? 'cosh' : 'tanh');
-      this.insertAtCursor(`${name}()`, input, name.length + 1); this.shiftActive = false; this.alphaActive = false; this.updateKeyLayers(); return;
+      this.insertAtCursor(`${name}()`, input); this.shiftActive = false; this.alphaActive = false; this.updateKeyLayers(); return;
     }
     const shifted = button?.dataset.shift;
     const alpha = button?.dataset.alpha;
     if (this.shiftActive && shifted === 'clear') { this.openClearDialog(input); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (this.shiftActive && shifted === 'units') { this.setMode('units'); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (this.shiftActive && shifted === 'STAT') { this.setCalculationMode('STAT'); this.shiftActive = false; this.updateKeyLayers(); return; }
-    if (this.shiftActive && shifted === 'MED') { this.insertAtCursor('median()', input, 7); this.shiftActive = false; this.updateKeyLayers(); return; }
-    if (this.shiftActive && shifted === 'σ') { this.insertAtCursor('stdev()', input, 6); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (this.shiftActive && shifted === 'MED') { this.insertAtCursor('median()', input); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (this.shiftActive && shifted === 'σ') { this.insertAtCursor('stdev()', input); this.shiftActive = false; this.updateKeyLayers(); return; }
     let insertion = key;
     if (this.alphaActive && alpha) insertion = alpha;
     else if (this.shiftActive && shifted) insertion = shifted === 'FACT' ? '!' : shifted;
     const useOverwrite = !this.insertMode;
-    const openParen = String(insertion).indexOf('(');
-    const cursorOffset = this.shiftActive && openParen >= 0 ? openParen + 1 : String(insertion).length;
-    this.insertAtCursor(insertion, input, cursorOffset, useOverwrite);
+    this.insertAtCursor(insertion, input, useOverwrite);
     if (this.shiftActive || this.alphaActive) { this.shiftActive = false; this.alphaActive = false; this.updateKeyLayers(); }
   }
 
   moveNavigation(direction, input) {
     if (direction === 'center') { this.evaluateCurrent(); return; }
     if (direction === 'left' || direction === 'right') {
-      const start = input.selectionStart ?? input.value.length;
-      const end = input.selectionEnd ?? start;
+      const { start, end } = this.selectionForExpression(input);
       const next = start !== end
         ? (direction === 'left' ? start : end)
         : Math.max(0, Math.min(input.value.length, start + (direction === 'left' ? -1 : 1)));
       input.focus();
       input.setSelectionRange?.(next, next);
+      this.rememberExpressionSelection(input);
       this.expressionIsEditing = true;
-      this.refreshExpressionPreview();
+      if (this.container.querySelector('.sc-expression-stage')?.classList.contains('is-rendered')) this.refreshExpressionPreview();
       return;
     }
     const entries = this.data.history;
@@ -655,6 +668,7 @@ export class ScientificCalculator {
     this.awaitingNewExpression = false;
     input.focus();
     input.setSelectionRange?.(input.value.length, input.value.length);
+    this.rememberExpressionSelection(input);
     this.expressionIsEditing = true;
     this.refreshExpressionPreview();
   }
@@ -662,8 +676,7 @@ export class ScientificCalculator {
   openFractionDialog(input) {
     this.prepareForNewEntry(input);
     const host = this.container.querySelector('.sc-dialog-host');
-    const start = input.selectionStart ?? input.value.length;
-    const end = input.selectionEnd ?? start;
+    const { start, end } = this.selectionForExpression(input);
     host.innerHTML = `<div class="sc-mode-scrim sc-fraction-scrim"><form class="sc-fraction-dialog" role="dialog" aria-modal="true" aria-labelledby="${this.instanceId}-fraction-title"><div class="sc-dialog-header"><h2 id="${this.instanceId}-fraction-title">Enter a fraction</h2><button type="button" class="sc-dialog-close" data-fraction-cancel aria-label="Cancel">×</button></div><p>Enter the numerator above the fraction bar and the denominator below.</p><div class="sc-fraction-template"><input name="numerator" aria-label="Numerator" inputmode="decimal" autocomplete="off" required><span class="sc-fraction-rule" aria-hidden="true"></span><input name="denominator" aria-label="Denominator" inputmode="decimal" autocomplete="off" required></div><div class="sc-fraction-dialog-actions"><button type="button" class="sc-secondary-button" data-fraction-cancel>Cancel</button><button type="submit" class="sc-primary-button">Insert fraction</button></div></form></div>`;
     const form = host.querySelector('.sc-fraction-dialog');
     const close = () => {
@@ -686,7 +699,7 @@ export class ScientificCalculator {
       const token = `((${numerator})/(${denominator}))`;
       this.expression = `${input.value.slice(0, start)}${token}${input.value.slice(end)}`;
       input.value = this.expression; close();
-      const cursor = start + token.length; input.setSelectionRange?.(cursor, cursor);
+      const cursor = start + token.length; input.setSelectionRange?.(cursor, cursor); this.rememberExpressionSelection(input);
       input.blur?.();
       this.showNotice('Stacked fraction inserted into the expression.');
     });
@@ -705,12 +718,29 @@ export class ScientificCalculator {
     });
   }
 
+  rememberExpressionSelection(input) {
+    this.expressionSelection = {
+      value: input.value,
+      start: input.selectionStart ?? input.value.length,
+      end: input.selectionEnd ?? input.selectionStart ?? input.value.length
+    };
+  }
+
+  selectionForExpression(input) {
+    if (this.expressionIsEditing) {
+      return { start: input.selectionStart ?? input.value.length, end: input.selectionEnd ?? input.selectionStart ?? input.value.length };
+    }
+    if (this.expressionSelection?.value === input.value) return this.expressionSelection;
+    return { start: input.value.length, end: input.value.length };
+  }
+
   prepareForNewEntry(input) {
     if (!this.awaitingNewExpression) return false;
     this.awaitingNewExpression = false;
     this.expression = '';
     input.value = '';
     input.setSelectionRange?.(0, 0);
+    this.rememberExpressionSelection(input);
     this.calculationOutput = null;
     this.lastEntryId = null;
     this.lastResult = null;
@@ -720,30 +750,30 @@ export class ScientificCalculator {
     return true;
   }
 
-  insertAtCursor(text, input, offset = String(text).length, overwrite = false) {
+  insertAtCursor(text, input, overwrite = false) {
     this.prepareForNewEntry(input);
-    const start = input.selectionStart ?? input.value.length;
-    const selectedEnd = input.selectionEnd ?? start;
+    const { start, end: selectedEnd } = this.selectionForExpression(input);
     const end = overwrite && start === selectedEnd ? Math.min(input.value.length, start + String(text).length) : selectedEnd;
     this.expression = `${input.value.slice(0, start)}${text}${input.value.slice(end)}`;
     input.value = this.expression;
     this.historyCursor = -1;
     this.historyDraft = '';
     this.awaitingNewExpression = false;
-    const cursor = start + Math.min(String(text).length, Math.max(0, offset));
+    const cursor = start + String(text).length;
     input.focus();
     input.setSelectionRange?.(cursor, cursor);
+    this.rememberExpressionSelection(input);
     this.expressionIsEditing = true;
     this.refreshExpressionPreview();
   }
 
   deleteAtCursor(input) {
     if (this.prepareForNewEntry(input)) { input.focus(); this.refreshExpressionPreview(); return; }
-    const start = input.selectionStart ?? input.value.length; const end = input.selectionEnd ?? start;
+    const { start, end } = this.selectionForExpression(input);
     const from = start === end ? Math.max(0, start - 1) : start;
     this.expression = `${input.value.slice(0, from)}${input.value.slice(end)}`; input.value = this.expression;
     this.historyCursor = -1; this.historyDraft = ''; this.awaitingNewExpression = false;
-    input.focus(); input.setSelectionRange?.(from, from); this.expressionIsEditing = true; this.refreshExpressionPreview();
+    input.focus(); input.setSelectionRange?.(from, from); this.rememberExpressionSelection(input); this.expressionIsEditing = true; this.refreshExpressionPreview();
   }
 
   cycleAngleMode() {
@@ -990,7 +1020,7 @@ export class ScientificCalculator {
     if (!entries.length) { const empty = document.createElement('p'); empty.className = 'sc-empty-state'; empty.textContent = this.sidePanel === 'history' ? 'No calculations yet. Try the keypad, graph analysis, integrals, units or science tools.' : 'No saved calculations yet. Save a result to keep it here.'; panel.appendChild(empty); return; }
     entries.slice(0, 100).forEach((entry) => {
       const card = document.createElement('article'); card.className = 'sc-entry-card';
-      const expression = document.createElement('button'); expression.type = 'button'; expression.className = 'sc-entry-expression'; expression.textContent = entry.expression; expression.title = 'Load this expression without calculating'; expression.addEventListener('click', () => { this.expression = entry.expression; this.setMode('calculator'); const input = this.container.querySelector('.sc-expression'); input.value = this.expression; input.focus(); });
+      const expression = document.createElement('button'); expression.type = 'button'; expression.className = 'sc-entry-expression'; this.renderFractionExpression(expression, entry.expression); expression.setAttribute('aria-label', `Load expression: ${entry.expression}`); expression.title = 'Load this expression without calculating'; expression.addEventListener('click', () => { this.expression = entry.expression; this.awaitingNewExpression = false; this.historyCursor = -1; this.historyDraft = ''; this.setMode('calculator'); const input = this.container.querySelector('.sc-expression'); input.value = this.expression; input.focus(); input.setSelectionRange?.(input.value.length, input.value.length); this.rememberExpressionSelection(input); this.expressionIsEditing = true; this.refreshExpressionPreview(); });
       const result = document.createElement('p'); result.className = 'sc-entry-result'; result.textContent = `${entry.formatted}${entry.unit ? ` ${entry.unit}` : ''}`;
       const timestamp = document.createElement('small'); timestamp.textContent = new Date(entry.createdAt).toLocaleString();
       const actions = document.createElement('div'); actions.className = 'sc-entry-actions';
