@@ -50,6 +50,8 @@ test('custom tab hover card replaces the native title tooltip and remains readab
     shell.state.tabs[0].url = 'yayra://newtab';
     const el = shell.render(container);
     const tab = el.querySelector('.fb-tab-item');
+    tab.getBoundingClientRect = () => ({ left: 170, bottom: 68 });
+    shell.viewportElement.getBoundingClientRect = () => ({ top: 130 });
 
     assert.equal(tab.getAttribute('title'), null,
       'no native title attribute exists to draw a duplicate tooltip');
@@ -62,8 +64,12 @@ test('custom tab hover card replaces the native title tooltip and remains readab
     assert.equal(card.getAttribute('role'), 'tooltip');
     assert.equal(card.querySelector('strong')?.textContent, 'New Tab');
     assert.equal(card.querySelector('span')?.textContent, 'newtab');
+    assert.equal(card.style.top, '68px',
+      'the full tooltip is clamped above the native page surface instead of sinking behind it');
 
     const hoverRule = ruleBody('.fb-tab-hover-card');
+    assert.match(hoverRule, /z-index:\s*2147483647/,
+      'the tooltip overlays browser chrome rather than sitting behind another HTML layer');
     assert.match(hoverRule, /box-sizing:\s*border-box/);
     assert.match(hoverRule, /background:\s*#111827/);
     assert.match(hoverRule, /color:\s*#f8fafc/);

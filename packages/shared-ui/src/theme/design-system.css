@@ -9650,7 +9650,7 @@ button.fb-site-passkey-indicator {
 .fb-performance-status { color: var(--fb-text-secondary, #9ca3af); font-size: .76rem; }
 .fb-performance-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 14px; }
 .fb-tab-item.fb-tab-inactive-dim:not(:hover) .fb-tab-title { opacity: .68; }
-.fb-tab-hover-card { position: fixed; z-index: 100001; box-sizing: border-box; width: min(280px, calc(100vw - 16px)); display: flex; flex-direction: column; gap: 5px; padding: 11px 13px; border: 1px solid rgba(255,255,255,.16); border-radius: 10px; background: #111827; color: #f8fafc; box-shadow: 0 12px 34px rgba(0,0,0,.4); pointer-events: none; }
+.fb-tab-hover-card { position: fixed; z-index: 2147483647; box-sizing: border-box; width: min(280px, calc(100vw - 16px)); display: flex; flex-direction: column; gap: 5px; padding: 11px 13px; border: 1px solid rgba(255,255,255,.16); border-radius: 10px; background: #111827; color: #f8fafc; box-shadow: 0 12px 34px rgba(0,0,0,.4); pointer-events: none; }
 .fb-tab-hover-card strong { overflow: hidden; color: inherit; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; line-height: 1.35; }
 .fb-tab-hover-card span { overflow: hidden; color: #cbd5e1; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; line-height: 1.35; }
 [data-theme="light"] .fb-tab-hover-card { border-color: rgba(15,23,42,.16); background: #ffffff; color: #0f172a; box-shadow: 0 12px 30px rgba(15,23,42,.22); }

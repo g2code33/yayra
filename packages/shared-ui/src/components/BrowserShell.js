@@ -3308,10 +3308,22 @@ export class BrowserShell {
             const height = typeof window !== 'undefined' ? (Number(window.innerHeight) || 800) : 800;
             const cardWidth = Math.min(280, Math.max(0, width - 16));
             const left = Math.max(8, Math.min(Number(rect?.left) || 8, width - cardWidth - 8));
-            const top = Math.max(8, Math.min((Number(rect?.bottom) || 0) + 8, height - 96));
+            const preferredTop = Math.max(8, (Number(rect?.bottom) || 0) + 8);
             card.style.left = `${left}px`;
-            card.style.top = `${top}px`;
+            card.style.top = `${preferredTop}px`;
             document.body.appendChild(card);
+            // On Electron, the native page surface paints above document
+            // content regardless of CSS z-index. Keep this tooltip wholly in
+            // browser chrome so the page cannot cover its lower title/address
+            // line when it opens near the top of the viewport.
+            const cardRect = card.getBoundingClientRect?.();
+            const cardHeight = Number(cardRect?.height) || Number(card.offsetHeight) || 58;
+            const viewportTop = Number(this.viewportElement?.getBoundingClientRect?.().top);
+            const maxTop = Number.isFinite(viewportTop) && viewportTop > 0
+              ? viewportTop - cardHeight - 4
+              : height - cardHeight - 8;
+            const top = Math.max(8, Math.min(preferredTop, maxTop));
+            card.style.top = `${top}px`;
             this._activeTabHoverCard = card;
           }, 450);
         };
