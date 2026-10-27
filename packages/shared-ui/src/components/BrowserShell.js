@@ -22078,7 +22078,8 @@ export class BrowserShell {
       return;
     }
     if (action === 'tools') { this.state.isToolsDropdownOpen = !this.state.isToolsDropdownOpen; this.render(); return; }
-    const routes = { documents: 'yayra://documents', dictionary: 'yayra://dictionary', extensions: 'yayra://extensions', calculator: 'yayra://calculator', history: 'yayra://history', bookmarks: 'yayra://bookmarks', settings: 'yayra://settings', passwords: 'yayra://passwords' };
+    if (action === 'calculator') { this.openCalculatorFromPreference(); return; }
+    const routes = { documents: 'yayra://documents', dictionary: 'yayra://dictionary', extensions: 'yayra://extensions', history: 'yayra://history', bookmarks: 'yayra://bookmarks', settings: 'yayra://settings', passwords: 'yayra://passwords' };
     if (routes[action]) this.openInternalPage(routes[action]);
   }
 
@@ -22126,6 +22127,11 @@ export class BrowserShell {
       button.addEventListener('click', () => {
         const selected = tools.find((tool) => tool.id === button.dataset.tool);
         this.state.isToolsDropdownOpen = false;
+        if (selected?.id === 'calculator') {
+          this.render();
+          this.openCalculatorFromPreference();
+          return;
+        }
         if (selected?.id === 'settings') {
           this.state.settingsActiveCategory = 'calculator';
           this.state.activeSettingsCategory = 'calculator';

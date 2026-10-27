@@ -189,3 +189,31 @@ test('Calculator settings toggle persists and its Open button follows the select
   assert.deepEqual(launches, ['yayra://calculator']);
   assert.equal(shell.getActiveTab().url, 'yayra://settings', 'mini launch keeps the settings tab intact');
 });
+
+test('Calculator toolbar and Tools menu honor the mini-window launch preference', async () => {
+  disk.clear();
+  const { shell, container } = await boot();
+  const launches = [];
+  window.yayra = { ...(window.yayra || {}), overlay: { openPageInMini: async (url) => { launches.push(url); return true; } } };
+  shell.state.tabs = [{ id: 't-web', title: 'Example', url: 'https://example.com/', isLoading: false, isPrivate: false, favicon: null }];
+  shell.state.activeTabId = 't-web';
+  shell.state.settings.calculatorOpenDestination = 'mini';
+  shell.state.settings.toolbarQuickActions = ['downloads', 'tools', 'calculator'];
+  shell.render(container);
+
+  container.querySelector('.fb-quick-calculator-btn').click();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(launches, ['yayra://calculator'], 'the calculator quick action opens in the mini window');
+  assert.equal(shell.getActiveTab().url, 'https://example.com/', 'quick launch preserves the current browser tab');
+
+  container.querySelector('.fb-quick-tools-btn').click();
+  assert.equal(shell.state.isToolsDropdownOpen, true, 'the Tools button opens its dropdown');
+  assert.ok(container.querySelector('.fb-tools-dropdown'), 'the dropdown is rendered in the browser container');
+  const calculatorMenuItem = [...container.querySelectorAll('.fb-tools-menu-item')].find((button) => button.dataset.tool === 'calculator');
+  assert.ok(calculatorMenuItem, 'the calculator action is available in the Tools menu');
+  calculatorMenuItem.click();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(launches, ['yayra://calculator', 'yayra://calculator'], 'the Tools menu uses the same mini-window preference');
+  assert.equal(shell.getActiveTab().url, 'https://example.com/', 'Tools menu launch also preserves the current browser tab');
+  assert.equal(container.querySelector('.fb-tools-dropdown'), null, 'the Tools menu closes after launching the mini calculator');
+});
