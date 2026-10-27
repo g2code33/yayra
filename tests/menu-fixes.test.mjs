@@ -635,6 +635,10 @@ test('TAB RIGHT-CLICK: pointer activation moves the tab into a durable group', a
     assert.equal(submenu.style.display, 'flex', 'the paired click does not immediately collapse the pointer-opened submenu');
     const addToWork = submenu.querySelectorAll('.fb-tab-context-submenu-item').find((button) => button.textContent === 'Work');
     assert.ok(addToWork, 'the submenu lists the existing group');
+    assert.equal(addToWork.style.getPropertyValue('-webkit-app-region'), 'no-drag',
+      'the actual group choice cannot be swallowed as a frameless-window drag region');
+    assert.equal(addToWork.style.getPropertyValue('pointer-events'), 'auto',
+      'the group choice remains a renderer hit target in Electron');
     dispatchPointer(addToWork, 'pointerdown');
     dispatchPointer(addToWork, 'pointerup');
     await flush();

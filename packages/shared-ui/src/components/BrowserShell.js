@@ -20801,7 +20801,18 @@ export class BrowserShell {
     // assistive technology, and suppress only the synthetic click belonging
     // to the pointer-up we already handled. Commands are exactly-once even if
     // both events arrive.
+    const pinMenuHitTarget = (button) => {
+      // Chromium/Electron can treat descendants of frameless chrome as drag
+      // regions even when their body-mounted menu is interactive. Pin each
+      // actual button as well as the menu container: submenu rows are the
+      // primary-action targets, so a visible hover must also receive presses.
+      button.style?.setProperty?.('-webkit-app-region', 'no-drag');
+      button.style?.setProperty?.('pointer-events', 'auto');
+      button.style?.setProperty?.('touch-action', 'manipulation');
+      return button;
+    };
     const bindReliablePress = (button, handler) => {
+      pinMenuHitTarget(button);
       let suppressNextClick = false;
       let suppressionTimer = null;
       let pressedPointer = null;
