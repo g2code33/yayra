@@ -106,19 +106,48 @@ test('dictionary pack choices always follow the selected category and explain an
   } finally { shell.destroy(); container.remove(); }
 });
 
-test('Dictionary is a working side-drawer destination and pack source links have independent spacing', () => {
+test('Dictionary and Calculator are working side-drawer destinations, in the requested order', async () => {
   const { shell, container } = makeShell();
+  const originalYayra = window.yayra;
   try {
     shell.state.isSideDrawerOpen = true;
     shell.render(container);
     const dictionaryButton = container.querySelector('.fb-dr-dictionary');
+    const calculatorButton = container.querySelector('.fb-dr-calculator');
     assert.ok(dictionaryButton, 'the side drawer includes the Dictionary entry');
-    dictionaryButton.click();
-    assert.equal(shell.getActiveTab().url, 'yayra://dictionary', 'the menu opens the offline dictionary page');
+    assert.ok(calculatorButton, 'the side drawer includes the Calculator entry');
+    const items = Array.from(container.querySelectorAll('.fb-drawer-item'));
+    assert.equal(items.indexOf(calculatorButton), items.indexOf(dictionaryButton) + 1,
+      'Calculator appears immediately below Dictionary');
+    calculatorButton.click();
+    assert.equal(shell.getActiveTab().url, 'yayra://calculator', 'the menu opens the calculator using the configured destination');
+    assert.equal(shell.state.isSideDrawerOpen, false, 'choosing Calculator closes the side drawer');
+
+    shell.state.isSideDrawerOpen = true;
+    shell.render(container);
+    container.querySelector('.fb-dr-dictionary').click();
+    assert.equal(shell.getActiveTab().url, 'yayra://dictionary', 'the menu still opens the offline dictionary page');
+
+    let resolveMiniOpen;
+    const miniOpened = new Promise((resolve) => { resolveMiniOpen = resolve; });
+    shell.state.settings.calculatorOpenDestination = 'mini';
+    window.yayra = { ...(window.yayra || {}), overlay: { openPageInMini: (url) => { resolveMiniOpen(url); return Promise.resolve(true); } } };
+    shell.state.isSideDrawerOpen = true;
+    shell.render(container);
+    container.querySelector('.fb-dr-calculator').click();
+    assert.equal(await miniOpened, 'yayra://calculator', 'the menu respects the mini-window preference');
+    assert.equal(shell.state.isSideDrawerOpen, false, 'the side drawer also closes when Calculator opens as a mini window');
+    assert.equal(shell.getActiveTab().url, 'yayra://dictionary', 'opening the mini calculator does not navigate the current tab');
+
     const source = requireBrowserShellSource();
     assert.match(source, /\.fb-dict-link\{display:block[^}]*margin-top:7px/,
       'license and verification links stack with visible spacing in pack cards');
-  } finally { shell.destroy(); container.remove(); }
+  } finally {
+    if (originalYayra === undefined) delete window.yayra;
+    else window.yayra = originalYayra;
+    shell.destroy();
+    container.remove();
+  }
 });
 
 function requireBrowserShellSource() {

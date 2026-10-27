@@ -18355,6 +18355,7 @@ export class BrowserShell {
         <button class="fb-drawer-item fb-dr-downloads">${Icons.download} <span>Downloads</span> <kbd>Ctrl+J</kbd></button>
         <button class="fb-drawer-item fb-dr-documents">${Icons.document} <span>Documents</span></button>
         <button class="fb-drawer-item fb-dr-dictionary">${Icons.dictionary} <span>Dictionary</span></button>
+        <button class="fb-drawer-item fb-dr-calculator">${Icons.calculator} <span>Calculator</span></button>
 
         <!-- 5. Bookmarks & Lists with Submenu -->
         <div class="fb-drawer-item-has-submenu">
@@ -18773,6 +18774,12 @@ export class BrowserShell {
     drawer.querySelector('.fb-dr-dictionary')?.addEventListener('click', () => {
       this.state.isSideDrawerOpen = false;
       this.openInternalPage('yayra://dictionary');
+    });
+
+    drawer.querySelector('.fb-dr-calculator')?.addEventListener('click', () => {
+      this.state.isSideDrawerOpen = false;
+      this.render();
+      this.openCalculatorFromPreference();
     });
 
     drawer.querySelector('.fb-dr-bookmarks')?.addEventListener('click', () => {
