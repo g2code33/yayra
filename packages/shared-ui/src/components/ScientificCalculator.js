@@ -113,17 +113,6 @@ export class ScientificCalculator {
   render() {
     this.container.innerHTML = `
       <section class="sc-workspace" data-mode="${this.mode}" aria-label="Scientific calculator and science workspace">
-        <header class="sc-header">
-          <div class="sc-heading"><span class="sc-brand-icon">${Icons.calculator}</span><div><p class="sc-eyebrow">${this.privateMode ? 'PRIVATE SESSION · MEMORY ONLY' : 'OFFLINE-FIRST · ON THIS DEVICE'}</p><h1>Scientific calculator</h1><p class="sc-subtitle">${this.privateMode ? 'Nothing here is saved to your profile.' : 'A complete local science desk. Your work stays in this Yayra profile.'}</p></div></div>
-          <div class="sc-header-actions">
-            <label class="sc-angle-control"><span>Angle</span><select class="sc-angle-mode" aria-label="Angle unit"><option value="DEG">DEG</option><option value="RAD">RAD</option><option value="GRAD">GRAD</option></select></label>
-            <label class="sc-angle-control"><span>Digits</span><select class="sc-precision-mode" aria-label="Significant digits"><option value="6">6</option><option value="9">9</option><option value="12">12</option><option value="15">15</option></select></label>
-            <label class="sc-angle-control"><span>Format</span><select class="sc-notation-mode" aria-label="Number format"><option value="auto">NORM</option><option value="norm1">NORM1</option><option value="norm2">NORM2</option><option value="fixed">FIX</option><option value="scientific">SCI</option><option value="engineering">ENG</option></select></label>
-            <button class="sc-icon-button sc-open-settings" type="button" title="Calculator settings" aria-label="Calculator settings">${Icons.settings}<span class="sc-settings-label">Settings</span></button>
-          </div>
-        </header>
-        <div class="sc-notice" role="status" aria-live="polite" hidden></div>
-        <nav class="sc-workspace-nav" aria-label="Scientific workspace">${NAV_ITEMS.map(([key, label, glyph]) => `<button type="button" class="sc-mode-button" data-mode="${key}" aria-pressed="false"><span aria-hidden="true">${glyph}</span><span>${label}</span></button>`).join('')}</nav>
         <div class="sc-layout">
           <main class="sc-calculator-column">
             <div class="sc-calculator-device">
@@ -144,12 +133,23 @@ export class ScientificCalculator {
               <div class="sc-memory-keys" aria-label="Calculator memory"><button type="button" data-memory="clear" title="Memory clear">MC</button><button type="button" data-memory="recall" title="Recall memory">RCL</button><button type="button" data-memory="add" title="Add result to memory">M+</button><button type="button" data-memory="subtract" title="Subtract result from memory">M−</button><span class="sc-memory-status">${this.data.memory === null ? 'M —' : `M ${ESCAPE(formatNumber(this.data.memory))}`}</span></div>
               <p id="${this.instanceId}-expression-help" class="sc-shortcut-hint">Type fractions as <code>numerator/denominator</code>. Press Enter to calculate.</p>
             </div>
+          </main>
+          <section class="sc-workspace-column" aria-label="Science workspace">
+            <header class="sc-header">
+              <div class="sc-heading"><span class="sc-brand-icon">${Icons.calculator}</span><div><p class="sc-eyebrow">${this.privateMode ? 'PRIVATE SESSION · MEMORY ONLY' : 'OFFLINE-FIRST · ON THIS DEVICE'}</p><h1>Scientific calculator</h1><p class="sc-subtitle">${this.privateMode ? 'Nothing here is saved to your profile.' : 'A complete local science desk. Your work stays in this Yayra profile.'}</p></div></div>
+              <div class="sc-header-actions">
+                <label class="sc-angle-control"><span>Angle</span><select class="sc-angle-mode" aria-label="Angle unit"><option value="DEG">DEG</option><option value="RAD">RAD</option><option value="GRAD">GRAD</option></select></label>
+                <label class="sc-angle-control"><span>Digits</span><select class="sc-precision-mode" aria-label="Significant digits"><option value="6">6</option><option value="9">9</option><option value="12">12</option><option value="15">15</option></select></label>
+                <label class="sc-angle-control"><span>Format</span><select class="sc-notation-mode" aria-label="Number format"><option value="auto">NORM</option><option value="norm1">NORM1</option><option value="norm2">NORM2</option><option value="fixed">FIX</option><option value="scientific">SCI</option><option value="engineering">ENG</option></select></label>
+                <button class="sc-icon-button sc-open-settings" type="button" title="Calculator settings" aria-label="Calculator settings">${Icons.settings}<span class="sc-settings-label">Settings</span></button>
+              </div>
+            </header>
+            <div class="sc-notice" role="status" aria-live="polite" hidden></div>
+            <nav class="sc-workspace-nav" aria-label="Scientific workspace">${NAV_ITEMS.map(([key, label, glyph]) => `<button type="button" class="sc-mode-button" data-mode="${key}" aria-pressed="false"><span aria-hidden="true">${glyph}</span><span>${label}</span></button>`).join('')}</nav>
             <section class="sc-answer-card" aria-live="polite" aria-label="Calculation result">
               <div class="sc-answer-heading"><span class="sc-answer-label">RESULT · ${this.privateMode ? 'PRIVATE MEMORY' : 'LOCAL'}</span><div class="sc-answer-actions"><button type="button" class="sc-copy-result" disabled>Copy</button><button type="button" class="sc-send-fraction" disabled title="Insert the result as a numerator/denominator expression">Send fraction</button><button type="button" class="sc-save-result" disabled>Save</button></div></div>
               <output class="sc-answer-value">Ready</output><div class="sc-answer-unit"></div><p class="sc-fraction-approximation" hidden></p><ol class="sc-answer-steps" hidden></ol><p class="sc-answer-disclosure" hidden></p>
             </section>
-          </main>
-          <section class="sc-workspace-column" aria-label="Science workspace">
             <div class="sc-mode-content"></div>
             <aside class="sc-side-column" aria-label="History, saved work, formulas, variables and notes">
               <div class="sc-side-heading"><div><p class="sc-eyebrow">YOUR LOCAL WORK</p><h2>Library &amp; notes</h2></div><span class="sc-local-indicator" title="Stored locally">● LOCAL</span></div>

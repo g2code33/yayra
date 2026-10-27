@@ -19,6 +19,21 @@ function newDOM() {
   return dom;
 }
 
+test('the answer, heading and workspace tabs scroll alongside the science tools, not below the static calculator', () => {
+  const { document } = newDOM();
+  const container = document.createElement('div');
+  new ScientificCalculator({ container, data: defaultScientificCalculatorData() });
+  const calculatorColumn = container.querySelector('.sc-calculator-column');
+  const workspaceColumn = container.querySelector('.sc-workspace-column');
+  assert.ok(calculatorColumn.querySelector('.sc-calculator-device'));
+  assert.equal(calculatorColumn.querySelector('.sc-answer-card'), null,
+    'the result is no longer clipped below the left-side calculator');
+  assert.equal(workspaceColumn.querySelector('.sc-answer-card').parentElement, workspaceColumn,
+    'the result is in the scrollable right side');
+  assert.ok(workspaceColumn.querySelector('.sc-header'));
+  assert.ok(workspaceColumn.querySelector('.sc-workspace-nav'));
+});
+
 test('interactive calculator evaluates locally, presents steps, records history and marks saved results', () => {
   const { document, window } = newDOM();
   const container = document.createElement('div');

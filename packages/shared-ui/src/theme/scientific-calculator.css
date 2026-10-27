@@ -261,7 +261,7 @@
 .fb-mobile-tab-tools { color:#7dd3fc!important; }
 @media (max-width:1050px) {
   .sc-layout { grid-template-columns:minmax(0,1fr); }
-  .sc-calculator-column { display:grid; grid-template-columns:minmax(0,1fr) minmax(230px,.72fr); align-items:start; }
+  .sc-calculator-column { display:grid; grid-template-columns:minmax(0,1fr); align-items:start; }
   .sc-answer-card { margin-top:0; }
   .sc-side-content { max-height:250px; }
 }
@@ -394,14 +394,23 @@
   .sc-key small { font-size:.4rem; }
   .sc-navigation-pad { height:70px; padding:3px; }
   .sc-shortcut-hint { margin-top:5px; font-size:.58rem; }
-  .sc-answer-card { padding:8px 11px; }
-  .sc-answer-value { margin-top:4px; font-size:clamp(1.15rem,2.2vw,1.65rem); }
-  .sc-answer-steps { max-height:90px; }
+  .sc-workspace-column { gap:9px; }
+  .sc-workspace-column > .sc-answer-card { margin:0; padding:6px 9px; border-radius:10px; }
+  .sc-workspace-column > .sc-answer-card .sc-answer-actions { gap:4px; }
+  .sc-workspace-column > .sc-answer-card .sc-answer-actions button { padding:4px 6px; font-size:.58rem; }
+  .sc-workspace-column > .sc-answer-card .sc-answer-value { margin-top:3px; font-size:clamp(1rem,1.7vw,1.4rem); }
+  .sc-workspace-column > .sc-answer-card .sc-answer-steps { max-height:65px; margin-top:5px; padding-top:5px; }
 }
 @media (max-width:1050px) {
   .fb-internal-page.fb-scientific-calculator-page { overflow-x:hidden; overflow-y:auto; }
   .sc-workspace { display:block; height:auto; min-height:100%; overflow:visible; }
   .sc-layout { flex:initial; min-height:auto; align-items:start; }
-  .sc-calculator-column { position:static; }
-  .sc-workspace-column { height:auto; max-height:none; overflow:visible; padding-right:0; }
+  .sc-calculator-column { position:static; order:3; }
+  .sc-workspace-column { display:contents; height:auto; max-height:none; overflow:visible; padding-right:0; }
+  .sc-header { order:0; }
+  .sc-notice { order:1; }
+  .sc-workspace-nav { order:2; }
+  .sc-answer-card { order:4; }
+  .sc-mode-content { order:5; }
+  .sc-side-column { order:6; }
 }

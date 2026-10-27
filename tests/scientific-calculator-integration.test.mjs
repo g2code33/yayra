@@ -61,15 +61,29 @@ test('calculator workspace includes numerical graph analysis, local calculus and
   assert.match(engine, /export function findFunctionRoots/);
 });
 
-test('desktop keeps calculator and answer visible while only the right workspace scrolls', () => {
+test('desktop pins only the calculator while the result and entire science workspace scroll on the right', () => {
   const desktop = css.slice(css.lastIndexOf('@media (min-width:1051px)'));
   assert.notEqual(desktop, css, 'desktop viewport rules are present');
   assert.match(desktop, /fb-internal-page\.fb-scientific-calculator-page \{ overflow:hidden; \}/);
   assert.match(desktop, /\.sc-workspace-column \{[^}]*overflow-y:auto/);
   assert.match(desktop, /\.sc-calculator-column \{[^}]*position:sticky/);
+  assert.match(desktop, /\.sc-workspace-column > \.sc-answer-card \{[^}]*padding:6px 9px/,
+    'the answer card stays compact in the right scroll pane');
   assert.match(desktop, /grid-auto-rows:minmax\(35px,auto\)/);
+  const calculatorColumn = calculator.slice(calculator.indexOf('<main class="sc-calculator-column">'), calculator.indexOf('</main>'));
+  assert.match(calculatorColumn, /sc-calculator-device/);
+  assert.doesNotMatch(calculatorColumn, /sc-answer-card/, 'the answer is no longer hidden below the fixed calculator');
+  const workspaceStart = calculator.indexOf('<section class="sc-workspace-column"');
+  assert.ok(calculator.indexOf('<header class="sc-header">') > workspaceStart,
+    'the page heading and settings scroll with the right workspace');
+  assert.ok(calculator.indexOf('<nav class="sc-workspace-nav"') > workspaceStart,
+    'the workspace tabs scroll with the right workspace');
+  assert.ok(calculator.indexOf('sc-answer-card') > workspaceStart,
+    'the result card lives in the independently scrollable right column');
   const mobileReflow = desktop.slice(desktop.indexOf('@media (max-width:1050px)'));
   assert.match(mobileReflow, /overflow-y:auto/);
+  assert.match(mobileReflow, /\.sc-workspace-column \{ display:contents/,
+    'mobile reflow preserves heading and navigation above the calculator');
 });
 
 test('calculator styles use the design system and responsive graph/canvas presentation', () => {
