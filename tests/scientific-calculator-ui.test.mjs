@@ -87,8 +87,80 @@ test('keypad insertions use the remembered caret and leave it after the complete
   assert.equal(input.value, '12+');
   assert.equal(input.selectionStart, input.value.length, 'the operation leaves the caret to its right');
   container.querySelector('.sc-key[data-action="sqrt"]').click();
-  assert.equal(input.value, '12+sqrt()');
-  assert.equal(input.selectionStart, input.value.length, 'function keys leave the caret after the whole inserted token');
+  assert.equal(input.value, '12+sqrt(');
+  assert.equal(input.selectionStart, input.value.length, 'function keys leave the caret directly after their opening token');
+  view.destroy();
+});
+
+test('operator, scientific-notation, power, root and trig keypad sequences calculate conventionally', () => {
+  const { document } = newDOM();
+  const container = document.createElement('div');
+  const view = new ScientificCalculator({ container, data: defaultScientificCalculatorData() });
+  const input = container.querySelector('.sc-expression');
+  const key = (name) => container.querySelector(`.sc-key[data-key="${name}"]`);
+  const calculate = () => key('=').click();
+  const clear = () => key('AC').click();
+  const result = () => container.querySelector('.sc-screen-result').textContent;
+
+  key('2').click(); key('5').click(); key('−').click(); key('9').click();
+  assert.equal(input.value, '25−9', 'the minus key is visible in the expression');
+  calculate();
+  assert.equal(result(), '16', 'Unicode minus calculates correctly');
+
+  clear(); key('5').click(); key('×10ˣ').click(); key('8').click();
+  assert.equal(input.value, '5*10^8', 'the ×10ˣ key inserts a usable scientific-notation token');
+  calculate();
+  assert.equal(result(), '500000000');
+
+  clear(); key('√').click(); key('9').click();
+  assert.equal(input.value, 'sqrt(9');
+  calculate();
+  assert.equal(input.value, 'sqrt(9)', 'open function parentheses are completed when evaluating');
+  assert.equal(result(), '3');
+
+  clear(); key('sin').click(); key('3').click(); key('0').click(); calculate();
+  assert.equal(input.value, 'sin(30)');
+  assert.equal(result(), '0.5');
+
+  clear(); key('2').click(); key('xʸ').click(); key('3').click(); calculate();
+  assert.equal(result(), '8', 'the power key places the exponent after the operator');
+
+  clear(); key('SHIFT').click(); key('√').click(); key('2').click(); key('7').click(); calculate();
+  assert.equal(result(), '3', 'the shifted cube-root key accepts the following number');
+  view.destroy();
+});
+
+test('up/down history browsing shows each selected answer and restores the live result with the draft', () => {
+  const { document } = newDOM();
+  const container = document.createElement('div');
+  const view = new ScientificCalculator({ container, data: defaultScientificCalculatorData() });
+  const input = container.querySelector('.sc-expression');
+  view.data.history = [
+    { id: 'recent', expression: '2+2', result: 4, formatted: '4', mode: 'calculator', steps: [] },
+    { id: 'older', expression: '3/4', result: 0.75, formatted: '0.75', mode: 'calculator', steps: [] }
+  ];
+  input.value = '8+0';
+  view.lastEntryId = 'draft-result';
+  view.lastResult = 8;
+  view.lastAnswer = 8;
+  view.calculationOutput = { value: 8, formatted: '8', expression: '8+0', mode: 'calculator', steps: [] };
+  view.updateAnswer(view.calculationOutput);
+  const press = (direction) => container.querySelector(`.sc-navigation-pad [data-nav="${direction}"]`).click();
+
+  press('up');
+  assert.equal(input.value, '2+2');
+  assert.equal(container.querySelector('.sc-screen-result').textContent, '4', 'the result belongs to the selected recent expression');
+  assert.equal(view.lastResult, 4);
+  press('up');
+  assert.equal(input.value, '3/4');
+  assert.equal(container.querySelector('.sc-screen-result').textContent, '0.75', 'older history also restores its own result');
+  press('down');
+  assert.equal(input.value, '2+2');
+  assert.equal(container.querySelector('.sc-screen-result').textContent, '4');
+  press('down');
+  assert.equal(input.value, '8+0');
+  assert.equal(container.querySelector('.sc-screen-result').textContent, '8', 'returning to the draft restores its previous displayed answer');
+  assert.equal(view.lastResult, 8);
   view.destroy();
 });
 
@@ -143,7 +215,7 @@ test('fraction expressions render as a stacked calculator-screen fraction with a
   assert.equal(stage.classList.contains('is-rendered'), true);
   assert.equal(preview.querySelector('.sc-fraction-numerator').textContent, '2');
   assert.equal(preview.querySelector('.sc-fraction-denominator').textContent, '5');
-  assert.ok(preview.querySelector('.sc-expression-edit-icon'));
+  assert.equal(preview.querySelector('.sc-expression-edit-icon'), null, 'the visible pencil edit mark is removed');
   preview.click();
   assert.equal(input.value, expression, 'the original safe expression remains editable');
   assert.equal(stage.classList.contains('is-rendered'), false, 'editing returns to the raw bracket expression so its cursor and edits stay aligned');
@@ -312,10 +384,10 @@ test('hardware-style keypad supports fraction templates, SHIFT/ALPHA layers, fra
   assert.equal(expression.value, '(1/2)');
   container.querySelector('.sc-key[data-action="shift"]').click();
   container.querySelector('.sc-key[data-key="sin"]').click();
-  assert.equal(expression.value, '(1/2)asin()');
+  assert.equal(expression.value, '(1/2)asin(');
   container.querySelector('.sc-key[data-action="alpha"]').click();
   container.querySelector('.sc-key[data-key="sin"]').click();
-  assert.equal(expression.value, '(1/2)asin()sec()');
+  assert.equal(expression.value, '(1/2)asin(sec(');
   container.querySelector('.sc-drg-key').click();
   assert.equal(view.data.settings.angleMode, 'RAD');
   assert.equal(view.data.settings.fractionDisplay, true);

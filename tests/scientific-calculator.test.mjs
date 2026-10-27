@@ -37,6 +37,9 @@ test('safe expression parser implements arithmetic precedence and common scienti
   assert.equal(evaluateExpression('2^3^2').value, 512);
   assert.equal(evaluateExpression('2(3 + 4) + 2pi').value, 14 + 2 * Math.PI);
   assert.equal(evaluateExpression('1.2e3 / 4').value, 300);
+  assert.equal(evaluateExpression('25−9').value, 16, 'the calculator Unicode minus keypad token is accepted');
+  assert.equal(evaluateExpression('25–9').value, 16, 'a typographic minus is normalized consistently');
+  assert.equal(evaluateExpression('5×10^8').value, 500000000, 'the scientific-notation keypad sequence evaluates correctly');
   assert.equal(evaluateExpression('50% + 10%').value, 0.6);
   assert.equal(evaluateExpression('10 % 3').value, 1);
   assert.equal(evaluateExpression('5!').value, 120);

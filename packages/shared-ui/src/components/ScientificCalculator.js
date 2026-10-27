@@ -74,6 +74,7 @@ export class ScientificCalculator {
     this.insertMode = true;
     this.historyCursor = -1;
     this.historyDraft = '';
+    this.historyDraftResult = null;
     this.fractionDisplay = Boolean(this.data.settings.fractionDisplay);
     this.pointerDrag = null;
     this.surfaceRotation = { yaw: -0.62, pitch: 0.58, zoom: 1 };
@@ -148,11 +149,7 @@ export class ScientificCalculator {
     const value = document.createElement('span');
     value.className = 'sc-expression-preview-value';
     this.renderFractionExpression(value, input.value);
-    const edit = document.createElement('span');
-    edit.className = 'sc-expression-edit-icon';
-    edit.setAttribute('aria-hidden', 'true');
-    edit.textContent = '✎';
-    preview.append(value, edit);
+    preview.append(value);
     preview.setAttribute('aria-label', `Edit expression: ${source}`);
     preview.title = `Click to edit expression: ${source.slice(0, 160)}`;
     stage.classList.toggle('is-rendered', !this.expressionIsEditing);
@@ -289,11 +286,11 @@ export class ScientificCalculator {
       ],
       [
         ['CALC', 'evaluate', '', '', 'SOLVE ='], ['∫dx', 'integral', '', '', '∫ f(x)'], null, null,
-        ['x^□', 'power', '!', '', 'x!'], ['loga', 'logbase', 'log()', '', '']
+        ['x^□', 'power', '!', '', 'x!'], ['loga', 'logbase', 'log(', '', '']
       ],
       [
         ['a/b', 'fraction', '', '', ''], ['√', 'sqrt', 'cbrt(', '', '∛'], ['x²', 'square', 'sqrt(', '', '√x'],
-        ['xʸ', 'power', 'root(,)', '', 'ʸ√x'], ['log', 'log', '10^(', '', '10ˣ'], ['ln', 'ln', 'exp()', '', 'eˣ']
+        ['xʸ', 'power', 'root(', '', 'ʸ√x'], ['log', 'log', '10^(', '', '10ˣ'], ['ln', 'ln', 'exp(', '', 'eˣ']
       ],
       [
         ['(−)', 'negative', '', '', ''], ['° ′ ″', 'dms', '', '', ''], ['hyp', 'hyp', '', '', ''],
@@ -316,7 +313,7 @@ export class ScientificCalculator {
         ['+', 'insert', '', '', ''], ['−', 'insert', '', '', ''], null
       ],
       [
-        ['0', 'insert', 'cbrt()', 'i', 'cbrt'], ['.', 'insert', 'exp()', 'j', 'exp'], ['×10ˣ', 'insert', '*10^(', '', ''],
+        ['0', 'insert', 'cbrt(', 'i', 'cbrt'], ['.', 'insert', 'exp(', 'j', 'exp'], ['×10ˣ', 'insert', '*10^', '', ''],
         ['Ans', 'answer', 'rand()', 'randint(,)', 'RAN#'], ['=', 'evaluate', '', '', 'EXE'], null
       ]
     ];
@@ -585,7 +582,7 @@ export class ScientificCalculator {
     if (action === 'negative') { this.insertAtCursor('(-', input); return; }
     if (action === 'answer') {
       if (this.shiftActive || this.alphaActive) {
-        const token = this.alphaActive ? 'randint(,)' : 'rand()';
+        const token = this.alphaActive ? 'randint(' : 'rand()';
         this.insertAtCursor(token, input);
         this.shiftActive = false; this.alphaActive = false; this.updateKeyLayers(); return;
       }
@@ -609,35 +606,66 @@ export class ScientificCalculator {
       this.persist(); this.updateDeviceStatus(); this.refreshFormattedAnswer();
       this.showNotice(`Display format: ${this.data.settings.notation.toUpperCase()}.`); this.shiftActive = false; this.updateKeyLayers(); return;
     }
-    if (action === 'logbase') { this.insertAtCursor(this.shiftActive ? 'log()' : 'log(,)', input); this.shiftActive = false; this.updateKeyLayers(); return; }
-    if (action === 'dms') { if (this.shiftActive) this.cycleAngleMode(); else this.insertAtCursor('dms(,,)', input); this.shiftActive = false; this.updateKeyLayers(); return; }
-    if (action === 'square') { this.insertAtCursor(this.shiftActive ? 'sqrt()' : '^2', input); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'logbase') { this.insertAtCursor('log(', input); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'dms') { if (this.shiftActive) this.cycleAngleMode(); else this.insertAtCursor('dms(', input); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'square') { this.insertAtCursor(this.shiftActive ? 'sqrt(' : '^2', input); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'power') {
       const shifted = button?.dataset.shift;
       this.insertAtCursor(this.shiftActive ? (shifted === '!' ? '!' : shifted || '!') : '^', input);
       this.shiftActive = false; this.updateKeyLayers(); return;
     }
-    if (action === 'sqrt') { this.insertAtCursor(this.shiftActive ? 'cbrt()' : 'sqrt()', input); this.shiftActive = false; this.updateKeyLayers(); return; }
-    if (action === 'log') { this.insertAtCursor(this.shiftActive ? '10^(' : 'log()', input); this.shiftActive = false; this.updateKeyLayers(); return; }
-    if (action === 'ln') { this.insertAtCursor(this.shiftActive ? 'exp()' : 'ln()', input); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'sqrt') { this.insertAtCursor(this.shiftActive ? 'cbrt(' : 'sqrt(', input); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'log') { this.insertAtCursor(this.shiftActive ? '10^(' : 'log(', input); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (action === 'ln') { this.insertAtCursor(this.shiftActive ? 'exp(' : 'ln(', input); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (action === 'trig') {
       let name = this.alphaActive ? (key === 'sin' ? 'sec' : key === 'cos' ? 'csc' : 'cot') : this.shiftActive ? (key === 'sin' ? 'asin' : key === 'cos' ? 'acos' : 'atan') : key;
       if (this.hyperbolicActive) name = this.shiftActive ? (key === 'sin' ? 'asinh' : key === 'cos' ? 'acosh' : 'atanh') : (key === 'sin' ? 'sinh' : key === 'cos' ? 'cosh' : 'tanh');
-      this.insertAtCursor(`${name}()`, input); this.shiftActive = false; this.alphaActive = false; this.updateKeyLayers(); return;
+      this.insertAtCursor(`${name}(`, input); this.shiftActive = false; this.alphaActive = false; this.updateKeyLayers(); return;
     }
     const shifted = button?.dataset.shift;
     const alpha = button?.dataset.alpha;
     if (this.shiftActive && shifted === 'clear') { this.openClearDialog(input); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (this.shiftActive && shifted === 'units') { this.setMode('units'); this.shiftActive = false; this.updateKeyLayers(); return; }
     if (this.shiftActive && shifted === 'STAT') { this.setCalculationMode('STAT'); this.shiftActive = false; this.updateKeyLayers(); return; }
-    if (this.shiftActive && shifted === 'MED') { this.insertAtCursor('median()', input); this.shiftActive = false; this.updateKeyLayers(); return; }
-    if (this.shiftActive && shifted === 'σ') { this.insertAtCursor('stdev()', input); this.shiftActive = false; this.updateKeyLayers(); return; }
-    let insertion = key;
+    if (this.shiftActive && shifted === 'MED') { this.insertAtCursor('median(', input); this.shiftActive = false; this.updateKeyLayers(); return; }
+    if (this.shiftActive && shifted === 'σ') { this.insertAtCursor('stdev(', input); this.shiftActive = false; this.updateKeyLayers(); return; }
+    let insertion = key === '×10ˣ' ? '*10^' : key;
     if (this.alphaActive && alpha) insertion = alpha;
-    else if (this.shiftActive && shifted) insertion = shifted === 'FACT' ? '!' : shifted;
+    else if (this.shiftActive && shifted) insertion = shifted === 'FACT' ? '!' : shifted.replace(/\(,\)$/, '(').replace(/\(\)$/, '(');
     const useOverwrite = !this.insertMode;
     this.insertAtCursor(insertion, input, useOverwrite);
     if (this.shiftActive || this.alphaActive) { this.shiftActive = false; this.alphaActive = false; this.updateKeyLayers(); }
+  }
+
+  showHistoryResult(entry) {
+    const value = Number(entry?.result);
+    const hasValue = entry?.result !== null && entry?.result !== undefined && Number.isFinite(value);
+    const output = hasValue ? {
+      ...entry,
+      value,
+      formatted: entry.formatted || formatNumber(value, { precision: this.data.settings.precision, notation: this.data.settings.notation, fixedDigits: this.data.settings.fixedDigits }),
+      expression: entry.expression,
+      unit: entry.unit || '',
+      steps: Array.isArray(entry.steps) ? entry.steps : [],
+      mode: entry.mode || 'calculator',
+      angleMode: entry.angleMode || this.data.settings.angleMode
+    } : null;
+    this.lastEntryId = entry?.id || null;
+    this.lastResult = hasValue ? value : null;
+    this.lastAnswer = hasValue ? value : this.lastAnswer;
+    this.calculationOutput = output;
+    this.updateAnswer(output);
+  }
+
+  restoreHistoryDraftResult() {
+    const snapshot = this.historyDraftResult;
+    this.historyDraftResult = null;
+    if (!snapshot) return this.showHistoryResult({ result: null });
+    this.lastEntryId = snapshot.lastEntryId;
+    this.lastResult = snapshot.lastResult;
+    this.lastAnswer = snapshot.lastAnswer;
+    this.calculationOutput = snapshot.calculationOutput;
+    this.updateAnswer(this.calculationOutput);
   }
 
   moveNavigation(direction, input) {
@@ -657,14 +685,28 @@ export class ScientificCalculator {
     const entries = this.data.history;
     if (!entries.length) { this.showNotice('No calculation history to browse.'); return; }
     if (direction === 'up') {
-      if (this.historyCursor < 0) { this.historyDraft = input.value; this.historyCursor = 0; }
-      else this.historyCursor = Math.min(entries.length - 1, this.historyCursor + 1);
+      if (this.historyCursor < 0) {
+        this.historyDraft = input.value;
+        this.historyDraftResult = {
+          lastEntryId: this.lastEntryId,
+          lastResult: this.lastResult,
+          lastAnswer: this.lastAnswer,
+          calculationOutput: this.calculationOutput ? { ...this.calculationOutput, steps: [...(this.calculationOutput.steps || [])] } : null
+        };
+        this.historyCursor = 0;
+      } else this.historyCursor = Math.min(entries.length - 1, this.historyCursor + 1);
     } else if (direction === 'down') {
       if (this.historyCursor < 0) return;
       this.historyCursor -= 1;
     }
-    if (this.historyCursor < 0) { input.value = this.historyDraft; this.expression = input.value; this.historyDraft = ''; }
-    else { input.value = entries[this.historyCursor].expression; this.expression = input.value; }
+    if (this.historyCursor < 0) {
+      input.value = this.historyDraft; this.expression = input.value; this.historyDraft = '';
+      this.restoreHistoryDraftResult();
+    } else {
+      const entry = entries[this.historyCursor];
+      input.value = entry.expression; this.expression = input.value;
+      this.showHistoryResult(entry);
+    }
     this.awaitingNewExpression = false;
     input.focus();
     input.setSelectionRange?.(input.value.length, input.value.length);
@@ -926,9 +968,28 @@ export class ScientificCalculator {
     this.persist(); const status = this.container.querySelector('.sc-memory-status'); if (status) status.textContent = this.data.memory === null ? 'M —' : `M ${formatNumber(this.data.memory)}`; this.updateDeviceStatus();
   }
 
+  completeOpenParentheses(expression) {
+    const source = String(expression ?? '');
+    let depth = 0;
+    let unmatchedClosing = false;
+    for (const character of source) {
+      if (character === '(') depth += 1;
+      else if (character === ')') {
+        if (depth === 0) unmatchedClosing = true;
+        else depth -= 1;
+      }
+    }
+    return !unmatchedClosing && depth > 0 ? `${source}${')'.repeat(depth)}` : source;
+  }
+
   async evaluateCurrent() {
     const input = this.container.querySelector('.sc-expression'); if (!input) return;
-    this.expression = input.value;
+    this.expression = this.completeOpenParentheses(input.value);
+    if (input.value !== this.expression) {
+      input.value = this.expression;
+      input.setSelectionRange?.(input.value.length, input.value.length);
+      this.rememberExpressionSelection(input);
+    }
     try {
       const result = evaluateExpression(this.expression, { variables: { ...this.variableValues(), ans: this.lastAnswer }, angleMode: this.data.settings.angleMode });
       const output = { ...result, formatted: formatNumber(result.value, { precision: this.data.settings.precision, notation: this.data.settings.notation, fixedDigits: this.data.settings.fixedDigits }), expression: this.expression, unit: '', steps: result.steps, mode: 'calculator', angleMode: this.data.settings.angleMode };

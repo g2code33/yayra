@@ -110,6 +110,10 @@ test('calculator styles use the design system and responsive graph/canvas presen
     'cursor position stays visible in the calculator LCD');
   assert.doesNotMatch(css, /\.sc-expression-stage:focus-within \{ outline:/,
     'the expression editor has no obstructive focus rectangle');
+  assert.match(css, /\.sc-expression \{[^}]*resize:none/,
+    'the calculator textarea has no visible native resize grip');
+  assert.doesNotMatch(css, /sc-expression-edit-icon/);
+  assert.doesNotMatch(calculator, /sc-expression-edit-icon/);
   assert.match(calculator, /rowNumber >= 6 && row\.filter\(Boolean\)\.length === 5 \? 6 : 5/, 'five-key rows expand to fill the final track span');
   assert.match(css, /sc-fraction-template/);
   assert.match(css, /sc-graph-curve/);

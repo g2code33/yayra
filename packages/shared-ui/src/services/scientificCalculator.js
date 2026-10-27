@@ -37,7 +37,7 @@ const MAX_TOKENS = 512;
 const MAX_FACTORIAL = 170;
 
 function tokenize(source) {
-  const text = String(source ?? '').replace(/[π]/g, 'pi').replace(/[×]/g, '*').replace(/[÷]/g, '/');
+  const text = String(source ?? '').replace(/[π]/g, 'pi').replace(/[×]/g, '*').replace(/[÷]/g, '/').replace(/[−–]/g, '-');
   const tokens = [];
   let i = 0;
   while (i < text.length) {

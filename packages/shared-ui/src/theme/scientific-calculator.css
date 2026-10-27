@@ -43,7 +43,7 @@
 .sc-display-status span:empty { display:none; }
 .sc-display-memory { margin-left:auto; }
 .sc-expression-stage { position:relative; min-height:44px; }
-.sc-expression { display:block; width:100%; min-height:44px; max-height:90px; resize:vertical; padding:4px 0!important; border:0!important; border-radius:0!important; outline:none!important; color:#101711!important; background:transparent!important; box-shadow:none!important; font:1.02rem/1.35 ui-monospace,SFMono-Regular,Menlo,monospace!important; overflow-wrap:anywhere; }
+.sc-expression { display:block; width:100%; min-height:44px; max-height:90px; resize:none; padding:4px 0!important; border:0!important; border-radius:0!important; outline:none!important; color:#101711!important; background:transparent!important; box-shadow:none!important; font:1.02rem/1.35 ui-monospace,SFMono-Regular,Menlo,monospace!important; overflow-wrap:anywhere; }
 .sc-expression::placeholder { color:#5e685d; opacity:.74; font-size:.77rem; }
 .sc-expression-preview { display:none; width:100%; min-height:44px; max-height:90px; align-items:center; gap:6px; overflow:auto; padding:4px 0; border:0; border-radius:0; color:#101711; background:transparent; font:1.02rem/1.35 ui-monospace,SFMono-Regular,Menlo,monospace; text-align:left; cursor:text; }
 .sc-expression-stage.is-rendered .sc-expression { display:none; }
@@ -52,7 +52,6 @@
 .sc-expression::selection { color:#101711; background:rgba(22,101,52,.2); }
 .sc-expression-preview:focus-visible { outline:none; text-decoration:underline; text-decoration-color:rgba(22,101,52,.72); text-underline-offset:3px; }
 .sc-expression-preview-value { display:inline-flex; min-width:0; min-height:34px; flex:1; align-items:center; white-space:pre-wrap; overflow-wrap:anywhere; }
-.sc-expression-edit-icon { align-self:flex-start; margin-left:auto; padding:0 2px; color:#56614f; font-size:.72rem; line-height:1; }
 .sc-screen-result { display:block; min-height:28px; overflow-wrap:anywhere; color:#111914; font:1.45rem/1.2 ui-monospace,SFMono-Regular,Menlo,monospace; text-align:right; }
 .sc-device-status { display:flex; align-items:center; gap:6px; margin:9px 2px 3px; }
 .sc-status-key { min-width:45px; min-height:25px; padding:3px 8px; border:1px solid rgba(255,255,255,.09); border-radius:20px; color:#cbd5e1; background:linear-gradient(#343a43,#191d23); font-size:.58rem!important; font-weight:800; cursor:pointer; box-shadow:0 2px 3px #080a0d; }
