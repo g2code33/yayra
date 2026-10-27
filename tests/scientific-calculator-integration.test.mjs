@@ -66,8 +66,10 @@ test('desktop pins the calculator and result area while the right-side science w
   assert.notEqual(desktop, css, 'desktop viewport rules are present');
   assert.match(desktop, /fb-internal-page\.fb-scientific-calculator-page \{ overflow:hidden; \}/);
   assert.match(desktop, /\.sc-workspace-column \{[^}]*overflow:hidden/);
-  assert.match(desktop, /\.sc-workspace-scroll \{[^}]*overflow-y:auto/,
-    'the right-side work area has its own vertical scrollbar');
+  assert.match(desktop, /\.sc-workspace-scroll \{[^}]*overflow-y:scroll/,
+    'the right-side work area keeps an explicit vertical scrollbar for its overflowing tools');
+  assert.match(desktop, /\.sc-workspace-scroll::-webkit-scrollbar \{ width:12px; \}/,
+    'the right-side scrollbar has a visible, usable hit target');
   assert.match(desktop, /\.sc-workspace-fixed \{[^}]*flex:none/,
     'the header, tabs and result occupy permanent space beside the calculator');
   assert.match(desktop, /\.sc-calculator-column \{[^}]*position:sticky[^}]*height:100%; max-height:100%; min-height:0; overflow-y:auto/,
