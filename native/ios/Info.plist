@@ -7,9 +7,9 @@
   <key>CFBundleDisplayName</key>
   <string>yayra</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.0.119</string>
+  <string>1.0.120</string>
   <key>CFBundleVersion</key>
-  <string>1000119</string>
+  <string>1000120</string>
   <key>LSApplicationQueriesSchemes</key>
   <array>
     <string>itms-apps</string>

@@ -265,13 +265,16 @@ test('STAYS LIVE (source pin): connectivity retries the active FAILED tab but ne
   const connBlock = src.slice(connStart, src.indexOf('buildOfflineFallback', connStart));
   assert.match(connBlock, /'offline'/, 'offline notice armed');
   assert.match(connBlock, /'online'/, 'online recovery armed');
-  assert.match(connBlock, /const activeFailure = this\._siteFailureFor\(this\.state\.activeTabId\)/,
-    'online recovery first proves the active tab failed');
+  assert.match(connBlock, /const activeFailure = activeIsLocalDocument \? null : this\._siteFailureFor\(this\.state\.activeTabId\)/,
+    'online recovery ignores local documents and otherwise checks the active tab failure');
   assert.match(connBlock, /if \(activeFailure\)[\s\S]*?_retrySiteRecovery/,
     'that failed active tab gets the requested immediate retry');
   assert.doesNotMatch(connBlock, /this\.reload\(/, 'there is no blanket reload call');
   assert.doesNotMatch(connBlock, /navigateActiveTab/, 'connectivity events never replace the address');
-  assert.match(connBlock, /Pages you already opened stay available/, 'the healthy-page promise is stated to the user');
+  assert.match(connBlock, /local files and saved documents remain available/,
+    'connectivity guidance explicitly says local documents remain usable offline');
+  assert.match(connBlock, /activeIsLocalDocument/,
+    'connectivity events recognize document tabs and leave them undisturbed');
   // The heal invariant is wired into render(), reload() and hardReload().
   const renderStart = src.indexOf('render(container = null) {');
   const renderHead = src.slice(renderStart, renderStart + 2000);

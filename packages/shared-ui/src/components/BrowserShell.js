@@ -13247,6 +13247,12 @@ export class BrowserShell {
     return true;
   }
 
+  _isLocalDocumentTab(tab = this.getActiveTab()) {
+    const url = String(tab?.url || '');
+    return Boolean(tab?.isDocument || tab?.isDocumentRecovery
+      || /^yayra:\/\/(?:doc|recover-document|documents)(?:\/|$)/i.test(url));
+  }
+
   _armConnectivityAwareness() {
     if (this._connectivityArmed || typeof window === 'undefined') return;
     this._connectivityArmed = true;
@@ -13256,8 +13262,9 @@ export class BrowserShell {
       // the recovery surface in place immediately rather than waiting for a
       // native engine's delayed error callback (and showing blank meanwhile).
       const activeTab = this.getActiveTab();
-      let activeFailure = this._siteFailureFor(this.state.activeTabId);
-      if (!activeFailure && activeTab?.isLoading && this._isWebsiteUrl(activeTab.url)) {
+      const activeIsLocalDocument = this._isLocalDocumentTab(activeTab);
+      let activeFailure = activeIsLocalDocument ? null : this._siteFailureFor(this.state.activeTabId);
+      if (!activeIsLocalDocument && !activeFailure && activeTab?.isLoading && this._isWebsiteUrl(activeTab.url)) {
         activeFailure = this._recordSiteFailure(activeTab.id, {
           url: activeTab.url,
           errorCode: -106,
@@ -13271,17 +13278,25 @@ export class BrowserShell {
         activeFailure.errorDescription = 'net::ERR_INTERNET_DISCONNECTED';
         this.requestRender();
       }
-      this.showTransientNotice('You\u2019re offline - new pages can\u2019t load until the connection is back. Pages you already opened stay available.');
+      // A connectivity notice is useful on websites, but it obscures an
+      // entirely local document and wrongly suggests that opening it needs the
+      // network. Local document tabs and the Documents hub are independent of
+      // navigator.onLine, so leave their viewer and tab strip untouched.
+      if (!activeIsLocalDocument) {
+        this.showTransientNotice('You\u2019re offline. Websites that need internet can\u2019t load; local files and saved documents remain available.');
+      }
     };
     const onOnline = () => {
       // Exactly the requested scope: immediately reload the active site only
       // when it is in a failed recovery state. Healthy tabs remain untouched.
-      const activeFailure = this._siteFailureFor(this.state.activeTabId);
+      const activeTab = this.getActiveTab();
+      const activeIsLocalDocument = this._isLocalDocumentTab(activeTab);
+      const activeFailure = activeIsLocalDocument ? null : this._siteFailureFor(this.state.activeTabId);
       if (activeFailure) {
         this.showTransientNotice('Back online - retrying this page now.');
         activeFailure.offline = false;
         this._retrySiteRecovery(activeFailure.tabId, { reason: 'online' });
-      } else {
+      } else if (!activeIsLocalDocument) {
         this.showTransientNotice('Back online.');
         try { this.render(); } catch { /* best-effort connectivity repaint */ }
       }

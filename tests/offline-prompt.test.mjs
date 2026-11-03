@@ -132,6 +132,71 @@ test('OFFLINE EVENTS: dropping offline and coming back are announced to the user
   }
 });
 
+test('OFFLINE DOCUMENT: a local file opens without network and connectivity changes leave its viewer and tabs untouched', async () => {
+  const previousOnline = globalThis.navigator?.onLine;
+  const previousYayra = window.yayra;
+  const listeners = {};
+  const originalAddEventListener = window.addEventListener;
+  window.addEventListener = (type, callback) => { listeners[type] = callback; };
+  setOnline(false);
+  let shell = null;
+  try {
+    const bytes = new TextEncoder().encode('Saved local document content').buffer;
+    window.yayra = {
+      system: {
+        documents: {
+          openFile: async () => ({ ok: true, name: 'offline-notes.txt', data: bytes })
+        }
+      }
+    };
+    const container = document.createElement('div');
+    shell = new BrowserShell({
+      container,
+      platform: 'linux',
+      isMobile: false,
+      documentRecoveryRepo: { save: async () => true }
+    });
+    const notices = [];
+    shell.showTransientNotice = (message) => notices.push(String(message));
+    await shell.initialize();
+    const originalTabId = shell.getActiveTab().id;
+    await shell.openDocument();
+
+    const tab = shell.getActiveTab();
+    assert.ok(tab.isDocument, 'the offline file picker still opens a first-class document tab');
+    assert.equal(tab.title, 'offline-notes.txt');
+    assert.ok(tab.url.startsWith('yayra://doc/'), 'local document routing never goes to a website frame');
+    assert.ok(shell.viewportElement.querySelector('.fb-doc-viewer'), 'the bundled viewer renders while offline');
+    assert.equal(shell.viewportElement.querySelector('.fb-offline-fallback'), null,
+      'website offline recovery never replaces a local document');
+    assert.equal(shell.webFrames.has(tab.id), false, 'no network frame is created for the file');
+    assert.ok(shell.state.tabs.some((candidate) => candidate.id === originalTabId),
+      'opening the file preserves the existing browser tab');
+
+    const tabIds = shell.state.tabs.map((candidate) => candidate.id);
+    const activeViewer = shell.viewportElement.querySelector('.fb-doc-viewer');
+    let renders = 0;
+    const render = shell.render.bind(shell);
+    shell.render = (...args) => { renders += 1; return render(...args); };
+    listeners.offline?.();
+    listeners.online?.();
+
+    assert.deepEqual(shell.state.tabs.map((candidate) => candidate.id), tabIds,
+      'connectivity changes do not alter or replace tabs');
+    assert.equal(shell.getActiveTab().id, tab.id, 'the document remains the active tab');
+    assert.equal(shell.viewportElement.querySelector('.fb-doc-viewer'), activeViewer,
+      'connectivity events do not remount or disturb the document viewer');
+    assert.equal(renders, 0, 'document viewing does not trigger a connectivity repaint');
+    assert.deepEqual(notices, [], 'online/offline website notices never cover a local document');
+  } finally {
+    shell?.destroy();
+    window.addEventListener = originalAddEventListener;
+    if (previousYayra === undefined) delete window.yayra;
+    else window.yayra = previousYayra;
+    setOnline(previousOnline !== false);
+  }
+});
+
 test('SOURCE PIN: offline wins over every other frame strategy, and tab-scoped retry is wired', () => {
   const src = readFileSync(new URL('../packages/shared-ui/src/components/BrowserShell.js', import.meta.url), 'utf8');
   const fnStart = src.indexOf('createWebContentFrame(url, { frameClassName');
