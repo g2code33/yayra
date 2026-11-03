@@ -458,6 +458,11 @@ function sanitizeDurableTabUrl(value) {
   return value === 'about:blank' ? value : null;
 }
 
+function sanitizeTabGroupMemberLabel(value) {
+  const label = String(value || '').replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim().slice(0, 80);
+  return label || null;
+}
+
 function sanitizeDurableTabGroup(group) {
   if (!group || typeof group !== 'object' || !TAB_GROUP_ID.test(String(group.id || ''))) return null;
   const name = String(group.name || '').replace(/\s+/g, ' ').trim().slice(0, 48);
@@ -474,10 +479,12 @@ function sanitizeDurableTabGroup(group) {
       : sanitizeDurableTabUrl(candidate?.url);
     if (!TAB_GROUP_MEMBER_ID.test(id) || seenMembers.has(id) || !url) continue;
     seenMembers.add(id);
+    const label = sanitizeTabGroupMemberLabel(candidate?.label);
     members.push({
       id,
       url,
       title: document?.name || String(candidate?.title || url).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 120) || url,
+      ...(label ? { label } : {}),
       ...(document ? { document } : {}),
       createdAt: Number(candidate?.createdAt) || Date.now(),
       updatedAt: Number(candidate?.updatedAt) || Number(candidate?.createdAt) || Date.now()
@@ -570,10 +577,11 @@ export function isSafeInternalSessionUrl(value) {
 
 export function createSessionRepo(storage) {
   const sanitize = (tabs) => (Array.isArray(tabs) ? tabs : [])
-    .map(({ url, title, group, groupMemberId, document, isPrivate } = {}) => {
+    .map(({ url, title, group, groupMemberId, groupLabel, document, isPrivate } = {}) => {
       if (isPrivate) return null;
       const safeGroup = sanitizeSessionGroup(group);
       const safeMemberId = TAB_GROUP_MEMBER_ID.test(String(groupMemberId || '')) ? String(groupMemberId) : null;
+      const safeGroupLabel = safeGroup && safeMemberId ? sanitizeTabGroupMemberLabel(groupLabel) : null;
       const safeDocument = sanitizeSessionDocument(document);
       if (safeDocument) {
         const id = safeDocument.libraryId || safeDocument.recoveryId;
@@ -582,7 +590,8 @@ export function createSessionRepo(storage) {
           title: safeDocument.name,
           document: safeDocument,
           ...(safeGroup ? { group: safeGroup } : {}),
-          ...(safeGroup && safeMemberId ? { groupMemberId: safeMemberId } : {})
+          ...(safeGroup && safeMemberId ? { groupMemberId: safeMemberId } : {}),
+          ...(safeGroupLabel ? { groupLabel: safeGroupLabel } : {})
         };
       }
       if (isSafeInternalSessionUrl(url)) {
@@ -590,7 +599,8 @@ export function createSessionRepo(storage) {
           url,
           title: String(title || url).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 120),
           ...(safeGroup ? { group: safeGroup } : {}),
-          ...(safeGroup && safeMemberId ? { groupMemberId: safeMemberId } : {})
+          ...(safeGroup && safeMemberId ? { groupMemberId: safeMemberId } : {}),
+          ...(safeGroupLabel ? { groupLabel: safeGroupLabel } : {})
         };
       }
       if (typeof url !== 'string' || !/^https?:\/\//i.test(url) || url.length > 8192) return null;
@@ -602,7 +612,8 @@ export function createSessionRepo(storage) {
         url,
         title: String(title || url).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 120),
         ...(safeGroup ? { group: safeGroup } : {}),
-        ...(safeGroup && safeMemberId ? { groupMemberId: safeMemberId } : {})
+        ...(safeGroup && safeMemberId ? { groupMemberId: safeMemberId } : {}),
+        ...(safeGroupLabel ? { groupLabel: safeGroupLabel } : {})
       };
     })
     .filter(Boolean);

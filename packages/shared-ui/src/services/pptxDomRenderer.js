@@ -74,6 +74,11 @@ function fitTextFrame(frame, inner, anchor) {
   };
   if (typeof requestAnimationFrame === 'function') requestAnimationFrame(run);
   else setTimeout(run, 0);
+  // The first measurement can precede local font resolution. Refit once the
+  // renderer's installed fonts are known so headings and body text do not get
+  // clipped just because a font fallback changed its glyph metrics afterward.
+  const fontsReady = frame?.ownerDocument?.fonts?.ready;
+  if (fontsReady && typeof fontsReady.then === 'function') fontsReady.then(run).catch(() => {});
 }
 
 function renderParagraph(doc, paragraph, textModel, helpers) {
@@ -377,7 +382,7 @@ function renderShape(doc, shape, helpers, showImages, thumbnail) {
   frame.dataset.shape = shape.isTitle ? 'title' : 'text';
   frame.style.cssText = [
     shapeBase(shape),
-    shape.isTitle ? 'overflow:visible' : 'overflow:hidden',
+    'overflow:hidden',
     shape.fill ? `background:${shape.fill}` : '',
     shape.fill ? `color:${readableForeground(shape.fill)}` : '',
     shape.borderColor ? `border:${Math.max(1, shape.borderWidth || 1)}px solid ${shape.borderColor}` : '',

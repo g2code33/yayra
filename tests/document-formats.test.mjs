@@ -213,6 +213,8 @@ test('PPTX TITLES: title frames that extend beyond slide edges are brought fully
     assert.equal(title.style.left, '740px', 'an off-slide right edge shifts the full-width title frame inward');
     assert.equal(title.style.top, '0px', 'an off-slide top edge is clamped into the slide');
     assert.equal(title.style.width, '220px', 'the original title width is retained when it fits');
+    assert.match(title.getAttribute('style') || title.style.cssText, /overflow:hidden/,
+      'title text remains clipped to its corrected frame instead of leaking past the slide edge');
     assert.match(title.textContent, /Presynaptic modulation/, 'all heading text remains in the rendered title');
   } finally {
     removeMount(host);

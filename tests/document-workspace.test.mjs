@@ -372,6 +372,41 @@ test('TAB INTEGRATION: a document opens in its OWN tab - never the web frame or 
   }
 });
 
+test('PPTX SIDEBAR: selecting a slide from toolbar scrolls its thumbnail into view and marks it current', async () => {
+  const { shell } = await bootShell();
+  try {
+    shell._documentEngineOverrides = { pptx: fakePptxEngine({ slides: 6 }) };
+    const doc = shell.addDocumentTab({ name: 'autonomic.pptx', bytes: new Uint8Array([1, 2, 3]) });
+    assert.ok(doc);
+    const tab = shell.getActiveTab();
+    const session = shell._documentViewerSessions.get(tab.id);
+    await session?.loadPromise;
+    assert.equal(tab.docState.status, 'ready');
+    const thumbs = shell.viewportElement.querySelectorAll('.fb-doc-thumb');
+    assert.equal(thumbs.length, 6, 'the deck shows one thumbnail for every slide');
+    const target = [...shell.viewportElement.querySelectorAll('.fb-doc-thumb')]
+      .find((thumb) => thumb.dataset.page === '5');
+    assert.ok(target);
+    const scrollCalls = [];
+    target.scrollIntoView = (options) => scrollCalls.push(options);
+
+    await session.viewer.setPage(5);
+    assert.equal(tab.docState.page, 5, 'the main slide navigation updates the shared viewer state');
+    assert.equal(target.getAttribute('aria-current'), 'page', 'the matching thumbnail is marked as current');
+    assert.ok(scrollCalls.length > 0, 'the thumbnail rail scrolls the selected slide into view');
+    assert.deepEqual(scrollCalls.at(-1), { block: 'nearest', behavior: 'smooth' });
+
+    const slideTwo = [...shell.viewportElement.querySelectorAll('.fb-doc-thumb')]
+      .find((thumb) => thumb.dataset.page === '2');
+    slideTwo.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(tab.docState.page, 2, 'clicking a thumbnail changes the main presentation slide');
+    assert.equal(slideTwo.getAttribute('aria-current'), 'page');
+  } finally {
+    shell.destroy();
+  }
+});
+
 test('DOCUMENT RESUME: per-file viewing position persists in profile settings and reapplies on reopen', async () => {
   const stored = {};
   const settingsRepo = {

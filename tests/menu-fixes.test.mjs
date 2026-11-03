@@ -410,10 +410,88 @@ test('TAB GROUP PICKER: New group opens a visible, keyboard-ready prompt and pub
     shell.openModal('tab-groups');
     const entry = container.querySelector('.fb-tab-group-picker-item');
     assert.ok(entry, 'the new group appears immediately in the group picker');
-    assert.match(entry.getAttribute('aria-label'), /Research group \(2 tabs\)/);
+    assert.match(entry.getAttribute('aria-label'), /Open all 2 tabs in Research/);
     entry.click();
     assert.equal(shell.state.tabs.filter((tab) => tab.group?.name === 'Research').length, 2, 'opening a group keeps every group tab open');
     assert.ok(shell.getActiveTab().group?.name === 'Research', 'the group click activates one of its member tabs');
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('TAB GROUP PICKER: hover previews members, opens one tab, and saves custom member labels', async () => {
+  const storage = makeStorage();
+  const { shell, container } = await makeShell({ storage });
+  try {
+    const first = shell.getActiveTab();
+    first.url = 'https://course.example/overview';
+    first.title = 'Course overview';
+    shell._textPromptDialog = async () => 'Pharmacology';
+    assert.equal(await shell.groupTabWithPrompt(first.id, {
+      title: 'Create tab group', description: 'Create a test group', placeholder: 'Pharmacology'
+    }), true);
+    const group = shell.getTabGroups().find((candidate) => candidate.name === 'Pharmacology');
+    assert.ok(group);
+
+    const second = shell.createNewTab();
+    second.url = 'https://course.example/autonomic';
+    second.title = 'Autonomic lecture';
+    assert.equal(shell.addTabToExistingGroup(second.id, group.id), true);
+    const memberId = second.groupMemberId;
+    assert.ok(memberId);
+    shell.openModal('tab-groups');
+
+    let card = container.querySelector('.fb-tab-group-picker-card');
+    assert.ok(card, 'the group picker wraps each group with a member preview');
+    const memberList = card.querySelector('.fb-tab-group-members');
+    assert.ok(memberList);
+    card.dispatchEvent({ type: 'mouseenter' });
+    assert.ok(card.classList.contains('is-expanded'), 'hovering a group reveals its tabs');
+    assert.equal(card.querySelector('.fb-tab-group-picker-item').getAttribute('aria-expanded'), 'true');
+    assert.equal(memberList.querySelectorAll('.fb-tab-group-member-row').length, 2);
+
+    shell._textPromptDialog = async () => 'Autonomic lecture — Week 4';
+    assert.equal(await shell.renameTabGroupMember(group.id, memberId), true,
+      'a saved tab receives a custom display label without changing its URL/title');
+    assert.equal(second.title, 'Autonomic lecture');
+    assert.equal(second.groupLabel, 'Autonomic lecture — Week 4');
+    const savedGroup = shell.state.tabGroupCatalog.find((candidate) => candidate.id === group.catalogId);
+    assert.equal(savedGroup.members.find((member) => member.id === memberId)?.label,
+      'Autonomic lecture — Week 4', 'the custom label is persisted in the durable group catalog');
+
+    card = container.querySelector('.fb-tab-group-picker-card');
+    card.dispatchEvent({ type: 'mouseenter' });
+    const renamedRow = [...card.querySelectorAll('.fb-tab-group-member-row')]
+      .find((row) => row.dataset.memberId === memberId);
+    assert.equal(renamedRow.querySelector('.fb-tab-group-member-title').textContent, 'Autonomic lecture — Week 4');
+    assert.equal(renamedRow.querySelector('.fb-tab-group-member-rename').textContent, 'Rename');
+
+    const closedTabId = second.id;
+    renamedRow.querySelector('.fb-tab-group-member-open').click();
+    assert.equal(shell.getActiveTab().id, closedTabId,
+      'clicking one item in the hover preview opens only that existing tab');
+    shell.closeTab(closedTabId);
+    shell.openModal('tab-groups');
+    card = container.querySelector('.fb-tab-group-picker-card');
+    card.dispatchEvent({ type: 'mouseenter' });
+    const savedRow = [...card.querySelectorAll('.fb-tab-group-member-row')]
+      .find((row) => row.dataset.memberId === memberId);
+    savedRow.querySelector('.fb-tab-group-member-open').click();
+    assert.notEqual(shell.getActiveTab().id, closedTabId, 'a closed saved tab is restored on demand');
+    assert.equal(shell.getActiveTab().groupLabel, 'Autonomic lecture — Week 4',
+      'the custom label is restored when opening a saved tab after closure');
+
+    const restarted = await makeShell({ storage });
+    try {
+      const restoredGroup = restarted.shell.getTabGroups().find((candidate) => candidate.catalogId === group.catalogId);
+      const restoredMember = restoredGroup?.tabs.find((candidate) => candidate.groupMemberId === memberId);
+      assert.equal(restoredMember?.groupLabel, 'Autonomic lecture — Week 4',
+        'the custom tab label survives a full shell restart');
+      assert.equal(restarted.shell.openTabGroupMember(restoredGroup.id, memberId), true);
+      assert.equal(restarted.shell.getActiveTab().groupLabel, 'Autonomic lecture — Week 4',
+        'opening a member from the durable catalog preserves its custom label');
+    } finally { restarted.shell.destroy(); }
   } finally {
     shell.destroy();
     delete globalThis.localStorage;

@@ -791,6 +791,101 @@ html {
   outline: none;
 }
 
+.fb-tab-group-picker-card {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--fb-border-glass);
+  border-radius: 12px;
+  background: var(--fb-bg-surface-elevated);
+}
+
+.fb-tab-group-picker-card .fb-tab-group-picker-item {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  transform: none;
+}
+
+.fb-tab-group-picker-card:hover,
+.fb-tab-group-picker-card:focus-within,
+.fb-tab-group-picker-card.is-expanded {
+  border-color: var(--fb-accent-primary);
+}
+
+.fb-tab-group-members {
+  display: none;
+  flex-direction: column;
+  gap: 4px;
+  max-height: min(32vh, 280px);
+  overflow: auto;
+  padding: 0 8px 8px;
+}
+
+.fb-tab-group-picker-card:hover .fb-tab-group-members,
+.fb-tab-group-picker-card:focus-within .fb-tab-group-members,
+.fb-tab-group-picker-card.is-expanded .fb-tab-group-members {
+  display: flex;
+}
+
+.fb-tab-group-member-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.fb-tab-group-member-open {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--fb-text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+
+.fb-tab-group-member-open:hover,
+.fb-tab-group-member-open:focus-visible {
+  background: var(--fb-bg-glass-input);
+  outline: 2px solid var(--fb-accent-primary);
+  outline-offset: -2px;
+}
+
+.fb-tab-group-member-title,
+.fb-tab-group-member-subtitle {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fb-tab-group-member-title { font-size: 0.84rem; font-weight: 650; }
+.fb-tab-group-member-subtitle { color: var(--fb-text-muted); font-size: 0.72rem; }
+
+.fb-tab-group-member-rename {
+  flex: 0 0 auto;
+  padding: 5px 8px;
+  border: 1px solid var(--fb-border-glass);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--fb-text-secondary);
+  font-size: 0.7rem;
+  cursor: pointer;
+}
+
+.fb-tab-group-member-rename:hover,
+.fb-tab-group-member-rename:focus-visible {
+  color: var(--fb-text-primary);
+  border-color: var(--fb-accent-primary);
+  outline: none;
+}
+
 .fb-tab-group-settings-header,
 .fb-tab-group-picker-copy {
   display: flex;

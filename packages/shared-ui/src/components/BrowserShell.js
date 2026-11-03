@@ -14261,6 +14261,11 @@ export class BrowserShell {
     return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   }
 
+  _sanitizeTabGroupMemberLabel(value) {
+    const label = String(value || '').replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim().slice(0, 80);
+    return label || null;
+  }
+
   _durableTabGroupUrl(value) {
     const url = String(value || '');
     if (!url || url.length > 8192 || /^yayra:\/\/doc\//i.test(url)) return null;
@@ -14340,6 +14345,11 @@ export class BrowserShell {
     if (!member && allowUrlReuse) {
       member = record.members.find((candidate) => candidate.url === url && !claimed.has(candidate.id)) || null;
     }
+    const label = this._sanitizeTabGroupMemberLabel(
+      tab.groupLabel === undefined ? member?.label : tab.groupLabel
+    );
+    if (tab.groupLabel === undefined && label) tab.groupLabel = label;
+    else if (tab.groupLabel !== undefined) tab.groupLabel = label;
     const now = Date.now();
     if (!member) {
       const requestedMemberId = /^tgm-[A-Za-z0-9_-]{1,120}$/.test(String(tab.groupMemberId || ''))
@@ -14350,6 +14360,7 @@ export class BrowserShell {
         id: requestedMemberId,
         url,
         title: document?.name || String(tab.title || url).slice(0, 120),
+        ...(label ? { label } : {}),
         ...(document ? { document } : {}),
         createdAt: now,
         updatedAt: now
@@ -14363,9 +14374,12 @@ export class BrowserShell {
     }
     const title = document?.name || String(tab.title || url).slice(0, 120);
     const documentChanged = JSON.stringify(member.document || null) !== JSON.stringify(document || null);
-    if (member.url !== url || member.title !== title || documentChanged) {
+    const labelChanged = (member.label || null) !== label;
+    if (member.url !== url || member.title !== title || documentChanged || labelChanged) {
       member.url = url;
       member.title = title;
+      if (label) member.label = label;
+      else delete member.label;
       if (document) member.document = document;
       else delete member.document;
       member.updatedAt = now;
@@ -14498,6 +14512,7 @@ export class BrowserShell {
         addMember({
           url: member.url,
           title: member.title,
+          ...(member.label ? { groupLabel: this._sanitizeTabGroupMemberLabel(member.label) } : {}),
           ...(member.document ? { document: member.document, documentRecovery: member.document } : {}),
           group,
           groupMemberId: member.id,
@@ -14551,6 +14566,7 @@ export class BrowserShell {
       if (ungrouped) {
         ungrouped.group = groupData;
         ungrouped.groupMemberId = saved.groupMemberId || null;
+        ungrouped.groupLabel = this._sanitizeTabGroupMemberLabel(member.groupLabel || saved.label || saved.groupLabel);
         this._rememberDurableTabGroupMember(ungrouped);
         openedMembers.push(ungrouped);
         restoredEntries.push(saved);
@@ -14559,6 +14575,7 @@ export class BrowserShell {
 
       const restored = this.createNewTab(false, { group: groupData, render: false });
       restored.groupMemberId = saved.groupMemberId || null;
+      restored.groupLabel = this._sanitizeTabGroupMemberLabel(member.groupLabel || saved.label || saved.groupLabel);
       const document = this.sanitizeDocumentRecoveryDescriptor(saved.document || saved.documentRecovery);
       if (document) {
         restored.url = this.documentRecoveryUrl(document);
@@ -14598,6 +14615,135 @@ export class BrowserShell {
     if (newlyOpened > 0) {
       this.showTransientNotice(`Opened ${newlyOpened} saved tab${newlyOpened === 1 ? '' : 's'} from “${group.name}”.`);
     }
+    return true;
+  }
+
+  openTabGroupMember(groupId, memberId) {
+    const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
+    if (!group) return false;
+    const key = String(memberId || '');
+    const member = group.tabs.find((candidate) =>
+      String(candidate.groupMemberId || '') === key
+      || String(candidate.id || '') === key
+      || String(candidate.url || '') === key);
+    if (!member) return false;
+
+    let target = member.id
+      ? this.state.tabs.find((tab) => tab.id === member.id)
+      : null;
+    if (!target && member.groupMemberId) {
+      target = this.state.tabs.find((tab) => tab.groupMemberId === member.groupMemberId
+        && this.tabGroupIdentity(tab.group, tab.isPrivate) === group.id);
+    }
+    const saved = member._durableGroupMember
+      ? member
+      : [...(this.state.tabGroupRestoreTabs || []), ...(this.state.continueTabs || [])].find((entry) =>
+        (member.groupMemberId && entry.groupMemberId === member.groupMemberId)
+        || (entry.url === member.url && this.tabGroupIdentity(entry.group, false) === group.id));
+    const groupData = { ...(group.catalogId ? { id: group.catalogId } : {}), name: group.name, color: group.color };
+
+    if (!target && saved && this._durableTabGroupUrl(saved.url)) {
+      target = this.state.tabs.find((tab) => !tab.isPrivate
+        && ((saved.groupMemberId && tab.groupMemberId === saved.groupMemberId)
+          || (tab.url === saved.url && this.tabGroupIdentity(tab.group, false) === group.id)));
+      if (!target) {
+        target = this.state.tabs.find((tab) => !tab.isPrivate && tab.url === saved.url
+          && !this.sanitizeTabGroup(tab.group));
+        if (target) {
+          target.group = groupData;
+          target.groupMemberId = saved.groupMemberId || member.groupMemberId || null;
+        }
+      }
+      if (!target) {
+        target = this.createNewTab(false, { group: groupData, render: false });
+        target.groupMemberId = saved.groupMemberId || member.groupMemberId || null;
+        const document = this.sanitizeDocumentRecoveryDescriptor(saved.document || saved.documentRecovery);
+        if (document) {
+          target.url = this.documentRecoveryUrl(document);
+          target.title = document.name;
+          target.isSecure = true;
+          target.isLoading = false;
+          target.isDocumentRecovery = true;
+          target.documentRecovery = document;
+          target.documentRecoveryError = null;
+        } else {
+          target.title = String(saved.title || saved.url).slice(0, 120);
+          this.navigateActiveTab(saved.url);
+        }
+      }
+      target.group = groupData;
+      target.groupMemberId = saved.groupMemberId || member.groupMemberId || target.groupMemberId || null;
+      target.groupLabel = this._sanitizeTabGroupMemberLabel(member.groupLabel || saved.label || saved.groupLabel);
+      if (saved.document || saved.documentRecovery) {
+        target.documentRecovery = this.sanitizeDocumentRecoveryDescriptor(saved.document || saved.documentRecovery);
+        if (target.isDocumentRecovery) void this.retryDocumentRecovery(target.id);
+      }
+      for (const keyName of ['tabGroupRestoreTabs', 'continueTabs']) {
+        this.state[keyName] = (this.state[keyName] || []).filter((entry) => {
+          const selectedEntry = target.groupMemberId
+            ? entry.groupMemberId === target.groupMemberId
+            : entry.url === saved.url && this.tabGroupIdentity(entry.group, false) === group.id;
+          return !selectedEntry;
+        });
+      }
+    }
+
+    if (!target) return false;
+    if (member.groupLabel !== undefined) target.groupLabel = this._sanitizeTabGroupMemberLabel(member.groupLabel);
+    this._rememberDurableTabGroupMember(target);
+    this.persistDurableTabGroups();
+    this.selectTab(target.id);
+    return true;
+  }
+
+  async renameTabGroupMember(groupId, memberId) {
+    const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
+    if (!group) return false;
+    const key = String(memberId || '');
+    const member = group.tabs.find((candidate) =>
+      String(candidate.groupMemberId || '') === key
+      || String(candidate.id || '') === key
+      || String(candidate.url || '') === key);
+    if (!member) return false;
+    const prompted = await this._textPromptDialog({
+      title: 'Name this saved tab',
+      description: 'Choose a short label for this tab in its group. Leave it empty to use the page title.',
+      placeholder: 'e.g. Lecture 3, Budget, Chapter 2',
+      initialValue: member.groupLabel || this.getTabTitle(member),
+      placement: 'tab-groups'
+    });
+    if (prompted === null || prompted === undefined) return false;
+    const label = this._sanitizeTabGroupMemberLabel(prompted);
+    const liveTab = member.id
+      ? this.state.tabs.find((tab) => tab.id === member.id)
+      : this.state.tabs.find((tab) => tab.groupMemberId === member.groupMemberId);
+    const catalog = this._catalogGroupByIdentity(group.catalogId || groupId);
+    const durableMember = catalog?.members?.find((candidate) => candidate.id === member.groupMemberId);
+    const isRestorable = [...(this.state.tabGroupRestoreTabs || []), ...(this.state.continueTabs || [])]
+      .some((entry) => member.groupMemberId
+        ? entry.groupMemberId === member.groupMemberId
+        : entry.url === member.url);
+    if (!liveTab && !durableMember && !isRestorable) return false;
+    if (liveTab) liveTab.groupLabel = label;
+    if (durableMember) {
+      if (label) durableMember.label = label;
+      else delete durableMember.label;
+      durableMember.updatedAt = Date.now();
+      catalog.updatedAt = durableMember.updatedAt;
+    }
+    for (const entry of [...(this.state.tabGroupRestoreTabs || []), ...(this.state.continueTabs || [])]) {
+      if ((member.groupMemberId && entry.groupMemberId === member.groupMemberId)
+        || (!member.groupMemberId && entry.url === member.url)) {
+        if (label) entry.groupLabel = label;
+        else delete entry.groupLabel;
+      }
+    }
+    if (liveTab) this._rememberDurableTabGroupMember(liveTab);
+    this.persistDurableTabGroups();
+    this.render();
+    this.showTransientNotice(label
+      ? `Saved tab label changed to “${label}”.`
+      : 'Saved tab label reset to the page title.');
     return true;
   }
 
@@ -14727,11 +14873,15 @@ export class BrowserShell {
       container.appendChild(empty);
       return;
     }
-    for (const group of groups) {
+    groups.forEach((group, groupIndex) => {
+      const card = document.createElement('section');
+      card.className = 'fb-tab-group-picker-card';
       const item = document.createElement('button');
       item.type = 'button';
       item.className = 'fb-tab-group-picker-item';
-      item.setAttribute('aria-label', `Open ${group.name} group (${group.tabs.length} tabs)`);
+      item.setAttribute('aria-label', `Open all ${group.tabs.length} tabs in ${group.name}`);
+      item.setAttribute('aria-expanded', 'false');
+      item.setAttribute('aria-controls', `fb-tab-group-members-${groupIndex}`);
       const swatch = document.createElement('span');
       swatch.className = 'fb-tab-group-swatch';
       swatch.style.background = group.color;
@@ -14740,8 +14890,7 @@ export class BrowserShell {
       const title = document.createElement('strong');
       title.textContent = group.name;
       const details = document.createElement('small');
-      const memberTitles = group.tabs.map((tab) => this.getTabTitle(tab)).join(', ');
-      details.textContent = `${group.tabs.length} tab${group.tabs.length === 1 ? '' : 's'}${memberTitles ? ` · ${memberTitles}` : ' · Saved until you delete it'}`;
+      details.textContent = `${group.tabs.length} tab${group.tabs.length === 1 ? '' : 's'} · Hover to choose a tab`;
       const open = document.createElement('span');
       open.className = 'fb-tab-group-picker-open';
       open.textContent = group.tabs.length > 1 ? 'Open all' : (group.tabs.length === 1 ? 'Open' : 'Empty');
@@ -14754,8 +14903,69 @@ export class BrowserShell {
         this.closeModal();
         this.openTabGroup(group.id);
       });
-      container.appendChild(item);
-    }
+      card.appendChild(item);
+
+      const members = document.createElement('div');
+      members.id = `fb-tab-group-members-${groupIndex}`;
+      members.className = 'fb-tab-group-members';
+      members.setAttribute('role', 'list');
+      members.setAttribute('aria-label', `Tabs in ${group.name}`);
+      for (const tab of group.tabs) {
+        const memberId = tab.groupMemberId || tab.id || tab.url;
+        const row = document.createElement('div');
+        row.className = 'fb-tab-group-member-row';
+        row.dataset.memberId = String(memberId || '');
+        row.setAttribute('role', 'listitem');
+        const openTab = document.createElement('button');
+        openTab.type = 'button';
+        openTab.className = 'fb-tab-group-member-open';
+        openTab.title = this.getTabTitle(tab);
+        const memberTitle = document.createElement('span');
+        memberTitle.className = 'fb-tab-group-member-title';
+        memberTitle.textContent = tab.groupLabel || this.getTabTitle(tab);
+        const memberUrl = document.createElement('small');
+        memberUrl.className = 'fb-tab-group-member-subtitle';
+        memberUrl.textContent = tab.groupLabel ? this.getTabTitle(tab) : String(tab.url || '').replace(/^https?:\/\//, '').slice(0, 100);
+        openTab.appendChild(memberTitle);
+        if (memberUrl.textContent && memberUrl.textContent !== memberTitle.textContent) openTab.appendChild(memberUrl);
+        openTab.addEventListener('click', () => {
+          this.closeModal();
+          this.openTabGroupMember(group.id, memberId);
+        });
+        const rename = document.createElement('button');
+        rename.type = 'button';
+        rename.className = 'fb-tab-group-member-rename';
+        rename.setAttribute('aria-label', `Rename ${this.getTabTitle(tab)} in ${group.name}`);
+        rename.title = 'Set a custom tab label';
+        rename.textContent = 'Rename';
+        rename.addEventListener('click', (event) => {
+          event?.preventDefault?.();
+          event?.stopPropagation?.();
+          void this.renameTabGroupMember(group.id, memberId);
+        });
+        row.appendChild(openTab);
+        row.appendChild(rename);
+        members.appendChild(row);
+      }
+      card.appendChild(members);
+      const reveal = () => {
+        card.classList.add('is-expanded');
+        item.setAttribute('aria-expanded', 'true');
+      };
+      const conceal = () => {
+        card.classList.remove('is-expanded');
+        item.setAttribute('aria-expanded', 'false');
+      };
+      card.addEventListener('mouseenter', reveal);
+      card.addEventListener('mouseleave', () => {
+        if (!card.contains?.(document.activeElement)) conceal();
+      });
+      card.addEventListener('focusin', reveal);
+      card.addEventListener('focusout', (event) => {
+        if (!card.contains?.(event.relatedTarget)) conceal();
+      });
+      container.appendChild(card);
+    });
   }
 
   renderTabGroupSettingsList(container) {
@@ -16884,6 +17094,7 @@ export class BrowserShell {
   sessionEntryForTab(tab) {
     if (!tab || tab.isPrivate) return null;
     const group = this.sanitizeTabGroup(tab.group);
+    const groupLabel = group ? this._sanitizeTabGroupMemberLabel(tab.groupLabel) : null;
     const isDocumentUrl = /^yayra:\/\/(?:doc|recover-document)\//i.test(String(tab.url || ''));
     const document = isDocumentUrl ? this.documentRecoveryDescriptorForTab(tab) : null;
     if (document) {
@@ -16892,7 +17103,8 @@ export class BrowserShell {
         title: document.name,
         document,
         ...(group ? { group } : {}),
-        ...(group && tab.groupMemberId ? { groupMemberId: tab.groupMemberId } : {})
+        ...(group && tab.groupMemberId ? { groupMemberId: tab.groupMemberId } : {}),
+        ...(groupLabel ? { groupLabel } : {})
       };
     }
     const url = String(tab.url || '');
@@ -16901,13 +17113,15 @@ export class BrowserShell {
       url,
       title: tab.title || url,
       ...(group ? { group } : {}),
-      ...(group && tab.groupMemberId ? { groupMemberId: tab.groupMemberId } : {})
+      ...(group && tab.groupMemberId ? { groupMemberId: tab.groupMemberId } : {}),
+      ...(groupLabel ? { groupLabel } : {})
     };
   }
 
   normalizeSessionEntry(value) {
     if (!value || typeof value !== 'object' || value.isPrivate) return null;
     const group = this.sanitizeTabGroup(value.group);
+    const groupLabel = group ? this._sanitizeTabGroupMemberLabel(value.groupLabel) : null;
     const groupMemberId = /^tgm-[A-Za-z0-9_-]{1,120}$/.test(String(value.groupMemberId || ''))
       ? String(value.groupMemberId)
       : null;
@@ -16918,7 +17132,8 @@ export class BrowserShell {
         title: document.name,
         document,
         ...(group ? { group } : {}),
-        ...(group && groupMemberId ? { groupMemberId } : {})
+        ...(group && groupMemberId ? { groupMemberId } : {}),
+        ...(groupLabel ? { groupLabel } : {})
       };
     }
     const url = String(value.url || '');
@@ -16927,7 +17142,8 @@ export class BrowserShell {
         url,
         title: String(value.title || url).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 120) || url,
         ...(group ? { group } : {}),
-        ...(group && groupMemberId ? { groupMemberId } : {})
+        ...(group && groupMemberId ? { groupMemberId } : {}),
+        ...(groupLabel ? { groupLabel } : {})
       };
     }
     if (!/^https?:\/\//i.test(url) || url.length > 8192) return null;
@@ -16939,7 +17155,8 @@ export class BrowserShell {
       url,
       title: String(value.title || url).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 120) || url,
       ...(group ? { group } : {}),
-      ...(group && groupMemberId ? { groupMemberId } : {})
+      ...(group && groupMemberId ? { groupMemberId } : {}),
+      ...(groupLabel ? { groupLabel } : {})
     };
   }
 
@@ -17001,7 +17218,8 @@ export class BrowserShell {
         documentRecovery: descriptor,
         documentRecoveryError: failureReason,
         ...(normalized.group ? { group: normalized.group } : {}),
-        ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {})
+        ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {}),
+        ...(normalized.groupLabel ? { groupLabel: normalized.groupLabel } : {})
       };
     }
 
@@ -17028,7 +17246,8 @@ export class BrowserShell {
         documentRecovery: descriptor,
         documentRecoveryError: 'invalid-document',
         ...(normalized.group ? { group: normalized.group } : {}),
-        ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {})
+        ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {}),
+        ...(normalized.groupLabel ? { groupLabel: normalized.groupLabel } : {})
       };
     }
     if (source.recoveryId) doc.recoveryId = source.recoveryId;
@@ -17060,7 +17279,8 @@ export class BrowserShell {
       docState,
       documentRecovery: recoveredDescriptor,
       ...(normalized.group ? { group: normalized.group } : {}),
-      ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {})
+      ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {}),
+      ...(normalized.groupLabel ? { groupLabel: normalized.groupLabel } : {})
     };
   }
 
@@ -17082,7 +17302,8 @@ export class BrowserShell {
     const recovered = await this.createRecoveredDocumentTab({
       document: descriptor,
       group: tab.group,
-      groupMemberId: tab.groupMemberId
+      groupMemberId: tab.groupMemberId,
+      groupLabel: tab.groupLabel
     }, { tabId });
     if (!recovered || recovered.isDocumentRecovery) {
       if (recovered) this.state.tabs[index] = recovered;
@@ -17213,7 +17434,8 @@ export class BrowserShell {
       isPrivate: false,
       favicon: null,
       ...(normalized.group ? { group: normalized.group } : {}),
-      ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {})
+      ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {}),
+      ...(normalized.groupLabel ? { groupLabel: normalized.groupLabel } : {})
     };
   }
 
@@ -24986,25 +25208,50 @@ export class BrowserShell {
     }
 
     let sidebarStructureKey = '';
+    let lastScrolledThumbPage = null;
+    const syncSelectedThumbnail = () => {
+      if (!state.sidebarOpen || state.sidebarTab !== 'thumbnails') {
+        lastScrolledThumbPage = null;
+        return;
+      }
+      const page = Number(state.page) || 1;
+      const selected = [...sidebarBody.querySelectorAll('.fb-doc-thumb')]
+        .find((thumb) => Number(thumb.dataset.page) === page);
+      if (!selected) return;
+      for (const thumb of sidebarBody.querySelectorAll('.fb-doc-thumb')) {
+        if (Number(thumb.dataset.page) === page) thumb.setAttribute('aria-current', 'page');
+        else thumb.removeAttribute('aria-current');
+      }
+      if (lastScrolledThumbPage === page) return;
+      lastScrolledThumbPage = page;
+      try { selected.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' }); }
+      catch { try { selected.scrollIntoView?.(); } catch { /* unsupported embedder */ } }
+    };
     const renderSidebar = () => {
       try {
         const canShowSidebar = capabilities.outline || capabilities.thumbnails;
         sidebar.style.display = canShowSidebar && state.sidebarOpen ? 'block' : 'none';
         if (!canShowSidebar || !state.sidebarOpen) {
           sidebarStructureKey = '';
+          lastScrolledThumbPage = null;
           sidebarBody.innerHTML = '';
           return;
         }
         const nextStructureKey = `${state.sidebarTab}|${state.numPages}|${state.outline.length}|${documentKind}`;
         if (sidebarStructureKey === nextStructureKey && state.sidebarTab === 'thumbnails') {
           for (const tile of sidebarBody.querySelectorAll('.fb-doc-thumb')) {
-            tile.style.borderColor = Number(tile.dataset.page) === Number(state.page)
+            const isCurrent = Number(tile.dataset.page) === Number(state.page);
+            tile.style.borderColor = isCurrent
               ? 'var(--fb-accent-primary,#6d5df2)'
               : 'var(--fb-border-glass,rgba(255,255,255,0.12))';
+            if (isCurrent) tile.setAttribute('aria-current', 'page');
+            else tile.removeAttribute('aria-current');
           }
+          syncSelectedThumbnail();
           return;
         }
         sidebarStructureKey = nextStructureKey;
+        lastScrolledThumbPage = null;
         sidebarBody.innerHTML = '';
         for (const b of sidebarTabs.querySelectorAll('.fb-doc-sidebar-tab')) {
           b.style.background = 'var(--fb-bg-glass-input,rgba(255,255,255,0.07))';
@@ -25023,6 +25270,7 @@ export class BrowserShell {
             thumb.dataset.page = String(p);
             thumb.setAttribute('role', 'button');
             thumb.setAttribute('aria-label', `Go to ${pageNoun} ${p}`);
+            if (p === Number(state.page)) thumb.setAttribute('aria-current', 'page');
             thumb.style.cssText = `margin:0 auto 10px; width:140px; min-height:44px; padding:4px; border:1px solid ${p === state.page ? 'var(--fb-accent-primary,#6d5df2)' : 'var(--fb-border-glass,rgba(255,255,255,0.12))'}; border-radius:7px; cursor:pointer; text-align:center; background:var(--fb-bg-glass-input,#0e111a); overflow:hidden;`;
             const label = document.createElement('div');
             label.textContent = `${isPowerPointDocument(documentKind) ? 'Slide ' : ''}${p}`;
@@ -25043,6 +25291,7 @@ export class BrowserShell {
               renderPreview();
             }
           }
+          syncSelectedThumbnail();
           return;
         }
         if (!state.outline.length) {
