@@ -1143,6 +1143,75 @@ test('DOCUMENT PRINT: duplicate requests coalesce and a tab switch cancels the s
   }
 });
 
+test('PRINT PREVIEW: document settings generate an in-app PDF preview, then reach the selected printer settings', async () => {
+  const tab = {
+    id: 'print-preview-doc', isDocument: true, title: 'Slides for printing',
+    docState: { status: 'ready', viewer: 'pptx', numPages: 5, page: 3 }
+  };
+  let prepareCalls = 0;
+  let finishCalls = 0;
+  const previewCalls = [];
+  const printCalls = [];
+  const session = {
+    disposed: false,
+    viewer: {
+      preparePrint: async () => { prepareCalls += 1; return true; },
+      finishPrint: async () => { finishCalls += 1; }
+    }
+  };
+  const shell = Object.create(BrowserShell.prototype);
+  shell.state = { activeModal: null };
+  shell._activeDocViewer = { tabId: tab.id, ...session };
+  shell._documentViewerSessions = new Map([[tab.id, shell._activeDocViewer]]);
+  shell._documentPrintInFlight = null;
+  shell.getActiveTab = () => tab;
+  shell.render = () => {};
+  shell.showTransientNotice = () => {};
+  const printBridge = {
+    printPreview: async (tabId, settings) => {
+      previewCalls.push({ tabId, settings });
+      return { ok: true, pdf: new Uint8Array([37, 80, 68, 70]) };
+    },
+    print: async (tabId, settings) => {
+      printCalls.push({ tabId, settings });
+      return { ok: true, mode: 'printer' };
+    }
+  };
+  Object.defineProperty(shell, 'nativeWebview', { get: () => printBridge });
+  const modal = document.createElement('div');
+  try {
+    assert.equal(await shell.printActivePage(), true);
+    assert.equal(prepareCalls, 1);
+    assert.equal(shell.state.activeModal, 'print-preview');
+    shell.renderPrintPreviewModal(modal);
+    document.body.appendChild(modal);
+    await new Promise((resolve) => setTimeout(resolve, 190));
+    assert.ok(previewCalls.length > 0, 'an in-app preview is generated from the prepared slide deck');
+    assert.ok(modal.querySelector('.fb-print-preview-frame')?.src, 'the preview PDF is displayed before printing');
+
+    const form = modal.querySelector('.fb-print-preview-form');
+    form.querySelector('.fb-print-scope').value = 'range';
+    form.querySelector('.fb-print-range').value = '2-4';
+    form.querySelector('.fb-print-paper').value = 'Letter';
+    form.querySelector('.fb-print-orientation').value = 'landscape';
+    form.querySelector('.fb-print-color').value = 'grayscale';
+    form.querySelector('.fb-print-copies').value = '2';
+    shell._printPreviewState.options = shell.printOptionsFromPreview(shell._printPreviewState, form);
+    assert.equal(await shell.completePrintPreview(), true);
+    assert.equal(printCalls.length, 1);
+    assert.equal(printCalls[0].tabId, tab.id);
+    assert.equal(printCalls[0].settings.pageRange, '2-4');
+    assert.equal(printCalls[0].settings.paper, 'Letter');
+    assert.equal(printCalls[0].settings.orientation, 'landscape');
+    assert.equal(printCalls[0].settings.color, 'grayscale');
+    assert.equal(printCalls[0].settings.copies, 2);
+    assert.equal(finishCalls, 1, 'temporary presentation print DOM is disposed after printing');
+  } finally {
+    modal.remove();
+    if (shell._printPreviewState) await shell.finishPrintPreview();
+  }
+});
+
 test('PPTX NOTES COLOUR: native wheel stays live beside the accessible presentation overflow and persists by profile', async () => {
   const priorStorage = globalThis.localStorage;
   const storage = makeMemoryStorage();

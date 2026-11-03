@@ -193,6 +193,38 @@ test('FORMAT ROUTING: signatures outrank spoofed names; OOXML and CFB siblings a
   assert.strictEqual(legacyStored.bytes, doc, 'the legacy original—not its viewing copy—belongs to the Documents library');
 });
 
+test('PPTX DIAGRAMS: connectors keep their geometry and dark-filled nodes keep labels legible', () => {
+  const host = mount(500, 320);
+  try {
+    const slide = {
+      slideNumber: 7,
+      background: '#ffffff',
+      shapes: [
+        {
+          id: 19, type: 'line', x: 20, y: 30, w: 220, h: 90, geom: 'bentConnector3',
+          flipH: false, flipV: true, lineStart: 'none', lineEnd: 'triangle', lineDash: 'solid',
+          fill: '#101820', borderWidth: 2
+        },
+        {
+          id: 20, type: 'text', x: 260, y: 60, w: 150, h: 55, fill: '#000000',
+          text: { paragraphs: [{ level: 0, runs: [{ text: 'CENTRAL NERVOUS SYSTEM', color: '#000000' }] }], levels: [], defaultSizePt: 16, fontScale: 1 }
+        }
+      ]
+    };
+    renderPptxSlide(host, { slide, width: 500, height: 320 });
+    const connector = host.querySelector('.fb-pptx-line');
+    const path = connector?.querySelector('.fb-pptx-connector-path');
+    assert.equal(connector?.namespaceURI, 'http://www.w3.org/2000/svg', 'connectors use real SVG strokes rather than opaque rectangles');
+    assert.match(path?.getAttribute('d') || '', /L 110 90 L 110 0 L 220 0/,  'elbow connectors retain both orthogonal segments and slope direction');
+    assert.equal(path?.getAttribute('stroke'), '#101820');
+    assert.match(path?.getAttribute('marker-end') || '', /pptx-arrow-end/, 'PowerPoint arrowheads survive rendering');
+    const label = host.querySelector('.fb-pptx-text .fb-pptx-runs span');
+    assert.equal(label?.style.color, '#ffffff', 'near-invisible black text on a black node is corrected to the readable contrast colour');
+  } finally {
+    removeMount(host);
+  }
+});
+
 test('PPTX TITLES: title frames that extend beyond slide edges are brought fully into view', () => {
   const host = mount(960, 540);
   try {

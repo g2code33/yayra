@@ -6,6 +6,7 @@
 
 const FONT_STACK = 'Calibri, Aptos, "Segoe UI", "Helvetica Neue", Arial, sans-serif';
 const PT_TO_PX = 4 / 3;
+let connectorRenderId = 0;
 
 const px = (value) => `${Math.max(0, Number(value) || 0)}px`;
 
@@ -39,6 +40,30 @@ function readableForeground(background, fallback = '#000000') {
   // 0.179 is the crossover at which WCAG contrast against black becomes
   // greater than contrast against white; choose the stronger of the two.
   return luminance < 0.179 ? '#ffffff' : '#000000';
+}
+
+function colorLuminance(value) {
+  const match = String(value || '').trim().match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+  if (!match) return null;
+  const hex = match[1].length === 3
+    ? Array.from(match[1], (channel) => `${channel}${channel}`).join('')
+    : match[1];
+  const channels = [0, 2, 4].map((offset) => parseInt(hex.slice(offset, offset + 2), 16) / 255);
+  const linear = channels.map((channel) => channel <= 0.04045
+    ? channel / 12.92
+    : ((channel + 0.055) / 1.055) ** 2.4);
+  return (0.2126 * linear[0]) + (0.7152 * linear[1]) + (0.0722 * linear[2]);
+}
+
+function visibleTextColor(foreground, background) {
+  if (!foreground || !background) return foreground;
+  const text = colorLuminance(foreground);
+  const surface = colorLuminance(background);
+  if (text === null || surface === null) return foreground;
+  const contrast = (Math.max(text, surface) + 0.05) / (Math.min(text, surface) + 0.05);
+  // Preserve authored colours when legible; repair only near-invisible
+  // text-on-fill combinations that Chromium otherwise paints as solid boxes.
+  return contrast < 3 ? readableForeground(background, foreground) : foreground;
 }
 
 function symbolText(text, font, helpers) {
@@ -81,7 +106,7 @@ function fitTextFrame(frame, inner, anchor) {
   if (fontsReady && typeof fontsReady.then === 'function') fontsReady.then(run).catch(() => {});
 }
 
-function renderParagraph(doc, paragraph, textModel, helpers) {
+function renderParagraph(doc, paragraph, textModel, helpers, shapeFill = null) {
   const row = doc.createElement('div');
   row.className = 'fb-pptx-paragraph';
   const level = textModel.levels?.[paragraph.level] || {};
@@ -131,13 +156,14 @@ function renderParagraph(doc, paragraph, textModel, helpers) {
     const family = run.mathMl
       ? 'Cambria Math'
       : runIsSymbol ? '' : (run.font || (helpers?.isSymbolBulletFont?.(level.font) ? '' : level.font) || '');
+    const runColor = visibleTextColor(run.color || level.color, shapeFill);
     span.style.cssText = [
       run.mathMl ? 'display:inline-block;vertical-align:middle;max-width:100%' : '',
       run.sizePt ? `font-size:${run.sizePt * PT_TO_PX * (textModel.fontScale || 1)}px` : '',
       (run.bold ?? level.bold) ? 'font-weight:700' : '',
       (run.italic ?? level.italic) ? 'font-style:italic' : '',
       run.underline ? 'text-decoration:underline' : '',
-      (run.color || level.color) ? `color:${run.color || level.color}` : '',
+      runColor ? `color:${runColor}` : '',
       family ? `font-family:${JSON.stringify(family)},${run.mathMl ? '"STIX Two Math", "Latin Modern Math", serif' : FONT_STACK}` : ''
     ].filter(Boolean).join(';');
     runs.appendChild(span);
@@ -358,17 +384,86 @@ function renderVideo(doc, shape, showImages, thumbnail) {
   return video;
 }
 
+function renderPptxConnector(doc, shape) {
+  const svgNs = 'http://www.w3.org/2000/svg';
+  const svg = doc.createElementNS(svgNs, 'svg');
+  const renderId = ++connectorRenderId;
+  svg.setAttribute('class', 'fb-pptx-shape fb-pptx-line');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('focusable', 'false');
+  svg.setAttribute('viewBox', `0 0 ${Math.max(1, shape.w || 0)} ${Math.max(1, shape.h || 0)}`);
+  svg.setAttribute('preserveAspectRatio', 'none');
+  svg.style.cssText = `${shapeBase(shape)};overflow:visible;pointer-events:none;`;
+
+  const width = Math.max(1, Number(shape.w) || 0);
+  const height = Math.max(1, Number(shape.h) || 0);
+  const inverse = shape.geom === 'lineInv';
+  const startX = shape.flipH ? width : 0;
+  const endX = shape.flipH ? 0 : width;
+  const startBottom = Boolean(shape.flipV) !== inverse;
+  const endBottom = !startBottom;
+  const startY = startBottom ? height : 0;
+  const endY = endBottom ? height : 0;
+  const isBent = /^(bentConnector|elbowConnector)/i.test(String(shape.geom || ''));
+  const middleX = (startX + endX) / 2;
+  const pathData = isBent
+    ? `M ${startX} ${startY} L ${middleX} ${startY} L ${middleX} ${endY} L ${endX} ${endY}`
+    : `M ${startX} ${startY} L ${endX} ${endY}`;
+  const stroke = shape.fill || shape.borderColor || '#000000';
+  const path = doc.createElementNS(svgNs, 'path');
+  path.setAttribute('class', 'fb-pptx-connector-path');
+  path.setAttribute('d', pathData);
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke', stroke);
+  path.setAttribute('stroke-width', String(Math.max(0.5, Number(shape.borderWidth) || 2)));
+  path.setAttribute('stroke-linecap', 'round');
+  path.setAttribute('stroke-linejoin', 'round');
+  const dashPatterns = {
+    sysDot: '1 3', sysDash: '5 3', sysDashDot: '5 3 1 3', sysDashDotDot: '5 3 1 3 1 3',
+    dash: '6 4', dashDot: '6 3 1 3', lgDash: '10 4', lgDashDot: '10 3 1 3', lgDashDotDot: '10 3 1 3 1 3'
+  };
+  if (dashPatterns[shape.lineDash]) path.setAttribute('stroke-dasharray', dashPatterns[shape.lineDash]);
+
+  const addArrow = (type, markerId, isStart) => {
+    if (!type || type === 'none') return;
+    const defs = svg.querySelector('defs') || doc.createElementNS(svgNs, 'defs');
+    if (!defs.parentNode) svg.appendChild(defs);
+    const marker = doc.createElementNS(svgNs, 'marker');
+    marker.setAttribute('id', markerId);
+    marker.setAttribute('viewBox', '0 -5 10 10');
+    marker.setAttribute('markerWidth', '7');
+    marker.setAttribute('markerHeight', '7');
+    marker.setAttribute('refX', isStart ? '1' : '9');
+    marker.setAttribute('refY', '0');
+    marker.setAttribute('orient', 'auto-start-reverse');
+    marker.setAttribute('markerUnits', 'strokeWidth');
+    const tip = String(type).toLowerCase();
+    const arrow = doc.createElementNS(svgNs, tip === 'oval' ? 'circle' : 'path');
+    if (tip === 'oval') {
+      arrow.setAttribute('cx', '5'); arrow.setAttribute('cy', '0'); arrow.setAttribute('r', '4');
+    } else if (tip === 'diamond') {
+      arrow.setAttribute('d', 'M 0 0 L 4 -4 L 8 0 L 4 4 Z');
+    } else if (tip === 'stealth') {
+      arrow.setAttribute('d', 'M 0 -5 L 10 0 L 0 5 L 3 0 Z');
+    } else {
+      arrow.setAttribute('d', 'M 0 -5 L 10 0 L 0 5 Z');
+    }
+    arrow.setAttribute('fill', stroke);
+    marker.appendChild(arrow);
+    defs.appendChild(marker);
+    path.setAttribute(isStart ? 'marker-start' : 'marker-end', `url(#${markerId})`);
+  };
+  addArrow(shape.lineStart, `pptx-arrow-start-${shape.id}-${renderId}`, true);
+  addArrow(shape.lineEnd, `pptx-arrow-end-${shape.id}-${renderId}`, false);
+  svg.appendChild(path);
+  return svg;
+}
+
 function renderShape(doc, shape, helpers, showImages, thumbnail) {
   if (shape.type === 'video') return renderVideo(doc, shape, showImages, thumbnail);
   if (shape.type === 'image') return renderImage(doc, shape, showImages, thumbnail);
   if (shape.type === 'table') return renderTable(doc, shape);
-  if (shape.type === 'line') {
-    const line = doc.createElement('div');
-    line.className = 'fb-pptx-shape fb-pptx-line';
-    line.setAttribute('aria-hidden', 'true');
-    line.style.cssText = `${shapeBase(shape)};background:${shape.fill || shape.borderColor || '#000'};min-width:${Math.max(shape.w || 0, 1)}px;min-height:${Math.max(shape.h || 0, shape.borderWidth || 2)}px;border-radius:2px;`;
-    return line;
-  }
+  if (shape.type === 'line') return renderPptxConnector(doc, shape);
   if (shape.type === 'chart') {
     const chart = doc.createElement('div');
     chart.className = 'fb-pptx-shape fb-pptx-chart';
@@ -396,7 +491,7 @@ function renderShape(doc, shape, helpers, showImages, thumbnail) {
   inner.className = 'fb-pptx-text-inner';
   const justify = text.anchor === 'ctr' ? 'center' : text.anchor === 'b' ? 'flex-end' : 'flex-start';
   inner.style.cssText = `height:100%;display:flex;flex-direction:column;justify-content:${justify};padding:5px 9px;box-sizing:border-box;transform-origin:top left;`;
-  for (const paragraph of text.paragraphs || []) inner.appendChild(renderParagraph(doc, paragraph, text, helpers));
+  for (const paragraph of text.paragraphs || []) inner.appendChild(renderParagraph(doc, paragraph, text, helpers, shape.fill));
   frame.appendChild(inner);
   fitTextFrame(frame, inner, text.anchor);
   return frame;

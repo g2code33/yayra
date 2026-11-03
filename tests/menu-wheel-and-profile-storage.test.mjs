@@ -524,6 +524,40 @@ test('webview IPC: print, zoom (clamped), media state and mute act on the real p
   assert.deepEqual(reader.blocks, [{ tag: 'p', text: 'hello' }]);
 });
 
+test('webview IPC: print preview and printer/PDF output share the selected paper, range, layout, and appearance settings', async () => {
+  const { handlers, views } = makeWebviewHarness();
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-1', url: 'https://example.com/' });
+  const wc = views[0].webContents;
+  const pdfOptions = [];
+  wc.printToPDF = async (options) => { pdfOptions.push(options); return Buffer.from('%PDF-preview'); };
+  const settings = {
+    scope: 'range', pageRange: '2-4, 7', paper: 'Letter', orientation: 'landscape',
+    margin: 'custom', color: 'grayscale', printBackground: false, headerFooter: true,
+    copies: 2, scaleFactor: 90
+  };
+  const preview = await handlers.get('yayra:webview-print-preview')(null, { tabId: 'tab-1', settings });
+  assert.equal(preview.ok, true);
+  assert.equal(preview.pdf.toString(), '%PDF-preview');
+  assert.deepEqual(pdfOptions[0], {
+    printBackground: false, preferCSSPageSize: false, landscape: true, pageSize: 'Letter',
+    scale: 0.9, displayHeaderFooter: true,
+    headerTemplate: '<div style="font-size:8px;width:100%;text-align:center"><span class="title"></span></div>',
+    footerTemplate: '<div style="font-size:8px;width:100%;text-align:center"><span class="pageNumber"></span> / <span class="totalPages"></span></div>',
+    margins: { top: 0.35, bottom: 0.35, left: 0.35, right: 0.35 }, pageRanges: '2-4,7'
+  });
+
+  wc.getPrintersAsync = async () => [{ name: 'office', displayName: 'Office printer' }];
+  let nativeSettings = null;
+  wc.print = (options, callback) => { nativeSettings = options; callback(true); };
+  const printed = await handlers.get('yayra:webview-print')(null, { tabId: 'tab-1', settings });
+  assert.equal(printed.ok, true);
+  assert.deepEqual(nativeSettings, {
+    silent: false, printBackground: false, landscape: true, color: false, copies: 2,
+    scaleFactor: 90, pageSize: 'Letter', headerFooter: true,
+    margins: { marginType: 'custom', top: 0.35, bottom: 0.35, left: 0.35, right: 0.35 }, pages: [1, 2, 3, 6]
+  });
+});
+
 test('webview IPC: no printer falls back to a user-selected PDF instead of a missing default queue', async () => {
   const writes = [];
   const dialog = {
@@ -549,7 +583,14 @@ test('webview IPC: no printer falls back to a user-selected PDF instead of a mis
     path: '/tmp/clear-page.pdf',
     fallbackReason: 'no-printers'
   });
-  assert.deepEqual(pdfOptions, [{ printBackground: true, preferCSSPageSize: true }]);
+  assert.deepEqual(pdfOptions, [{
+    printBackground: true,
+    preferCSSPageSize: false,
+    landscape: false,
+    pageSize: 'A4',
+    scale: 1,
+    displayHeaderFooter: false
+  }]);
   assert.equal(views[0].calls.some(([name]) => name === 'print'), false, 'native print is skipped when no destination exists');
   assert.equal(writes.length, 1);
   assert.equal(writes[0][0], '/tmp/clear-page.pdf');

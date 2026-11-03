@@ -155,7 +155,8 @@ const api = {
     suggestEmailAddresses: (tabId, emails = []) => ipcRenderer.invoke('yayra:webview-suggest-email-addresses', { tabId, emails }),
     // Menu > More tools: REAL page-level actions on the native engine.
     openDevTools: (tabId) => ipcRenderer.invoke('yayra:webview-open-devtools', { tabId }),
-    print: (tabId) => ipcRenderer.invoke('yayra:webview-print', { tabId }),
+    printPreview: (tabId, settings = {}) => ipcRenderer.invoke('yayra:webview-print-preview', { tabId, settings }),
+    print: (tabId, settings = {}) => ipcRenderer.invoke('yayra:webview-print', { tabId, settings }),
     savePage: (tabId) => ipcRenderer.invoke('yayra:webview-save-page', { tabId }),
     setZoom: (tabId, factor) => ipcRenderer.invoke('yayra:webview-set-zoom', { tabId, factor }),
     readerExtract: (tabId) => ipcRenderer.invoke('yayra:webview-reader-extract', { tabId }),

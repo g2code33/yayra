@@ -5018,19 +5018,30 @@ function parsePic(pic, ctx) {
 }
 function parseCxnSp(cxn, ctx) {
   const spPr = child(cxn, "p:spPr") || (inNamespace(cxn, DIAGRAM_DRAWING_NS) ? childByLocalName(cxn, "spPr") : null);
+  const transform = spPr ? child(spPr, "a:xfrm") : null;
   const box = applyT(ctx.t, parseXfrm(spPr));
   const ln = spPr ? child(spPr, "a:ln") : null;
   const color = ln ? solidColor(child(ln, "a:solidFill")) : void 0;
-  const w = ln?.getAttribute("w") ? emuToPx(parseInt(ln.getAttribute("w"), 10)) : 2;
+  const strokeWidth = ln?.getAttribute("w") ? emuToPx(parseInt(ln.getAttribute("w"), 10)) : 2;
+  const lineType = (name) => child(ln, `a:${name}`)?.getAttribute("type") || void 0;
+  const dash = child(ln, "a:prstDash")?.getAttribute("val") || void 0;
+  const geom = child(spPr, "a:prstGeom")?.getAttribute("prst") || "line";
   return {
     id: ctx.nextId(),
     type: "line",
     x: box.x,
     y: box.y,
     w: Math.max(box.w, 1),
-    h: Math.max(box.h, Math.max(1, w)),
+    h: Math.max(box.h, 1),
     rot: box.rot,
+    geom,
+    flipH: transform?.getAttribute("flipH") === "1",
+    flipV: transform?.getAttribute("flipV") === "1",
+    lineStart: lineType("headEnd"),
+    lineEnd: lineType("tailEnd"),
+    lineDash: dash,
     fill: color,
+    borderWidth: Math.max(0.5, strokeWidth),
     textScale: 1,
     isTitle: false
   };

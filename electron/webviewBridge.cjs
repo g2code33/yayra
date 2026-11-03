@@ -3690,7 +3690,90 @@ function createWebviewBridge({
     }
   });
 
-  async function savePrintAsPdf(event, wc, fallbackReason = 'no-printers') {
+  function normalizePrintSettings(value = {}) {
+    const settings = value && typeof value === 'object' ? value : {};
+    const paper = ['A4', 'A3', 'A5', 'Letter', 'Legal', 'Tabloid'].includes(settings.paper) ? settings.paper : 'A4';
+    const margin = ['default', 'none', 'printableArea', 'custom'].includes(settings.margin) ? settings.margin : 'default';
+    const candidateRange = typeof settings.pageRange === 'string' && /^[0-9,\s-]{1,200}$/.test(settings.pageRange)
+      ? settings.pageRange.replace(/\s+/g, '')
+      : '';
+    const pageRange = candidateRange && candidateRange.split(',').every((part) => {
+      if (!/^\d+(?:-\d+)?$/.test(part)) return false;
+      const [first, last] = part.split('-').map(Number);
+      return first > 0 && (last === undefined || last >= first);
+    }) ? candidateRange : '';
+    const pages = pageRange ? pageRange.split(',').flatMap((part) => {
+      const [first, last] = part.split('-').map(Number);
+      if (!Number.isInteger(first) || first < 1) return [];
+      if (last !== undefined && (!Number.isInteger(last) || last < first)) return [];
+      return Array.from({ length: Math.min(1000, (last || first) - first + 1) }, (_, index) => first + index - 1);
+    }) : [];
+    return {
+      paper,
+      landscape: settings.orientation === 'landscape',
+      color: settings.color !== 'grayscale',
+      printBackground: settings.printBackground !== false,
+      headerFooter: Boolean(settings.headerFooter),
+      copies: Math.max(1, Math.min(99, Math.round(Number(settings.copies) || 1))),
+      scaleFactor: Math.max(10, Math.min(200, Math.round(Number(settings.scaleFactor) || 100))),
+      margin,
+      pageRange,
+      pages
+    };
+  }
+
+  function electronPrintOptions(settings) {
+    return {
+      silent: false,
+      printBackground: settings.printBackground,
+      landscape: settings.landscape,
+      color: settings.color,
+      copies: settings.copies,
+      scaleFactor: settings.scaleFactor,
+      pageSize: settings.paper,
+      headerFooter: settings.headerFooter,
+      margins: settings.margin === 'custom'
+        ? { marginType: 'custom', top: 0.35, bottom: 0.35, left: 0.35, right: 0.35 }
+        : { marginType: settings.margin },
+      ...(settings.pages.length ? { pages: settings.pages } : {})
+    };
+  }
+
+  function pdfPrintOptions(settings) {
+    const customMargins = settings.margin === 'custom';
+    return {
+      printBackground: settings.printBackground,
+      preferCSSPageSize: false,
+      landscape: settings.landscape,
+      pageSize: settings.paper,
+      scale: settings.scaleFactor / 100,
+      displayHeaderFooter: settings.headerFooter,
+      ...(settings.headerFooter ? {
+        headerTemplate: '<div style="font-size:8px;width:100%;text-align:center"><span class="title"></span></div>',
+        footerTemplate: '<div style="font-size:8px;width:100%;text-align:center"><span class="pageNumber"></span> / <span class="totalPages"></span></div>'
+      } : {}),
+      ...(customMargins
+        ? { margins: { top: 0.35, bottom: 0.35, left: 0.35, right: 0.35 } }
+        : settings.margin === 'none' ? { margins: { top: 0, bottom: 0, left: 0, right: 0 } } : {}),
+      ...(settings.pageRange ? { pageRanges: settings.pageRange } : {})
+    };
+  }
+
+  async function renderPrintPdf(wc, settings) {
+    let grayscaleStyle = null;
+    try {
+      if (!settings.color && typeof wc.insertCSS === 'function') {
+        grayscaleStyle = await wc.insertCSS('@media print { html { filter: grayscale(1) !important; } }');
+      }
+      return await wc.printToPDF(pdfPrintOptions(settings));
+    } finally {
+      if (grayscaleStyle && typeof wc.removeInsertedCSS === 'function') {
+        try { await wc.removeInsertedCSS(grayscaleStyle); } catch { /* print snapshot already completed */ }
+      }
+    }
+  }
+
+  async function savePrintAsPdf(event, wc, fallbackReason = 'no-printers', settings = normalizePrintSettings()) {
     if (!wc || typeof wc.printToPDF !== 'function' || !dialog || typeof dialog.showSaveDialog !== 'function'
       || typeof writeFile !== 'function') {
       return { ok: false, reason: fallbackReason, pdfFallbackUnavailable: true };
@@ -3709,7 +3792,7 @@ function createWebviewBridge({
         return { ok: false, canceled: true, mode: 'pdf', fallbackReason };
       }
       const filePath = /\.pdf$/i.test(result.filePath) ? result.filePath : `${result.filePath}.pdf`;
-      const pdf = await wc.printToPDF({ printBackground: true, preferCSSPageSize: true });
+      const pdf = await renderPrintPdf(wc, settings);
       if (!pdf || !Number(pdf.length)) throw new Error('empty_pdf');
       await writeFile(filePath, pdf);
       return { ok: true, mode: 'pdf', path: filePath, fallbackReason };
@@ -3719,10 +3802,27 @@ function createWebviewBridge({
     }
   }
 
-  ipcMain.handle('yayra:webview-print', async (event, { tabId } = {}) => {
+  ipcMain.handle('yayra:webview-print-preview', async (event, { tabId, settings } = {}) => {
+    const entry = views.get(viewKey(event, tabId));
+    const wc = (entry && entry.view && entry.view.webContents) || (event && event.sender) || null;
+    if (!wc || typeof wc.printToPDF !== 'function') return { ok: false, reason: 'unavailable' };
+    try {
+      const pdf = await renderPrintPdf(wc, normalizePrintSettings(settings));
+      if (!pdf || !Number(pdf.length)) return { ok: false, reason: 'empty-preview' };
+      return { ok: true, pdf };
+    } catch (err) {
+      logger.warn?.('[yayra:webview] print preview generation failed', err);
+      return { ok: false, reason: 'preview-failed' };
+    }
+  });
+
+  ipcMain.handle('yayra:webview-print', async (event, { tabId, settings: rawSettings } = {}) => {
     const entry = views.get(viewKey(event, tabId));
     const wc = (entry && entry.view && entry.view.webContents) || (event && event.sender) || null;
     if (!wc || typeof wc.print !== 'function') return { ok: false, reason: 'unavailable' };
+    const hasSettings = rawSettings && typeof rawSettings === 'object' && Object.keys(rawSettings).length > 0;
+    const settings = normalizePrintSettings(rawSettings);
+    const printOptions = hasSettings ? electronPrintOptions(settings) : {};
 
     // Electron exposes the actual destination list. Do not send Linux to a
     // synthetic/nonexistent "default" queue: when there is no printer, save
@@ -3731,7 +3831,7 @@ function createWebviewBridge({
       try {
         const printers = await wc.getPrintersAsync();
         if (!Array.isArray(printers) || printers.length === 0) {
-          return savePrintAsPdf(event, wc, 'no-printers');
+          return savePrintAsPdf(event, wc, 'no-printers', settings);
         }
       } catch (err) {
         logger.warn?.('[yayra:webview] printer discovery failed; native print will verify the destination', err);
@@ -3739,7 +3839,7 @@ function createWebviewBridge({
 
       try {
         return await new Promise((resolve) => {
-          wc.print({}, (success, failureReason = '') => {
+          wc.print(printOptions, (success, failureReason = '') => {
             if (success) {
               resolve({ ok: true, mode: 'printer' });
               return;
@@ -3751,23 +3851,23 @@ function createWebviewBridge({
               resolve({ ok: false, canceled: true, mode: 'printer' });
               return;
             }
-            Promise.resolve(savePrintAsPdf(event, wc, String(failureReason || 'printer-failed'))).then(resolve);
+            Promise.resolve(savePrintAsPdf(event, wc, String(failureReason || 'printer-failed'), settings)).then(resolve);
           });
         });
       } catch (err) {
         logger.error?.('[yayra:webview] native print failed; using PDF fallback', err);
-        return savePrintAsPdf(event, wc, 'printer-threw');
+        return savePrintAsPdf(event, wc, 'printer-threw', settings);
       }
     }
 
     // Compatibility path for older Electron/test hosts that do not expose
     // printer discovery. Preserve their existing native print behavior.
     try {
-      wc.print({});
+      wc.print(printOptions);
       return { ok: true, mode: 'printer' };
     } catch (err) {
       logger.error?.('[yayra:webview] print failed; using PDF fallback', err);
-      return savePrintAsPdf(event, wc, 'printer-threw');
+      return savePrintAsPdf(event, wc, 'printer-threw', settings);
     }
   });
 

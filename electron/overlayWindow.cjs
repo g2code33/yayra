@@ -154,6 +154,19 @@ function createOverlayBridge({
     }
   }
 
+  function keepBubbleAboveMini() {
+    if (!bothOverlaySurfacesVisible() || !overlayWin || overlayWin.isDestroyed()) return;
+    try {
+      if (typeof overlayWin.isAlwaysOnTop !== 'function' || !overlayWin.isAlwaysOnTop()) {
+        overlayWin.setAlwaysOnTop(true, 'screen-saver');
+      }
+      // Equal topmost levels are ordered by most-recently-raised window.
+      // Explicitly put the non-focusable Yayra bubble after the mini panel
+      // so Windows cannot leave the panel covering the launcher bubble.
+      if (typeof overlayWin.moveTop === 'function') overlayWin.moveTop();
+    } catch { /* window raced destruction */ }
+  }
+
   function assertTopmost(win) {
     if (!win || (typeof win.isDestroyed === 'function' && win.isDestroyed())) return;
     try {
@@ -165,12 +178,24 @@ function createOverlayBridge({
       // bubble's single-click hide all looked dead on Windows PCs
       // (the panel hid for a frame and instantly came back).
       if (typeof win.isVisible === 'function' && !win.isVisible()) return;
-      // WINDOWS FIX - no sibling z-fights: while BOTH the bubble and
-      // the mini panel are on screen, their two out-of-phase heartbeats
-      // re-inserted each window above the other every tick, visibly
-      // BLINKING the pair. If the topmost flag is already in place
-      // there is nothing to repair - skip the reorder entirely.
-      if (bothOverlaySurfacesVisible() && typeof win.isAlwaysOnTop === 'function' && win.isAlwaysOnTop()) return;
+      const bothVisible = bothOverlaySurfacesVisible();
+      if (bothVisible && win === miniWin) {
+        if (typeof win.isAlwaysOnTop !== 'function' || !win.isAlwaysOnTop()) {
+          win.setAlwaysOnTop(true, 'screen-saver');
+        }
+        if (typeof win.setVisibleOnAllWorkspaces === 'function') {
+          win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
+        }
+        keepBubbleAboveMini();
+        return;
+      }
+      // When both surfaces are visible, only the bubble is allowed to
+      // change sibling order. This prevents out-of-phase heartbeats from
+      // making the two windows blink over one another.
+      if (bothVisible && win === overlayWin && typeof win.isAlwaysOnTop === 'function' && win.isAlwaysOnTop()) {
+        if (typeof win.moveTop === 'function') win.moveTop();
+        return;
+      }
       win.setAlwaysOnTop(true, 'screen-saver');
       if (typeof win.moveTop === 'function') win.moveTop();
       if (typeof win.setVisibleOnAllWorkspaces === 'function') {
@@ -189,6 +214,7 @@ function createOverlayBridge({
         if (!isOnTop) assertTopmost(win);
       });
       win.on('show', () => assertTopmost(win));
+      win.on('focus', () => assertTopmost(win));
       // The instant the user clicks INTO another app is exactly when the
       // WM is most likely to promote that app over us - reassert on the
       // spot instead of waiting for the heartbeat.
@@ -791,6 +817,7 @@ function createOverlayBridge({
     miniTopmostTimer = stopTopmostGuard(miniTopmostTimer);
     miniTopmostTimer = startTopmostGuard(miniWin);
     miniWin.loadURL(urlOverride || miniUrl);
+    keepBubbleAboveMini();
     miniWin.on('closed', () => {
       miniWin = null;
       miniTopmostTimer = stopTopmostGuard(miniTopmostTimer);

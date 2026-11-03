@@ -9289,7 +9289,8 @@ export class BrowserShell {
             this.state.activeSettingsCategory = 'calculator';
             this.openInternalPage('yayra://settings');
           },
-          onPrompt: (title, placeholder) => this._textPromptDialog({ title, placeholder })
+          onPrompt: (title, placeholder) => this._textPromptDialog({ title, placeholder }),
+          onPrint: ({ onClose } = {}) => { void this.printActivePage({ onClose }); }
         });
         this._scientificCalculatorViews.set(page, calculator);
       } catch (error) {
@@ -12863,75 +12864,253 @@ export class BrowserShell {
     this.showTransientNotice("DevTools aren't available in the web build - use your browser's own (F12 / Ctrl+Shift+I).");
   }
 
-  /** Print the active website or local document. Document tabs never use the
-   *  native website surface; PDF pages are fully painted just for the print
-   *  snapshot and returned to their normal windowed-memory state afterward. */
-  async printActivePage() {
+  /** Open an in-app print preview for websites, documents, and local tools. */
+  async printActivePage({ onClose = null } = {}) {
+    if (this._printPreviewState) return false;
     const tab = this.getActiveTab();
-    if (tab?.isDocument || String(tab?.url || '').startsWith('yayra://doc/')) {
-      const session = this._activeDocViewer?.tabId === tab.id ? this._activeDocViewer : null;
-      const viewer = session?.viewer;
+    if (!tab) return false;
+    const isDocument = Boolean(tab.isDocument || String(tab.url || '').startsWith('yayra://doc/'));
+    let session = null;
+    let viewer = null;
+    if (isDocument) {
+      session = this._activeDocViewer?.tabId === tab.id ? this._activeDocViewer : null;
+      viewer = session?.viewer;
       if (!viewer || tab.docState?.status !== 'ready') {
         this.showTransientNotice('Wait for the document to finish opening before printing.');
-        return;
+        return false;
       }
       if (this._documentPrintInFlight) {
         this.showTransientNotice('Yayra is already preparing a document for printing.');
-        return;
+        return false;
       }
       this._documentPrintInFlight = tab.id;
-      try {
-        if (typeof viewer?.preparePrint === 'function') {
-          const kind = tab.docState?.viewer;
-          this.showTransientNotice(isPowerPointDocument(kind)
-            ? 'Preparing every slide for printing…'
-            : 'Preparing every page for printing…');
-          const ready = await viewer.preparePrint();
-          if (!ready) {
-            this.showTransientNotice('Couldn’t prepare this document for printing. The original is still available.');
-            return;
-          }
+      if (typeof viewer.preparePrint === 'function') {
+        this.showTransientNotice(isPowerPointDocument(tab.docState?.viewer)
+          ? 'Preparing the presentation preview…'
+          : 'Preparing the document preview…');
+        let ready = false;
+        try { ready = await viewer.preparePrint(); } catch { ready = false; }
+        if (!ready) {
+          try { await viewer.finishPrint?.(); } catch { /* preparation cleanup is best effort */ }
+          if (this._documentPrintInFlight === tab.id) this._documentPrintInFlight = null;
+          this.showTransientNotice('Couldn’t prepare this document for printing. The original is still available.');
+          return false;
         }
-        const stillActive = this.getActiveTab()?.id === tab.id
-          && this._documentViewerSessions?.get?.(tab.id) === session
-          && !session?.disposed;
-        if (!stillActive) {
-          this.showTransientNotice('Printing was canceled because the document tab changed.');
-          return;
-        }
-        if (this.nativeWebview && typeof this.nativeWebview.print === 'function') {
-          const result = await this.nativeWebview.print(tab.id);
-          if (result?.ok && result.mode === 'pdf') {
-            this.showTransientNotice(`No usable printer was available. Saved a PDF to ${result.path}.`);
-          } else if (!result?.ok && !result?.canceled) {
-            this.showTransientNotice('Yayra couldn’t print this document or save the PDF fallback.');
-          }
-        } else if (typeof window !== 'undefined' && typeof window.print === 'function') {
-          window.print();
-        }
-      } catch {
-        this.showTransientNotice('Yayra couldn’t open the print dialog for this document.');
-      } finally {
-        try { await viewer?.finishPrint?.(); } catch { /* print cleanup is best effort */ }
-        if (this._documentPrintInFlight === tab.id) this._documentPrintInFlight = null;
       }
-      return;
+      const stillActive = this.getActiveTab()?.id === tab.id
+        && this._documentViewerSessions?.get?.(tab.id) === session
+        && !session?.disposed;
+      if (!stillActive) {
+        try { await viewer?.finishPrint?.(); } catch { /* stale tab cleanup is best effort */ }
+        if (this._documentPrintInFlight === tab.id) this._documentPrintInFlight = null;
+        this.showTransientNotice('Print preview was canceled because the document tab changed.');
+        return false;
+      }
     }
-    if (this.nativeWebview && typeof this.nativeWebview.print === 'function' && tab) {
+
+    const pageCount = isDocument
+      ? Math.max(1, Number(tab.docState?.numPages || tab.docState?.pageCount || tab.docState?.totalPages || 1))
+      : null;
+    this._printPreviewState = {
+      tabId: tab.id,
+      tabTitle: String(tab.title || this.getTabTitle(tab) || 'Page').slice(0, 160),
+      isDocument,
+      pageCount,
+      currentPage: Math.max(1, Math.min(pageCount, Number(tab.docState?.page) || 1)),
+      session,
+      viewer,
+      onClose,
+      options: {
+        scope: 'all', pageRange: '', paper: 'A4', orientation: 'portrait',
+        margin: 'default', color: 'color', printBackground: true,
+        headerFooter: false, copies: 1, scaleFactor: 100
+      },
+      previewUrl: null,
+      generation: 0,
+      timer: null,
+      finishing: false
+    };
+    this.state.activeModal = 'print-preview';
+    this.render?.();
+    return true;
+  }
+
+  printOptionsFromPreview(state, form) {
+    const scope = form.querySelector('.fb-print-scope')?.value || 'all';
+    const range = String(form.querySelector('.fb-print-range')?.value || '').trim();
+    const pageRange = scope === 'current' ? String(state.currentPage) : scope === 'range' ? range : '';
+    return {
+      scope,
+      pageRange,
+      paper: form.querySelector('.fb-print-paper')?.value || 'A4',
+      orientation: form.querySelector('.fb-print-orientation')?.value || 'portrait',
+      margin: form.querySelector('.fb-print-margin')?.value || 'default',
+      color: form.querySelector('.fb-print-color')?.value || 'color',
+      printBackground: Boolean(form.querySelector('.fb-print-background')?.checked),
+      headerFooter: Boolean(form.querySelector('.fb-print-header-footer')?.checked),
+      copies: Math.max(1, Math.min(99, Number(form.querySelector('.fb-print-copies')?.value) || 1)),
+      scaleFactor: Math.max(10, Math.min(200, Number(form.querySelector('.fb-print-scale')?.value) || 100))
+    };
+  }
+
+  async refreshPrintPreview(state, frame, status) {
+    if (!state || this._printPreviewState !== state) return;
+    if (state.timer) clearTimeout(state.timer);
+    const generation = ++state.generation;
+    const update = async () => {
+      if (this._printPreviewState !== state || generation !== state.generation) return;
+      if (!this.nativeWebview || typeof this.nativeWebview.printPreview !== 'function') {
+        if (status) status.textContent = 'Preview will open in your browser’s print dialog when you continue.';
+        return;
+      }
+      if (status) status.textContent = 'Updating print preview…';
       try {
-        const res = await this.nativeWebview.print(tab.id);
-        if (res?.ok && res.mode === 'pdf') {
-          this.showTransientNotice(`No usable printer was available. Saved a PDF to ${res.path}.`);
+        const result = await this.nativeWebview.printPreview(state.tabId, state.options);
+        if (this._printPreviewState !== state || generation !== state.generation) return;
+        if (!result?.ok || !result.pdf) {
+          if (status) status.textContent = 'A page preview is unavailable here. Your print settings will still be applied when you continue.';
           return;
         }
-        if (res?.ok || res?.canceled) return;
-        this.showTransientNotice(res?.pdfFallbackUnavailable
-          ? 'No printer is available and PDF saving is unavailable in this build.'
-          : 'Yayra could not print this page or save the PDF fallback.');
-        return;
-      } catch { /* fall through */ }
+        const bytes = result.pdf?.data && Array.isArray(result.pdf.data) ? new Uint8Array(result.pdf.data) : result.pdf;
+        const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+        if (state.previewUrl) URL.revokeObjectURL(state.previewUrl);
+        state.previewUrl = url;
+        if (frame) frame.src = url;
+        if (status) status.textContent = state.pageCount
+          ? `Preview ready · ${state.pageCount} page${state.pageCount === 1 ? '' : 's'}`
+          : 'Preview ready · page count follows the print layout';
+      } catch {
+        if (this._printPreviewState === state && status) status.textContent = 'Could not generate the page preview. You can still continue to the printer dialog.';
+      }
+    };
+    state.timer = setTimeout(update, 160);
+  }
+
+  async finishPrintPreview(state = this._printPreviewState) {
+    if (!state || state.finishing) return;
+    state.finishing = true;
+    if (state.timer) clearTimeout(state.timer);
+    if (state.previewUrl) {
+      try { URL.revokeObjectURL(state.previewUrl); } catch { /* no blob URL in this host */ }
     }
-    if (typeof window !== 'undefined' && window.print) window.print();
+    if (this._printPreviewState === state) this._printPreviewState = null;
+    try { await state.viewer?.finishPrint?.(); } catch { /* cleanup is best effort */ }
+    if (this._documentPrintInFlight === state.tabId) this._documentPrintInFlight = null;
+    try { state.onClose?.(); } catch { /* tool-specific print mode cleanup */ }
+  }
+
+  async completePrintPreview() {
+    const state = this._printPreviewState;
+    if (!state) return false;
+    const tab = this.getActiveTab();
+    if (!tab || tab.id !== state.tabId) {
+      this.showTransientNotice('Printing was canceled because the page changed.');
+      await this.finishPrintPreview(state);
+      this.state.activeModal = null;
+      this.render?.();
+      return false;
+    }
+    const form = document.querySelector('.fb-print-preview-form');
+    if (form) state.options = this.printOptionsFromPreview(state, form);
+    const rangeParts = state.options.pageRange ? state.options.pageRange.split(',') : [];
+    const validPageRange = rangeParts.length > 0 && rangeParts.every((part) => {
+      if (!/^\d+(?:-\d+)?$/.test(part)) return false;
+      const [first, last] = part.split('-').map(Number);
+      return first >= 1 && (last === undefined || (last >= first && last <= state.pageCount));
+    });
+    if (state.options.scope === 'range' && state.pageCount > 1 && !validPageRange) {
+      const status = document.querySelector('.fb-print-preview-status');
+      if (status) status.textContent = `Enter pages from 1 to ${state.pageCount}, like 1-3, 5. Nothing has been sent to the printer.`;
+      return false;
+    }
+    this.state.activeModal = null;
+    this.render?.();
+    let browserStyle = null;
+    try {
+      if (this.nativeWebview && typeof this.nativeWebview.print === 'function') {
+        const result = await this.nativeWebview.print(state.tabId, state.options);
+        if (result?.ok && result.mode === 'pdf') {
+          this.showTransientNotice(`No usable printer was available. Saved a PDF to ${result.path}.`);
+        } else if (!result?.ok && !result?.canceled) {
+          this.showTransientNotice(result?.pdfFallbackUnavailable
+            ? 'No printer is available and PDF saving is unavailable in this build.'
+            : 'Yayra could not print this page or save the PDF fallback.');
+        }
+      } else if (typeof window !== 'undefined' && typeof window.print === 'function') {
+        browserStyle = document.createElement('style');
+        browserStyle.id = 'yayra-print-preview-settings';
+        const orientation = state.options.orientation === 'landscape' ? 'landscape' : 'portrait';
+        const margin = state.options.margin === 'none' ? '0' : state.options.margin === 'custom' ? '0.35in' : '';
+        browserStyle.textContent = `@page{size:${state.options.paper} ${orientation};${margin ? `margin:${margin}` : ''}}@media print{*{-webkit-print-color-adjust:${state.options.printBackground ? 'exact' : 'economy'};print-color-adjust:${state.options.printBackground ? 'exact' : 'economy'}}}`;
+        document.head?.appendChild(browserStyle);
+        window.print();
+      }
+    } catch {
+      this.showTransientNotice('Yayra couldn’t open the print dialog.');
+    } finally {
+      browserStyle?.remove?.();
+      await this.finishPrintPreview(state);
+    }
+    return true;
+  }
+
+  renderPrintPreviewModal(modal) {
+    const state = this._printPreviewState;
+    if (!state) return;
+    modal.className = 'fb-modal-card fb-print-preview-modal';
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    modal.setAttribute('aria-label', 'Print preview and settings');
+    const title = document.createElement('h2');
+    title.className = 'fb-modal-title';
+    title.textContent = 'Print preview';
+    const close = document.createElement('button');
+    close.type = 'button'; close.className = 'fb-modal-close-btn'; close.setAttribute('aria-label', 'Close print preview'); close.textContent = '×';
+    const header = document.createElement('div'); header.className = 'fb-modal-header'; header.appendChild(title); header.appendChild(close);
+    const body = document.createElement('div'); body.className = 'fb-modal-body fb-print-preview-body';
+    const previewPanel = document.createElement('section'); previewPanel.className = 'fb-print-preview-stage';
+    const iframe = document.createElement('iframe'); iframe.className = 'fb-print-preview-frame'; iframe.title = `Print preview for ${state.tabTitle}`;
+    const status = document.createElement('p'); status.className = 'fb-print-preview-status'; status.setAttribute('role', 'status'); status.textContent = 'Preparing preview…';
+    previewPanel.appendChild(iframe); previewPanel.appendChild(status);
+    const form = document.createElement('div'); form.className = 'fb-print-preview-form';
+    const pageDescription = state.pageCount
+      ? `${state.pageCount} page${state.pageCount === 1 ? '' : 's'}`
+      : 'page count follows print layout';
+    form.innerHTML = `
+      <p class="fb-print-preview-document">${escapeHtml(state.tabTitle)} · ${pageDescription}</p>
+      <label>Pages<select class="fb-print-scope"><option value="all">All pages</option>${state.pageCount > 1 ? `<option value="current">Current page (${state.currentPage})</option><option value="range">Custom range</option>` : ''}</select></label>
+      ${state.pageCount > 1 ? `<label class="fb-print-range-wrap" hidden>Page range<input class="fb-print-range" inputmode="numeric" placeholder="1-3, 5" aria-label="Custom page range"></label>` : ''}
+      <div class="fb-print-preview-grid">
+        <label>Paper<select class="fb-print-paper"><option>A4</option><option>A3</option><option>A5</option><option>Letter</option><option>Legal</option><option>Tabloid</option></select></label>
+        <label>Orientation<select class="fb-print-orientation"><option value="portrait">Portrait</option><option value="landscape">Landscape</option></select></label>
+        <label>Margins<select class="fb-print-margin"><option value="default">Default</option><option value="none">None</option><option value="printableArea">Printable area</option><option value="custom">Custom (0.35 in)</option></select></label>
+        <label>Color<select class="fb-print-color"><option value="color">Color</option><option value="grayscale">Grayscale</option></select></label>
+        <label>Scale<select class="fb-print-scale"><option value="100">100%</option><option value="90">90%</option><option value="80">80%</option><option value="70">70%</option><option value="110">110%</option></select></label>
+        <label>Copies<input class="fb-print-copies" type="number" min="1" max="99" value="1"></label>
+      </div>
+      <label class="fb-print-checkbox"><input class="fb-print-background" type="checkbox" checked> Print backgrounds and images</label>
+      <label class="fb-print-checkbox"><input class="fb-print-header-footer" type="checkbox"> Headers and footers</label>
+    `;
+    body.appendChild(previewPanel); body.appendChild(form);
+    const footer = document.createElement('div'); footer.className = 'fb-print-preview-actions';
+    const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'fb-btn fb-btn-secondary fb-print-cancel'; cancel.textContent = 'Cancel';
+    const print = document.createElement('button'); print.type = 'button'; print.className = 'fb-btn fb-btn-primary fb-print-confirm'; print.textContent = 'Continue to Print';
+    footer.appendChild(cancel); footer.appendChild(print);
+    modal.appendChild(header); modal.appendChild(body); modal.appendChild(footer);
+
+    const scope = form.querySelector('.fb-print-scope');
+    const rangeWrap = form.querySelector('.fb-print-range-wrap');
+    const update = () => {
+      state.options = this.printOptionsFromPreview(state, form);
+      if (rangeWrap) rangeWrap.hidden = scope?.value !== 'range';
+      void this.refreshPrintPreview(state, iframe, status);
+    };
+    form.addEventListener('change', update);
+    form.querySelector('.fb-print-range')?.addEventListener('input', update);
+    close.addEventListener('click', () => this.closeModal());
+    cancel.addEventListener('click', () => this.closeModal());
+    print.addEventListener('click', () => { void this.completePrintPreview(); });
+    void this.refreshPrintPreview(state, iframe, status);
   }
 
   /** Save a website (HTML + assets) or download a document's unchanged source. */
@@ -19429,6 +19608,9 @@ export class BrowserShell {
       case 'tab-groups':
         this.renderTabGroupsModal(modal);
         break;
+      case 'print-preview':
+        this.renderPrintPreviewModal(modal);
+        break;
       case 'search-overlay':
         this.renderMobileSearchOverlay(modal);
         break;
@@ -22730,8 +22912,10 @@ export class BrowserShell {
   }
 
   closeModal() {
+    const closingPrintPreview = this.state.activeModal === 'print-preview';
     this.state.activeModal = null;
     this.render();
+    if (closingPrintPreview) void this.finishPrintPreview();
   }
 
   toggleModal(modalName) {

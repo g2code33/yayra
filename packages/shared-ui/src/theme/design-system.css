@@ -10071,6 +10071,22 @@ button.fb-site-passkey-indicator {
     visibility: hidden !important;
   }
 
+  body:not(.sc-print-graph-mode) .fb-internal-page,
+  body:not(.sc-print-graph-mode) .fb-internal-page * {
+    visibility: visible !important;
+  }
+
+  body:not(.sc-print-graph-mode) .fb-internal-page {
+    position: absolute !important;
+    inset: 0 !important;
+    width: 100% !important;
+    height: auto !important;
+    min-height: 0 !important;
+    overflow: visible !important;
+    color: #000 !important;
+    background: #fff !important;
+  }
+
   .fb-doc-viewer,
   .fb-doc-viewer * {
     visibility: visible !important;
@@ -11278,4 +11294,130 @@ button.fb-site-passkey-indicator {
 @media (max-width:720px) {
   .fb-google-connected-banner-content { gap:8px; }
   .fb-google-connected-banner[data-collapsed="true"] { min-height:36px; }
+}
+
+/* Print is a two-step workflow: inspect the generated document preview,
+   choose print settings, then hand off to the system printer/PDF destination. */
+.fb-modal-card.fb-print-preview-modal {
+  width: min(1180px, calc(100vw - 28px));
+  max-width: 1180px;
+  max-height: min(92vh, 920px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.fb-print-preview-modal .fb-modal-header { flex: 0 0 auto; }
+.fb-print-preview-body {
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 320px);
+  gap: 16px;
+  overflow: hidden;
+}
+.fb-print-preview-stage {
+  position: relative;
+  min-width: 0;
+  min-height: 300px;
+  overflow: hidden;
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+  border: 1px solid var(--fb-border-glass, rgba(255,255,255,.15));
+  border-radius: 12px;
+  background: #252833;
+}
+.fb-print-preview-frame {
+  width: 100%;
+  height: 100%;
+  min-height: 440px;
+  border: 0;
+  background: #fff;
+}
+.fb-print-preview-status {
+  position: absolute;
+  left: 12px;
+  bottom: 10px;
+  max-width: calc(100% - 24px);
+  margin: 0;
+  padding: 6px 9px;
+  border-radius: 7px;
+  color: #fff;
+  background: rgba(15, 18, 28, .82);
+  font-size: 12px;
+}
+.fb-print-preview-form {
+  min-width: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 2px 3px 8px;
+}
+.fb-print-preview-document {
+  margin: 0;
+  color: var(--fb-text-muted, #aab0c0);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.fb-print-preview-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  color: var(--fb-text-primary, #f6f7fb);
+  font-size: 12px;
+  font-weight: 600;
+}
+.fb-print-preview-form select,
+.fb-print-preview-form input:not([type="checkbox"]) {
+  width: 100%;
+  min-height: 36px;
+  box-sizing: border-box;
+  padding: 7px 9px;
+  border: 1px solid var(--fb-border-glass, rgba(255,255,255,.18));
+  border-radius: 7px;
+  color: var(--fb-text-primary, #f6f7fb);
+  background: var(--fb-surface-raised, #242735);
+  font: inherit;
+}
+.fb-print-preview-form .fb-print-preview-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.fb-print-preview-form .fb-print-checkbox {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 9px;
+  font-weight: 500;
+}
+.fb-print-preview-form .fb-print-checkbox input { accent-color: var(--fb-accent-primary, #6d5df2); }
+.fb-print-preview-actions {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+  padding: 12px 18px 16px;
+  border-top: 1px solid var(--fb-border-glass, rgba(255,255,255,.12));
+}
+[data-theme="light"] .fb-print-preview-form label { color: #1b2030; }
+[data-theme="light"] .fb-print-preview-document { color: #5f6677; }
+[data-theme="light"] .fb-print-preview-form select,
+[data-theme="light"] .fb-print-preview-form input:not([type="checkbox"]) {
+  color: #1b2030;
+  background: #fff;
+  border-color: rgba(35, 43, 61, .2);
+}
+@media (max-width: 760px) {
+  .fb-modal-card.fb-print-preview-modal {
+    width: calc(100vw - 16px);
+    max-height: calc(100dvh - 16px);
+  }
+  .fb-print-preview-body {
+    grid-template-columns: minmax(0, 1fr);
+    overflow-y: auto;
+  }
+  .fb-print-preview-stage { min-height: 40vh; }
+  .fb-print-preview-frame { min-height: 40vh; }
+  .fb-print-preview-form { overflow: visible; }
 }

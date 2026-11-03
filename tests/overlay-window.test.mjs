@@ -28,11 +28,13 @@ function fakeScreen() {
 
 function makeFakeBrowserWindowClass() {
   const instances = [];
+  const topOrder = [];
   class FakeBrowserWindow {
     constructor(opts) {
       this.opts = opts;
       this.destroyed = false;
       this.alwaysOnTop = null;
+      this.visible = opts.show !== false;
       this.visibleOnAllWorkspaces = null;
       this.loadedUrl = null;
       this._listeners = {};
@@ -40,15 +42,21 @@ function makeFakeBrowserWindowClass() {
       instances.push(this);
     }
     setAlwaysOnTop(flag, level) { this.alwaysOnTop = { flag, level }; }
+    isAlwaysOnTop() { return Boolean(this.alwaysOnTop?.flag); }
+    isVisible() { return this.visible; }
+    moveTop() { topOrder.push(this); }
+    show() { this.visible = true; this._listeners.show?.(); }
+    hide() { this.visible = false; }
+    focus() { this._listeners.focus?.(); }
     setVisibleOnAllWorkspaces(flag, opts) { this.visibleOnAllWorkspaces = { flag, opts }; }
     setContentProtection() {}
     loadURL(url) { this.loadedUrl = url; }
     on(event, cb) { this._listeners[event] = cb; }
     getPosition() { return this._position; }
-    close() { this.destroyed = true; this._listeners.closed?.(); }
+    close() { this.visible = false; this.destroyed = true; this._listeners.closed?.(); }
     isDestroyed() { return this.destroyed; }
   }
-  return { FakeBrowserWindow, instances };
+  return { FakeBrowserWindow, instances, topOrder };
 }
 
 function fakeApp() {
@@ -217,6 +225,7 @@ test('overlayWindow: disabled-by-default means ensureOverlayWindow() is a no-op 
 
 function makeRicherBrowserWindowClass() {
   const instances = [];
+  const topOrder = [];
   class FakeBrowserWindow {
     constructor(opts) {
       this.opts = opts;
@@ -231,6 +240,8 @@ function makeRicherBrowserWindowClass() {
       instances.push(this);
     }
     setAlwaysOnTop(flag, level) { this.alwaysOnTop = { flag, level }; }
+    isAlwaysOnTop() { return Boolean(this.alwaysOnTop?.flag); }
+    moveTop() { topOrder.push(this); }
     setVisibleOnAllWorkspaces(flag, opts) { this.visibleOnAllWorkspaces = { flag, opts }; }
     setContentProtection() {}
     loadURL(url) { this.loadedUrl = url; }
@@ -240,18 +251,18 @@ function makeRicherBrowserWindowClass() {
     isDestroyed() { return this.destroyed; }
     isVisible() { return this.visible; }
     hide() { this.visible = false; }
-    show() { this.visible = true; }
-    focus() {}
+    show() { this.visible = true; this._listeners.show?.(); }
+    focus() { this._listeners.focus?.(); }
     isMinimized() { return false; }
     restore() {}
   }
-  return { FakeBrowserWindow, instances };
+  return { FakeBrowserWindow, instances, topOrder };
 }
 
 function makeMiniHarness({ getMainWindow = () => null, createMainWindow = null } = {}) {
   const dir = makeTempDir();
   const overlayStore = createOverlayStore({ fs, userDataDir: dir });
-  const { FakeBrowserWindow, instances } = makeRicherBrowserWindowClass();
+  const { FakeBrowserWindow, instances, topOrder } = makeRicherBrowserWindowClass();
   const ipcMain = fakeIpcMain();
   const bridge = createOverlayBridge({
     BrowserWindow: FakeBrowserWindow,
@@ -266,11 +277,11 @@ function makeMiniHarness({ getMainWindow = () => null, createMainWindow = null }
     getMainWindow,
     createMainWindow
   });
-  return { bridge, ipcMain, instances };
+  return { bridge, ipcMain, instances, topOrder };
 }
 
-test('overlayWindow: single bubble click opens the floating mini browser window - no main window involved at all', () => {
-  const { bridge, ipcMain, instances } = makeMiniHarness();
+test('overlayWindow: bubble stays above its mini panel in the Windows sibling z-order', () => {
+  const { bridge, ipcMain, instances, topOrder } = makeMiniHarness();
   bridge.initializeOnStartup();
   assert.equal(instances.length, 1, 'just the bubble so far');
 
@@ -283,6 +294,9 @@ test('overlayWindow: single bubble click opens the floating mini browser window 
   assert.equal(mini.opts.frame, false, 'frameless floating panel');
   assert.equal(mini.opts.webPreferences.preload, '/fake/preload.cjs', 'full window.yayra API preload (native tabs work inside the mini)');
   assert.equal(mini.alwaysOnTop.level, 'screen-saver', 'floats above other apps like the bubble');
+  assert.equal(topOrder.at(-1), instances[0], 'the floating Yayra bubble is raised above the mini window');
+  mini.focus();
+  assert.equal(topOrder.at(-1), instances[0], 'focusing the mini cannot leave the bubble covered');
 });
 
 test('overlayWindow: a selected tab opens in mini through the validated IPC handoff and reuses its tabs', () => {

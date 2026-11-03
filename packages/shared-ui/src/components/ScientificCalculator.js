@@ -46,7 +46,7 @@ const unitLabel = (unit) => { const metadata = getUnitMetadata(unit); return met
 const unitOptions = (selected = '') => Object.entries(SCIENTIFIC_UNIT_GROUPS).map(([group, units]) => `<optgroup label="${ESCAPE(group)}">${Object.entries(units).map(([unit, [name]]) => `<option value="${ESCAPE(unit)}" ${unit === selected ? 'selected' : ''}>${ESCAPE(name)} (${ESCAPE(unit)})</option>`).join('')}</optgroup>`).join('');
 
 export class ScientificCalculator {
-  constructor({ container, data, onDataChange = () => {}, onOpenSettings = () => {}, onPrompt = null, privateMode = false } = {}) {
+  constructor({ container, data, onDataChange = () => {}, onOpenSettings = () => {}, onPrompt = null, onPrint = null, privateMode = false } = {}) {
     if (!container) throw new TypeError('ScientificCalculator requires a container element.');
     this.container = container;
     this.instanceId = `sc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -54,6 +54,7 @@ export class ScientificCalculator {
     this.onDataChange = onDataChange;
     this.onOpenSettings = onOpenSettings;
     this.onPrompt = onPrompt;
+    this.onPrint = onPrint;
     this.privateMode = Boolean(privateMode);
     this.mode = 'calculator';
     this.calculationMode = this.data.settings.calculationMode || 'COMP';
@@ -1257,8 +1258,16 @@ export class ScientificCalculator {
     const page = this.container.querySelector('.sc-graph-card'); if (!page) return;
     page.classList.add('sc-printing-graph');
     document.body.classList.add('sc-print-graph-mode');
+    const cleanup = () => {
+      page.classList.remove('sc-printing-graph');
+      document.body.classList.remove('sc-print-graph-mode');
+    };
+    if (typeof this.onPrint === 'function') {
+      this.onPrint({ onClose: cleanup });
+      return;
+    }
     try { window.print(); } catch { this.showNotice('Printing is not available in this window.', 'error'); }
-    setTimeout(() => { page.classList.remove('sc-printing-graph'); document.body.classList.remove('sc-print-graph-mode'); }, 700);
+    setTimeout(cleanup, 700);
   }
 
   drawSurface() {

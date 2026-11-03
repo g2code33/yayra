@@ -127,8 +127,15 @@ export interface PptxShape {
   w: number;
   h: number;
   rot: number; // degrees
-  /** prstGeom name (rect, roundRect, ellipse, …). */
+  /** prstGeom name (rect, roundRect, ellipse, line, bentConnector3, …). */
   geom?: string;
+  /** Connector orientation from a:xfrm. */
+  flipH?: boolean;
+  flipV?: boolean;
+  /** OOXML connector arrow-end types. */
+  lineStart?: string;
+  lineEnd?: string;
+  lineDash?: string;
   /** CSS colour or gradient. */
   fill?: string;
   borderColor?: string;
@@ -2101,19 +2108,30 @@ function parsePic(pic: Element, ctx: ShapeCtx): PptxShape {
 function parseCxnSp(cxn: Element, ctx: ShapeCtx): PptxShape {
   const spPr = child(cxn, 'p:spPr')
     || (inNamespace(cxn, DIAGRAM_DRAWING_NS) ? childByLocalName(cxn, 'spPr') : null);
+  const transform = spPr ? child(spPr, 'a:xfrm') : null;
   const box = applyT(ctx.t, parseXfrm(spPr));
   const ln = spPr ? child(spPr, 'a:ln') : null;
   const color = ln ? solidColor(child(ln, 'a:solidFill')) : undefined;
-  const w = ln?.getAttribute('w') ? emuToPx(parseInt(ln.getAttribute('w')!, 10)) : 2;
+  const strokeWidth = ln?.getAttribute('w') ? emuToPx(parseInt(ln.getAttribute('w')!, 10)) : 2;
+  const lineType = (name: string) => child(ln, `a:${name}`)?.getAttribute('type') || undefined;
+  const dash = child(ln, 'a:prstDash')?.getAttribute('val') || undefined;
+  const geom = child(spPr, 'a:prstGeom')?.getAttribute('prst') || 'line';
   return {
     id: ctx.nextId(),
     type: 'line',
     x: box.x,
     y: box.y,
     w: Math.max(box.w, 1),
-    h: Math.max(box.h, Math.max(1, w)),
+    h: Math.max(box.h, 1),
     rot: box.rot,
+    geom,
+    flipH: transform?.getAttribute('flipH') === '1',
+    flipV: transform?.getAttribute('flipV') === '1',
+    lineStart: lineType('headEnd'),
+    lineEnd: lineType('tailEnd'),
+    lineDash: dash,
     fill: color,
+    borderWidth: Math.max(0.5, strokeWidth),
     textScale: 1,
     isTitle: false,
   };
