@@ -626,7 +626,7 @@ function buildTextSelectionActionsScript() {
           if (!document.getElementById('yayra-selection-highlight-style')) {
             var style = document.createElement('style');
             style.id = 'yayra-selection-highlight-style';
-            style.textContent = '::highlight(' + name + ') { background-color: ' + color + '; color: inherit; }';
+            style.textContent = '::highlight(' + name + ') { background-color: color-mix(in srgb, ' + color + ' 38%, transparent); color: inherit; }';
             (document.head || document.documentElement).appendChild(style);
           }
           return true;

@@ -54,6 +54,32 @@ test('Native engine ABSENT (web/PWA fallback): external navigation still renders
   assert.equal(el.querySelector('.fb-native-webview-slot'), null);
 });
 
+test('Chrome render swaps shells without clearing the painted page first', async () => {
+  delete globalThis.window.yayra;
+  const container = document.createElement('div');
+  const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+  await shell.initialize();
+  shell.render(container);
+  const oldRoot = shell.rootElement;
+  let observedAtomicSwap = false;
+  const appendChild = container.appendChild.bind(container);
+  container.appendChild = (node) => {
+    if (node !== oldRoot && node.classList?.contains('fb-browser-shell')) {
+      assert.equal(oldRoot.parentElement, container,
+        'the old chrome/page remains attached until the replacement shell is ready');
+      observedAtomicSwap = true;
+    }
+    return appendChild(node);
+  };
+  shell.state.isSideDrawerOpen = true;
+  shell.render(container);
+  container.appendChild = appendChild;
+  assert.ok(observedAtomicSwap, 'the replacement shell is appended before the old one is detached');
+  assert.notEqual(shell.rootElement, oldRoot);
+  assert.equal(oldRoot.parentElement, null);
+  shell.destroy();
+});
+
 test('Web/PWA no-blink fix: re-rendering chrome REUSES the same <iframe> element and never resets its src', async () => {
   delete globalThis.window.yayra;
   const container = document.createElement('div');

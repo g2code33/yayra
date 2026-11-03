@@ -2339,6 +2339,11 @@ export class BrowserShell {
     }
 
     this.lastRenderTarget = target;
+    // Keep the currently painted chrome attached while the replacement tree
+    // is assembled off-DOM. Removing it up front exposes the white app
+    // background for a frame on some compositor paths (notably when opening
+    // menus and switching internal documents).
+    const previousRoot = this.rootElement?.parentElement === target ? this.rootElement : null;
 
     // FREEZE FIX (stuck update splash): if every one of its dismissal
     // triggers somehow failed (frozen timers, exotic embedders), any
@@ -2366,20 +2371,12 @@ export class BrowserShell {
     // state change, and the JSON-compare inside makes no-op calls free.
     this.queueSessionSnapshot();
 
-    // CRITICAL (web/PWA no-blink fix): the persistent web-frame layer holds
-    // the live <iframe> for each external tab. It must SURVIVE re-renders -
-    // recreating (or even reparenting) an <iframe> forces the embedded page
-    // to fully reload, which users saw as a white flash of the whole page
-    // every time any piece of chrome re-rendered (opening the Yayra menu,
-    // pressing "Check for updates", toggling a dropdown...). So instead of
-    // wiping the container wholesale, every child EXCEPT the frame layer is
-    // removed and rebuilt as before.
-    if (this.webFrameLayer && this.webFrameLayer.parentElement === target) {
-      for (const child of [...(target.children || [])]) {
-        if (child !== this.webFrameLayer) child.remove();
-      }
-    } else {
-      target.innerHTML = '';
+    // Keep both the live iframe layer and the currently painted shell in
+    // place while building the next shell off-DOM. The old shell is replaced
+    // atomically after the new one is ready, avoiding the short white flash
+    // previously exposed by clearing target.innerHTML at every interaction.
+    for (const child of [...(target.children || [])]) {
+      if (child !== this.webFrameLayer && child !== previousRoot) child.remove();
     }
     // The first truth-check above deliberately runs before teardown so real
     // overlays remain protected. Check once more now: an omnibox dropdown in
@@ -2497,6 +2494,7 @@ export class BrowserShell {
     }
 
     target.appendChild(shell);
+    if (previousRoot && previousRoot !== shell) previousRoot.remove();
     this.rootElement = shell;
 
     // A pooled frame can begin a real navigation while this render is being
@@ -8937,7 +8935,7 @@ export class BrowserShell {
           const card = document.createElement('article'); card.className = 'fb-dict-card';
           const title = document.createElement('h3'); title.textContent = `${item.starred ? '★ ' : ''}${item.term}`; card.appendChild(title);
           const detail = document.createElement('p'); detail.className = 'fb-dict-source'; detail.textContent = `${item.kind}${item.category ? ` · ${item.category}` : ''}${item.collectionId ? ` · ${item.collectionId}` : ''}`; card.appendChild(detail);
-          if (item.selectedText) { const quote = document.createElement('blockquote'); quote.className = 'fb-dict-def'; quote.textContent = item.selectedText; if (item.kind === 'highlight') { quote.classList.add('fb-dict-highlight-quote'); quote.style.backgroundColor = /^#[0-9a-f]{6}$/i.test(item.highlightColor || '') ? item.highlightColor : '#ffe08a'; quote.style.color = '#312000'; quote.style.padding = '10px 12px'; quote.style.borderRadius = '8px'; } card.appendChild(quote); }
+          if (item.selectedText) { const quote = document.createElement('blockquote'); quote.className = 'fb-dict-def'; quote.textContent = item.selectedText; if (item.kind === 'highlight') { quote.classList.add('fb-dict-highlight-quote'); quote.style.backgroundColor = `color-mix(in srgb, ${/^#[0-9a-f]{6}$/i.test(item.highlightColor || '') ? item.highlightColor : '#ffe08a'} 38%, transparent)`; quote.style.color = '#312000'; quote.style.padding = '10px 12px'; quote.style.borderRadius = '8px'; } card.appendChild(quote); }
           for (const definition of (item.definitions || []).slice(0, 4)) { const line = document.createElement('p'); line.className = 'fb-dict-def'; line.textContent = definition.text || ''; card.appendChild(line); }
           if (item.note) { const note = document.createElement('p'); note.className = 'fb-dict-muted'; note.textContent = `Note: ${item.note}`; card.appendChild(note); }
           if (item.tags?.length) { const tags = document.createElement('p'); tags.className = 'fb-dict-source'; tags.textContent = `Tags: ${item.tags.join(', ')}`; card.appendChild(tags); }
@@ -14926,6 +14924,18 @@ export class BrowserShell {
     return true;
   }
 
+  async editTabGroup(groupId) {
+    const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
+    if (!group) return false;
+    // The edit path starts with the group name, then opens the group picker
+    // where every saved member already has its own Rename control. Even if
+    // the user cancels the group-name prompt, the picker still lets them edit
+    // member labels independently.
+    const renamed = await this.renameTabGroup(groupId);
+    this.openModal('tab-groups');
+    return renamed;
+  }
+
   async renameTabGroup(groupId) {
     const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
     if (!group) return false;
@@ -15041,6 +15051,67 @@ export class BrowserShell {
     this.openInternalPage('yayra://settings');
   }
 
+  renderTabGroupContextMenu(x, y, group) {
+    if (!group) return;
+    const previous = document.body.querySelector('.fb-tab-context-menu');
+    const previousScrim = Array.from(document.body.querySelectorAll('.fb-dropdown-scrim') || [])
+      .find((el) => el?.dataset?.tabCtx === 'true');
+    (previous?._yayraDismiss || previousScrim?._yayraDismiss)?.();
+
+    const scrim = document.createElement('button');
+    scrim.type = 'button';
+    scrim.className = 'fb-dropdown-scrim';
+    scrim.dataset.tabCtx = 'true';
+    scrim.setAttribute('aria-label', 'Close menu');
+    const menu = document.createElement('div');
+    menu.className = 'fb-tab-context-menu';
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-label', `${group.name} tab group`);
+    menu.style.setProperty?.('-webkit-app-region', 'no-drag');
+    menu.style.setProperty?.('pointer-events', 'auto');
+    const stripBottom = Math.max(36, Number(this.tabStripElement?.getBoundingClientRect?.().bottom) || 0);
+    scrim.style.top = `${stripBottom}px`;
+    scrim.style.height = `calc(100% - ${stripBottom}px)`;
+    let dismissed = false;
+    const dismiss = () => {
+      if (dismissed) return;
+      dismissed = true;
+      scrim.remove();
+      menu.remove();
+      clearTimeout(timer);
+      try { this.healStuckPageSurface(); } catch { /* best effort */ }
+    };
+    menu._yayraDismiss = scrim._yayraDismiss = dismiss;
+    scrim.addEventListener('pointerdown', (event) => { event.preventDefault?.(); dismiss(); });
+    scrim.addEventListener('click', dismiss);
+    const timer = setTimeout(dismiss, 30000);
+    timer?.unref?.();
+    for (const item of [
+      { label: 'Edit', action: () => { void this.editTabGroup(group.id); } },
+      { label: `Open “${group.name}”`, action: () => this.openTabGroup(group.id) }
+    ]) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'fb-tab-context-menu-item';
+      button.setAttribute('role', 'menuitem');
+      button.textContent = item.label;
+      button.addEventListener('click', (event) => {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        dismiss();
+        item.action();
+      });
+      menu.appendChild(button);
+    }
+    const left = Math.max(8, Math.min(Number(x) || 8, (window.innerWidth || 1024) - 248));
+    const top = Math.max(stripBottom + 4, Math.min(Number(y) || stripBottom + 4, (window.innerHeight || 768) - 100));
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+    document.body.appendChild(scrim);
+    document.body.appendChild(menu);
+    try { this.setPageObscured(true); } catch { /* no native page */ }
+  }
+
   renderTabGroupPickerList(container) {
     if (!container) return;
     container.innerHTML = '';
@@ -15083,6 +15154,11 @@ export class BrowserShell {
         this.openTabGroup(group.id);
       });
       card.appendChild(item);
+      card.addEventListener('contextmenu', (event) => {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        this.renderTabGroupContextMenu(event.clientX, event.clientY, group);
+      });
 
       const members = document.createElement('div');
       members.id = `fb-tab-group-members-${groupIndex}`;
@@ -15964,7 +16040,7 @@ export class BrowserShell {
       if (!document.getElementById('yayra-selection-highlight-style')) {
         const style = document.createElement('style');
         style.id = 'yayra-selection-highlight-style';
-        style.textContent = `::highlight(${name}) { background-color: ${color}; color: inherit; }`;
+        style.textContent = `::highlight(${name}) { background-color: color-mix(in srgb, ${color} 38%, transparent); color: inherit; }`;
         (document.head || document.documentElement).appendChild(style);
       }
       return true;
@@ -21254,6 +21330,7 @@ export class BrowserShell {
         }))
       }] : []),
       ...(currentGroup ? [
+        { label: `Edit “${currentGroup.name}” group`, action: () => { void this.editTabGroup(currentGroup.id); } },
         { label: `Open “${currentGroup.name}” group`, action: () => this.openTabGroup(currentGroup.id) },
         { label: `Remove from “${currentGroup.name}”`, action: () => this.ungroupTab(tab.id) }
       ] : []),

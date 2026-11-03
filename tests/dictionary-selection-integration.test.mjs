@@ -94,6 +94,9 @@ test('selected-text Highlight applies color and saves a personal highlight witho
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(globalThis.CSS.highlights.get('yayra-selection-highlight').ranges.length, 1,
       'the selected live range receives a visible CSS highlight');
+    const highlightStyle = document.getElementById('yayra-selection-highlight-style');
+    assert.match(highlightStyle?.textContent || '', /color-mix\(in srgb, #ffe08a 38%, transparent\)/,
+      'the persisted highlight uses translucent color so the document text remains legible');
     assert.equal(navigated, '', 'Highlight stays on the current tab');
     const [highlight] = await shell.getDictionaryLibrary().getPersonalData({ includeHistory: false });
     assert.equal(highlight.kind, 'highlight');

@@ -444,6 +444,17 @@ test('TAB GROUP PICKER: hover previews members, opens one tab, and saves custom 
 
     let card = container.querySelector('.fb-tab-group-picker-card');
     assert.ok(card, 'the group picker wraps each group with a member preview');
+    card.dispatchEvent({ type: 'contextmenu', clientX: 80, clientY: 120, preventDefault() {}, stopPropagation() {} });
+    const groupMenu = document.body.querySelector('.fb-tab-context-menu');
+    assert.ok([...groupMenu.querySelectorAll('.fb-tab-context-menu-item')].some((button) => button.textContent === 'Edit'),
+      'right-clicking a saved/closed group offers Edit');
+    groupMenu._yayraDismiss?.();
+    shell._textPromptDialog = async () => group.name;
+    assert.equal(await shell.editTabGroup(group.id), true, 'Edit opens a group-name editor');
+    assert.equal(shell.state.activeModal, 'tab-groups', 'Edit continues to the group picker where member labels can be renamed');
+    shell.closeModal();
+    shell.openModal('tab-groups');
+    card = container.querySelector('.fb-tab-group-picker-card');
     const memberList = card.querySelector('.fb-tab-group-members');
     assert.ok(memberList);
     card.dispatchEvent({ type: 'mouseenter' });
@@ -736,6 +747,7 @@ test('TAB RIGHT-CLICK: pointer activation moves the tab into a durable group', a
     shell.renderTabContextMenu(40, 40, target);
     buttons = [...document.body.querySelectorAll('.fb-tab-context-menu-item')];
     assert.ok(buttons.some((button) => button.textContent === 'Open “Work” group'), 'a grouped tab can open its whole group');
+    assert.ok(buttons.some((button) => button.textContent === 'Edit “Work” group'), 'a grouped tab can edit its group and member labels');
     const remove = buttons.find((button) => button.textContent === 'Remove from “Work”');
     assert.ok(remove, 'a grouped tab can be removed from its group');
     remove.click();
