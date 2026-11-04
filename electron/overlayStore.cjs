@@ -33,6 +33,9 @@ const DEFAULTS = Object.freeze({
   // until it is triple-clicked again. Persisted so a locked bubble stays
   // locked across restarts.
   positionLocked: false,
+  // New pages opened from the floating bubble reuse the same mini by
+  // default; the alternate opens each destination in a separate mini window.
+  miniOpenBehavior: 'same-mini',
   // Customized radial action wheel synced from the in-app customizer
   // ({id,title,url,type} items). null = show the classic default ring.
   wheelItems: null

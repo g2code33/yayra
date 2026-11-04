@@ -9,6 +9,7 @@ const CONTEXT_MENU_ACTION_CHANNEL = 'yayra:context-menu-action';
 const CONTEXT_MENU_NAV_STATE_CHANNEL = 'yayra:context-menu-navigation-state';
 const dictionaryLookupListeners = new Set();
 const miniPageListeners = new Set();
+const miniOpenPreferenceListeners = new Set();
 const pendingMiniPages = [];
 let pendingDictionaryLookup = null;
 ipcRenderer.on('yayra:overlay-mini-open-page', (_event, payload) => {
@@ -19,6 +20,12 @@ ipcRenderer.on('yayra:overlay-mini-open-page', (_event, payload) => {
   }
   for (const callback of miniPageListeners) {
     try { callback(safePayload); } catch { /* isolated renderer listener */ }
+  }
+});
+ipcRenderer.on('yayra:overlay-mini-open-preference', (_event, payload) => {
+  const miniOpenBehavior = payload?.miniOpenBehavior === 'separate-mini' ? 'separate-mini' : 'same-mini';
+  for (const callback of miniOpenPreferenceListeners) {
+    try { callback(miniOpenBehavior); } catch { /* isolated renderer listener */ }
   }
 });
 ipcRenderer.on('yayra:overlay-dictionary-lookup', (_event, payload) => {
@@ -282,6 +289,12 @@ const api = {
     setBubbleSize: (size) => ipcRenderer.invoke('yayra:overlay-set-bubble-size', size),
     setBubbleOpacity: (opacity) => ipcRenderer.invoke('yayra:overlay-set-bubble-opacity', opacity),
     setBubbleShadow: (shadowPx) => ipcRenderer.invoke('yayra:overlay-set-bubble-shadow', shadowPx),
+    setMiniOpenBehavior: (behavior) => ipcRenderer.invoke('yayra:overlay-set-mini-open-behavior', behavior),
+    onMiniOpenPreference: (callback) => {
+      if (typeof callback !== 'function') return () => {};
+      miniOpenPreferenceListeners.add(callback);
+      return () => miniOpenPreferenceListeners.delete(callback);
+    },
     // Mirrors the bubble's triple-click position lock from Settings.
     setPositionLocked: (locked) => ipcRenderer.invoke('yayra:overlay-set-position-locked', locked),
     // "Minimize to bubble" on desktop hides the real OS window; the native

@@ -15,6 +15,7 @@ const target = detectTarget();
 // the desktop bubble expands into loads this same bundle with ?shell=mini
 // and gets the compact layout + a slim draggable titlebar instead of the
 // full desktop chrome. See electron/overlayWindow.cjs.
+const miniInstanceId = typeof location !== 'undefined' ? new URLSearchParams(location.search || '').get('instance') || '' : '';
 const isMiniShell = typeof location !== 'undefined' && new URLSearchParams(location.search || '').get('shell') === 'mini';
 
 // Yayra mini's view: 'desktop' (DEFAULT - the same tab strip and toolbar
@@ -148,6 +149,7 @@ if (root) {
     // mini tabs use their own snapshot and close-choice keys, never the
     // main browser's "Continue with these tabs?" state.
     isMiniShell,
+    miniSessionId: miniInstanceId,
     updateService: service,
     initialUrl: bootPage || 'yayra://newtab',
     initialPrivate: bootPrivate
@@ -173,7 +175,7 @@ if (root) {
       }
     });
     const overlayApi = (window.yayra && window.yayra.overlay) || (window.ibrowse && window.ibrowse.overlay) || null;
-    overlayApi?.onOpenPage?.(({ url } = {}) => browserShell.openUrlHandoff?.(url));
+    overlayApi?.onOpenPage?.(({ url, openInNewTab = true } = {}) => browserShell.openUrlHandoff?.(url, { openInNewTab }));
   }
   if (!isMiniShell) {
     const overlayApi = (window.yayra && window.yayra.overlay) || (window.ibrowse && window.ibrowse.overlay) || null;

@@ -16,6 +16,7 @@ test('overlayStore: defaults ship ENABLED, launch-at-startup ON, and overlay-all
   assert.equal(settings.enabled, true);
   assert.equal(settings.launchAtStartup, true);
   assert.equal(settings.overlayAllApps, true);
+  assert.equal(settings.miniOpenBehavior, 'same-mini', 'floating bubble actions reuse the same mini window by default');
 });
 
 test('overlayStore: save() merges partial updates and persists them across a fresh store instance', () => {

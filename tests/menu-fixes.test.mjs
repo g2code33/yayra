@@ -545,6 +545,39 @@ test('TAB GROUP DURABILITY: closed tabs and ungrouping all preserve the saved gr
   }
 });
 
+test('FLOATING MINI SETTINGS: offers same-mini versus separate-mini windows and persists the choice', async () => {
+  const saved = [];
+  const overlayBridge = {
+    getSettings: async () => ({ miniOpenBehavior: 'same-mini' }),
+    setMiniOpenBehavior: async (miniOpenBehavior) => { saved.push(miniOpenBehavior); return { miniOpenBehavior }; }
+  };
+  const previousYayra = window.yayra;
+  window.yayra = { ...(previousYayra || {}), overlay: overlayBridge };
+  const { shell, container } = await makeShell();
+  try {
+    shell.state.settingsActiveCategory = 'floating';
+    shell.state.activeSettingsCategory = 'floating';
+    shell.navigateActiveTab('yayra://settings');
+    shell.render(container);
+    const preference = container.querySelector('#fb-in-mini-open-behavior');
+    assert.ok(preference, 'Floating & Transparency exposes the mini-window preference');
+    const selectedOption = [...preference.querySelectorAll('option')].find((option) => option.hasAttribute('selected'));
+    assert.equal(selectedOption?.getAttribute('value'), 'same-mini', 'reusing the same mini window is the default');
+    assert.match(preference.textContent, /Same mini window/);
+    assert.match(preference.textContent, /Separate mini windows/);
+    const changeHandler = preference.listeners?.get('change')?.[0];
+    assert.equal(typeof changeHandler, 'function', 'the preference select saves changes');
+    await changeHandler({ target: { value: 'separate-mini' } });
+    await flush();
+    assert.deepEqual(saved, ['separate-mini'], 'the user choice is saved through the native overlay settings store');
+    assert.equal(shell.state.overlaySettings.miniOpenBehavior, 'separate-mini');
+  } finally {
+    shell.destroy();
+    container.remove();
+    if (previousYayra === undefined) delete window.yayra; else window.yayra = previousYayra;
+  }
+});
+
 test('TAB GROUP DRAWER: prompt actions dismiss the drawer cleanly, including on Cancel', async () => {
   const { shell } = await makeShell();
   try {

@@ -104,11 +104,13 @@ function createOverlayBridge({
 }) {
   let overlayWin = null;
   let miniWin = null;
+  const miniWindows = new Set();
+  let miniInstanceSequence = 0;
   let cachedLogoDataUrl;
   // Heartbeats that keep the bubble/mini windows genuinely above every
   // other application - see assertTopmost() for why this is needed.
   let overlayTopmostTimer = null;
-  let miniTopmostTimer = null;
+  const miniTopmostTimers = new Map();
   // Manual drag state (the bubble has NO native drag region - drag regions
   // swallow left-button events, which broke clicking entirely). The window
   // follows pointermove screen coordinates STREAMED from the renderer; the
@@ -147,7 +149,7 @@ function createOverlayBridge({
   function bothOverlaySurfacesVisible() {
     try {
       const bubbleVisible = Boolean(overlayWin && !overlayWin.isDestroyed() && overlayWin.isVisible?.());
-      const miniVisible = Boolean(miniWin && !miniWin.isDestroyed() && miniWin.isVisible?.());
+      const miniVisible = [...miniWindows].some((win) => win && !win.isDestroyed() && win.isVisible?.());
       return bubbleVisible && miniVisible;
     } catch {
       return false;
@@ -179,7 +181,7 @@ function createOverlayBridge({
       // (the panel hid for a frame and instantly came back).
       if (typeof win.isVisible === 'function' && !win.isVisible()) return;
       const bothVisible = bothOverlaySurfacesVisible();
-      if (bothVisible && win === miniWin) {
+      if (bothVisible && miniWindows.has(win)) {
         if (typeof win.isAlwaysOnTop !== 'function' || !win.isAlwaysOnTop()) {
           win.setAlwaysOnTop(true, 'screen-saver');
         }
@@ -784,11 +786,11 @@ function createOverlayBridge({
     }
   }
 
-  function ensureMiniWindow(urlOverride = null) {
+  function ensureMiniWindow(urlOverride = null, { forceNew = false } = {}) {
     if (!mainPreloadPath) return null;
-    if (miniWin && !miniWin.isDestroyed()) return miniWin;
+    if (!forceNew && miniWin && !miniWin.isDestroyed()) return miniWin;
     const bounds = miniDefaultBounds();
-    miniWin = new BrowserWindow({
+    const createdMini = new BrowserWindow({
       ...bounds,
       frame: false,
       resizable: true,
@@ -806,51 +808,95 @@ function createOverlayBridge({
         sandbox: true
       }
     });
-    miniWin.setAlwaysOnTop(true, 'screen-saver');
-    if (typeof miniWin.setVisibleOnAllWorkspaces === 'function') {
-      miniWin.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+    miniWin = createdMini;
+    miniWindows.add(createdMini);
+    createdMini.setAlwaysOnTop(true, 'screen-saver');
+    if (typeof createdMini.setVisibleOnAllWorkspaces === 'function') {
+      createdMini.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
     }
-    // The mini panel must also stay above whatever app is focused (it opens
-    // from the bubble while the user is inside another application). It
-    // stays focusable - it hosts a real browser that needs the keyboard -
-    // so the heartbeat is what keeps it topmost after focus round-trips.
-    miniTopmostTimer = stopTopmostGuard(miniTopmostTimer);
-    miniTopmostTimer = startTopmostGuard(miniWin);
-    miniWin.loadURL(urlOverride || miniUrl);
+    // Each mini panel stays above whatever app is focused. Give every
+    // separately-created mini its own heartbeat so none falls behind.
+    miniTopmostTimers.set(createdMini, startTopmostGuard(createdMini));
+    createdMini.loadURL(urlOverride || miniUrl);
     keepBubbleAboveMini();
-    miniWin.on('closed', () => {
-      miniWin = null;
-      miniTopmostTimer = stopTopmostGuard(miniTopmostTimer);
+    createdMini.on('closed', () => {
+      miniWindows.delete(createdMini);
+      miniTopmostTimers.set(createdMini, stopTopmostGuard(miniTopmostTimers.get(createdMini)));
+      miniTopmostTimers.delete(createdMini);
+      if (miniWin === createdMini) {
+        miniWin = [...miniWindows].filter((win) => win && !win.isDestroyed()).at(-1) || null;
+      }
     });
-    return miniWin;
+    return createdMini;
+  }
+
+  function miniOpenPagePayload(url) {
+    return { url: String(url || ''), openInNewTab: true };
+  }
+
+  function deliverMiniPage(url) {
+    const current = miniWin;
+    if (!current || current.isDestroyed()) return false;
+    const deliver = () => {
+      try {
+        if (miniWin !== current || current.isDestroyed()) return;
+        current.webContents.send('yayra:overlay-mini-open-page', miniOpenPagePayload(url));
+      } catch { /* mini closed during handoff */ }
+    };
+    try {
+      current.show?.();
+      current.focus?.();
+      if (typeof current.webContents?.isLoading === 'function' && current.webContents.isLoading()) {
+        current.webContents.once('did-finish-load', deliver);
+      } else deliver();
+      keepBubbleAboveMini();
+      return true;
+    } catch { return false; }
   }
 
   /**
-   * Open the floating mini browser directly on an internal page (e.g.
-   * 'yayra://ai' from the radial menu's AI button or the bubble's
-   * right-click menu). The &page= boot param is read by
-   * src/browser/main.js, which starts the mini shell on that page.
-   * An already-open mini is recreated - deep-linking wins over reuse.
+   * Open a page from the floating bubble. By default, the first page boots
+   * directly and later pages become tabs in that same mini. The alternate
+   * setting creates a separate mini window for every selected destination.
    */
   function openMiniPanelAt(page) {
     if (!mainPreloadPath) return restoreMainWindow();
-    destroyMiniWindow();
+    const url = String(page || '');
+    const separate = overlayStore.load().miniOpenBehavior === 'separate-mini';
+    if (!separate && miniWin && !miniWin.isDestroyed()) {
+      deliverMiniPage(url);
+      return miniWin;
+    }
+    const instanceId = separate ? `mini-${Date.now().toString(36)}-${++miniInstanceSequence}` : null;
+    const params = [`page=${encodeURIComponent(url)}`];
+    if (instanceId) params.unshift(`instance=${encodeURIComponent(instanceId)}`);
     const sep = miniUrl.includes('?') ? '&' : '?';
-    return ensureMiniWindow(`${miniUrl}${sep}page=${encodeURIComponent(String(page || ''))}`);
+    return ensureMiniWindow(`${miniUrl}${sep}${params.join('&')}`, { forceNew: separate });
   }
 
   function openDictionaryLookupInMini(page) {
     const url = typeof page === 'string' && /^yayra:\/\/dictionary(?:\?|$)/i.test(page) ? page.slice(0, 4000) : '';
     if (!url || !mainPreloadPath) return false;
-    if (!miniWin || miniWin.isDestroyed()) return Boolean(openMiniPanelAt(url));
+    if (overlayStore.load().miniOpenBehavior === 'separate-mini' || !miniWin || miniWin.isDestroyed()) {
+      return Boolean(openMiniPanelAt(url));
+    }
+    const current = miniWin;
     const deliver = () => {
-      try { if (miniWin && !miniWin.isDestroyed()) miniWin.webContents.send('yayra:overlay-dictionary-lookup', { url }); } catch { /* mini closed */ }
+      try {
+        if (miniWin === current && !current.isDestroyed()) {
+          current.webContents.send('yayra:overlay-dictionary-lookup', {
+            url,
+            openInNewTab: miniOpenPagePayload(url).openInNewTab
+          });
+        }
+      } catch { /* mini closed */ }
     };
     try {
-      miniWin.show?.();
-      miniWin.focus?.();
-      if (typeof miniWin.webContents?.isLoading === 'function' && miniWin.webContents.isLoading()) miniWin.webContents.once('did-finish-load', deliver);
+      current.show?.();
+      current.focus?.();
+      if (typeof current.webContents?.isLoading === 'function' && current.webContents.isLoading()) current.webContents.once('did-finish-load', deliver);
       else deliver();
+      keepBubbleAboveMini();
       return true;
     } catch { return false; }
   }
@@ -862,27 +908,30 @@ function createOverlayBridge({
     if (parsed.username || parsed.password || !['http:', 'https:', 'yayra:'].includes(parsed.protocol)) return false;
     if (parsed.protocol === 'yayra:' && !/^[a-z0-9-]+$/i.test(parsed.hostname)) return false;
     const url = page;
-    if (!miniWin || miniWin.isDestroyed()) return Boolean(openMiniPanelAt(url));
-    const deliver = () => {
-      try { if (miniWin && !miniWin.isDestroyed()) miniWin.webContents.send('yayra:overlay-mini-open-page', { url }); } catch { /* mini closed */ }
-    };
-    try {
-      miniWin.show?.();
-      miniWin.focus?.();
-      if (typeof miniWin.webContents?.isLoading === 'function' && miniWin.webContents.isLoading()) miniWin.webContents.once('did-finish-load', deliver);
-      else deliver();
-      return true;
-    } catch { return false; }
+    if (overlayStore.load().miniOpenBehavior === 'separate-mini' || !miniWin || miniWin.isDestroyed()) {
+      return Boolean(openMiniPanelAt(url));
+    }
+    return deliverMiniPage(url);
   }
 
   function destroyMiniWindow() {
-    miniTopmostTimer = stopTopmostGuard(miniTopmostTimer);
-    if (miniWin && !miniWin.isDestroyed()) miniWin.close();
+    for (const [win, timer] of miniTopmostTimers) {
+      stopTopmostGuard(timer);
+      miniTopmostTimers.delete(win);
+    }
+    for (const win of [...miniWindows]) {
+      if (win && !win.isDestroyed()) win.close();
+    }
+    miniWindows.clear();
     miniWin = null;
   }
 
   function getMiniWindow() {
     return miniWin;
+  }
+
+  function miniWindowForSender(sender) {
+    return [...miniWindows].find((win) => win && !win.isDestroyed() && win.webContents === sender) || miniWin;
   }
 
   function toggleMiniPanel() {
@@ -1550,6 +1599,18 @@ function createOverlayBridge({
     return next;
   }
 
+  function setMiniOpenBehavior(value) {
+    const miniOpenBehavior = value === 'separate-mini' ? 'separate-mini' : 'same-mini';
+    const next = overlayStore.save({ miniOpenBehavior });
+    const payload = { miniOpenBehavior };
+    const recipients = [...miniWindows, getMainWindow()];
+    for (const recipient of new Set(recipients)) {
+      if (!recipient || recipient.isDestroyed?.()) continue;
+      try { recipient.webContents?.send?.('yayra:overlay-mini-open-preference', payload); } catch { /* next interaction reads the persisted setting */ }
+    }
+    return next;
+  }
+
   /**
    * Sync the customized in-app action wheel onto the bubble's double-tap
    * radial. `items` is an array of plain {id,title,url,type} (or null to
@@ -1619,6 +1680,7 @@ function createOverlayBridge({
   ipcMain.handle('yayra:overlay-set-bubble-size', (_e, size) => setBubbleSize(size));
   ipcMain.handle('yayra:overlay-set-bubble-opacity', (_e, opacity) => setBubbleOpacity(opacity));
   ipcMain.handle('yayra:overlay-set-bubble-shadow', (_e, shadowPx) => setBubbleShadow(shadowPx));
+  ipcMain.handle('yayra:overlay-set-mini-open-behavior', (_e, behavior) => setMiniOpenBehavior(behavior));
   ipcMain.handle('yayra:overlay-set-wheel-items', (_e, items) => setWheelItems(items));
   ipcMain.on('yayra:overlay-restore', () => restoreMainWindow());
   // Single bubble click: toggle the floating mini browser (independent of
@@ -1648,11 +1710,13 @@ function createOverlayBridge({
   // Settings toggle mirrors the triple-click lock.
   ipcMain.handle('yayra:overlay-set-position-locked', (_e, locked) => setPositionLocked(locked));
   // Sent from the mini shell's own chrome (close / expand buttons).
-  ipcMain.on('yayra:overlay-mini-close', () => {
-    if (miniWin && !miniWin.isDestroyed()) miniWin.hide();
+  ipcMain.on('yayra:overlay-mini-close', (event) => {
+    const sourceMini = miniWindowForSender(event?.sender);
+    if (sourceMini && !sourceMini.isDestroyed()) sourceMini.hide();
   });
-  ipcMain.on('yayra:overlay-mini-open-full', (_event, payload = {}) => {
-    if (miniWin && !miniWin.isDestroyed()) miniWin.hide();
+  ipcMain.on('yayra:overlay-mini-open-full', (event, payload = {}) => {
+    const sourceMini = miniWindowForSender(event?.sender);
+    if (sourceMini && !sourceMini.isDestroyed()) sourceMini.hide();
     const win = restoreMainWindow();
     // Hand the mini's CURRENT site over to the full browser, so "open
     // full browser" continues exactly where the user was - not a blank
@@ -1717,6 +1781,7 @@ function createOverlayBridge({
     setBubbleSize,
     setBubbleOpacity,
     setBubbleShadow,
+    setMiniOpenBehavior,
     setPositionLocked,
     togglePositionLock,
     handleBubbleTap,

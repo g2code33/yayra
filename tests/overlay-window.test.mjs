@@ -316,9 +316,40 @@ test('overlayWindow: a selected tab opens in mini through the validated IPC hand
   const secondUrl = 'yayra://downloads';
   assert.equal(bridge.openPageInMini(secondUrl), true, 'a later handoff is accepted');
   assert.equal(bridge.getMiniWindow(), mini, 'the existing mini window is reused');
-  assert.deepEqual(mini.webContents.sent, [['yayra:overlay-mini-open-page', { url: secondUrl }]],
-    'the mini renderer receives a safe open-page event instead of replacing its session');
+  assert.deepEqual(mini.webContents.sent, [['yayra:overlay-mini-open-page', { url: secondUrl, openInNewTab: true }]],
+    'the mini renderer receives a safe open-page event with the new-tab preference instead of replacing its session');
   assert.equal(instances.length, 1, 'handoffs do not create duplicate mini windows');
+});
+
+test('overlayWindow: radial assistant picks reuse one mini by default or open separate mini windows by preference', () => {
+  const { bridge, ipcMain, instances } = makeMiniHarness();
+  const first = 'https://chatgpt.com/';
+  const second = 'https://claude.ai/new';
+  const third = 'https://gemini.google.com/';
+  const fourth = 'https://copilot.microsoft.com/';
+  const mini = bridge.openMiniPanelAt(first);
+  assert.ok(mini.loadedUrl.includes(`page=${encodeURIComponent(first)}`), 'first destination boots directly in the mini');
+  assert.equal(bridge.openMiniPanelAt(second), mini, 'the default reuses the same mini window');
+  assert.equal(instances.length, 1, 'same-mini preference does not create another window');
+  assert.deepEqual(mini.webContents.sent.at(-1), ['yayra:overlay-mini-open-page', { url: second, openInNewTab: true }],
+    'the second destination becomes a new tab inside that mini');
+
+  const setPreference = ipcMain.handlers.get('yayra:overlay-set-mini-open-behavior');
+  assert.equal(typeof setPreference, 'function', 'Settings has a native preference handler');
+  assert.equal(setPreference(null, 'separate-mini').miniOpenBehavior, 'separate-mini', 'the separate-window choice is persisted');
+  const otherMini = bridge.openMiniPanelAt(third);
+  assert.notEqual(otherMini, mini, 'the alternate preference creates a distinct mini window');
+  assert.equal(instances.length, 2, 'one separate mini is created for the selected page');
+  assert.ok(otherMini.loadedUrl.includes(`page=${encodeURIComponent(third)}`));
+  assert.ok(otherMini.loadedUrl.includes('instance=mini-'), 'separate windows receive unique mini-session identifiers');
+  assert.equal(bridge.openMiniPanelAt(fourth), instances[2], 'each later destination opens another separate mini');
+  assert.equal(instances.length, 3);
+
+  assert.equal(setPreference(null, 'untrusted-value').miniOpenBehavior, 'same-mini', 'invalid values safely fall back to same-mini');
+  assert.equal(bridge.openMiniPanelAt(first), instances[2], 'switching back to same-mini reuses the newest mini');
+  assert.equal(instances.length, 3);
+  bridge.destroyMiniWindow();
+  assert.ok(instances.every((win) => win.isDestroyed()), 'cleaning up the mini feature closes every separate window');
 });
 
 test('preload: mini page events are queued until the mini shell subscribes, then delivered and unsubscribed safely', async () => {
@@ -355,6 +386,13 @@ test('preload: mini page events are queued until the mini shell subscribes, then
   assert.equal(await exposed.overlay.openPageInMini('https://example.test/first'), true);
   assert.equal(calls.at(-1).channel, 'yayra:overlay-open-mini-page');
   assert.equal(calls.at(-1).payload.url, 'https://example.test/first');
+  let preference = null;
+  const stopPreference = exposed.overlay.onMiniOpenPreference((value) => { preference = value; });
+  listeners.get('yayra:overlay-mini-open-preference')({}, { miniOpenBehavior: 'separate-mini' });
+  assert.equal(preference, 'separate-mini', 'the mini receives preference changes made from another window');
+  await exposed.overlay.setMiniOpenBehavior('separate-mini');
+  assert.equal(calls.at(-1).channel, 'yayra:overlay-set-mini-open-behavior');
+  stopPreference();
 });
 
 test('overlayWindow: clicking the bubble again hides the mini panel; clicking once more brings the SAME window back', () => {

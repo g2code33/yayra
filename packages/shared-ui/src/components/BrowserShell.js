@@ -283,10 +283,13 @@ export class BrowserShell {
       if (!this.storageAdapter) this.storageAdapter = scoped;
       this.wheelRepo = options.wheelRepo || createWheelRepo(scoped);
       this.shortcutsRepo = options.shortcutsRepo || createShortcutsRepo(scoped);
+      const miniSessionScope = options.miniSessionId
+        ? `mini:${encodeURIComponent(String(options.miniSessionId))}:`
+        : 'mini:';
       const sessionStorage = options.isMiniShell
         ? {
-          get: (key) => scoped.get(`mini:${key}`),
-          set: (key, value) => scoped.set(`mini:${key}`, value)
+          get: (key) => scoped.get(`${miniSessionScope}${key}`),
+          set: (key, value) => scoped.set(`${miniSessionScope}${key}`, value)
         }
         : scoped;
       this.sessionRepo = options.sessionRepo || createSessionRepo(sessionStorage);
@@ -454,7 +457,7 @@ export class BrowserShell {
       // System-wide floating overlay bubble (see electron/overlayWindow.cjs).
       // These mirror the Electron-side defaults so the UI shows sane values
       // even before overlayBridge.getSettings() resolves.
-      overlaySettings: { enabled: true, launchAtStartup: true, overlayAllApps: true, positionLocked: false, shadowPx: 0 },
+      overlaySettings: { enabled: true, launchAtStartup: true, overlayAllApps: true, positionLocked: false, shadowPx: 0, miniOpenBehavior: 'same-mini' },
       passwordsItems: [],
       // API keys / tokens / secure notes living in the same encrypted vault.
       vaultKeysItems: [],
@@ -2141,12 +2144,24 @@ export class BrowserShell {
       }
       if (typeof this.overlayBridge.onDictionaryLookup === 'function') {
         try {
-          this._unsubscribeDictionaryLookup = this.overlayBridge.onDictionaryLookup(({ url } = {}) => {
+          this._unsubscribeDictionaryLookup = this.overlayBridge.onDictionaryLookup(({ url, openInNewTab = true } = {}) => {
             if (typeof url !== 'string' || !/^yayra:\/\/dictionary(?:\?|$)/i.test(url)) return;
             const current = this.getActiveTab();
-            this.createNewTab(Boolean(current?.isPrivate), { afterTabId: current?.id || null, group: current?.group || null });
+            if (openInNewTab !== false) {
+              this.createNewTab(Boolean(current?.isPrivate), { afterTabId: current?.id || null, group: current?.group || null });
+            }
             this.navigateActiveTab(url);
             this.render();
+          });
+        } catch { /* older preload without the channel */ }
+      }
+      if (typeof this.overlayBridge.onMiniOpenPreference === 'function') {
+        try {
+          this._unsubscribeMiniOpenPreference = this.overlayBridge.onMiniOpenPreference((behavior) => {
+            const miniOpenBehavior = behavior === 'separate-mini' ? 'separate-mini' : 'same-mini';
+            this.state.overlaySettings = { ...this.state.overlaySettings, miniOpenBehavior };
+            const control = this.rootElement?.querySelector?.('#fb-in-mini-open-behavior');
+            if (control) control.value = miniOpenBehavior;
           });
         } catch { /* older preload without the channel */ }
       }
@@ -9406,6 +9421,17 @@ export class BrowserShell {
               <input type="checkbox" id="fb-in-set-mini-desktop" ${this.getMiniLayoutPref() === 'desktop' ? 'checked' : ''} />
             </div>
 
+            <div class="fb-setting-toggle-row">
+              <div>
+                <strong>When opening from the floating bubble</strong>
+                <p>Choose whether selected pages reuse the same Yayra mini window or each open in a separate mini window.</p>
+              </div>
+              <select id="fb-in-mini-open-behavior" class="fb-select" style="max-width:240px" aria-label="Floating mini window preference" ${this.overlayBridge?.setMiniOpenBehavior ? '' : 'disabled'}>
+                <option value="same-mini" ${(this.state.overlaySettings.miniOpenBehavior || 'same-mini') === 'same-mini' ? 'selected' : ''}>Same mini window</option>
+                <option value="separate-mini" ${this.state.overlaySettings.miniOpenBehavior === 'separate-mini' ? 'selected' : ''}>Separate mini windows</option>
+              </select>
+            </div>
+
             <div class="fb-setting-slider-row">
               <div class="fb-slider-header">
                 <label for="fb-in-bubble-opacity">Collapsed Bubble Opacity</label>
@@ -10365,6 +10391,17 @@ export class BrowserShell {
     page.querySelector('#fb-in-set-mini-desktop')?.addEventListener('change', (e) => {
       const desktop = !!(e?.target?.checked ?? page.querySelector('#fb-in-set-mini-desktop')?.checked);
       this.setMiniLayoutPref(desktop ? 'desktop' : 'mobile');
+    });
+    page.querySelector('#fb-in-mini-open-behavior')?.addEventListener('change', async (event) => {
+      const behavior = event?.target?.value === 'separate-mini' ? 'separate-mini' : 'same-mini';
+      if (!this.overlayBridge?.setMiniOpenBehavior) return;
+      try {
+        const next = await this.overlayBridge.setMiniOpenBehavior(behavior);
+        this.state.overlaySettings = { ...this.state.overlaySettings, ...next };
+        this.showTransientNotice(behavior === 'same-mini'
+          ? 'New pages will open in the same Yayra mini window.'
+          : 'Each new page will open in a separate Yayra mini window.');
+      } catch { this.showTransientNotice('Could not save the floating mini opening preference.'); }
     });
 
     // Transparency, size and shadow sliders preview live on 'input'; persist
@@ -17728,7 +17765,10 @@ export class BrowserShell {
   }
 
   closeSessionStorageKey() {
-    const shellScope = this.options?.isMiniShell ? 'mini:' : '';
+    const miniId = this.options?.miniSessionId;
+    const shellScope = this.options?.isMiniShell
+      ? (miniId ? `mini:${encodeURIComponent(String(miniId))}:` : 'mini:')
+      : '';
     return `yayra:${shellScope}close-session:${encodeURIComponent(this.currentProfileId())}`;
   }
 
@@ -21930,12 +21970,12 @@ export class BrowserShell {
    * reused; otherwise the url opens in a fresh tab - never clobbering
    * a page the user already has open in main.
    */
-  openUrlHandoff(url) {
+  openUrlHandoff(url, { openInNewTab = true } = {}) {
     const target = String(url || '');
     if (!/^(https?:\/\/|yayra:\/\/)/i.test(target)) return false;
     const active = this.getActiveTab();
     const pristine = active && active.url === 'yayra://newtab' && !active.isPrivate;
-    if (!pristine) this.createNewTab();
+    if (!pristine && openInNewTab !== false) this.createNewTab();
     this.navigateActiveTab(target);
     return true;
   }
@@ -27009,6 +27049,10 @@ export class BrowserShell {
     this._topChromeRecoveryInstalled = false;
     try { this._unsubscribeTopChromeRecovery?.(); } catch { /* native bridge already gone */ }
     this._unsubscribeTopChromeRecovery = null;
+    try { this._unsubscribeDictionaryLookup?.(); } catch { /* preload already gone */ }
+    this._unsubscribeDictionaryLookup = null;
+    try { this._unsubscribeMiniOpenPreference?.(); } catch { /* preload already gone */ }
+    this._unsubscribeMiniOpenPreference = null;
     if (typeof window !== 'undefined') {
       window.removeEventListener('resize', this.boundResizeHandler);
       window.removeEventListener('keydown', this.boundKeyHandler);
