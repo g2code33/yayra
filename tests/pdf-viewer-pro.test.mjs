@@ -211,7 +211,7 @@ test('SHELL INTEGRATION: the pro toolbar (jump-to-page, fit, rotate, night, outl
     shell._docEngineOverride = fakePdfjs();
     shell.addDocumentTab({ name: 'pro.pdf', bytes: new Uint8Array([1, 2, 3]) });
     await flush(25);
-    const vp = shell.viewportElement;
+    let vp = shell.viewportElement;
     for (const cls of ['fb-doc-page-input', 'fb-doc-btn-fitw', 'fb-doc-btn-fitp', 'fb-doc-btn-rotate', 'fb-doc-btn-night', 'fb-doc-btn-outline', 'fb-doc-btn-print', 'fb-doc-overflow-btn']) {
       assert.ok(vp.querySelector(`.${cls}`), `${cls} renders`);
     }
@@ -228,7 +228,13 @@ test('SHELL INTEGRATION: the pro toolbar (jump-to-page, fit, rotate, night, outl
     assert.equal(shell.getActiveTab().docState.night, true, 'night button inverts the page');
     vp.querySelector('.fb-doc-btn-print').click();
     await flush(40);
-    assert.equal(printCalls, 1, 'document print uses the shell print view after preparing all pages');
+    assert.equal(shell.state.activeModal, 'print-preview', 'document print opens the in-app preview and customization before printing');
+    const printPreview = container.querySelector('.fb-print-preview-modal');
+    assert.ok(printPreview, 'the print preview is visible before any output is sent');
+    printPreview.querySelector('.fb-print-confirm').click();
+    await flush(40);
+    assert.equal(printCalls, 1, 'continuing from the preview opens the browser print dialog after preparing all pages');
+    vp = shell.viewportElement;
 
     // The sidebar opens with the outline and jumps on click.
     vp.querySelector('.fb-doc-btn-outline').click();
