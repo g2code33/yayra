@@ -393,6 +393,13 @@ test('Yayra passkey dialogs hide the native website surface so PIN controls stay
     assert.ok(fakeBridge.visibility.some((item) => item.tabId === tab.id && item.visible === false),
       'native page is hidden beneath the trusted renderer dialog');
     const overlay = document.body.querySelector('.fb-passkey-dialog-overlay');
+    const dialog = overlay?.querySelector('[role="dialog"]');
+    assert.equal(dialog?.getAttribute('aria-modal'), 'true', 'verification uses an accessible modal dialog');
+    assert.match(dialog?.style.cssText || '', /fb-bg-surface-elevated/,
+      'dialog surface uses the theme-matched elevated background for readable contrast');
+    const pin = overlay?.querySelector('input');
+    assert.match(pin?.style.cssText || '', /fb-bg-glass-input/,
+      'PIN field uses the theme-matched input background');
     const cancel = overlay?.querySelector('button');
     assert.ok(cancel, 'dialog cancel button is present');
     cancel.click();
@@ -461,11 +468,9 @@ test('Website passkeys: a genuine native lifecycle request gets an immediate omn
     assert.equal(tab.sitePasskeyRequest?.requestId, 'yayra-wa-linux-local-1', 'local request is retained on its tab');
     shell.render(container);
     const confirm = container.querySelector('.fb-site-passkey-indicator');
-    assert.ok(confirm, 'Linux local provider turns the dead status chip into an explicit confirmation control');
-    assert.equal(confirm.tagName, 'BUTTON');
-    assert.match(confirm.textContent, /Create with Yayra/i);
-    confirm.click();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.ok(confirm, 'the active local request remains visible in browser chrome');
+    assert.ok(await waitFor(() => fakeBridge.passkeyContinuations.length === 1),
+      'the trusted in-app approval flow starts automatically without a toolbar click');
     assert.deepEqual(fakeBridge.passkeyContinuations.at(-1), {
       tabId: tab.id,
       requestId: 'yayra-wa-linux-local-1',
@@ -520,8 +525,10 @@ test('Website passkeys: a genuine native lifecycle request gets an immediate omn
       requestId: 'yayra-wa-conditional-1',
       action: 'get',
       rpId: 'github.com',
-      conditional: true
+      conditional: true,
+      provider: { mode: 'local', available: true, reason: '', credentialCount: 1 }
     });
+    const continuationCountBeforeAccountPick = fakeBridge.passkeyContinuations.length;
     shell.render(container);
     assert.equal(container.querySelector('.fb-site-passkey-indicator'), null, 'passive conditional mediation remains quiet until account interaction');
     shell.handleNativeWebviewEvent({
@@ -533,7 +540,18 @@ test('Website passkeys: a genuine native lifecycle request gets an immediate omn
     });
     shell.render(container);
     assert.ok(container.querySelector('.fb-site-passkey-indicator'),
-      'account interaction promotes conditional mediation to a visible active ceremony');
+      'account discovery promotes conditional mediation to a visible active ceremony');
+    assert.equal(fakeBridge.passkeyContinuations.length, continuationCountBeforeAccountPick,
+      'the verification prompt waits while Chromium is still showing its account chooser');
+    shell.handleNativeWebviewEvent({
+      tabId: tab.id,
+      type: 'webauthn-account-selected',
+      requestId: 'yayra-wa-conditional-1',
+      rpId: 'github.com'
+    });
+    assert.ok(await waitFor(() => fakeBridge.passkeyContinuations.length === continuationCountBeforeAccountPick + 1),
+      'after account selection, the Yayra approval prompt opens without an address-bar tap');
+    assert.equal(fakeBridge.passkeyContinuations.at(-1).requestId, 'yayra-wa-conditional-1');
   } finally {
     fakeBridge.uninstall();
   }
@@ -567,7 +585,11 @@ test('Website passkeys: configured Yayra PIN mints a request-bound grant before 
       passkeyService
     });
     await shell.initialize();
-    shell._passkeyDialog = async () => ({ action: 'confirm', values: { pin: '204896' } });
+    let approvalDialogOptions = null;
+    shell._passkeyDialog = async (options) => {
+      approvalDialogOptions = options;
+      return { action: 'confirm', values: { pin: '204896' } };
+    };
     shell.render(container);
     const tab = shell.getActiveTab();
     tab.url = 'https://github.com/login';
@@ -583,9 +605,10 @@ test('Website passkeys: configured Yayra PIN mints a request-bound grant before 
     });
     shell.render(container);
     const useYayra = container.querySelector('.fb-site-passkey-indicator');
-    assert.match(useYayra.textContent, /Use Yayra passkey/i);
-    useYayra.click();
+    assert.ok(useYayra, 'the passkey ceremony remains visible in the browser chrome');
     assert.ok(await waitFor(() => fakeBridge.passkeyContinuations.length === 1));
+    assert.match(approvalDialogOptions?.title || '', /Verify with your Yayra passkey/i,
+      'the PIN approval prompt opens automatically instead of waiting for an address-bar click');
     assert.deepEqual(websiteRequestContexts, [{
       tabId: tab.id,
       requestId: 'yayra-wa-yayra-pin-1',

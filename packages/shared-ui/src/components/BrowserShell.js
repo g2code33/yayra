@@ -6106,6 +6106,21 @@ export class BrowserShell {
     return { success: true, authorizationToken: verified.authorizationToken };
   }
 
+  _queueWebsitePasskeyPrompt(tab, request) {
+    if (!tab || !request || request.conditional || request.provider?.mode !== 'local'
+        || tab.id !== this.state.activeTabId || request.autoPromptQueued) return false;
+    request.autoPromptQueued = true;
+    const launch = () => {
+      request.autoPromptQueued = false;
+      if (tab.sitePasskeyRequest?.requestId !== request.requestId
+          || tab.id !== this.state.activeTabId) return;
+      void this.continueWebsitePasskey(tab, request).catch(() => {});
+    };
+    if (typeof queueMicrotask === 'function') queueMicrotask(launch);
+    else Promise.resolve().then(launch);
+    return true;
+  }
+
   async continueWebsitePasskey(tab, request) {
     if (!tab || !request || !this.nativeWebview?.continuePasskey) return;
     if (['prompting', 'system-prompt', 'approved', 'handed-off'].includes(request.providerState)) return;
@@ -6585,6 +6600,11 @@ export class BrowserShell {
             startedAt: Date.now()
           };
           if (!tab.sitePasskeyRequest.conditional && tabId === this.state.activeTabId) this.requestRender();
+          // A local Yayra-managed passkey uses its own trusted approval dialog;
+          // launch it as soon as the active page starts WebAuthn, instead of
+          // requiring a click on the small address-bar chip. Passive conditional
+          // mediation stays quiet until the user picks an account.
+          this._queueWebsitePasskeyPrompt(tab, tab.sitePasskeyRequest);
         } else if (evt.phase === 'settled') {
           const current = tab.sitePasskeyRequest;
           if (current?.requestId === evt.requestId) {
@@ -6622,9 +6642,8 @@ export class BrowserShell {
       }
       case 'webauthn-account-selection':
         // Conditional mediation is deliberately quiet until Chromium has an
-        // account to offer. A local Linux credential still needs the trusted
-        // toolbar click after account choice, so promote only the matching
-        // pending request to an active ceremony here.
+        // account to offer. Mark the chooser as active, but wait for the
+        // separate account-selected event before showing Yayra's PIN prompt.
         if (tab.sitePasskeyRequest?.conditional
             && (!evt.requestId || evt.requestId === tab.sitePasskeyRequest.requestId)) {
           tab.sitePasskeyRequest.conditional = false;
@@ -6636,6 +6655,14 @@ export class BrowserShell {
           this.showTransientNotice(`${evt.relyingPartyId || 'This site'} found ${Number(evt.accountCount) || 0} passkey account${Number(evt.accountCount) === 1 ? '' : 's'} - choose one to continue.`);
         }
         break;
+      case 'webauthn-account-selected': {
+        const request = tab.sitePasskeyRequest;
+        if (request && request.requestId === evt.requestId
+            && !request.conditional && request.provider?.mode === 'local') {
+          this._queueWebsitePasskeyPrompt(tab, request);
+        }
+        break;
+      }
       case 'autofill-captured':
         // Chrome-style: a login was submitted inside the page. Offer to
         // remember it (never for private tabs - checked again in the vault).
@@ -6951,17 +6978,35 @@ export class BrowserShell {
       if (typeof document === 'undefined' || !document.body) { resolve({ action: 'cancel', values: {} }); return; }
       const overlay = document.createElement('div');
       overlay.className = 'fb-passkey-dialog-overlay';
-      overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(8,10,16,0.62);display:flex;align-items:center;justify-content:center;';
+      overlay.setAttribute('role', 'presentation');
+      overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(3,7,18,0.68);backdrop-filter:blur(7px);-webkit-backdrop-filter:blur(7px);display:flex;align-items:center;justify-content:center;padding:20px;box-sizing:border-box;';
       const card = document.createElement('div');
-      card.style.cssText = 'background:var(--fb-bg-elevated,#171a22);color:var(--fb-text-primary,#f3f4f6);border-radius:16px;padding:22px;max-width:380px;width:92%;box-shadow:0 18px 60px rgba(0,0,0,0.5);display:flex;flex-direction:column;gap:12px;';
+      card.setAttribute('role', 'dialog');
+      card.setAttribute('aria-modal', 'true');
+      card.setAttribute('aria-label', title || 'Yayra passkey verification');
+      card.style.cssText = 'box-sizing:border-box;background:var(--fb-bg-surface-elevated,#111827);color:var(--fb-text-primary,#f8fafc);border:1px solid var(--fb-border-glass,rgba(255,255,255,.16));border-radius:20px;padding:24px;max-width:420px;width:min(100%,420px);box-shadow:0 24px 80px rgba(0,0,0,.58),0 0 0 1px rgba(255,255,255,.035);display:flex;flex-direction:column;gap:16px;';
+      const headingRow = document.createElement('div');
+      headingRow.style.cssText = 'display:flex;align-items:center;gap:13px;';
+      const mark = document.createElement('div');
+      mark.setAttribute('aria-hidden', 'true');
+      mark.innerHTML = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"></circle><path d="m11 12 9-9m-4 4 3 3m-6 0 3 3"></path></svg>';
+      mark.style.cssText = 'width:44px;height:44px;flex:0 0 44px;display:grid;place-items:center;border-radius:14px;background:var(--fb-accent-glow,rgba(109,93,242,.18));color:var(--fb-accent-primary,#8b7cff);';
+      const headingWrap = document.createElement('div');
+      const eyebrow = document.createElement('span');
+      eyebrow.textContent = 'YAYRA SECURITY';
+      eyebrow.style.cssText = 'display:block;margin-bottom:4px;font-size:.68rem;line-height:1.2;font-weight:800;letter-spacing:.12em;color:var(--fb-accent-primary,#8b7cff);';
       const h = document.createElement('strong');
       h.textContent = title;
-      h.style.cssText = 'font-size:1.05rem;';
-      card.appendChild(h);
+      h.style.cssText = 'display:block;font-size:1.08rem;line-height:1.3;color:var(--fb-text-primary,#f8fafc);';
+      headingWrap.appendChild(eyebrow);
+      headingWrap.appendChild(h);
+      headingRow.appendChild(mark);
+      headingRow.appendChild(headingWrap);
+      card.appendChild(headingRow);
       if (description) {
         const p = document.createElement('p');
         p.textContent = description;
-        p.style.cssText = 'margin:0;font-size:0.84rem;color:var(--fb-text-secondary,#9ca3af);line-height:1.5;';
+        p.style.cssText = 'margin:0;font-size:.9rem;color:var(--fb-text-secondary,#cbd5e1);line-height:1.55;';
         card.appendChild(p);
       }
       const fields = {};
@@ -6970,13 +7015,17 @@ export class BrowserShell {
         el.type = 'password';
         el.inputMode = 'numeric';
         el.maxLength = 6;
-        el.autocomplete = 'off';
+        el.autocomplete = 'one-time-code';
+        el.setAttribute('aria-label', input.label || 'Six-digit Yayra PIN');
         el.placeholder = input.placeholder || '6-digit PIN';
-        el.style.cssText = 'font-size:1.3rem;letter-spacing:0.5em;text-align:center;padding:10px;border-radius:10px;border:1px solid var(--fb-border,#2a2f3b);background:var(--fb-bg,#101218);color:inherit;';
+        el.style.cssText = 'box-sizing:border-box;width:100%;font-size:1.25rem;letter-spacing:.42em;text-align:center;padding:13px 14px;border-radius:12px;border:1px solid var(--fb-border-glass,rgba(255,255,255,.16));background:var(--fb-bg-glass-input,#0b1220);color:var(--fb-text-primary,#f8fafc);outline:none;';
         fields[input.id] = el;
         card.appendChild(el);
       }
+      let settled = false;
       const done = (action) => {
+        if (settled) return;
+        settled = true;
         const values = {};
         for (const [id, el] of Object.entries(fields)) values[id] = el.value || '';
         try { overlay.remove(); } catch { /* already gone */ }
@@ -6986,18 +7035,22 @@ export class BrowserShell {
         resolve({ action, values });
       };
       const row = document.createElement('div');
-      row.style.cssText = 'display:flex;flex-direction:column;gap:8px;';
+      row.style.cssText = 'display:flex;flex-direction:column;gap:9px;margin-top:2px;';
       for (const btn of buttons) {
         const b = document.createElement('button');
+        b.type = 'button';
         b.textContent = btn.label;
         b.style.cssText = btn.primary
-          ? 'padding:11px;border:none;border-radius:10px;font-weight:600;cursor:pointer;background:var(--fb-accent,#6d5df2);color:#fff;'
-          : 'padding:11px;border:none;border-radius:10px;font-weight:600;cursor:pointer;background:var(--fb-bg,#232734);color:inherit;';
+          ? 'min-height:46px;padding:12px 16px;border:1px solid transparent;border-radius:12px;font-weight:700;font-size:.94rem;cursor:pointer;background:var(--fb-accent-primary,#6d5df2);color:#fff;box-shadow:0 8px 22px var(--fb-accent-glow,rgba(109,93,242,.24));'
+          : 'min-height:44px;padding:11px 16px;border:1px solid var(--fb-border-glass,rgba(255,255,255,.14));border-radius:12px;font-weight:650;font-size:.92rem;cursor:pointer;background:var(--fb-bg-surface,rgba(255,255,255,.06));color:var(--fb-text-primary,#f8fafc);';
         b.addEventListener('click', () => done(btn.action));
         row.appendChild(b);
       }
       card.appendChild(row);
-      card.addEventListener('keydown', (e) => { if (e.key === 'Enter') done(buttons.find((b) => b.primary)?.action || 'cancel'); });
+      card.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); done('cancel'); }
+        else if (e.key === 'Enter') { e.preventDefault(); done(buttons.find((b) => b.primary)?.action || 'cancel'); }
+      });
       overlay.addEventListener('pointerdown', (e) => { if (e.target === overlay) done('cancel'); });
       overlay.appendChild(card);
       document.body.appendChild(overlay);
@@ -21143,6 +21196,9 @@ export class BrowserShell {
     this.state.urlInputValue = this.getDisplayUrl(tab.url);
     this.updateBookmarkState(tab.url);
     this.render();
+    // If a site began a local passkey request in a background tab, bring up
+    // Yayra's approval prompt when the user returns to that tab.
+    this._queueWebsitePasskeyPrompt(tab, tab.sitePasskeyRequest);
   }
 
   closeTab(tabId) {

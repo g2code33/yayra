@@ -1470,6 +1470,47 @@ test('website passkeys: discoverable-account chooser is installed once per Sessi
   assert.equal(shownDialogs.length, 1, 'no chooser is attached to an unrelated fallback window');
 });
 
+test('conditional local passkey selection signals the shell only after the account is chosen', async () => {
+  const sessionListeners = new Map();
+  const webauthnSession = { on(event, listener) { sessionListeners.set(event, listener); } };
+  const provider = {
+    describe: () => ({ mode: 'local', available: true, credentialCount: 1 }),
+    async confirm() { return { ok: true, verification: 'system-auth' }; }
+  };
+  const Dialog = { async showMessageBox() { return { response: 0 }; } };
+  const { handlers, listeners, sentEvents, views } = makeHarness({
+    webauthnSession, Dialog, websitePasskeyProvider: provider
+  });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-conditional-local', url: 'https://github.com/login' });
+  const requestingFrame = {};
+  views[0].webContents.mainFrame = requestingFrame;
+  listeners.get('yayra:site-passkey-request')({ sender: views[0].webContents }, {
+    phase: 'started', requestId: 'yayra-wa-conditional-local', action: 'get',
+    rpId: 'github.com', conditional: true, attachment: 'platform', controlled: true
+  });
+
+  const callbackValues = [];
+  sessionListeners.get('select-webauthn-account')({}, {
+    relyingPartyId: 'github.com', frame: requestingFrame,
+    accounts: [{ credentialId: 'AQID', name: 'ada@example.com', displayName: 'Ada' }]
+  }, (credentialId) => callbackValues.push(credentialId));
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const selected = sentEvents.find((event) => event.payload?.type === 'webauthn-account-selected');
+  assert.deepEqual(selected?.payload, {
+    tabId: 'tab-conditional-local', type: 'webauthn-account-selected',
+    requestId: 'yayra-wa-conditional-local', rpId: 'github.com'
+  });
+  assert.deepEqual(callbackValues, [], 'Chromium stays gated until Yayra verifies the selected account');
+
+  const result = await handlers.get('yayra:webview-continue-passkey')(null, {
+    tabId: 'tab-conditional-local', requestId: 'yayra-wa-conditional-local'
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(callbackValues, ['AQID'], 'only after approval does the selected credential return to Chromium');
+});
+
 /* -----------------------------------------------------------------
  * Chrome-style password capture / autofill routing
  * ----------------------------------------------------------------- */

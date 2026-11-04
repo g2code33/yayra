@@ -789,21 +789,20 @@ function buildTextSelectionActionsScript() {
  *
  * This observer wraps navigator.credentials.get/create for publicKey
  * requests only. Every genuine request is identified by relying-party ID and
- * reported (metadata only) to Yayra chrome. If the ceremony is not instantly
- * completed, an in-page helper explains the active device/security-key path
- * and provides a one-click system-browser fallback for phone/synced passkeys.
- * Success removes it immediately; an honest failure remains briefly with the
- * fallback instead of leaving the user at a dead spinner. Passive conditional
- * mediation stays silent, and password-manager credentials.get() calls (no
- * publicKey) are untouched.
+ * reported (metadata only) to Yayra chrome. The active shell shows its own
+ * trusted approval prompt for local credentials and an address-bar status for
+ * native or external providers. A delayed in-page helper remains only as a
+ * recovery hint for unusually long ceremonies; passive conditional mediation
+ * stays silent, and password-manager credentials.get() calls (no publicKey)
+ * are untouched.
  */
 function buildWebAuthnWatchdogScript() {
   return `(function () {
   if (window.__yayraWebauthnWatchdog) return;
   window.__yayraWebauthnWatchdog = true;
   if (!window.PublicKeyCredential || !navigator.credentials) return;
-  var WAIT_MS = Number(window.__yayraWebauthnWaitMs) > 0 ? Number(window.__yayraWebauthnWaitMs) : 350;
-  var LONG_WAIT_MS = Number(window.__yayraWebauthnLongWaitMs) > WAIT_MS ? Number(window.__yayraWebauthnLongWaitMs) : 8000;
+  var WAIT_MS = Number(window.__yayraWebauthnWaitMs) > 0 ? Number(window.__yayraWebauthnWaitMs) : 8000;
+  var LONG_WAIT_MS = Number(window.__yayraWebauthnLongWaitMs) > WAIT_MS ? Number(window.__yayraWebauthnLongWaitMs) : 15000;
   var banner = null;
   var bannerMessage = null;
   var currentRequest = null;
@@ -871,7 +870,7 @@ function buildWebAuthnWatchdogScript() {
     var text = site + ' is asking to ' + verb + '. The secure Chromium WebAuthn request is active in Yayra. ';
     if (platformAuthenticator === true) {
       text += linuxSession
-        ? 'Use the passkey action in Yayra’s address bar. Yayra will verify with your configured PIN, Touch ID, or system-lock method, or offer the exact-page fallback when this profile has no matching local credential.'
+        ? 'Yayra opens its secure verification prompt automatically. Approve with your configured PIN or system-lock method; if this profile has no matching local credential, use the exact-page system-browser fallback.'
         : 'Complete the Windows Hello or Touch ID prompt, or use a security key.';
     } else if (platformAuthenticator === false) {
       text += 'A built-in device authenticator is not exposed in this session; a compatible USB/NFC security key can still work when no unsupported PIN prompt is needed. Phone and synced passkeys can be used by opening this page in your system browser.';
@@ -891,7 +890,7 @@ function buildWebAuthnWatchdogScript() {
       banner.setAttribute('aria-live', 'polite');
       banner.setAttribute('style', 'position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:2147483647;width:min(560px,calc(100vw - 32px));box-sizing:border-box;background:#111827;color:#e5e7eb;border:1px solid rgba(255,255,255,0.18);border-radius:12px;padding:14px 16px;font:13px/1.5 system-ui,sans-serif;box-shadow:0 12px 40px rgba(0,0,0,0.55);');
       var heading = document.createElement('strong');
-      heading.textContent = 'Passkey request active';
+      heading.textContent = 'Passkey verification in progress';
       heading.setAttribute('style', 'display:block;margin-bottom:4px;color:#f8fafc;font-size:13px;');
       bannerMessage = document.createElement('div');
       bannerMessage.id = 'yayra-webauthn-message';
@@ -906,7 +905,7 @@ function buildWebAuthnWatchdogScript() {
       });
       var dismissBtn = document.createElement('button');
       dismissBtn.id = 'yayra-webauthn-dismiss';
-      dismissBtn.textContent = 'Continue here';
+      dismissBtn.textContent = 'Dismiss';
       dismissBtn.setAttribute('style', 'border:none;border-radius:8px;padding:6px 12px;background:rgba(255,255,255,0.12);color:#e5e7eb;cursor:pointer;font:600 12px system-ui,sans-serif;');
       dismissBtn.addEventListener('click', function () {
         if (currentRequest) currentRequest.dismissed = true;
@@ -2294,7 +2293,8 @@ function createWebviewBridge({
           // discover resident accounts. Return the user's chosen credential
           // immediately and restart the short completion watchdog. Conditional
           // autofill discovers accounts before verification, so it remains
-          // deferred behind the trusted toolbar action below.
+          // deferred until the shell receives the chosen account and presents
+          // its trusted Yayra approval prompt.
           if (requestMeta?.userVerified) {
             try { callback(selectedId); } catch { /* request expired */ }
             armSitePasskeyCompletionTimer(entry, requestMeta);
@@ -2311,6 +2311,10 @@ function createWebviewBridge({
           entry.pendingSitePasskeySelections.set(requestId, {
             approve: () => complete(true),
             cancel: () => complete(false)
+          });
+          sendTo(entry, 'webauthn-account-selected', {
+            requestId,
+            rpId: requestMeta?.rpId || relyingPartyId
           });
           return;
         }
