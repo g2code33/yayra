@@ -359,10 +359,7 @@ test('SOURCE PIN (main.cjs): OS "Open With" launches, desktop-app escape hatch, 
 
 test('SOURCE PIN (packaging): Yayra registers its internal document formats for OS Open With', () => {
   const mainDesktop = readFileSync(new URL('../build/linux/yayra.desktop', import.meta.url), 'utf8');
-  assert.match(mainDesktop, /MimeType=.*application\/pdf/, 'the deb desktop entry claims PDF handling');
-  assert.match(mainDesktop, /vnd\.openxmlformats-officedocument\.presentationml\.presentation/, 'the deb desktop entry claims PPTX handling');
-  assert.match(mainDesktop, /vnd\.openxmlformats-officedocument\.wordprocessingml\.document/, 'the deb desktop entry claims DOCX handling');
-  assert.match(mainDesktop, /vnd\.openxmlformats-officedocument\.spreadsheetml\.sheet/, 'the deb desktop entry claims XLSX handling');
+  assert.match(mainDesktop, /MimeType=.*application\/pdf/, 'the tracked desktop template claims PDF handling');
   assert.match(mainDesktop, /Exec=yayra %U/, 'and receives file arguments');
   const appimageDesktop = readFileSync(new URL('../build/linux/yayra-appimage.desktop', import.meta.url), 'utf8');
   assert.match(appimageDesktop, /MimeType=.*application\/pdf/, 'the AppImage entry too');

@@ -4953,6 +4953,24 @@ export class BrowserShell {
     viewport.appendChild(page);
   }
 
+  formatGoogleServiceError(serviceId, error) {
+    const code = String(error || '');
+    const service = googleServiceById(serviceId);
+    const serviceName = service?.title || service?.name || 'Google service';
+    if (code === 'service_scope_required') {
+      const permission = serviceId === 'drive' ? 'read-only Drive permission' : `read-only ${serviceName} permission`;
+      return `${serviceName} previews need the ${permission}. Reconnect Google services and grant that permission.`;
+    }
+    if (code === 'google_services_reconnect_required') {
+      return `Reconnect Google services to restore permission for the ${serviceName} preview.`;
+    }
+    if (code === 'google_service_permission_denied') {
+      const api = serviceId === 'drive' ? 'Google Drive API' : `${serviceName} API`;
+      return `Google denied access to this preview. Check the consent scopes and enable ${api} in your Google Cloud project.`;
+    }
+    return this.formatGoogleSignInError(code);
+  }
+
   async loadGoogleServicePreview(serviceId) {
     const service = googleServiceById(serviceId);
     if (!service?.api) return;
@@ -5119,7 +5137,7 @@ export class BrowserShell {
         panel.appendChild(loading);
       } else if (preview.status === 'error' || preview.status === 'unavailable') {
         const error = document.createElement('p');
-        error.textContent = this.formatGoogleSignInError(preview.error);
+        error.textContent = this.formatGoogleServiceError(preview.serviceId, preview.error);
         panel.appendChild(error);
       } else if (!preview.items.length) {
         const empty = document.createElement('p');

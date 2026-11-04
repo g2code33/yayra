@@ -114,7 +114,15 @@ test('Linux Packaging: Debian package control file defines dependencies, arch am
   assert.match(postrm, /gtk-update-icon-cache/);
 });
 
-test('Linux Packaging: Builds valid 64-bit .deb archive with complete filesystem layout and icons', async () => {
+// The release workflow's dedicated linux deb and AppImage job performs this
+// full Electron archive build and verifies its contents. Keep the expensive,
+// network-dependent packaging smoke opt-in for local development so the web
+// unit-test job does not download Electron and assemble the same package twice.
+test('Linux Packaging: Builds valid 64-bit .deb archive with complete filesystem layout and icons', {
+  skip: process.env.YAYRA_RUN_LINUX_PACKAGE_TEST === '1'
+    ? false
+    : 'covered by the dedicated release packaging job; opt in with YAYRA_RUN_LINUX_PACKAGE_TEST=1'
+}, async () => {
   // Execute Debian packaging script
   const buildResult = spawnSync('node', ['scripts/package-linux-deb.mjs'], { cwd: root, encoding: 'utf8' });
   assert.equal(buildResult.status, 0, `Debian packaging script failed: ${buildResult.stderr}`);
