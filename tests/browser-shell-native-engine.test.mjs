@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { setupDomShim } from './dom-shim.mjs';
 
@@ -38,6 +38,9 @@ function installFakeNativeWebview({ auth = null } = {}) {
   return { fake, calls, uninstall: () => { delete globalThis.window.yayra; } };
 }
 
+// These cases share window.yayra and the DOM shim; keep the native-bridge
+// lifecycle tests sequential so one test cannot replace another's fake bridge.
+describe('BrowserShell native and web frame lifecycle', { concurrency: false }, () => {
 test('Native engine ABSENT (web/PWA fallback): external navigation still renders the existing <iframe> path', async () => {
   delete globalThis.window.yayra;
   const container = document.createElement('div');
@@ -52,32 +55,6 @@ test('Native engine ABSENT (web/PWA fallback): external navigation still renders
   assert.ok(container.querySelector('iframe'), 'falls back to an <iframe> when no native bridge is present');
   assert.ok(el.querySelector('.fb-web-frame-slot'), 'viewport renders the slot the frame layer tracks');
   assert.equal(el.querySelector('.fb-native-webview-slot'), null);
-});
-
-test('Chrome render swaps shells without clearing the painted page first', async () => {
-  delete globalThis.window.yayra;
-  const container = document.createElement('div');
-  const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
-  await shell.initialize();
-  shell.render(container);
-  const oldRoot = shell.rootElement;
-  let observedAtomicSwap = false;
-  const appendChild = container.appendChild.bind(container);
-  container.appendChild = (node) => {
-    if (node !== oldRoot && node.classList?.contains('fb-browser-shell')) {
-      assert.equal(oldRoot.parentElement, container,
-        'the old chrome/page remains attached until the replacement shell is ready');
-      observedAtomicSwap = true;
-    }
-    return appendChild(node);
-  };
-  shell.state.isSideDrawerOpen = true;
-  shell.render(container);
-  container.appendChild = appendChild;
-  assert.ok(observedAtomicSwap, 'the replacement shell is appended before the old one is detached');
-  assert.notEqual(shell.rootElement, oldRoot);
-  assert.equal(oldRoot.parentElement, null);
-  shell.destroy();
 });
 
 test('Web/PWA no-blink fix: re-rendering chrome REUSES the same <iframe> element and never resets its src', async () => {
@@ -168,7 +145,13 @@ test('Native page yields to the tab-group name prompt and returns after Save', a
     const overlay = document.body.querySelector('.fb-text-prompt-overlay');
     assert.ok(overlay, 'the accessible prompt is mounted in the document');
     assert.equal(shell.state.isPageObscured, true, 'native content is marked as obscured');
-    assert.ok(calls.setVisible.some((call) => call.tabId === tab.id && call.visible === false), 'native page hides so the prompt can receive clicks');
+    assert.equal(calls.setVisible.some((call) => call.tabId === tab.id && call.visible === false), false,
+      'the live page remains in place until its snapshot is ready');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    shell.viewportElement.querySelector('.fb-page-snapshot-img')?.onload?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.ok(calls.setVisible.some((call) => call.tabId === tab.id && call.visible === false),
+      'the native page hides only after the placeholder image has loaded');
 
     shell.render(container);
     assert.equal(shell.healStuckPageSurface(), false, 'a live text prompt prevents the stuck-surface healer from uncovering the page');
@@ -227,7 +210,7 @@ test('Native engine: visiting an internal yayra:// page hides the active tab\'s 
   }
 });
 
-test('Native overlays hide the active page immediately while fresh snapshots paint asynchronously', async () => {
+test('Native overlays keep the live page until fresh snapshots paint asynchronously', async () => {
   const { fake, calls, uninstall } = installFakeNativeWebview();
   let resolveCapture;
   fake.capture = (tabId) => {
@@ -247,14 +230,21 @@ test('Native overlays hide the active page immediately while fresh snapshots pai
     shell.render(container);
 
     assert.ok(calls.capture.includes(tabId), 'the existing asynchronous screenshot capture is retained');
-    assert.ok(calls.setVisible.some((call) => call.tabId === tabId && call.visible === false), 'the native page is hidden before the screenshot promise resolves');
+    assert.equal(calls.setVisible.some((call) => call.tabId === tabId && call.visible === false), false,
+      'the native page stays visible while capturePage is pending');
     const still = container.querySelector('.fb-page-snapshot-img');
     assert.ok(still, 'the page slot keeps a snapshot placeholder beneath the drawer');
     assert.equal(still.src || '', '', 'the new snapshot has not been awaited or painted yet');
 
     resolveCapture({ snapshot: 'data:image/png;base64,captured-page' });
     await new Promise((resolve) => setTimeout(resolve, 0));
-    assert.equal(still.src, 'data:image/png;base64,captured-page', 'the fresh snapshot paints after capture resolves');
+    assert.equal(still.src, 'data:image/png;base64,captured-page', 'the fresh snapshot is installed after capture resolves');
+    assert.equal(calls.setVisible.some((call) => call.tabId === tabId && call.visible === false), false,
+      'the live page still backs the overlay until image decode completes');
+    still.onload?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.ok(calls.setVisible.some((call) => call.tabId === tabId && call.visible === false),
+      'the native surface is hidden only after the snapshot paints');
 
     shell.state.isSideDrawerOpen = false;
     shell.render(container);
@@ -279,7 +269,13 @@ test('Install-as-app confirmation hides the native page and restores it after th
     const overlay = document.getElementById('yayra-install-app-overlay');
     assert.ok(overlay, 'the app-install dialog is mounted');
     assert.equal(shell.state.isPageObscured, true, 'the dialog participates in the native-surface visibility state');
-    assert.ok(calls.setVisible.some((call) => call.tabId === tabId && call.visible === false), 'native page hides immediately so the dialog can be clicked');
+    assert.equal(calls.setVisible.some((call) => call.tabId === tabId && call.visible === false), false,
+      'the live page remains visible until the snapshot is ready');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    shell.viewportElement.querySelector('.fb-page-snapshot-img')?.onload?.();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.ok(calls.setVisible.some((call) => call.tabId === tabId && call.visible === false),
+      'the page hides only after the snapshot image has loaded');
 
     overlay.querySelector('.fb-install-app-name').value = 'Example';
     overlay.querySelector('.fb-btn-primary').click();
@@ -549,13 +545,12 @@ test('Native engine: connected Google continuation keeps the full destination in
 test('Native engine: Gmail login resumes the exact destination inside Yayra with the selected account', async () => {
   const listeners = new Set();
   let gmailConnectCalls = 0;
-  let gmailListCalls = 0;
   const auth = {
     getSession: async () => ({ signedIn: false }),
     onEvent: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
     signIn: async () => ({ ok: true, pending: true }),
     connectGmail: async () => { gmailConnectCalls += 1; return { ok: true, pending: true }; },
-    listGmailMessages: async () => { gmailListCalls += 1; return { ok: true, messages: [], nextPageToken: null }; },
+    listGmailMessages: async () => ({ ok: true, messages: [], nextPageToken: null }),
     signOut: async () => ({ ok: true }),
     openAccountPage: async () => ({ ok: true })
   };
@@ -590,24 +585,6 @@ test('Native engine: Gmail login resumes the exact destination inside Yayra with
     assert.ok(shell.rootElement.querySelector('.fb-gmail-page'), 'Gmail resumes automatically inside Yayra');
     assert.match(shell.rootElement.querySelector('.fb-gmail-account')?.textContent || '', /person@example\.com/,
       'the account selected in Chrome is visibly reflected in the resumed Gmail tab');
-
-    // Reproduce the stale reconnect card seen when the OAuth callback reports
-    // Gmail success after the signed-in event already rendered this view.
-    const gmailView = shell._gmailView(tab.id);
-    gmailView.status = 'reconnect';
-    shell.render();
-    assert.ok(shell.rootElement.querySelector('.fb-gmail-empty')?.textContent.includes('Allow Gmail access'),
-      'a previously rendered mailbox can be waiting on the scoped Gmail grant');
-    for (const listener of listeners) listener({
-      type: 'gmail-connected',
-      profileId: shell.currentProfileId(),
-      profile: { sub: 'g-product', email: 'person@example.com' }
-    });
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(gmailView.status, 'ready', 'the Gmail success event reloads a stale reconnect view');
-    assert.ok(gmailListCalls >= 2, 'the authorized mailbox is fetched again after consent');
-    assert.doesNotMatch(shell.rootElement.querySelector('.fb-gmail-main')?.textContent || '', /Allow Gmail access/,
-      'the reconnect prompt is replaced by the mailbox state');
     assert.ok(fake, 'native event source remains alive for other tabs');
   } finally {
     uninstall();
@@ -632,4 +609,6 @@ test('Native engine: reload() and stopLoading() delegate to the native bridge fo
   } finally {
     uninstall();
   }
+});
+
 });

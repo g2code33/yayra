@@ -225,7 +225,7 @@ test('PPTX DIAGRAMS: connectors keep their geometry and dark-filled nodes keep l
   }
 });
 
-test('PPTX TITLES: title frames that extend beyond slide edges are brought fully into view', () => {
+test('PPTX TITLES: title frames that extend beyond slide edges are brought fully into view', async () => {
   const host = mount(960, 540);
   try {
     const slide = {
@@ -248,6 +248,22 @@ test('PPTX TITLES: title frames that extend beyond slide edges are brought fully
     assert.match(title.getAttribute('style') || title.style.cssText, /overflow:hidden/,
       'title text remains clipped to its corrected frame instead of leaking past the slide edge');
     assert.match(title.textContent, /Presynaptic modulation/, 'all heading text remains in the rendered title');
+    const titleParagraph = title.querySelector('.fb-pptx-paragraph');
+    assert.equal(titleParagraph.style.whiteSpace, 'nowrap', 'title text stays on one measurable line so fitTextFrame can shrink it rather than clip the right edge');
+    assert.equal(titleParagraph.style.overflowWrap, 'normal', 'titles do not break at arbitrary characters to hide horizontal overflow');
+    const titleInner = title.querySelector('.fb-pptx-text-inner');
+    Object.defineProperties(title, {
+      clientWidth: { value: 220, configurable: true },
+      clientHeight: { value: 80, configurable: true }
+    });
+    Object.defineProperties(titleInner, {
+      scrollWidth: { value: 500, configurable: true },
+      scrollHeight: { value: 40, configurable: true }
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const titleScale = Number.parseFloat(titleInner.style.transform.slice('scale('.length));
+    assert.ok(titleScale >= 0.35 && titleScale < 1,
+      'a long one-line heading is proportionally reduced until its measured width fits the frame');
   } finally {
     removeMount(host);
   }
@@ -365,6 +381,59 @@ test('PPTX REAL ENGINE: PowerPoint geometry, themes, image crop, merged table, n
     assert.match(index[0].text, /Notes: Emphasise the beta blocker contraindication/);
   } finally {
     deck.dispose();
+  }
+});
+
+test('PPTX CONNECTORS: line-only p:sp geometry is retained and painted as an SVG stroke', async () => {
+  const archive = await JSZip.loadAsync(await buildPowerPointDeck());
+  const slideFile = archive.file('ppt/slides/slide1.xml');
+  const slideXml = await slideFile.async('text');
+  const connectorShape = `
+    <p:sp>
+      <p:nvSpPr><p:cNvPr id="99" name="Nervous system connector"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+      <p:spPr>
+        <a:xfrm><a:off x="1000000" y="1200000"/><a:ext cx="1800000" cy="0"/></a:xfrm>
+        <a:prstGeom prst="line"><a:avLst/></a:prstGeom>
+        <a:noFill/><a:ln w="25400"><a:solidFill><a:srgbClr val="263238"/></a:solidFill><a:tailEnd type="triangle"/></a:ln>
+      </p:spPr>
+      <p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody>
+    </p:sp>
+    <p:sp>
+      <p:nvSpPr><p:cNvPr id="100" name="WPS elbow connector"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+      <p:spPr>
+        <a:xfrm flipH="1"><a:off x="3200000" y="1200000"/><a:ext cx="1000000" cy="500000"/></a:xfrm>
+        <a:prstGeom prst="bentConnector3"><a:avLst/></a:prstGeom>
+        <a:noFill/><a:ln w="19050"><a:solidFill><a:srgbClr val="263238"/></a:solidFill></a:ln>
+      </p:spPr>
+      <p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody>
+    </p:sp>`;
+  archive.file('ppt/slides/slide1.xml', slideXml.replace('</p:spTree>', `${connectorShape}</p:spTree>`));
+  const deckBytes = await archive.generateAsync({ type: 'uint8array' });
+  const deck = await pptxEngine.openPptxDeck(new Blob([deckBytes]), { lazyMedia: true });
+  const host = mount(1280, 720);
+  try {
+    const slide = await deck.getSlide(1);
+    const connectors = slide.shapes.filter((shape) => shape.type === 'line');
+    assert.equal(connectors.length, 2, 'straight and bent p:sp line presets are parsed instead of discarded as empty shapes');
+    const connector = connectors.find((shape) => shape.geom === 'line');
+    const elbow = connectors.find((shape) => shape.geom === 'bentConnector3');
+    assert.ok(connector);
+    assert.ok(elbow, 'numbered connector presets survive OOXML parsing');
+    assert.equal(connector.fill, '#263238');
+    assert.equal(connector.lineEnd, 'triangle');
+
+    renderPptxSlide(host, { slide, width: deck.slideWidth, height: deck.slideHeight });
+    const svgs = host.querySelectorAll('.fb-pptx-line');
+    assert.equal(svgs.length, 2, 'both connector types are painted as SVG strokes');
+    const path = svgs[0].querySelector('.fb-pptx-connector-path');
+    const elbowPath = svgs[1].querySelector('.fb-pptx-connector-path');
+    assert.ok(path, 'the straight connector is a real SVG path');
+    assert.equal(path.getAttribute('stroke'), '#263238');
+    assert.match(path.getAttribute('marker-end') || '', /pptx-arrow-end/);
+    assert.match(elbowPath.getAttribute('d') || '', /L .* L .* L /, 'WPS elbow connector segments are retained');
+  } finally {
+    deck.dispose();
+    removeMount(host);
   }
 });
 

@@ -63,13 +63,45 @@ test('web/PWA (no bridge): no window-control buttons - the browser owns the wind
   assert.equal(el.querySelector('.fb-tabstrip-drag-handle'), null, 'web/PWA has no desktop window drag handle');
 });
 
+test('frameless desktop chrome clears the OS top-panel work-area inset when overlapped', async () => {
+  const { uninstall } = installFakeWindowControls();
+  const previousScreen = window.screen;
+  const previousScreenY = window.screenY;
+  window.screen = { availTop: 28 };
+  window.screenY = 0;
+  const container = document.createElement('div');
+  const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+  try {
+    await shell.initialize();
+    const el = shell.render(container);
+    assert.equal(shell.getSystemTopInset(), 28,
+      'the reserved desktop panel height is derived from screen work-area coordinates');
+    assert.equal(el.style.getPropertyValue('--fb-window-system-top-inset'), '28px',
+      'the chrome layout receives the calculated inset before it paints');
+
+    window.screenY = 28;
+    assert.equal(shell.getSystemTopInset(), 0,
+      'already-positioned windows do not get an unnecessary extra gap');
+  } finally {
+    shell.destroy();
+    uninstall();
+    if (previousScreen === undefined) delete window.screen;
+    else window.screen = previousScreen;
+    if (previousScreenY === undefined) delete window.screenY;
+    else window.screenY = previousScreenY;
+  }
+});
+
 test('frameless top chrome has ZERO native drag regions, including the dedicated handle', () => {
   const css = readFileSync(new URL('../packages/shared-ui/src/theme/design-system.css', import.meta.url), 'utf8');
+  const shellRule = css.match(/\.fb-browser-shell\s*\{([\s\S]*?)\}/)?.[1] || '';
   const tabStripRule = css.match(/\.fb-chrome-tabstrip\s*\{([\s\S]*?)\}/)?.[1] || '';
   const dragHandleRule = css.match(/\.fb-tabstrip-drag-handle\s*\{([\s\S]*?)\}/)?.[1] || '';
   const tabListRule = css.match(/\.fb-chrome-tabstrip \.fb-tab-item,[\s\S]*?\{([\s\S]*?)\}/)?.[1] || '';
   const controlGapRule = css.match(/\.fb-window-controls-safe-gap\s*\{([\s\S]*?)\}/)?.[1] || '';
 
+  assert.match(shellRule, /padding-top:\s*var\(--fb-window-system-top-inset,\s*0px\)/,
+    'frameless chrome respects a calculated desktop panel/work-area inset');
   assert.match(tabStripRule, /-webkit-app-region:\s*no-drag/, 'the tab strip stays renderer-interactive');
   assert.match(dragHandleRule, /-webkit-app-region:\s*no-drag/, 'the handle uses pointer IPC, never a native input grab');
   assert.doesNotMatch(dragHandleRule, /-webkit-app-region:\s*drag(?:\s|;)/, 'no native drag region survives on the handle');

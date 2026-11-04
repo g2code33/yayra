@@ -469,7 +469,8 @@ test('Website passkeys: a genuine native lifecycle request gets an immediate omn
     shell.render(container);
     const confirm = container.querySelector('.fb-site-passkey-indicator');
     assert.ok(confirm, 'the active local request remains visible in browser chrome');
-    assert.ok(await waitFor(() => fakeBridge.passkeyContinuations.length === 1),
+    await waitFor(() => fakeBridge.passkeyContinuations.length === 1);
+    assert.equal(fakeBridge.passkeyContinuations.length, 1,
       'the trusted in-app approval flow starts automatically without a toolbar click');
     assert.deepEqual(fakeBridge.passkeyContinuations.at(-1), {
       tabId: tab.id,
@@ -605,7 +606,7 @@ test('Website passkeys: configured Yayra PIN mints a request-bound grant before 
     });
     shell.render(container);
     const useYayra = container.querySelector('.fb-site-passkey-indicator');
-    assert.ok(useYayra, 'the passkey ceremony remains visible in the browser chrome');
+    assert.ok(useYayra, 'the passkey ceremony is still visible in the browser chrome');
     assert.ok(await waitFor(() => fakeBridge.passkeyContinuations.length === 1));
     assert.match(approvalDialogOptions?.title || '', /Verify with your Yayra passkey/i,
       'the PIN approval prompt opens automatically instead of waiting for an address-bar click');

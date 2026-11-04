@@ -291,9 +291,8 @@ test('a thrown update check is reported as an error state with feedback - not si
 });
 
 /* -----------------------------------------------------------------
- * Overlay ordering: capture starts before the native surface is hidden,
- * but the view hides synchronously so chrome can never sit behind it.
- * The fresh still is painted asynchronously over the last available one.
+ * Overlay ordering: the native surface remains live until its captured still
+ * has decoded in the renderer, then hides beneath the already-painted chrome.
  * ----------------------------------------------------------------- */
 
 function installCaptureCapableWebview() {
@@ -344,21 +343,21 @@ test('drawer shows immediately: starts capture before hiding the native view and
     shell.state.isSideDrawerOpen = true;
     shell.render(container);
 
-    // Start a fresh capture from the active page, then immediately hide the
-    // native surface so the drawer is never composited underneath the page.
+    // Start a fresh capture, but do not hide the live page before there is a
+    // decoded image beneath the drawer.
     assert.deepEqual(calls.capture, [tabId], 'capture requested for the active tab');
-    assert.equal(calls.setVisible.length, 1, 'native view is hidden synchronously');
-    assert.equal(calls.setVisible[0].visible, false);
-    assert.deepEqual(order.slice(0, 2), ['capture', 'setVisible:false'], 'capture starts immediately before the hide');
+    assert.equal(calls.setVisible.length, 0, 'native page remains live while capture is unresolved');
+    assert.deepEqual(order, ['capture'], 'capture starts without a premature hide');
 
-    // The live chrome is already visible; only the higher-quality still is
-    // asynchronous and replaces the cached/empty placeholder when ready.
     const still = container.querySelector('.fb-page-snapshot-img');
     assert.ok(still, 'still image placeholder rendered');
-    assert.equal(order[0], 'capture', 'capture starts before the hide');
-    assert.ok(order.indexOf('setVisible:false') > order.indexOf('capture'));
     assert.ok(await waitForCondition(() => still.src === 'data:image/png;base64,LIVE-SNAPSHOT'),
-      'freshly captured snapshot painted into the slot');
+      'freshly captured snapshot installed into the slot');
+    assert.equal(calls.setVisible.length, 0, 'the live page remains until the image load event');
+    still.onload?.();
+    assert.ok(await waitForCondition(() => calls.setVisible.some((call) => call.visible === false)),
+      'the native surface hides after the snapshot loads');
+    assert.deepEqual(order.slice(0, 2), ['capture', 'setVisible:false']);
 
     // Closing the drawer restores the live page.
     shell.state.isSideDrawerOpen = false;

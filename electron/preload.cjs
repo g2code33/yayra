@@ -141,9 +141,9 @@ const api = {
     stop: (tabId) => ipcRenderer.invoke('yayra:webview-stop', { tabId }),
     isLoading: (tabId) => ipcRenderer.invoke('yayra:webview-is-loading', { tabId }),
     destroy: (tabId) => ipcRenderer.invoke('yayra:webview-destroy', { tabId }),
-    // Website passkeys: the shell presents a trusted Yayra verification dialog
-    // automatically for an active local ceremony, then releases the exact held
-    // WebAuthn call. No credential data crosses IPC.
+    // Linux website passkeys: an explicit toolbar click supplies a one-shot
+    // Yayra-passkey grant (or intentionally falls back to PolicyKit), then
+    // releases the exact held WebAuthn call. No credential data crosses IPC.
     continuePasskey: (tabId, requestId, options = {}) => {
       const normalized = typeof options === 'boolean' ? { external: options } : (options || {});
       return ipcRenderer.invoke('yayra:webview-continue-passkey', {

@@ -78,22 +78,27 @@ function symbolText(text, font, helpers) {
   }).join('');
 }
 
-function fitTextFrame(frame, inner, anchor) {
+function fitTextFrame(frame, inner, anchor, minimumScale = 0.55) {
   const run = () => {
     if (!frame?.isConnected || !inner) return;
     let scale = 1;
     inner.style.transform = '';
     inner.style.width = '100%';
     for (let attempt = 0; attempt < 5; attempt += 1) {
-      const overflowY = Number(inner.scrollHeight || 0) - Number(frame.clientHeight || 0);
-      const overflowX = Number(inner.scrollWidth || 0) - Number(frame.clientWidth || 0);
+      // inner.width expands as its transform shrinks; compare the transformed
+      // content dimensions with the frame or the refit would mistake that
+      // compensating width for overflow and over-shrink the text.
+      const contentHeight = Number(inner.scrollHeight || 0) * scale;
+      const contentWidth = Number(inner.scrollWidth || 0) * scale;
+      const overflowY = contentHeight - Number(frame.clientHeight || 0);
+      const overflowX = contentWidth - Number(frame.clientWidth || 0);
       if (overflowY <= Math.max(4, Number(frame.clientHeight || 0) * 0.04) && overflowX <= 2) break;
-      const hRatio = Number(frame.clientHeight || 1) / Math.max(Number(inner.scrollHeight || 1), 1);
-      const wRatio = Number(frame.clientWidth || 1) / Math.max(Number(inner.scrollWidth || 1), 1);
-      scale = Math.max(0.55, Math.min(scale * 0.92, scale * hRatio, scale * wRatio));
+      const hRatio = Number(frame.clientHeight || 1) / Math.max(contentHeight, 1);
+      const wRatio = Number(frame.clientWidth || 1) / Math.max(contentWidth, 1);
+      scale = Math.max(minimumScale, Math.min(scale * 0.92, scale * hRatio, scale * wRatio));
       inner.style.transform = `scale(${scale})`;
       inner.style.width = `${100 / scale}%`;
-      if (scale <= 0.55) break;
+      if (scale <= minimumScale) break;
     }
     inner.style.transformOrigin = anchor === 'ctr' ? 'center top' : anchor === 'b' ? 'center bottom' : 'top left';
   };
@@ -106,7 +111,7 @@ function fitTextFrame(frame, inner, anchor) {
   if (fontsReady && typeof fontsReady.then === 'function') fontsReady.then(run).catch(() => {});
 }
 
-function renderParagraph(doc, paragraph, textModel, helpers, shapeFill = null) {
+function renderParagraph(doc, paragraph, textModel, helpers, shapeFill = null, keepOnOneLine = false) {
   const row = doc.createElement('div');
   row.className = 'fb-pptx-paragraph';
   const level = textModel.levels?.[paragraph.level] || {};
@@ -121,8 +126,8 @@ function renderParagraph(doc, paragraph, textModel, helpers, shapeFill = null) {
     `margin-top:${(paragraph.spaceBeforePt || 0) * PT_TO_PX}px`,
     `margin-bottom:${(paragraph.spaceAfterPt || 0) * PT_TO_PX}px`,
     level.indentPx ? `margin-left:${level.indentPx}px` : '',
-    'white-space:pre-wrap',
-    'overflow-wrap:anywhere'
+    `white-space:${keepOnOneLine ? 'nowrap' : 'pre-wrap'}`,
+    `overflow-wrap:${keepOnOneLine ? 'normal' : 'anywhere'}`
   ].filter(Boolean).join(';');
 
   const explicitBullet = paragraph.bullet;
@@ -491,9 +496,14 @@ function renderShape(doc, shape, helpers, showImages, thumbnail) {
   inner.className = 'fb-pptx-text-inner';
   const justify = text.anchor === 'ctr' ? 'center' : text.anchor === 'b' ? 'flex-end' : 'flex-start';
   inner.style.cssText = `height:100%;display:flex;flex-direction:column;justify-content:${justify};padding:5px 9px;box-sizing:border-box;transform-origin:top left;`;
-  for (const paragraph of text.paragraphs || []) inner.appendChild(renderParagraph(doc, paragraph, text, helpers, shape.fill));
+  for (const paragraph of text.paragraphs || []) {
+    // Title placeholders often have a fixed, narrow frame with large single-line
+    // text. Keep that authored line intact so fitTextFrame can measure its true
+    // horizontal overflow and scale it into the slide instead of clipping it.
+    inner.appendChild(renderParagraph(doc, paragraph, text, helpers, shape.fill, shape.isTitle));
+  }
   frame.appendChild(inner);
-  fitTextFrame(frame, inner, text.anchor);
+  fitTextFrame(frame, inner, text.anchor, shape.isTitle ? 0.35 : 0.55);
   return frame;
 }
 

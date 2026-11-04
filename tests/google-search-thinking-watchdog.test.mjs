@@ -7,7 +7,7 @@ function runWatchdog({
   host = 'www.google.com',
   pathname = '/search',
   search = '?q=watchdog-test',
-  text = 'Search results\nThinking\n',
+  text = 'Thinking',
   visibilityState = 'visible',
   timeoutMs = 25,
   pollIntervalMs = 5,
@@ -37,7 +37,15 @@ function runWatchdog({
       return timer;
     }
   };
-  const documentObj = { body: { innerText: text }, visibilityState };
+  // Model the browser's bounded, layout-free status-node query. The live
+  // watchdog intentionally avoids body.innerText because serializing a long
+  // Google AI thread on every poll caused typing jank.
+  const statusNode = { nodeType: 1, childNodes: [{ nodeType: 3, nodeValue: text }] };
+  const documentObj = {
+    body: { get innerText() { throw new Error('body.innerText must not be scanned'); } },
+    visibilityState,
+    querySelectorAll: () => [statusNode]
+  };
   const sandbox = { window: windowObj, document: documentObj, Date, Math };
   vm.createContext(sandbox);
   vm.runInContext(buildGoogleSearchThinkingWatchdogScript({ timeoutMs, pollIntervalMs, reloadCooldownMs }), sandbox);

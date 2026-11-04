@@ -9,6 +9,7 @@ test('CSP is pinned to self, exact hosts, and desktop custom scheme', () => {
   assert.match(csp, /default-src 'self' yayra:/);
   assert.match(csp, /script-src 'self' yayra:/);
   assert.match(csp, /worker-src 'self' blob: yayra:/, 'offline PDF.js workers work on both the app scheme and file fallback');
+  assert.match(csp, /frame-src http: https: blob: yayra:/, 'the in-app PDF print preview can frame its generated blob URL');
   assert.match(csp, /style-src 'self' 'unsafe-inline' yayra:/);
   assert.match(csp, /img-src 'self' data: blob: yayra: https:\/\/yayra\.pages\.dev https:\/\/icons\.duckduckgo\.com https:\/\/lh3\.googleusercontent\.com/);
   assert.match(csp, /media-src 'self' blob: yayra:/, 'embedded PPTX video can play only from same-origin or local in-memory blobs');

@@ -6,6 +6,8 @@ import {
   requiresSystemBrowserAuth,
   secureSystemBrowserAuthUrl,
   isGoogleDriveDownloadUrl,
+  printActionForInput,
+  buildPrintRequestBridgeScript,
   sanitizeBounds,
   buildBrowserUserAgent,
   buildContextMenuTemplate,
@@ -250,6 +252,14 @@ test('custom text cursor uses caret hit-testing, excludes controls, and cleans u
   assert.equal([...windowListeners.values()].reduce((count, listeners) => count + listeners.size, 0), 0, 'cleanup removes window listeners');
 });
 
+test('print request bridge: Ctrl+P is intercepted and page print() can be routed to Yayra preview', () => {
+  assert.equal(printActionForInput({ type: 'keyDown', key: 'p', control: true }), true);
+  assert.equal(printActionForInput({ type: 'keyDown', key: 'P', meta: true }), true);
+  assert.equal(printActionForInput({ type: 'keyDown', key: 'p', control: true, shift: true }), false);
+  assert.equal(printActionForInput({ type: 'keyUp', key: 'p', control: true }), false);
+  assert.match(buildPrintRequestBridgeScript(), /source: 'yayra-print-request'/);
+});
+
 test('sanitizeBounds: clamps negative/missing values and rounds floats', () => {
   assert.deepEqual(sanitizeBounds({ x: -5, y: 12.6, width: 300.2, height: NaN }), { x: 0, y: 13, width: 300, height: 0 });
   assert.deepEqual(sanitizeBounds(undefined), { x: 0, y: 0, width: 0, height: 0 });
@@ -397,6 +407,23 @@ test('webview bridge: creating a tab adds a WebContentsView as a child view and 
 
   assert.equal(views.length, 1, 'exactly one native view created');
   assert.equal(fakeWin.contentView.children.length, 1, 'view attached to the window content view (not an <iframe>)');
+});
+
+test('webview print requests from guest pages reach the owning shell and suppress Chromium default printing', async () => {
+  const { handlers, listeners, sentEvents, views } = makeHarness();
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-print', url: 'https://example.com/report.pdf' });
+  const webContents = views[0].webContents;
+  let prevented = false;
+  webContents.emit('before-input-event', { preventDefault: () => { prevented = true; } }, {
+    type: 'keyDown', key: 'p', control: true
+  });
+  assert.equal(prevented, true, 'Ctrl+P does not invoke Chromium’s printer directly');
+  assert.ok(sentEvents.some((event) => event.payload.type === 'print-request' && event.payload.tabId === 'tab-print'),
+    'the shell receives a print request for the source tab');
+
+  listeners.get('yayra:webview-print-request')({ sender: webContents });
+  assert.equal(sentEvents.filter((event) => event.payload.type === 'print-request').length, 2,
+    'window.print() requests from PDF viewer toolbars are routed to the same shell flow');
 });
 
 test('webview bridge: superseded ERR_ABORTED navigation is silent but a final ERR_FAILED remains visible', async () => {
@@ -951,6 +978,49 @@ test('webview bridge: setBounds and setVisible(false) manipulate the native view
   assert.equal(views[0].webContents.isDestroyed(), false);
 });
 
+test('webview bridge: identical geometry is a no-op and a new bounds report cancels a stale async hide', async () => {
+  const { bridge, handlers, views } = makeHarness();
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-bounds', url: 'https://example.com/' });
+  const native = views[0];
+  let boundsWrites = 0;
+  const setBounds = native.setBounds.bind(native);
+  native.setBounds = (bounds) => { boundsWrites += 1; setBounds(bounds); };
+  const pageBounds = { x: 12, y: 80, width: 900, height: 620 };
+
+  await handlers.get('yayra:webview-set-bounds')(null, { tabId: 'tab-bounds', bounds: pageBounds });
+  await handlers.get('yayra:webview-set-bounds')(null, { tabId: 'tab-bounds', bounds: pageBounds });
+  assert.equal(boundsWrites, 1, 'duplicate ResizeObserver geometry does not mutate the native view');
+
+  let finishCapture;
+  native.webContents.capturePage = () => new Promise((resolve) => { finishCapture = resolve; });
+  const hiding = handlers.get('yayra:webview-set-visible')(null, { tabId: 'tab-bounds', visible: false, capture: true });
+  await Promise.resolve();
+  const newerBounds = { x: 20, y: 92, width: 700, height: 500 };
+  await handlers.get('yayra:webview-set-bounds')(null, { tabId: 'tab-bounds', bounds: newerBounds });
+  finishCapture({ isEmpty: () => false, toDataURL: () => 'data:image/png;base64,STALE' });
+  await hiding;
+  assert.deepEqual(native.bounds, newerBounds, 'a later visible geometry update wins the capture/hide race');
+
+  await handlers.get('yayra:webview-set-visible')(null, { tabId: 'tab-bounds', visible: false });
+  const hiddenWrites = boundsWrites;
+  await handlers.get('yayra:webview-set-visible')(null, { tabId: 'tab-bounds', visible: false });
+  assert.equal(boundsWrites, hiddenWrites, 'repeated hidden state is idempotent');
+  assert.deepEqual(native.bounds, { x: 0, y: 0, width: 0, height: 0 });
+  bridge.destroyForWebContents(native.webContents);
+});
+
+test('webview bridge: capturePage results from an older navigation are discarded', async () => {
+  const { bridge, handlers, views } = makeHarness();
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-capture-race', url: 'https://example.com/old' });
+  let finishCapture;
+  views[0].webContents.capturePage = () => new Promise((resolve) => { finishCapture = resolve; });
+  const pending = bridge._internal.capture('tab-capture-race');
+  await Promise.resolve();
+  views[0].webContents.emit('did-start-loading');
+  finishCapture({ isEmpty: () => false, toDataURL: () => 'data:image/png;base64,OLD' });
+  assert.equal(await pending, undefined, 'a stale document image cannot enter the snapshot cache');
+});
+
 // --- Chrome-equivalent native right-click context menu ------------------
 
 function findItem(template, label) {
@@ -1305,18 +1375,20 @@ test('webview bridge: set-visible(false, capture) returns a page snapshot and th
   assert.deepEqual(views[0].bounds, { x: 0, y: 0, width: 0, height: 0 });
 });
 
-test('webview bridge: set-visible(false) without capture, or with a failing capturePage, still hides and never throws', async () => {
+test('webview bridge: set-visible(false) without capture hides, while a failed overlay capture leaves the live view visible', async () => {
   const { handlers, views } = makeHarness();
   await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-1', url: 'https://example.com/' });
+  await handlers.get('yayra:webview-set-bounds')(null, { tabId: 'tab-1', bounds: { x: 0, y: 80, width: 800, height: 600 } });
 
   const plain = await handlers.get('yayra:webview-set-visible')(null, { tabId: 'tab-1', visible: false });
   assert.equal(plain, undefined);
   assert.deepEqual(views[0].bounds, { x: 0, y: 0, width: 0, height: 0 });
 
+  await handlers.get('yayra:webview-set-bounds')(null, { tabId: 'tab-1', bounds: { x: 0, y: 80, width: 800, height: 600 } });
   views[0].webContents.capturePage = async () => { throw new Error('gpu context lost'); };
   const failed = await handlers.get('yayra:webview-set-visible')(null, { tabId: 'tab-1', visible: false, capture: true });
-  assert.equal(failed, undefined, 'capture failure degrades to a plain hide');
-  assert.deepEqual(views[0].bounds, { x: 0, y: 0, width: 0, height: 0 });
+  assert.equal(failed, undefined, 'capture failure is reported without hiding the live page');
+  assert.deepEqual(views[0].bounds, { x: 0, y: 80, width: 800, height: 600 });
 });
 
 /* -----------------------------------------------------------------

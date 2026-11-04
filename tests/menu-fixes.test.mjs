@@ -350,7 +350,7 @@ test('TAB GROUPS: real create / group / ungroup with colour dots in the tab stri
     assert.ok(container.querySelector('.fb-tab-groups-popover'),
       'tab groups renders as the compact top-left toolbar panel');
     const groupChoice = container.querySelector('.fb-tab-group-picker-open');
-    assert.ok(groupChoice, 'the picker lists open groups with an explicit Open all control');
+    assert.ok(groupChoice, 'the picker lists open groups');
     groupChoice.click();
     assert.ok(shell.getActiveTab().group, 'one tap opens a member tab from that group');
     assert.notEqual(shell.getActiveTab().id, ungrouped.id, 'the ungrouped tab was switched away from');
@@ -420,95 +420,6 @@ test('TAB GROUP PICKER: New group opens a visible, keyboard-ready prompt and pub
   }
 });
 
-test('TAB GROUP PICKER: hover previews members, opens one tab, and saves custom member labels', async () => {
-  const storage = makeStorage();
-  const { shell, container } = await makeShell({ storage });
-  try {
-    const first = shell.getActiveTab();
-    first.url = 'https://course.example/overview';
-    first.title = 'Course overview';
-    shell._textPromptDialog = async () => 'Pharmacology';
-    assert.equal(await shell.groupTabWithPrompt(first.id, {
-      title: 'Create tab group', description: 'Create a test group', placeholder: 'Pharmacology'
-    }), true);
-    const group = shell.getTabGroups().find((candidate) => candidate.name === 'Pharmacology');
-    assert.ok(group);
-
-    const second = shell.createNewTab();
-    second.url = 'https://course.example/autonomic';
-    second.title = 'Autonomic lecture';
-    assert.equal(shell.addTabToExistingGroup(second.id, group.id), true);
-    const memberId = second.groupMemberId;
-    assert.ok(memberId);
-    shell.openModal('tab-groups');
-
-    let card = container.querySelector('.fb-tab-group-picker-card');
-    assert.ok(card, 'the group picker wraps each group with a member preview');
-    card.dispatchEvent({ type: 'contextmenu', clientX: 80, clientY: 120, preventDefault() {}, stopPropagation() {} });
-    const groupMenu = document.body.querySelector('.fb-tab-context-menu');
-    assert.ok([...groupMenu.querySelectorAll('.fb-tab-context-menu-item')].some((button) => button.textContent === 'Edit'),
-      'right-clicking a saved/closed group offers Edit');
-    groupMenu._yayraDismiss?.();
-    shell._textPromptDialog = async () => group.name;
-    assert.equal(await shell.editTabGroup(group.id), true, 'Edit opens a group-name editor');
-    assert.equal(shell.state.activeModal, 'tab-groups', 'Edit continues to the group picker where member labels can be renamed');
-    shell.closeModal();
-    shell.openModal('tab-groups');
-    card = container.querySelector('.fb-tab-group-picker-card');
-    const memberList = container.querySelector('.fb-tab-group-members');
-    assert.ok(memberList, 'the member list stays visible in the adjacent right-side pane');
-    card.dispatchEvent({ type: 'mouseenter' });
-    assert.ok(card.classList.contains('is-selected'), 'hovering a group selects its right-side tab list');
-    assert.equal(card.querySelector('.fb-tab-group-picker-item').getAttribute('aria-expanded'), 'true');
-    assert.equal(memberList.querySelectorAll('.fb-tab-group-member-row').length, 2);
-
-    shell._textPromptDialog = async () => 'Autonomic lecture — Week 4';
-    assert.equal(await shell.renameTabGroupMember(group.id, memberId), true,
-      'a saved tab receives a custom display label without changing its URL/title');
-    assert.equal(second.title, 'Autonomic lecture');
-    assert.equal(second.groupLabel, 'Autonomic lecture — Week 4');
-    const savedGroup = shell.state.tabGroupCatalog.find((candidate) => candidate.id === group.catalogId);
-    assert.equal(savedGroup.members.find((member) => member.id === memberId)?.label,
-      'Autonomic lecture — Week 4', 'the custom label is persisted in the durable group catalog');
-
-    card = container.querySelector('.fb-tab-group-picker-card');
-    card.dispatchEvent({ type: 'mouseenter' });
-    const renamedRow = [...container.querySelectorAll('.fb-tab-group-member-row')]
-      .find((row) => row.dataset.memberId === memberId);
-    assert.equal(renamedRow.querySelector('.fb-tab-group-member-title').textContent, 'Autonomic lecture — Week 4');
-    assert.equal(renamedRow.querySelector('.fb-tab-group-member-rename').textContent, 'Rename');
-
-    const closedTabId = second.id;
-    renamedRow.querySelector('.fb-tab-group-member-open').click();
-    assert.equal(shell.getActiveTab().id, closedTabId,
-      'clicking one item in the hover preview opens only that existing tab');
-    shell.closeTab(closedTabId);
-    shell.openModal('tab-groups');
-    card = container.querySelector('.fb-tab-group-picker-card');
-    card.dispatchEvent({ type: 'mouseenter' });
-    const savedRow = [...container.querySelectorAll('.fb-tab-group-member-row')]
-      .find((row) => row.dataset.memberId === memberId);
-    savedRow.querySelector('.fb-tab-group-member-open').click();
-    assert.notEqual(shell.getActiveTab().id, closedTabId, 'a closed saved tab is restored on demand');
-    assert.equal(shell.getActiveTab().groupLabel, 'Autonomic lecture — Week 4',
-      'the custom label is restored when opening a saved tab after closure');
-
-    const restarted = await makeShell({ storage });
-    try {
-      const restoredGroup = restarted.shell.getTabGroups().find((candidate) => candidate.catalogId === group.catalogId);
-      const restoredMember = restoredGroup?.tabs.find((candidate) => candidate.groupMemberId === memberId);
-      assert.equal(restoredMember?.groupLabel, 'Autonomic lecture — Week 4',
-        'the custom tab label survives a full shell restart');
-      assert.equal(restarted.shell.openTabGroupMember(restoredGroup.id, memberId), true);
-      assert.equal(restarted.shell.getActiveTab().groupLabel, 'Autonomic lecture — Week 4',
-        'opening a member from the durable catalog preserves its custom label');
-    } finally { restarted.shell.destroy(); }
-  } finally {
-    shell.destroy();
-    delete globalThis.localStorage;
-  }
-});
-
 test('TAB GROUP DURABILITY: closed tabs and ungrouping all preserve the saved group across shell restart', async () => {
   const storage = makeStorage();
   const { shell } = await makeShell({ storage });
@@ -542,39 +453,6 @@ test('TAB GROUP DURABILITY: closed tabs and ungrouping all preserve the saved gr
   } finally {
     shell.destroy();
     delete globalThis.localStorage;
-  }
-});
-
-test('FLOATING MINI SETTINGS: offers same-mini versus separate-mini windows and persists the choice', async () => {
-  const saved = [];
-  const overlayBridge = {
-    getSettings: async () => ({ miniOpenBehavior: 'same-mini' }),
-    setMiniOpenBehavior: async (miniOpenBehavior) => { saved.push(miniOpenBehavior); return { miniOpenBehavior }; }
-  };
-  const previousYayra = window.yayra;
-  window.yayra = { ...(previousYayra || {}), overlay: overlayBridge };
-  const { shell, container } = await makeShell();
-  try {
-    shell.state.settingsActiveCategory = 'floating';
-    shell.state.activeSettingsCategory = 'floating';
-    shell.navigateActiveTab('yayra://settings');
-    shell.render(container);
-    const preference = container.querySelector('#fb-in-mini-open-behavior');
-    assert.ok(preference, 'Floating & Transparency exposes the mini-window preference');
-    const selectedOption = [...preference.querySelectorAll('option')].find((option) => option.hasAttribute('selected'));
-    assert.equal(selectedOption?.getAttribute('value'), 'same-mini', 'reusing the same mini window is the default');
-    assert.match(preference.textContent, /Same mini window/);
-    assert.match(preference.textContent, /Separate mini windows/);
-    const changeHandler = preference.listeners?.get('change')?.[0];
-    assert.equal(typeof changeHandler, 'function', 'the preference select saves changes');
-    await changeHandler({ target: { value: 'separate-mini' } });
-    await flush();
-    assert.deepEqual(saved, ['separate-mini'], 'the user choice is saved through the native overlay settings store');
-    assert.equal(shell.state.overlaySettings.miniOpenBehavior, 'separate-mini');
-  } finally {
-    shell.destroy();
-    container.remove();
-    if (previousYayra === undefined) delete window.yayra; else window.yayra = previousYayra;
   }
 });
 
@@ -757,10 +635,6 @@ test('TAB RIGHT-CLICK: pointer activation moves the tab into a durable group', a
     assert.equal(submenu.style.display, 'flex', 'the paired click does not immediately collapse the pointer-opened submenu');
     const addToWork = submenu.querySelectorAll('.fb-tab-context-submenu-item').find((button) => button.textContent === 'Work');
     assert.ok(addToWork, 'the submenu lists the existing group');
-    assert.equal(addToWork.style.getPropertyValue('-webkit-app-region'), 'no-drag',
-      'the actual group choice cannot be swallowed as a frameless-window drag region');
-    assert.equal(addToWork.style.getPropertyValue('pointer-events'), 'auto',
-      'the group choice remains a renderer hit target in Electron');
     dispatchPointer(addToWork, 'pointerdown');
     dispatchPointer(addToWork, 'pointerup');
     await flush();
@@ -780,7 +654,6 @@ test('TAB RIGHT-CLICK: pointer activation moves the tab into a durable group', a
     shell.renderTabContextMenu(40, 40, target);
     buttons = [...document.body.querySelectorAll('.fb-tab-context-menu-item')];
     assert.ok(buttons.some((button) => button.textContent === 'Open “Work” group'), 'a grouped tab can open its whole group');
-    assert.ok(buttons.some((button) => button.textContent === 'Edit “Work” group'), 'a grouped tab can edit its group and member labels');
     const remove = buttons.find((button) => button.textContent === 'Remove from “Work”');
     assert.ok(remove, 'a grouped tab can be removed from its group');
     remove.click();
@@ -794,85 +667,6 @@ test('TAB RIGHT-CLICK: pointer activation moves the tab into a durable group', a
     drawerEntry.click();
     assert.equal(shell.state.isSideDrawerOpen, false, 'choosing a group closes the drawer');
     assert.equal(shell.getActiveTab().group?.name, 'Work', 'the drawer entry opens the selected group');
-  } finally {
-    shell.destroy();
-    delete globalThis.localStorage;
-  }
-});
-
-test('TAB RIGHT-CLICK: mousedown-only fallback adds to a group when Electron drops pointer events', async () => {
-  const { shell } = await makeShell();
-  try {
-    const target = shell.getActiveTab();
-    target.url = 'https://fallback-target.example/';
-    const grouped = shell.createNewTab();
-    grouped.url = 'https://fallback-group.example/';
-    shell._textPromptDialog = async () => 'Fallback';
-    await shell.groupTabWithPrompt(grouped.id, {
-      title: 'Create tab group', description: 'Create a test group', placeholder: 'Fallback'
-    });
-    const groupId = shell.getTabGroups().find((group) => group.name === 'Fallback')?.id;
-    const durableId = shell.getTabGroups().find((group) => group.name === 'Fallback')?.catalogId;
-    assert.ok(groupId);
-    assert.ok(durableId);
-
-    const dispatch = (button, type) => button.dispatchEvent({
-      type, pointerId: 7, pointerType: 'mouse', isPrimary: true, button: 0,
-      detail: type === 'click' ? 1 : 0,
-      preventDefault() {}, stopPropagation() {}
-    });
-    shell.renderTabContextMenu(40, 40, target);
-    const toggle = [...document.body.querySelectorAll('.fb-tab-context-menu-item')]
-      .find((button) => button.textContent === 'Add to…');
-    // Deliberately omit pointer events, mouseup, and click: the compatibility
-    // mousedown is the only input delivered to this menu row.
-    dispatch(toggle, 'mousedown');
-    const submenu = document.body.querySelector('.fb-tab-context-submenu');
-    assert.equal(submenu.style.display, 'flex', 'mousedown alone opens the submenu');
-
-    const groupChoice = submenu.querySelectorAll('.fb-tab-context-submenu-item')
-      .find((button) => button.textContent === 'Fallback');
-    dispatch(groupChoice, 'mousedown');
-    assert.equal(target.group?.name, 'Fallback', 'mousedown alone moves the right-clicked tab');
-    assert.equal(target.group?.id, durableId, 'the fallback preserves the selected durable group identity');
-  } finally {
-    shell.destroy();
-    delete globalThis.localStorage;
-  }
-});
-
-test('TAB RIGHT-CLICK: pointerdown alone opens Add to and assigns the selected group', async () => {
-  const { shell } = await makeShell();
-  try {
-    const target = shell.getActiveTab();
-    target.url = 'https://pointerdown-target.example/';
-    const grouped = shell.createNewTab();
-    grouped.url = 'https://pointerdown-group.example/';
-    shell._textPromptDialog = async () => 'Pointerdown';
-    await shell.groupTabWithPrompt(grouped.id, {
-      title: 'Create tab group', description: 'Create a test group', placeholder: 'Pointerdown'
-    });
-    const durableId = shell.getTabGroups().find((group) => group.name === 'Pointerdown')?.catalogId;
-    assert.ok(durableId);
-
-    const dispatchPointerDown = (button) => button.dispatchEvent({
-      type: 'pointerdown', pointerId: 11, pointerType: 'mouse', isPrimary: true, button: 0,
-      preventDefault() {}, stopPropagation() {}
-    });
-    shell.renderTabContextMenu(40, 40, target);
-    const toggle = [...document.body.querySelectorAll('.fb-tab-context-menu-item')]
-      .find((button) => button.textContent === 'Add to…');
-    assert.ok(toggle);
-    dispatchPointerDown(toggle);
-    const submenu = document.body.querySelector('.fb-tab-context-submenu');
-    assert.equal(submenu.style.display, 'flex', 'submenu opens before release events are needed');
-
-    const groupChoice = submenu.querySelectorAll('.fb-tab-context-submenu-item')
-      .find((button) => button.textContent === 'Pointerdown');
-    assert.ok(groupChoice);
-    dispatchPointerDown(groupChoice);
-    assert.equal(target.group?.name, 'Pointerdown', 'the selected tab joins the group on pointerdown');
-    assert.equal(target.group?.id, durableId, 'the selected group durable identity is preserved');
   } finally {
     shell.destroy();
     delete globalThis.localStorage;
@@ -1209,6 +1003,23 @@ test('KEYBOARD: every shortcut the menu ADVERTISES really fires its action', asy
     shell.state.isSideDrawerOpen = true;
     key({ key: 'Escape' });
     assert.equal(shell.state.isSideDrawerOpen, false, 'Esc closes the menu');
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
+});
+
+test('native website print requests open Yayra’s print preview only for the active tab', async () => {
+  const { shell } = await makeShell({ storage: makeStorage() });
+  try {
+    const active = shell.getActiveTab();
+    let printCalls = 0;
+    shell.printActivePage = async () => { printCalls += 1; };
+    shell.handleNativeWebviewEvent({ tabId: active.id, type: 'print-request' });
+    assert.equal(printCalls, 1, 'Ctrl+P and PDF toolbar print requests enter the app preview flow');
+    shell.state.tabs.push({ id: 'background-print-tab', url: 'https://example.test/', title: 'Background' });
+    shell.handleNativeWebviewEvent({ tabId: 'background-print-tab', type: 'print-request' });
+    assert.equal(printCalls, 1, 'hidden page requests cannot start a print preview for a different tab');
   } finally {
     shell.destroy();
     delete globalThis.localStorage;

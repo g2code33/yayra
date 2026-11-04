@@ -221,6 +221,10 @@ const activeSitePasskeyRequests = new Map();
 window.addEventListener('message', (event) => {
   if (event.source !== window) return;
   const payload = event.data;
+  if (payload?.source === 'yayra-print-request' && payload.version === 1) {
+    try { ipcRenderer.send('yayra:webview-print-request'); } catch { /* view closed during print request */ }
+    return;
+  }
   if (!payload || payload.source !== 'yayra-site-passkey' || payload.version !== 1) return;
   const phase = payload.phase === 'started' || payload.phase === 'settled' ? payload.phase : null;
   const action = payload.action === 'create' || payload.action === 'get' ? payload.action : null;

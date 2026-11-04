@@ -357,27 +357,18 @@ standalone-PWA compatibility without a cross-site cookie dependency.
 Create a **Web application** OAuth client with exact values:
 
 - Authorized JavaScript origins:
-  - `https://yayra.app` (production custom domain)
-  - `https://yayra.pages.dev` (Cloudflare Pages deployment URL)
-  - `http://localhost:4173` (local development only)
+  - `https://yayra.app`
+  - `https://yayra.pages.dev`
+  - `http://localhost:4173`
 - Authorized redirect URIs:
   - `https://yayra.app/auth/callback`
   - `https://yayra.pages.dev/auth/callback`
-  - `http://localhost:4173/auth/callback` (local development only)
+  - `http://localhost:4173/auth/callback`
 
-In Google Auth Platform → Branding, use the deployed product information pages:
+Public OAuth disclosures:
 
-- Application home page: `https://yayra.app/about/`
 - Privacy policy: `https://yayra.app/privacy/`
-- Terms of Service: `https://yayra.app/terms/`
-- Authorized domain: `yayra.app` (verify domain ownership in Search Console first)
-- Developer contact: `support@yayra.app`
-
-The static policy pages are part of `public/` and are included in the web build.
-Deploy the Pages site before submitting these links to Google, and verify each
-URL opens publicly over HTTPS without a sign-in. Add `https://yayra.app` to the
-Worker's exact `GOOGLE_WEB_ALLOWED_ORIGINS` list and deploy the Worker too; do
-not use a wildcard origin.
+- Terms of service: `https://yayra.app/terms/`
 
 Put the confidential Web client values only on the Worker:
 

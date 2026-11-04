@@ -779,10 +779,13 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null,
       mountedContainer.appendChild?.(root);
       bindScroll();
       refreshPageBoxes();
-      void renderWindow(viewerState.page);
+      // A renderer may discard canvas backing stores while its browser tab is
+      // backgrounded. Repaint the visible window when the document is mounted
+      // again instead of trusting cached page keys from the previous tab.
+      void renderWindow(viewerState.page, true);
     } else if (pdfDoc && viewerState.status === 'ready') {
       buildPages();
-      void renderWindow(viewerState.page);
+      void renderWindow(viewerState.page, true);
     }
     notify();
     return Promise.resolve(viewerState);

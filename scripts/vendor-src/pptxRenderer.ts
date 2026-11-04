@@ -1995,6 +1995,14 @@ function parseSp(sp: Element, ctx: ShapeCtx): PptxShape | null {
   const hasTextContent = () => Boolean(text?.paragraphs.some((paragraph) =>
     paragraph.runs.some((run) => run.text || run.mathMl),
   ));
+  // PowerPoint and WPS also serialize simple lines/connectors as p:sp with a
+  // line preset (rather than p:cxnSp). The ordinary shape path ignores
+  // line-only shapes with no fill or text, making their strokes disappear.
+  // Route these geometry-only shapes through the shared connector parser so
+  // they retain their stroke, direction, dash and arrowheads.
+  if (!hasTextContent() && /^(?:line(?:Inv)?|(?:bent|curved|elbow|straight)Connector\d*)$/i.test(prst || '')) {
+    return parseCxnSp(sp, ctx);
+  }
   // Some producers leave the cached a:fld value empty. A slide-number field
   // still has deterministic local meaning and must remain visible.
   if (phType === 'sldNum' && !hasTextContent()) {

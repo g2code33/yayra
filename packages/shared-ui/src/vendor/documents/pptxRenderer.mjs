@@ -4926,6 +4926,9 @@ function parseSp(sp, ctx) {
   const hasTextContent = () => Boolean(text?.paragraphs.some(
     (paragraph) => paragraph.runs.some((run) => run.text || run.mathMl)
   ));
+  if (!hasTextContent() && /^(?:line(?:Inv)?|(?:bent|curved|elbow|straight)Connector\d*)$/i.test(prst || "")) {
+    return parseCxnSp(sp, ctx);
+  }
   if (phType === "sldNum" && !hasTextContent()) {
     text = {
       paragraphs: [{ runs: [{ text: String(ctx.slideNumber) }], level: 0 }],

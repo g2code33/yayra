@@ -213,28 +213,10 @@ test('mini shell keeps a separate profile-scoped snapshot and does not consume m
   assert.equal(mainReload.shell.state.recentTabsOffer?.[0]?.url, 'https://main-close.example.test/');
 
   const src = fs.readFileSync(new URL('../packages/shared-ui/src/components/BrowserShell.js', import.meta.url), 'utf8');
-  assert.match(src, /scoped\.get\(`\$\{miniSessionScope\}\$\{key\}`\)/, 'each mini session has its own key namespace within the profile');
+  assert.match(src, /scoped\.get\(`mini:\$\{key\}`\)/, 'mini sessions use their own key namespace within the profile');
   const mainJs = fs.readFileSync(new URL('../src/browser/main.js', import.meta.url), 'utf8');
   assert.match(mainJs, /isMiniShell,/, 'main.js passes the mini flag into the shell');
-  assert.match(mainJs, /onOpenPage\?\.\(\(\{ url, openInNewTab = true \} = \{\}\) => browserShell\.openUrlHandoff/, 'mini listens for main-tab handoffs and applies its tab-opening preference');
-});
-
-test('separate mini windows use independent recovery keys', async () => {
-  disk.clear();
-  const first = await boot({ isMiniShell: true, miniSessionId: 'mini-one' });
-  const second = await boot({ isMiniShell: true, miniSessionId: 'mini-two' });
-  try {
-    const firstKey = first.shell.closeSessionStorageKey();
-    const secondKey = second.shell.closeSessionStorageKey();
-    assert.notEqual(firstKey, secondKey, 'each separate mini has its own close-session record');
-    assert.match(firstKey, /mini:mini-one:close-session/);
-    assert.match(secondKey, /mini:mini-two:close-session/);
-  } finally {
-    first.shell.destroy();
-    second.shell.destroy();
-    first.container.remove();
-    second.container.remove();
-  }
+  assert.match(mainJs, /onOpenPage\?\.\(\(\{ url \} = \{\}\) => browserShell\.openUrlHandoff/, 'mini listens for main-tab handoffs');
 });
 
 test('calculator, dictionary, document hub and website tabs all reappear from the saved session', async () => {

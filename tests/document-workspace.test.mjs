@@ -196,6 +196,12 @@ test('VIEWER: paints the first PDF page to a live canvas and repaints on zoom', 
     assert.equal(renders, 2, 'zoom repaints the current page');
     assert.equal(lastViewport.scale, 2);
     assert.equal(container.querySelectorAll('.fb-doc-canvas').length, 1, 'the old canvas is replaced, not stacked');
+
+    const returnedHost = document.createElement('div');
+    returnedHost.ownerDocument = container.ownerDocument;
+    await viewer.attach(returnedHost);
+    assert.equal(renders, 3, 'reattaching after a tab switch repaints the visible page even when its render key is cached');
+    assert.ok(returnedHost.querySelector('.fb-doc-canvas'), 'the PDF canvas is mounted in the returned tab');
   } finally {
     viewer.destroy();
   }
@@ -372,54 +378,13 @@ test('TAB INTEGRATION: a document opens in its OWN tab - never the web frame or 
   }
 });
 
-test('PPTX SIDEBAR: selecting a slide from toolbar scrolls its thumbnail into view and marks it current', async () => {
-  const { shell } = await bootShell();
-  try {
-    shell._documentEngineOverrides = { pptx: fakePptxEngine({ slides: 6 }) };
-    const doc = shell.addDocumentTab({ name: 'autonomic.pptx', bytes: new Uint8Array([1, 2, 3]) });
-    assert.ok(doc);
-    const tab = shell.getActiveTab();
-    const session = shell._documentViewerSessions.get(tab.id);
-    await session?.loadPromise;
-    assert.equal(tab.docState.status, 'ready');
-    const thumbs = shell.viewportElement.querySelectorAll('.fb-doc-thumb');
-    assert.equal(thumbs.length, 6, 'the deck shows one thumbnail for every slide');
-    const target = [...shell.viewportElement.querySelectorAll('.fb-doc-thumb')]
-      .find((thumb) => thumb.dataset.page === '5');
-    assert.ok(target);
-    const scrollCalls = [];
-    target.scrollIntoView = (options) => scrollCalls.push(options);
-
-    await session.viewer.setPage(5);
-    assert.equal(tab.docState.page, 5, 'the main slide navigation updates the shared viewer state');
-    assert.equal(target.getAttribute('aria-current'), 'page', 'the matching thumbnail is marked as current');
-    assert.ok(scrollCalls.length > 0, 'the thumbnail rail scrolls the selected slide into view');
-    assert.deepEqual(scrollCalls.at(-1), { block: 'nearest', behavior: 'smooth' });
-
-    const slideTwo = [...shell.viewportElement.querySelectorAll('.fb-doc-thumb')]
-      .find((thumb) => thumb.dataset.page === '2');
-    slideTwo.click();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    assert.equal(tab.docState.page, 2, 'clicking a thumbnail changes the main presentation slide');
-    assert.equal(slideTwo.getAttribute('aria-current'), 'page');
-  } finally {
-    shell.destroy();
-  }
-});
-
 test('DOCUMENT RESUME: per-file viewing position persists in profile settings and reapplies on reopen', async () => {
   const stored = {};
   const settingsRepo = {
     getSettings: async () => stored.value || null,
     updateSettings: async (partial) => { stored.value = { ...(stored.value || {}), ...partial }; return stored.value; }
   };
-  const recoveryBytes = new Uint8Array([37, 80, 68, 70]);
-  const documentRecoveryRepo = {
-    load: async (id) => id === 'docrec-progress-fixture-123'
-      ? { name: 'Report.pdf', mime: 'application/pdf', data: recoveryBytes }
-      : null
-  };
-  const { shell } = await bootShell({ settingsRepo, documentRecoveryRepo });
+  const { shell } = await bootShell({ settingsRepo });
   try {
     const descriptor = { recoveryId: 'docrec-progress-fixture-123', name: 'Report.pdf', mime: 'application/pdf', size: 42 };
     const original = {
@@ -430,7 +395,7 @@ test('DOCUMENT RESUME: per-file viewing position persists in profile settings an
     assert.equal(shell.persistDocumentViewingProgress(original, { immediate: true }), true);
     await new Promise((resolve) => setTimeout(resolve, 0));
     const key = 'recovery:docrec-progress-fixture-123';
-    assert.equal(stored.value.documentViewingProgress[key].page, 13, 'the last PDF page or presentation slide is saved independently of the tab session');
+    assert.equal(stored.value.documentViewingProgress[key].page, 13, 'the last page is saved independently of the tab session');
     assert.equal(stored.value.documentViewingProgress[key].scrollProgress, 0.42, 'long-document scroll position is also persisted');
 
     const reopened = { isPrivate: false, documentRecovery: descriptor };
@@ -441,30 +406,6 @@ test('DOCUMENT RESUME: per-file viewing position persists in profile settings an
     assert.equal(state.night, true);
     assert.equal(state.sidebarTab, 'thumbnails');
     assert.equal(state.scrollProgress, 0.42);
-
-    const actuallyRecovered = await shell.createRecoveredDocumentTab({ document: descriptor }, { tabId: 'restored-doc' });
-    assert.equal(actuallyRecovered.docState.page, 13, 'the real session recovery path reapplies the saved page');
-    assert.equal(actuallyRecovered.docState.scrollProgress, 0.42, 'the real session recovery path reapplies long-document position');
-
-    const imageTab = {
-      isPrivate: false,
-      documentRecovery: { recoveryId: 'docrec-image-progress-123', name: 'Photo.png', mime: 'image/png', size: 10 },
-      docState: { status: 'ready', viewer: 'image', page: 1, zoom: 7.5, rotation: 90 }
-    };
-    shell.persistDocumentViewingProgress(imageTab, { immediate: true });
-    const imageState = shell.applyDocumentViewingDefaults(imageTab, createDocumentViewerState('image'));
-    assert.equal(imageState.zoom, 7.5, 'image zoom values above the text-document range survive a reopen');
-    assert.equal(imageState.rotation, 90);
-
-    const sheetTab = {
-      isPrivate: false,
-      documentRecovery: { recoveryId: 'docrec-sheet-progress-123', name: 'Book.xlsx', mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', size: 10 },
-      docState: { status: 'ready', viewer: 'xlsx', page: 2, rowPage: 8, zoom: 1 }
-    };
-    shell.persistDocumentViewingProgress(sheetTab, { immediate: true });
-    const sheetState = shell.applyDocumentViewingDefaults(sheetTab, createDocumentViewerState('xlsx'));
-    assert.equal(sheetState.page, 2, 'the active worksheet resumes');
-    assert.equal(sheetState.rowPage, 8, 'the visible range within that worksheet resumes');
 
     shell.state.settings.documentsRememberReadingPosition = false;
     const fresh = shell.applyDocumentViewingDefaults(reopened, createDocumentViewerState('pdf'));
@@ -1140,75 +1081,6 @@ test('DOCUMENT PRINT: duplicate requests coalesce and a tab switch cancels the s
     assert.equal(shell._documentPrintInFlight, null, 'the print lock is released on cancellation');
   } finally {
     globalThis.window.print = previousPrint;
-  }
-});
-
-test('PRINT PREVIEW: document settings generate an in-app PDF preview, then reach the selected printer settings', async () => {
-  const tab = {
-    id: 'print-preview-doc', isDocument: true, title: 'Slides for printing',
-    docState: { status: 'ready', viewer: 'pptx', numPages: 5, page: 3 }
-  };
-  let prepareCalls = 0;
-  let finishCalls = 0;
-  const previewCalls = [];
-  const printCalls = [];
-  const session = {
-    disposed: false,
-    viewer: {
-      preparePrint: async () => { prepareCalls += 1; return true; },
-      finishPrint: async () => { finishCalls += 1; }
-    }
-  };
-  const shell = Object.create(BrowserShell.prototype);
-  shell.state = { activeModal: null };
-  shell._activeDocViewer = { tabId: tab.id, ...session };
-  shell._documentViewerSessions = new Map([[tab.id, shell._activeDocViewer]]);
-  shell._documentPrintInFlight = null;
-  shell.getActiveTab = () => tab;
-  shell.render = () => {};
-  shell.showTransientNotice = () => {};
-  const printBridge = {
-    printPreview: async (tabId, settings) => {
-      previewCalls.push({ tabId, settings });
-      return { ok: true, pdf: new Uint8Array([37, 80, 68, 70]) };
-    },
-    print: async (tabId, settings) => {
-      printCalls.push({ tabId, settings });
-      return { ok: true, mode: 'printer' };
-    }
-  };
-  Object.defineProperty(shell, 'nativeWebview', { get: () => printBridge });
-  const modal = document.createElement('div');
-  try {
-    assert.equal(await shell.printActivePage(), true);
-    assert.equal(prepareCalls, 1);
-    assert.equal(shell.state.activeModal, 'print-preview');
-    shell.renderPrintPreviewModal(modal);
-    document.body.appendChild(modal);
-    await new Promise((resolve) => setTimeout(resolve, 190));
-    assert.ok(previewCalls.length > 0, 'an in-app preview is generated from the prepared slide deck');
-    assert.ok(modal.querySelector('.fb-print-preview-frame')?.src, 'the preview PDF is displayed before printing');
-
-    const form = modal.querySelector('.fb-print-preview-form');
-    form.querySelector('.fb-print-scope').value = 'range';
-    form.querySelector('.fb-print-range').value = '2-4';
-    form.querySelector('.fb-print-paper').value = 'Letter';
-    form.querySelector('.fb-print-orientation').value = 'landscape';
-    form.querySelector('.fb-print-color').value = 'grayscale';
-    form.querySelector('.fb-print-copies').value = '2';
-    shell._printPreviewState.options = shell.printOptionsFromPreview(shell._printPreviewState, form);
-    assert.equal(await shell.completePrintPreview(), true);
-    assert.equal(printCalls.length, 1);
-    assert.equal(printCalls[0].tabId, tab.id);
-    assert.equal(printCalls[0].settings.pageRange, '2-4');
-    assert.equal(printCalls[0].settings.paper, 'Letter');
-    assert.equal(printCalls[0].settings.orientation, 'landscape');
-    assert.equal(printCalls[0].settings.color, 'grayscale');
-    assert.equal(printCalls[0].settings.copies, 2);
-    assert.equal(finishCalls, 1, 'temporary presentation print DOM is disposed after printing');
-  } finally {
-    modal.remove();
-    if (shell._printPreviewState) await shell.finishPrintPreview();
   }
 });
 

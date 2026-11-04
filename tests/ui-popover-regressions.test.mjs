@@ -31,23 +31,24 @@ test('tab-group picker rows are width-safe and cannot create the horizontal scro
   const list = ruleBody('.fb-tab-groups-picker-list');
   const item = ruleBody('.fb-tab-group-picker-item');
   const popover = ruleBody('.fb-modal-card.fb-tab-groups-popover');
+  const picker = ruleBody('.fb-tab-groups-picker-list.fb-tab-groups-picker');
+  const flyout = ruleBody('.fb-tab-group-hover-flyout');
 
   assert.match(list, /overflow-x:\s*hidden/, 'the picker clips accidental horizontal overflow');
   assert.match(item, /box-sizing:\s*border-box/, '100% row width includes its padding and border');
   assert.match(item, /min-width:\s*0/, 'long titles may shrink inside the row');
   assert.match(item, /overflow:\s*hidden/, 'long tab details stay inside the rounded row');
   assert.match(popover, /background:\s*#[0-9a-f]{6}/i, 'popover owns an opaque background');
-  const picker = css.match(/\.fb-tab-groups-picker-list\.fb-tab-groups-picker\s*\{([^}]*)\}/)?.[1] || '';
-  assert.match(picker, /display:\s*grid/, 'member tabs are displayed beside their group instead of below it');
-  assert.match(picker, /grid-template-columns:/, 'the group rail and tab panel have separate columns');
+  assert.match(picker, /display:\s*flex/, 'the group picker stays a compact single column');
+  assert.doesNotMatch(picker, /grid-template-columns:/, 'member previews do not widen the picker into a permanent second pane');
+  assert.match(flyout, /position:\s*fixed/, 'hovered group members render in a separate anchored flyout');
   const docViewer = css.match(/\.fb-doc-viewer\s*\{([^}]*)\}/)?.[1] || '';
-  assert.match(docViewer, /min-width:\s*0/, 'document controls cannot widen and shift the app viewport');
-  assert.match(ruleBody('.fb-doc-toolbar2'), /flex-wrap:\s*wrap !important/,
-    'document controls wrap within the viewport instead of clipping at its left edge');
+  assert.match(docViewer, /min-width:\s*0/, 'document controls cannot widen and shift the entire app viewport');
+  assert.match(ruleBody('.fb-doc-toolbar2'), /flex-wrap:\s*wrap !important/, 'document controls wrap instead of leaving their first controls clipped offscreen');
 });
 
 
-test('tab-group picker opens selected tabs in a right-side pane', async () => {
+test('compact tab-group picker previews tabs to the right on hover and closes when the pointer leaves', async () => {
   delete globalThis.window.yayra;
   const container = document.createElement('div');
   const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
@@ -61,17 +62,37 @@ test('tab-group picker opens selected tabs in a right-side pane', async () => {
 
     shell.openModal('tab-groups');
     const picker = container.querySelector('.fb-tab-groups-picker-list');
-    assert.ok(picker?.classList.contains('fb-tab-groups-picker'));
-    assert.ok(picker.querySelector('.fb-tab-groups-picker-groups'), 'group names stay in the left rail');
-    const members = picker.querySelector('.fb-tab-group-members');
-    assert.ok(members, 'member tabs display in the adjacent right-side pane');
-    assert.equal(members.querySelectorAll('.fb-tab-group-member-row').length, 2);
-    assert.equal(members.querySelectorAll('.fb-tab-group-member-rename').length, 2,
-      'custom tab labels stay editable');
+    assert.ok(picker?.classList.contains('fb-tab-groups-picker'), 'the picker uses a compact single-column layout');
+    assert.ok(picker.querySelector('.fb-tab-groups-picker-groups'), 'only group choices occupy the main picker');
+    assert.equal(picker.querySelector('.fb-tab-group-members'), null, 'the member preview is not permanently shown');
 
+    const card = picker.querySelector('.fb-tab-group-picker-card');
+    card.getBoundingClientRect = () => ({ left: 40, right: 300, top: 60, bottom: 110 });
+    card.dispatchEvent({ type: 'mouseenter' });
+    let flyout = document.body.querySelector('.fb-tab-group-hover-flyout');
+    assert.ok(flyout, 'hovering a group opens its member preview');
+    assert.equal(flyout.style.left, '308px', 'the preview opens immediately to the right of the hovered group');
+    assert.equal(flyout.querySelectorAll('.fb-tab-group-member-open').length, 2,
+      'all member tabs are listed in the hover preview');
+
+    card.dispatchEvent({ type: 'mouseleave' });
+    flyout.dispatchEvent({ type: 'mouseenter' });
+    await new Promise((resolve) => setTimeout(resolve, 165));
+    assert.equal(document.body.querySelector('.fb-tab-group-hover-flyout'), flyout,
+      'moving from the group row into its preview keeps it open');
+    flyout.dispatchEvent({ type: 'mouseleave' });
+    await new Promise((resolve) => setTimeout(resolve, 165));
+    assert.equal(document.body.querySelector('.fb-tab-group-hover-flyout'), null,
+      'the preview closes after the pointer leaves the group and preview');
+
+    card.dispatchEvent({ type: 'mouseenter' });
+    flyout = document.body.querySelector('.fb-tab-group-hover-flyout');
     const target = group.tabs[1];
-    members.querySelectorAll('.fb-tab-group-member-open')[1].click();
-    assert.equal(shell.getActiveTab().id, target.id, 'the selected tab opens directly');
+    flyout.querySelectorAll('.fb-tab-group-member-open')[1].click();
+    assert.equal(shell.getActiveTab().id, target.id,
+      'choosing a member from the hover preview opens that tab as the active tab');
+    assert.equal(document.body.querySelector('.fb-tab-group-hover-flyout'), null,
+      'opening a member also removes the transient preview');
   } finally {
     shell.destroy();
     delete globalThis.localStorage;
@@ -90,7 +111,9 @@ test('custom tab hover card replaces the native title tooltip and remains readab
     const el = shell.render(container);
     const tab = el.querySelector('.fb-tab-item');
     tab.getBoundingClientRect = () => ({ left: 170, bottom: 68 });
-    shell.viewportElement.getBoundingClientRect = () => ({ top: 130 });
+    el.querySelector('.fb-chrome-tabstrip').getBoundingClientRect = () => ({ bottom: 72 });
+    el.querySelector('.fb-chrome-navbar').getBoundingClientRect = () => ({ bottom: 112 });
+    shell.viewportElement.getBoundingClientRect = () => ({ top: 170 });
 
     assert.equal(tab.getAttribute('title'), null,
       'no native title attribute exists to draw a duplicate tooltip');
@@ -103,8 +126,8 @@ test('custom tab hover card replaces the native title tooltip and remains readab
     assert.equal(card.getAttribute('role'), 'tooltip');
     assert.equal(card.querySelector('strong')?.textContent, 'New Tab');
     assert.equal(card.querySelector('span')?.textContent, 'newtab');
-    assert.equal(card.style.top, '68px',
-      'the full tooltip is clamped above the native page surface instead of sinking behind it');
+    assert.equal(card.style.top, '118px',
+      'the tooltip starts below the navigation/address toolbar, not between the tab strip and toolbar');
 
     const hoverRule = ruleBody('.fb-tab-hover-card');
     assert.match(hoverRule, /z-index:\s*2147483647/,

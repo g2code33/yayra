@@ -283,13 +283,10 @@ export class BrowserShell {
       if (!this.storageAdapter) this.storageAdapter = scoped;
       this.wheelRepo = options.wheelRepo || createWheelRepo(scoped);
       this.shortcutsRepo = options.shortcutsRepo || createShortcutsRepo(scoped);
-      const miniSessionScope = options.miniSessionId
-        ? `mini:${encodeURIComponent(String(options.miniSessionId))}:`
-        : 'mini:';
       const sessionStorage = options.isMiniShell
         ? {
-          get: (key) => scoped.get(`${miniSessionScope}${key}`),
-          set: (key, value) => scoped.set(`${miniSessionScope}${key}`, value)
+          get: (key) => scoped.get(`mini:${key}`),
+          set: (key, value) => scoped.set(`mini:${key}`, value)
         }
         : scoped;
       this.sessionRepo = options.sessionRepo || createSessionRepo(sessionStorage);
@@ -457,7 +454,7 @@ export class BrowserShell {
       // System-wide floating overlay bubble (see electron/overlayWindow.cjs).
       // These mirror the Electron-side defaults so the UI shows sane values
       // even before overlayBridge.getSettings() resolves.
-      overlaySettings: { enabled: true, launchAtStartup: true, overlayAllApps: true, positionLocked: false, shadowPx: 0, miniOpenBehavior: 'same-mini' },
+      overlaySettings: { enabled: true, launchAtStartup: true, overlayAllApps: true, positionLocked: false, shadowPx: 0 },
       passwordsItems: [],
       // API keys / tokens / secure notes living in the same encrypted vault.
       vaultKeysItems: [],
@@ -774,6 +771,8 @@ export class BrowserShell {
     this._inAppOnlyGoogleTabs = new Set();
     this._ownedMediaUrlsByTab = new Map();
     this._nativeWebviewResizeObservers = new Map();
+    this._nativeWebviewVisibilityByTab = new Map();
+    this._nativeWebviewBoundsByTab = new Map();
     this._lastAppliedNativePointerConfig = null;
     this._lastAppliedAndroidPointerConfig = null;
     this._unsubscribeNativeWebview = null;
@@ -959,6 +958,18 @@ export class BrowserShell {
     return bridge && typeof bridge.close === 'function' ? bridge : null;
   }
 
+  getSystemTopInset() {
+    if (!this.windowControls || this.options?.isMiniShell || this.state?.isMobile
+      || typeof window === 'undefined' || !window.screen) return 0;
+    const availableTop = Number(window.screen.availTop);
+    const windowTop = Number(window.screenY);
+    if (!Number.isFinite(availableTop) || !Number.isFinite(windowTop)) return 0;
+    // Frameless windows have no native titlebar to keep their contents below
+    // a desktop panel. Align the renderer chrome with the OS work-area edge
+    // when the window itself starts above it (e.g. a top GNOME panel).
+    return Math.max(0, Math.min(96, Math.ceil(availableTop - windowTop)));
+  }
+
   // window.yayra.updates (exposed by electron/preload.cjs, backed by
   // electron/desktopUpdater.cjs): main-process download+verify+install for
   // desktop updates. Only treated as present when the REAL pipeline
@@ -1012,6 +1023,62 @@ export class BrowserShell {
       s.updateInstallPrompt ||
       s.isPageObscured
     );
+  }
+
+  /**
+   * Refresh only the transient overlay subtree for chrome-only toggles. The
+   * page, tab strip, toolbar and focused address field stay mounted, avoiding
+   * the visible white flash and unnecessary native/web frame synchronization
+   * caused by rebuilding the full shell for a menu or dropdown click.
+   */
+  renderOverlayLayerInPlace() {
+    const layer = this.overlayLayer;
+    if (!layer || !layer.parentElement || !this.rootElement
+        || this.state.isMinimizedToBubble || this.state.isFloatingMiniOpen
+        || this.state.isRadialLauncherOpen) {
+      this.render();
+      return false;
+    }
+
+    layer.innerHTML = '';
+    this.renderActiveModal(layer);
+    if (this.state.isSideDrawerOpen) this.renderSideDrawer(layer);
+    if (this.state.isSecurityDropdownOpen) this.renderSecurityDropdown(layer);
+    if (this.state.isAccountMenuOpen) this.renderAccountDropdown(layer);
+    if (this.state.isDownloadsDropdownOpen) this.renderDownloadsDropdown(layer);
+    if (this.state.isToolsDropdownOpen) this.renderToolsDropdown(layer);
+    if (this.state.profileSuggestion) this.renderProfileSuggestionCard(layer);
+    if (this.state.closePrompt) this.renderClosePromptModal(layer);
+    if (this.state.recentTabsOffer?.length) this.renderRecentTabsOffer(layer);
+    if (this.state.findInPage?.isOpen) this.renderFindInPageBar(layer);
+    if (this.state.pendingPasswordSave) this.renderPasswordSaveBar(layer);
+
+    const tab = this.getActiveTab();
+    if (tab && this._androidTabWebIds?.has?.(tab.id)) {
+      const url = tab.url || '';
+      const isInternal = !url || url === 'about:blank' || url.startsWith('yayra://');
+      const blockPage = !isInternal && !this.isSystemBrowserAuthHost(url)
+        && !this.isGoogleAccountConnectionUrl(url) && !this.isGmailProductUrl(url)
+        && !this._siteFailureFor(tab);
+      this.syncAndroidTabWebVisibility(tab.id, blockPage && !this.hasBlockingOverlay());
+    }
+    if (tab && this.nativeWebview && this._nativeWebviewTabIds.has(tab.id)) {
+      const url = tab.url || '';
+      const isInternal = !url || url === 'about:blank' || url.startsWith('yayra://');
+      const blockPage = !isInternal && !this.isSystemBrowserAuthHost(url)
+        && !this.isGoogleAccountConnectionUrl(url) && !this.isGmailProductUrl(url)
+        && !this._siteFailureFor(tab);
+      const obscured = blockPage && this.hasBlockingOverlay();
+      if (obscured) {
+        this.ensureNativePageSnapshotPlaceholder(tab.id);
+        this.syncNativeWebviewVisibility(tab.id, false, { captureActive: true });
+      } else {
+        this.viewportElement?.querySelectorAll('.fb-page-snapshot-img').forEach((img) => img.remove());
+        this.syncNativeWebviewVisibility(tab.id, blockPage);
+        if (blockPage) this.restoreActiveNativeBounds(tab.id);
+      }
+    }
+    return true;
   }
 
   isGoogleAccountConnectionUrl(url) {
@@ -1450,7 +1517,7 @@ export class BrowserShell {
 
   toggleAccountMenu() {
     this.state.isAccountMenuOpen = !this.state.isAccountMenuOpen;
-    this.render();
+    this.renderOverlayLayerInPlace();
   }
 
   handleGoogleAuthEvent(evt) {
@@ -1497,45 +1564,9 @@ export class BrowserShell {
         this.handleAccountSignal(evt.profile?.email, { source: 'yayra-account' });
         this.showTransientNotice(`Google connected to Yayra${evt.profile?.email ? ` as ${evt.profile.email}` : ''}.`);
         break;
-      case 'gmail-connected': {
-        const profile = evt.profile || this.state.googleAccount?.profile || null;
-        if (profile) {
-          this.state.googleAccount = {
-            status: 'signed-in',
-            signedIn: true,
-            profile,
-            error: null,
-            savedAt: evt.savedAt || this.state.googleAccount?.savedAt || new Date().toISOString()
-          };
-          for (const record of this._googleAccountConnections.values()) {
-            record.status = 'connected';
-            record.error = null;
-            record.autoStart = false;
-          }
-          this.handleAccountSignal(profile.email, { source: 'yayra-account' });
-        }
-        this.showTransientNotice(`Gmail is ready inside Yayra${profile?.email ? ` for ${profile.email}` : ''}.`);
-
-        // A Gmail view may have rendered its reconnect card before the
-        // external OAuth handoff completed. The signed-in event updates the
-        // account header, but that does not change the view's `reconnect`
-        // state. Retry every open Gmail tab now that the scoped credential
-        // has been stored, so the successful grant is visible immediately.
-        let needsRender = false;
-        for (const tab of this.state.tabs || []) {
-          if (!this.isGmailProductUrl(tab?.url)) continue;
-          const view = this._gmailViews.get(tab.id);
-          if (!view) {
-            needsRender = true;
-          } else if (['reconnect', 'error', 'loading', 'loading-more'].includes(view.status)) {
-            // Supersede a request that may have raced the credential save; the
-            // generation guard discards its stale response if it arrives later.
-            this._loadGmailMessages(tab.id).catch(() => {});
-          }
-        }
-        if (needsRender) this.render();
+      case 'gmail-connected':
+        this.showTransientNotice(`Gmail is ready inside Yayra${evt.profile?.email ? ` for ${evt.profile.email}` : ''}.`);
         break;
-      }
       case 'google-services-connected':
         this.state.googleServices = {
           status: 'signed-in',
@@ -2144,24 +2175,12 @@ export class BrowserShell {
       }
       if (typeof this.overlayBridge.onDictionaryLookup === 'function') {
         try {
-          this._unsubscribeDictionaryLookup = this.overlayBridge.onDictionaryLookup(({ url, openInNewTab = true } = {}) => {
+          this._unsubscribeDictionaryLookup = this.overlayBridge.onDictionaryLookup(({ url } = {}) => {
             if (typeof url !== 'string' || !/^yayra:\/\/dictionary(?:\?|$)/i.test(url)) return;
             const current = this.getActiveTab();
-            if (openInNewTab !== false) {
-              this.createNewTab(Boolean(current?.isPrivate), { afterTabId: current?.id || null, group: current?.group || null });
-            }
+            this.createNewTab(Boolean(current?.isPrivate), { afterTabId: current?.id || null, group: current?.group || null });
             this.navigateActiveTab(url);
             this.render();
-          });
-        } catch { /* older preload without the channel */ }
-      }
-      if (typeof this.overlayBridge.onMiniOpenPreference === 'function') {
-        try {
-          this._unsubscribeMiniOpenPreference = this.overlayBridge.onMiniOpenPreference((behavior) => {
-            const miniOpenBehavior = behavior === 'separate-mini' ? 'separate-mini' : 'same-mini';
-            this.state.overlaySettings = { ...this.state.overlaySettings, miniOpenBehavior };
-            const control = this.rootElement?.querySelector?.('#fb-in-mini-open-behavior');
-            if (control) control.value = miniOpenBehavior;
           });
         } catch { /* older preload without the channel */ }
       }
@@ -2317,6 +2336,21 @@ export class BrowserShell {
     return this.state.tabs.find((t) => t.id === this.state.activeTabId) || this.state.tabs[0];
   }
 
+  dismissTabHoverCard() {
+    if (this._tabHoverTimer) clearTimeout(this._tabHoverTimer);
+    this._tabHoverTimer = null;
+    this._activeTabHoverCard?.remove?.();
+    this._activeTabHoverCard = null;
+    const obscuredTabId = this._tabHoverObscuredTabId;
+    this._tabHoverObscuredTabId = null;
+    if (!obscuredTabId || !this.state?.isPageObscured || this.state.activeTabId !== obscuredTabId) return;
+    const state = this.state;
+    const anotherOverlayIsOpen = state.isSideDrawerOpen || state.activeModal || state.isSecurityDropdownOpen
+      || state.isAccountMenuOpen || state.isDownloadsDropdownOpen || state.isFloatingMiniOpen
+      || state.isRadialLauncherOpen || state.findInPage?.isOpen || state.pendingPasswordSave || state.closePrompt;
+    if (!anotherOverlayIsOpen) this.setPageObscured(false);
+  }
+
   render(container = null) {
     // A render can replace the selected node. Never leave a body-mounted
     // selection action bar pointing at a detached range.
@@ -2329,10 +2363,7 @@ export class BrowserShell {
     // Keep the live native page invariant explicit at the render boundary.
     // A second truth-check below runs after an aged splash is retired.
     try { this.healStuckPageSurface(); } catch { /* best-effort heal */ }
-    if (this._tabHoverTimer) clearTimeout(this._tabHoverTimer);
-    this._tabHoverTimer = null;
-    this._activeTabHoverCard?.remove?.();
-    this._activeTabHoverCard = null;
+    this.dismissTabHoverCard();
     // The old strip is about to detach. Desktop rendering assigns the fresh
     // one before overlays are built; mobile layout intentionally leaves null.
     this.tabStripElement = null;
@@ -2354,11 +2385,6 @@ export class BrowserShell {
     }
 
     this.lastRenderTarget = target;
-    // Keep the currently painted chrome attached while the replacement tree
-    // is assembled off-DOM. Removing it up front exposes the white app
-    // background for a frame on some compositor paths (notably when opening
-    // menus and switching internal documents).
-    const previousRoot = this.rootElement?.parentElement === target ? this.rootElement : null;
 
     // FREEZE FIX (stuck update splash): if every one of its dismissal
     // triggers somehow failed (frozen timers, exotic embedders), any
@@ -2386,12 +2412,20 @@ export class BrowserShell {
     // state change, and the JSON-compare inside makes no-op calls free.
     this.queueSessionSnapshot();
 
-    // Keep both the live iframe layer and the currently painted shell in
-    // place while building the next shell off-DOM. The old shell is replaced
-    // atomically after the new one is ready, avoiding the short white flash
-    // previously exposed by clearing target.innerHTML at every interaction.
-    for (const child of [...(target.children || [])]) {
-      if (child !== this.webFrameLayer && child !== previousRoot) child.remove();
+    // CRITICAL (web/PWA no-blink fix): the persistent web-frame layer holds
+    // the live <iframe> for each external tab. It must SURVIVE re-renders -
+    // recreating (or even reparenting) an <iframe> forces the embedded page
+    // to fully reload, which users saw as a white flash of the whole page
+    // every time any piece of chrome re-rendered (opening the Yayra menu,
+    // pressing "Check for updates", toggling a dropdown...). So instead of
+    // wiping the container wholesale, every child EXCEPT the frame layer is
+    // removed and rebuilt as before.
+    if (this.webFrameLayer && this.webFrameLayer.parentElement === target) {
+      for (const child of [...(target.children || [])]) {
+        if (child !== this.webFrameLayer) child.remove();
+      }
+    } else {
+      target.innerHTML = '';
     }
     // The first truth-check above deliberately runs before teardown so real
     // overlays remain protected. Check once more now: an omnibox dropdown in
@@ -2415,6 +2449,8 @@ export class BrowserShell {
     const blurRadius = this.state.settings.glassmorphismBlurRadius || 24;
     shell.style.setProperty('--fb-frame-opacity', String(frameOpacity));
     shell.style.setProperty('--fb-blur-radius', `${blurRadius}px`);
+    const systemTopInset = this.getSystemTopInset();
+    if (systemTopInset > 0) shell.style.setProperty('--fb-window-system-top-inset', `${systemTopInset}px`);
 
     if (this.state.isMinimizedToBubble) {
       shell.style.display = 'none';
@@ -2437,36 +2473,45 @@ export class BrowserShell {
       this.renderDesktopLayout(shell, activeTab);
     }
 
+    // Keep ephemeral chrome in its own subtree so simple menu/dropdown
+    // toggles can update overlays without detaching the toolbar, viewport,
+    // focused controls, or persistent page frame.
+    const overlayLayer = document.createElement('div');
+    overlayLayer.className = 'fb-browser-overlay-layer';
+    overlayLayer.style.display = 'contents';
+    shell.appendChild(overlayLayer);
+    this.overlayLayer = overlayLayer;
+
     // Modal / Dialog Overlay (Menu, Tab Switcher, etc.)
-    this.renderActiveModal(shell);
+    this.renderActiveModal(overlayLayer);
 
     // Right Side Drawer Menu (No Blur)
     if (this.state.isSideDrawerOpen) {
-      this.renderSideDrawer(shell);
+      this.renderSideDrawer(overlayLayer);
     }
 
     // Security Dropdown & Search Engine Switcher
     if (this.state.isSecurityDropdownOpen) {
-      this.renderSecurityDropdown(shell);
+      this.renderSecurityDropdown(overlayLayer);
     }
 
     // Persistent Account Dropdown (top-right account button)
     if (this.state.isAccountMenuOpen) {
-      this.renderAccountDropdown(shell);
+      this.renderAccountDropdown(overlayLayer);
     }
 
     // Downloads dropdown (latest 5 + state-aware actions) under the
     // toolbar download button - tracking without leaving the page.
     if (this.state.isDownloadsDropdownOpen) {
-      this.renderDownloadsDropdown(shell);
+      this.renderDownloadsDropdown(overlayLayer);
     }
     if (this.state.isToolsDropdownOpen && !this.state.isFloatingMiniOpen) {
-      this.renderToolsDropdown(shell);
+      this.renderToolsDropdown(overlayLayer);
     }
 
     // Chrome-style "Keep your browsing separate?" profile suggestion
     if (this.state.profileSuggestion) {
-      this.renderProfileSuggestionCard(shell);
+      this.renderProfileSuggestionCard(overlayLayer);
     }
 
     // "Update available - now or later?" card (auto background checks)
@@ -2480,22 +2525,22 @@ export class BrowserShell {
 
     // "Close Yayra?" prompt (close all tabs / just close / keep all tabs)
     if (this.state.closePrompt) {
-      this.renderClosePromptModal(shell);
+      this.renderClosePromptModal(overlayLayer);
     }
 
     // "Reopen recent tabs?" offer after a plain close last session
     if (this.state.recentTabsOffer && this.state.recentTabsOffer.length) {
-      this.renderRecentTabsOffer(shell);
+      this.renderRecentTabsOffer(overlayLayer);
     }
 
     // Find in Page Toolbar
     if (this.state.findInPage.isOpen) {
-      this.renderFindInPageBar(shell);
+      this.renderFindInPageBar(overlayLayer);
     }
 
     // Chrome-style "Save password?" bar (captured login submission)
     if (this.state.pendingPasswordSave) {
-      this.renderPasswordSaveBar(shell);
+      this.renderPasswordSaveBar(overlayLayer);
     }
 
     // Floating Mini-Browser Window Popup
@@ -2509,7 +2554,6 @@ export class BrowserShell {
     }
 
     target.appendChild(shell);
-    if (previousRoot && previousRoot !== shell) previousRoot.remove();
     this.rootElement = shell;
 
     // A pooled frame can begin a real navigation while this render is being
@@ -2786,12 +2830,7 @@ export class BrowserShell {
       // A hover card never owns input (CSS pointer-events:none), but keeping
       // a detached fixed layer around after focus/render loss serves no
       // purpose and has historically made top-edge hit testing ambiguous.
-      if (closeTransientMenus && this._activeTabHoverCard) {
-        try { this._activeTabHoverCard.remove?.(); } catch { /* already gone */ }
-        this._activeTabHoverCard = null;
-        if (this._tabHoverTimer) clearTimeout(this._tabHoverTimer);
-        this._tabHoverTimer = null;
-      }
+      if (closeTransientMenus && this._activeTabHoverCard) this.dismissTabHoverCard();
     } catch { /* DOM probing is a recovery path and must itself never stall */ }
 
     if (healed) {
@@ -3342,7 +3381,7 @@ export class BrowserShell {
           if (this._tabHoverTimer) clearTimeout(this._tabHoverTimer);
           this._tabHoverTimer = setTimeout(() => {
             if (typeof document === 'undefined' || !document.body) return;
-            this._activeTabHoverCard?.remove?.();
+            this.dismissTabHoverCard();
             const card = document.createElement('div');
             card.className = 'fb-tab-hover-card';
             card.setAttribute('role', 'tooltip');
@@ -3354,34 +3393,38 @@ export class BrowserShell {
             card.appendChild(cardAddress);
             const rect = tabEl.getBoundingClientRect?.();
             const width = typeof window !== 'undefined' ? (Number(window.innerWidth) || 1280) : 1280;
-            const height = typeof window !== 'undefined' ? (Number(window.innerHeight) || 800) : 800;
             const cardWidth = Math.min(280, Math.max(0, width - 16));
             const left = Math.max(8, Math.min(Number(rect?.left) || 8, width - cardWidth - 8));
-            const preferredTop = Math.max(8, (Number(rect?.bottom) || 0) + 8);
+            const tabStripBottom = Number(tabEl.closest?.('.fb-browser-shell')
+              ?.querySelector?.('.fb-chrome-tabstrip')?.getBoundingClientRect?.().bottom) || 0;
+            const navbarBottom = Number(tabEl.closest?.('.fb-browser-shell')
+              ?.querySelector?.('.fb-chrome-navbar')?.getBoundingClientRect?.().bottom) || 0;
+            // The information card belongs below the complete chrome (tabs
+            // AND navigation/address toolbar), never between those rows.
+            const belowChromeTop = Math.max(8, Number(rect?.bottom) || 0, tabStripBottom, navbarBottom) + 6;
             card.style.left = `${left}px`;
-            card.style.top = `${preferredTop}px`;
+            card.style.top = `${belowChromeTop}px`;
             document.body.appendChild(card);
-            // On Electron, the native page surface paints above document
-            // content regardless of CSS z-index. Keep this tooltip wholly in
-            // browser chrome so the page cannot cover its lower title/address
-            // line when it opens near the top of the viewport.
-            const cardRect = card.getBoundingClientRect?.();
-            const cardHeight = Number(cardRect?.height) || Number(card.offsetHeight) || 58;
-            const viewportTop = Number(this.viewportElement?.getBoundingClientRect?.().top);
-            const maxTop = Number.isFinite(viewportTop) && viewportTop > 0
-              ? viewportTop - cardHeight - 4
-              : height - cardHeight - 8;
-            const top = Math.max(8, Math.min(preferredTop, maxTop));
-            card.style.top = `${top}px`;
             this._activeTabHoverCard = card;
+
+            // Native WebContentsViews paint above renderer chrome. Keep the
+            // tooltip below the tab; if its compact card reaches the page,
+            // temporarily replace that native surface with its snapshot.
+            const cardRect = card.getBoundingClientRect?.();
+            const cardHeight = Number(cardRect?.height) || Number(card.offsetHeight) || 42;
+            const viewportTop = Number(this.viewportElement?.getBoundingClientRect?.().top);
+            const overlapsPage = Number.isFinite(viewportTop) && viewportTop > 0
+              && belowChromeTop + cardHeight > viewportTop - 3;
+            const active = this.getActiveTab();
+            const isNativePage = this.nativeWebview && active && active.id === this.state.activeTabId
+              && this._nativeWebviewTabIds?.has?.(active.id) && /^https?:\/\//i.test(String(active.url || ''));
+            if (overlapsPage && isNativePage && !this.state.isPageObscured) {
+              this._tabHoverObscuredTabId = active.id;
+              this.setPageObscured(true);
+            }
           }, 450);
         };
-        const hideHoverCard = () => {
-          if (this._tabHoverTimer) clearTimeout(this._tabHoverTimer);
-          this._tabHoverTimer = null;
-          this._activeTabHoverCard?.remove?.();
-          this._activeTabHoverCard = null;
-        };
+        const hideHoverCard = () => this.dismissTabHoverCard();
         tabEl.addEventListener('mouseenter', showHoverCard);
         tabEl.addEventListener('mouseleave', hideHoverCard);
         tabEl.addEventListener('focus', showHoverCard);
@@ -3592,7 +3635,7 @@ export class BrowserShell {
     securityBadge.addEventListener('click', (e) => {
       e.stopPropagation();
       this.state.isSecurityDropdownOpen = !this.state.isSecurityDropdownOpen;
-      this.render();
+      this.renderOverlayLayerInPlace();
     });
     omnibox.appendChild(securityBadge);
 
@@ -3824,7 +3867,7 @@ export class BrowserShell {
     menuBtn.innerHTML = Icons.moreVertical;
     menuBtn.addEventListener('click', () => {
       this.state.isSideDrawerOpen = !this.state.isSideDrawerOpen;
-      this.render();
+      this.renderOverlayLayerInPlace();
     });
     toolbarActions.appendChild(menuBtn);
 
@@ -3941,7 +3984,7 @@ export class BrowserShell {
     const topActions = [
       { className: 'fb-mobile-tab-overview', icon: Icons.tabs, title: 'Show all tabs', action: () => this.openModal('tab-switcher') },
       { className: 'fb-mobile-tab-downloads', icon: Icons.download, title: 'Downloads', action: () => this.openInternalPage('yayra://downloads') },
-      { className: 'fb-mobile-tab-tools', icon: Icons.tools, title: 'Tools', action: () => { this.state.isToolsDropdownOpen = !this.state.isToolsDropdownOpen; this.render(); } },
+      { className: 'fb-mobile-tab-tools', icon: Icons.tools, title: 'Tools', action: () => { this.state.isToolsDropdownOpen = !this.state.isToolsDropdownOpen; this.renderOverlayLayerInPlace(); } },
       { className: 'fb-mobile-tab-bookmarks', icon: Icons.bookmark, title: 'Bookmarks', action: () => this.openInternalPage('yayra://bookmarks') },
       { className: 'fb-mobile-tab-privacy', icon: Icons.shield, title: 'Privacy and shields', action: () => this.openInternalPage('yayra://permissions') },
       { className: 'fb-mobile-tab-history', icon: Icons.history, title: 'History', action: () => this.openInternalPage('yayra://history') }
@@ -4108,7 +4151,7 @@ export class BrowserShell {
     bMenu.innerHTML = Icons.moreVertical;
     bMenu.addEventListener('click', () => {
       this.state.isSideDrawerOpen = !this.state.isSideDrawerOpen;
-      this.render();
+      this.renderOverlayLayerInPlace();
     });
     toolRow.appendChild(bMenu);
 
@@ -4306,6 +4349,9 @@ export class BrowserShell {
         }
       }
       viewport.appendChild(webViewContainer);
+      if (this._nativeWebviewTabIds.has(activeTab.id)) {
+        this.finishPendingNativeSnapshotHide(activeTab.id);
+      }
     }
 
     // A newly-created pooled iframe marks itself loading while this render
@@ -5073,7 +5119,7 @@ export class BrowserShell {
         panel.appendChild(loading);
       } else if (preview.status === 'error' || preview.status === 'unavailable') {
         const error = document.createElement('p');
-        error.textContent = this.formatGoogleServiceError(preview.serviceId, preview.error);
+        error.textContent = this.formatGoogleSignInError(preview.error);
         panel.appendChild(error);
       } else if (!preview.items.length) {
         const empty = document.createElement('p');
@@ -5527,7 +5573,7 @@ export class BrowserShell {
       if (this.hasBlockingOverlay()) return;
       try {
         const rect = wrapper.getBoundingClientRect();
-        this.nativeWebview.setBounds(tabId, {
+        this.reportNativeWebviewBounds(tabId, {
           x: rect.left,
           y: rect.top,
           width: rect.width,
@@ -5725,57 +5771,156 @@ export class BrowserShell {
    * tab not currently on screen must be explicitly hidden or it would float
    * over whatever IS on screen.
    */
+  setNativeWebviewVisible(tabId, visible, options) {
+    const next = Boolean(visible);
+    if (!this.nativeWebview || !tabId) return Promise.resolve(undefined);
+    if (this._nativeWebviewVisibilityByTab?.get(tabId) === next && !options?.capture) {
+      return Promise.resolve(undefined);
+    }
+    this._nativeWebviewVisibilityByTab?.set(tabId, next);
+    if (!next) this._nativeWebviewBoundsByTab?.set(tabId, '0,0,0,0');
+    let result;
+    try { result = this.nativeWebview.setVisible(tabId, next, options); }
+    catch (error) {
+      this._nativeWebviewVisibilityByTab?.delete(tabId);
+      return Promise.reject(error);
+    }
+    return Promise.resolve(result).catch((error) => {
+      if (this._nativeWebviewVisibilityByTab?.get(tabId) === next) {
+        this._nativeWebviewVisibilityByTab.delete(tabId);
+      }
+      if (!next) this._nativeWebviewBoundsByTab?.delete(tabId);
+      throw error;
+    });
+  }
+
+  reportNativeWebviewBounds(tabId, bounds, { force = false } = {}) {
+    if (!this.nativeWebview || !tabId || !bounds) return false;
+    const clean = (value) => Number.isFinite(Number(value)) ? Math.max(0, Math.round(Number(value))) : 0;
+    const next = { x: clean(bounds.x), y: clean(bounds.y), width: clean(bounds.width), height: clean(bounds.height) };
+    if (next.width > 0 && next.height > 0 && next.y < 36) {
+      const covered = 36 - next.y;
+      next.y = 36;
+      next.height = Math.max(0, next.height - covered);
+    }
+    const key = `${next.x},${next.y},${next.width},${next.height}`;
+    if (!force && this._nativeWebviewBoundsByTab?.get(tabId) === key) return false;
+    this._nativeWebviewBoundsByTab?.set(tabId, key);
+    try {
+      const result = this.nativeWebview.setBounds(tabId, next);
+      if (result && typeof result.catch === 'function') {
+        result.catch(() => {
+          if (this._nativeWebviewBoundsByTab?.get(tabId) === key) this._nativeWebviewBoundsByTab.delete(tabId);
+        });
+      }
+      return true;
+    } catch {
+      if (this._nativeWebviewBoundsByTab?.get(tabId) === key) this._nativeWebviewBoundsByTab.delete(tabId);
+      return false;
+    }
+  }
+
+  ensureNativePageSnapshotPlaceholder(tabId) {
+    if (typeof document === 'undefined' || !tabId) return null;
+    const slot = this.viewportElement?.querySelector('.fb-native-webview-slot');
+    if (!slot) return null;
+    let still = Array.from(slot.querySelectorAll('.fb-page-snapshot-img') || [])
+      .find((image) => image.dataset?.tabId === tabId) || null;
+    if (!still) {
+      still = document.createElement('img');
+      still.className = 'fb-page-snapshot-img';
+      still.dataset.tabId = tabId;
+      still.alt = '';
+      still.draggable = false;
+      still.style.cssText = 'position:absolute; inset:0; width:100%; height:100%; object-fit:cover; object-position:top left; background:var(--fb-bg-glass-input,#101218);';
+      slot.appendChild(still);
+    }
+    const snapshot = this._pageSnapshots.get(tabId);
+    if (snapshot && still.src !== snapshot) still.src = snapshot;
+    return still;
+  }
+
   syncNativeWebviewVisibility(activeTabId, showActive, { captureActive = false } = {}) {
     if (!this.nativeWebview || this._nativeWebviewTabIds.size === 0) return;
     for (const tabId of this._nativeWebviewTabIds) {
       const visible = tabId === activeTabId && showActive;
       if (visible) {
-        this.nativeWebview.setVisible(tabId, true).catch(() => {});
+        this.setNativeWebviewVisible(tabId, true).catch(() => {});
         continue;
       }
-      // Hiding the ACTIVE tab because chrome needs to overlay it. Start a
-      // snapshot capture, but never make the UI wait for it: native views
-      // paint above every HTML overlay, so wait-for-snapshot made menus
-      // appear behind the page (sometimes for hundreds of milliseconds).
-      // The placeholder already contains the last available still; a fresh
-      // one is painted asynchronously when capturePage resolves.
+
       const wantsCapture = captureActive && tabId === activeTabId;
       if (wantsCapture && typeof this.nativeWebview.capture === 'function') {
-        if (!this._nativeSnapshotCaptures) this._nativeSnapshotCaptures = new Set();
-        const capturePending = this._nativeSnapshotCaptures;
-        let capturePromise = null;
-        if (!capturePending.has(tabId)) {
-          capturePending.add(tabId);
+        if (!this._pendingNativeSnapshotHide) this._pendingNativeSnapshotHide = new Set();
+        const requestHideAfterPaint = () => {
+          // The overlay can be dismissed or the user can switch tabs while
+          // capturePage()/image decode is pending. A stale completion must
+          // never hide the now-active page surface.
+          const tab = this.state.tabs.find((item) => item.id === tabId);
+          if (!tab || this.state.activeTabId !== tabId || !this.hasBlockingOverlay()) return;
+          this._pendingNativeSnapshotHide.add(tabId);
+          this.applyPageSnapshot(tabId, () => {
+            this._pendingNativeSnapshotHide.delete(tabId);
+            if (this.state.activeTabId !== tabId || !this.hasBlockingOverlay()) return;
+            const hidden = this.setNativeWebviewVisible(tabId, false);
+            if (hidden && typeof hidden.catch === 'function') hidden.catch(() => {});
+          });
+        };
+
+        // Reuse the most recent painted still for immediate feedback, then
+        // refresh it asynchronously. If there is no still yet, keep the live
+        // native page visible until a new image has decoded in the renderer.
+        if (this._pageSnapshots.has(tabId)) requestHideAfterPaint();
+        if (!this._nativeSnapshotCaptures) this._nativeSnapshotCaptures = new Map();
+        let capturePromise = this._nativeSnapshotCaptures.get(tabId);
+        if (!capturePromise) {
+          const requestedUrl = this.state.tabs.find((item) => item.id === tabId)?.url;
           try {
-            capturePromise = Promise.resolve(this.nativeWebview.capture(tabId));
+            capturePromise = Promise.resolve(this.nativeWebview.capture(tabId)).then((res) => {
+              const current = this.state.tabs.find((item) => item.id === tabId);
+              if (res?.snapshot && current && current.url === requestedUrl
+                  && this._nativeWebviewTabIds.has(tabId)) {
+                this.storePageSnapshot(tabId, res.snapshot);
+                this.applyPageSnapshot(tabId);
+                this.refreshTabSwitcherPreviews();
+                return res.snapshot;
+              }
+              return null;
+            }).catch(() => null).finally(() => {
+              if (this._nativeSnapshotCaptures.get(tabId) === capturePromise) {
+                this._nativeSnapshotCaptures.delete(tabId);
+              }
+            });
+            this._nativeSnapshotCaptures.set(tabId, capturePromise);
           } catch {
-            capturePending.delete(tabId);
+            capturePromise = null;
           }
         }
-
-        // Hide immediately, independently of the snapshot's completion.
-        const hiddenResult = this.nativeWebview.setVisible(tabId, false);
-        if (hiddenResult && typeof hiddenResult.catch === 'function') hiddenResult.catch(() => {});
-
-        if (capturePromise) {
-          capturePromise.then((res) => {
-            if (res && res.snapshot) {
-              this.storePageSnapshot(tabId, res.snapshot);
-              this.applyPageSnapshot(tabId);
-              // The tab switcher may already be on screen showing a stale
-              // or placeholder preview for this tab - paint the fresh one.
-              this.refreshTabSwitcherPreviews();
+        if (!this._pageSnapshots.has(tabId) && capturePromise) {
+          capturePromise.then((snapshot) => {
+            if (snapshot) {
+              requestHideAfterPaint();
+              return;
             }
-          }).catch(() => {}).finally(() => capturePending.delete(tabId));
+            // If capture is unavailable, keep the overlay interactive over its
+            // neutral placeholder rather than letting the native sibling
+            // surface swallow every click. The still gets a dark matte and
+            // closing chrome restores the untouched live page.
+            const tab = this.state.tabs.find((item) => item.id === tabId);
+            if (!tab || this.state.activeTabId !== tabId || !this.hasBlockingOverlay()) return;
+            const hidden = this.setNativeWebviewVisible(tabId, false);
+            if (hidden && typeof hidden.catch === 'function') hidden.catch(() => {});
+          }).catch(() => {});
         }
         continue;
       }
-      // Legacy combined path (older preloads without capture()): the main
-      // process snapshots before zeroing bounds and returns the image.
-      const result = this.nativeWebview.setVisible(tabId, false, wantsCapture ? { capture: true } : undefined);
+
+      // Legacy preload compatibility. Current Electron preload exposes
+      // capture() and follows the decoded-snapshot path above.
+      const result = this.setNativeWebviewVisible(tabId, false, wantsCapture ? { capture: true } : undefined);
       if (wantsCapture && result && typeof result.then === 'function') {
         result.then((res) => {
-          if (res && res.snapshot) {
+          if (res?.snapshot) {
             this.storePageSnapshot(tabId, res.snapshot);
             this.applyPageSnapshot(tabId);
             this.refreshTabSwitcherPreviews();
@@ -5785,6 +5930,16 @@ export class BrowserShell {
         result.catch(() => {});
       }
     }
+  }
+
+  finishPendingNativeSnapshotHide(tabId) {
+    if (!this._pendingNativeSnapshotHide?.has(tabId)) return;
+    this.applyPageSnapshot(tabId, () => {
+      this._pendingNativeSnapshotHide.delete(tabId);
+      if (this.state.activeTabId !== tabId || !this.hasBlockingOverlay()) return;
+      const hidden = this.nativeWebview?.setVisible?.(tabId, false);
+      if (hidden && typeof hidden.catch === 'function') hidden.catch(() => {});
+    });
   }
 
   /**
@@ -5820,9 +5975,15 @@ export class BrowserShell {
    */
   applyPageSnapshot(tabId, onPainted = null) {
     const done = () => { if (typeof onPainted === 'function') onPainted(); };
-    if (typeof document === 'undefined' || !this.hasBlockingOverlay()) { done(); return; }
+    if (typeof document === 'undefined' || !this.hasBlockingOverlay()) {
+      if (typeof onPainted !== 'function') done();
+      return;
+    }
     const snapshot = this._pageSnapshots.get(tabId);
-    if (!snapshot) { done(); return; }
+    if (!snapshot) {
+      if (typeof onPainted !== 'function') done();
+      return;
+    }
     // Search the shell's own rendered tree first (works for the main
     // window, the mini window, and detached test containers), falling
     // back to the whole document.
@@ -5834,20 +5995,43 @@ export class BrowserShell {
         || (typeof el.getAttribute === 'function' && el.getAttribute('data-tab-id') === tabId)) || null;
       if (img) break;
     }
-    if (!img) { done(); return; }
-    if (img.src === snapshot) { done(); return; }
-    if (typeof onPainted === 'function') {
-      // Signal readiness only after the data-URL actually decodes and
-      // paints, so the native view hides UNDER an already-visible still.
-      let signalled = false;
-      const signal = () => { if (!signalled) { signalled = true; done(); } };
-      img.onload = () => { img.onload = null; signal(); };
-      setTimeout(signal, 250); // decode fail-safe
-      img.src = snapshot;
-      if (img.complete) signal();
+    if (!img) {
+      // During a full chrome render the native slot is attached after this
+      // visibility sync. Keep the live surface in place and let slot mounting
+      // retry the paint/hide hand-off instead of treating a missing image as
+      // a successful paint.
+      if (typeof onPainted === 'function') {
+        if (!this._pendingNativeSnapshotHide) this._pendingNativeSnapshotHide = new Set();
+        this._pendingNativeSnapshotHide.add(tabId);
+        return;
+      }
+      done();
       return;
     }
-    img.src = snapshot;
+    const alreadyDecoded = img.src === snapshot && img.complete === true
+      && Number(img.naturalWidth) > 0;
+    if (alreadyDecoded) { done(); return; }
+    if (typeof onPainted === 'function') {
+      // Only retire the native surface after a successful decode. There is no
+      // timeout-based hide: a slow image remains backed by the live page.
+      let signalled = false;
+      const signal = () => {
+        if (signalled) return;
+        signalled = true;
+        img.onload = null;
+        img.onerror = null;
+        done();
+      };
+      img.onload = signal;
+      img.onerror = () => { img.onload = null; img.onerror = null; };
+      if (img.src !== snapshot) img.src = snapshot;
+      if (img.complete && Number(img.naturalWidth) > 0) signal();
+      else if (typeof img.decode === 'function') {
+        Promise.resolve(img.decode()).then(signal).catch(() => {});
+      }
+      return;
+    }
+    if (img.src !== snapshot) img.src = snapshot;
   }
 
   /**
@@ -5871,8 +6055,6 @@ export class BrowserShell {
       // FREEZE FIX: surfaces obscured while the window is hidden are the
       // ones whose close paths can freeze - arm the return-to-window heal.
       this.ensureSurfaceHealOnReturn();
-      this.syncNativeWebviewVisibility(tab.id, false, { captureActive: true });
-      this.syncAndroidTabWebVisibility(tab.id, false);
       if (typeof document !== 'undefined') {
         const slot = this.viewportElement?.querySelector('.fb-native-webview-slot');
         if (slot && !slot.querySelector('.fb-page-snapshot-img')) {
@@ -5886,6 +6068,11 @@ export class BrowserShell {
           slot.appendChild(still);
         }
       }
+      // Install the placeholder before starting the asynchronous capture/hide
+      // hand-off; the native page remains live until this image has painted.
+      this.syncAndroidTabWebVisibility(tab.id, false);
+      this.syncNativeWebviewVisibility(tab.id, false, { captureActive: true });
+      this.finishPendingNativeSnapshotHide(tab.id);
     } else {
       if (typeof document !== 'undefined') {
         this.viewportElement?.querySelectorAll('.fb-page-snapshot-img').forEach((el) => el.remove());
@@ -5897,7 +6084,7 @@ export class BrowserShell {
         this.syncAndroidTabWebVisibility(tab.id, false);
         return;
       }
-      const restored = this.nativeWebview.setVisible(tab.id, true);
+      const restored = this.setNativeWebviewVisible(tab.id, true);
       if (restored && typeof restored.catch === 'function') restored.catch(() => {});
       this.restoreActiveNativeBounds(tab.id);
     }
@@ -5932,6 +6119,7 @@ export class BrowserShell {
     if (typeof document !== 'undefined' && document.body) {
       try {
         const up = (el) => Boolean(el) && el.hidden !== true;
+        if (up(document.querySelector('.fb-tab-hover-card'))) return false;
         if (up(document.querySelector('.fb-update-splash'))) return false;
         if (up(document.querySelector('.fb-text-prompt-overlay'))) return false;
         if (up(document.querySelector('.fb-tab-context-menu'))) return false;
@@ -5990,22 +6178,26 @@ export class BrowserShell {
     try { this.viewportElement?.querySelectorAll('.fb-page-snapshot-img').forEach((el) => el.remove()); } catch { /* detached */ }
     if (this.nativeWebview && this._nativeWebviewTabIds.has(tabId)) {
       try {
-        const shown = this.nativeWebview.setVisible(tabId, true);
+        // Recovery is explicitly a force-reassertion: the bridge may have
+        // lost bounds/visibility without the renderer receiving a matching
+        // event, so do not trust the normal idempotence cache here.
+        this._nativeWebviewVisibilityByTab.delete(tabId);
+        const shown = this.setNativeWebviewVisible(tabId, true);
         if (shown && typeof shown.catch === 'function') shown.catch(() => {});
       } catch { /* bridge unavailable during teardown */ }
-      this.restoreActiveNativeBounds(tabId);
+      this.restoreActiveNativeBounds(tabId, { force: true });
     }
     if (this._androidTabWebIds?.has?.(tabId)) this.syncAndroidTabWebVisibility(tabId, true);
     return true;
   }
 
-  restoreActiveNativeBounds(tabId) {
+  restoreActiveNativeBounds(tabId, { force = false } = {}) {
     if (typeof document === 'undefined' || !this.nativeWebview) return;
     const slot = this.viewportElement?.querySelector('.fb-native-webview-slot');
     if (!slot) return;
     try {
       const rect = slot.getBoundingClientRect();
-      this.nativeWebview.setBounds(tabId, { x: rect.left, y: rect.top, width: rect.width, height: rect.height });
+      this.reportNativeWebviewBounds(tabId, { x: rect.left, y: rect.top, width: rect.width, height: rect.height }, { force });
     } catch {
       // No layout engine (tests) - nothing on screen to reposition.
     }
@@ -6343,6 +6535,9 @@ export class BrowserShell {
     if (!tab) return;
 
     switch (type) {
+      case 'print-request':
+        if (tabId === this.state.activeTabId) void this.printActivePage();
+        break;
       case 'loading-start':
         // A top-level load invalidates the document that owned any prior
         // WebAuthn request. Main sends an explicit AbortError settle first;
@@ -7326,6 +7521,10 @@ export class BrowserShell {
     this.destroyAndroidTabWebview(tabId);
     if (!this._nativeWebviewTabIds.has(tabId)) return;
     this._nativeWebviewTabIds.delete(tabId);
+    this._nativeWebviewVisibilityByTab.delete(tabId);
+    this._nativeWebviewBoundsByTab.delete(tabId);
+    this._nativeSnapshotCaptures?.delete?.(tabId);
+    this._pendingNativeSnapshotHide?.delete?.(tabId);
     const observer = this._nativeWebviewResizeObservers.get(tabId);
     if (observer) {
       observer.disconnect();
@@ -8661,37 +8860,6 @@ export class BrowserShell {
     return 'Please try again.';
   }
 
-  formatGoogleServiceError(serviceId, error) {
-    const code = String(error || '');
-    const service = googleServiceById(serviceId);
-    const name = service?.title || 'Google service';
-    if (code.includes('service_scope_required') || code.includes('scope_not_granted')) {
-      return `Google has not granted Yayra the read-only ${name} permission. Reconnect Google services and approve that scope.`;
-    }
-    if (code.includes('google_services_reconnect_required') || code.includes('google_services_session_required')) {
-      return `The Google services session expired or is missing. Reconnect Google services, then retry the ${name} preview.`;
-    }
-    if (code.includes('google_service_permission_denied') || code.includes('google_service_upstream_failed')
-      || /google_service_failed:(?:403|400)/.test(code)) {
-      const apiNames = {
-        drive: 'Google Drive API',
-        gmail: 'Gmail API',
-        calendar: 'Google Calendar API',
-        contacts: 'People API',
-        photos: 'Google Photos Library API',
-        tasks: 'Google Tasks API',
-        classroom: 'Google Classroom API',
-        youtube: 'YouTube Data API'
-      };
-      const apiName = apiNames[serviceId] || `${name} API`;
-      return `Google rejected the ${name} preview. In the same Cloud project as Yayra’s OAuth client, enable ${apiName}, confirm the read-only scope is approved, then reconnect Google services.`;
-    }
-    if (code.includes('google_service_upstream_unavailable') || /fetch failed|network/i.test(code)) {
-      return `Yayra could not reach Google to load ${name}. Check your connection and retry.`;
-    }
-    return this.formatGoogleSignInError(code);
-  }
-
   renderGoogleAccountSectionHtml() {
     if (!this.authBridge) {
       return `
@@ -9003,7 +9171,7 @@ export class BrowserShell {
           const card = document.createElement('article'); card.className = 'fb-dict-card';
           const title = document.createElement('h3'); title.textContent = `${item.starred ? '★ ' : ''}${item.term}`; card.appendChild(title);
           const detail = document.createElement('p'); detail.className = 'fb-dict-source'; detail.textContent = `${item.kind}${item.category ? ` · ${item.category}` : ''}${item.collectionId ? ` · ${item.collectionId}` : ''}`; card.appendChild(detail);
-          if (item.selectedText) { const quote = document.createElement('blockquote'); quote.className = 'fb-dict-def'; quote.textContent = item.selectedText; if (item.kind === 'highlight') { quote.classList.add('fb-dict-highlight-quote'); quote.style.backgroundColor = `color-mix(in srgb, ${/^#[0-9a-f]{6}$/i.test(item.highlightColor || '') ? item.highlightColor : '#ffe08a'} 38%, transparent)`; quote.style.color = '#312000'; quote.style.padding = '10px 12px'; quote.style.borderRadius = '8px'; } card.appendChild(quote); }
+          if (item.selectedText) { const quote = document.createElement('blockquote'); quote.className = 'fb-dict-def'; quote.textContent = item.selectedText; if (item.kind === 'highlight') { quote.classList.add('fb-dict-highlight-quote'); quote.style.backgroundColor = /^#[0-9a-f]{6}$/i.test(item.highlightColor || '') ? item.highlightColor : '#ffe08a'; quote.style.color = '#312000'; quote.style.padding = '10px 12px'; quote.style.borderRadius = '8px'; } card.appendChild(quote); }
           for (const definition of (item.definitions || []).slice(0, 4)) { const line = document.createElement('p'); line.className = 'fb-dict-def'; line.textContent = definition.text || ''; card.appendChild(line); }
           if (item.note) { const note = document.createElement('p'); note.className = 'fb-dict-muted'; note.textContent = `Note: ${item.note}`; card.appendChild(note); }
           if (item.tags?.length) { const tags = document.createElement('p'); tags.className = 'fb-dict-source'; tags.textContent = `Tags: ${item.tags.join(', ')}`; card.appendChild(tags); }
@@ -9355,8 +9523,7 @@ export class BrowserShell {
             this.state.activeSettingsCategory = 'calculator';
             this.openInternalPage('yayra://settings');
           },
-          onPrompt: (title, placeholder) => this._textPromptDialog({ title, placeholder }),
-          onPrint: ({ onClose } = {}) => { void this.printActivePage({ onClose }); }
+          onPrompt: (title, placeholder) => this._textPromptDialog({ title, placeholder })
         });
         this._scientificCalculatorViews.set(page, calculator);
       } catch (error) {
@@ -9472,17 +9639,6 @@ export class BrowserShell {
                 <p>On: the mini window uses the same desktop tab strip and toolbar as the main browser. Off: the compact mobile view with the controls at the bottom. Applies to an open mini window immediately.</p>
               </div>
               <input type="checkbox" id="fb-in-set-mini-desktop" ${this.getMiniLayoutPref() === 'desktop' ? 'checked' : ''} />
-            </div>
-
-            <div class="fb-setting-toggle-row">
-              <div>
-                <strong>When opening from the floating bubble</strong>
-                <p>Choose whether selected pages reuse the same Yayra mini window or each open in a separate mini window.</p>
-              </div>
-              <select id="fb-in-mini-open-behavior" class="fb-select" style="max-width:240px" aria-label="Floating mini window preference" ${this.overlayBridge?.setMiniOpenBehavior ? '' : 'disabled'}>
-                <option value="same-mini" ${(this.state.overlaySettings.miniOpenBehavior || 'same-mini') === 'same-mini' ? 'selected' : ''}>Same mini window</option>
-                <option value="separate-mini" ${this.state.overlaySettings.miniOpenBehavior === 'separate-mini' ? 'selected' : ''}>Separate mini windows</option>
-              </select>
             </div>
 
             <div class="fb-setting-slider-row">
@@ -10444,17 +10600,6 @@ export class BrowserShell {
     page.querySelector('#fb-in-set-mini-desktop')?.addEventListener('change', (e) => {
       const desktop = !!(e?.target?.checked ?? page.querySelector('#fb-in-set-mini-desktop')?.checked);
       this.setMiniLayoutPref(desktop ? 'desktop' : 'mobile');
-    });
-    page.querySelector('#fb-in-mini-open-behavior')?.addEventListener('change', async (event) => {
-      const behavior = event?.target?.value === 'separate-mini' ? 'separate-mini' : 'same-mini';
-      if (!this.overlayBridge?.setMiniOpenBehavior) return;
-      try {
-        const next = await this.overlayBridge.setMiniOpenBehavior(behavior);
-        this.state.overlaySettings = { ...this.state.overlaySettings, ...next };
-        this.showTransientNotice(behavior === 'same-mini'
-          ? 'New pages will open in the same Yayra mini window.'
-          : 'Each new page will open in a separate Yayra mini window.');
-      } catch { this.showTransientNotice('Could not save the floating mini opening preference.'); }
     });
 
     // Transparency, size and shadow sliders preview live on 'input'; persist
@@ -12952,7 +13097,9 @@ export class BrowserShell {
     this.showTransientNotice("DevTools aren't available in the web build - use your browser's own (F12 / Ctrl+Shift+I).");
   }
 
-  /** Open an in-app print preview for websites, documents, and local tools. */
+  /** Print the active website or local document. Document tabs never use the
+   *  native website surface; PDF pages are fully painted just for the print
+   *  snapshot and returned to their normal windowed-memory state afterward. */
   async printActivePage({ onClose = null } = {}) {
     if (this._printPreviewState) return false;
     const tab = this.getActiveTab();
@@ -13514,12 +13661,6 @@ export class BrowserShell {
     return true;
   }
 
-  _isLocalDocumentTab(tab = this.getActiveTab()) {
-    const url = String(tab?.url || '');
-    return Boolean(tab?.isDocument || tab?.isDocumentRecovery
-      || /^yayra:\/\/(?:doc|recover-document|documents)(?:\/|$)/i.test(url));
-  }
-
   _armConnectivityAwareness() {
     if (this._connectivityArmed || typeof window === 'undefined') return;
     this._connectivityArmed = true;
@@ -13529,9 +13670,8 @@ export class BrowserShell {
       // the recovery surface in place immediately rather than waiting for a
       // native engine's delayed error callback (and showing blank meanwhile).
       const activeTab = this.getActiveTab();
-      const activeIsLocalDocument = this._isLocalDocumentTab(activeTab);
-      let activeFailure = activeIsLocalDocument ? null : this._siteFailureFor(this.state.activeTabId);
-      if (!activeIsLocalDocument && !activeFailure && activeTab?.isLoading && this._isWebsiteUrl(activeTab.url)) {
+      let activeFailure = this._siteFailureFor(this.state.activeTabId);
+      if (!activeFailure && activeTab?.isLoading && this._isWebsiteUrl(activeTab.url)) {
         activeFailure = this._recordSiteFailure(activeTab.id, {
           url: activeTab.url,
           errorCode: -106,
@@ -13545,25 +13685,17 @@ export class BrowserShell {
         activeFailure.errorDescription = 'net::ERR_INTERNET_DISCONNECTED';
         this.requestRender();
       }
-      // A connectivity notice is useful on websites, but it obscures an
-      // entirely local document and wrongly suggests that opening it needs the
-      // network. Local document tabs and the Documents hub are independent of
-      // navigator.onLine, so leave their viewer and tab strip untouched.
-      if (!activeIsLocalDocument) {
-        this.showTransientNotice('You\u2019re offline. Websites that need internet can\u2019t load; local files and saved documents remain available.');
-      }
+      this.showTransientNotice('You\u2019re offline - new pages can\u2019t load until the connection is back. Pages you already opened stay available.');
     };
     const onOnline = () => {
       // Exactly the requested scope: immediately reload the active site only
       // when it is in a failed recovery state. Healthy tabs remain untouched.
-      const activeTab = this.getActiveTab();
-      const activeIsLocalDocument = this._isLocalDocumentTab(activeTab);
-      const activeFailure = activeIsLocalDocument ? null : this._siteFailureFor(this.state.activeTabId);
+      const activeFailure = this._siteFailureFor(this.state.activeTabId);
       if (activeFailure) {
         this.showTransientNotice('Back online - retrying this page now.');
         activeFailure.offline = false;
         this._retrySiteRecovery(activeFailure.tabId, { reason: 'online' });
-      } else if (!activeIsLocalDocument) {
+      } else {
         this.showTransientNotice('Back online.');
         try { this.render(); } catch { /* best-effort connectivity repaint */ }
       }
@@ -14528,11 +14660,6 @@ export class BrowserShell {
     return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   }
 
-  _sanitizeTabGroupMemberLabel(value) {
-    const label = String(value || '').replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim().slice(0, 80);
-    return label || null;
-  }
-
   _durableTabGroupUrl(value) {
     const url = String(value || '');
     if (!url || url.length > 8192 || /^yayra:\/\/doc\//i.test(url)) return null;
@@ -14612,11 +14739,6 @@ export class BrowserShell {
     if (!member && allowUrlReuse) {
       member = record.members.find((candidate) => candidate.url === url && !claimed.has(candidate.id)) || null;
     }
-    const label = this._sanitizeTabGroupMemberLabel(
-      tab.groupLabel === undefined ? member?.label : tab.groupLabel
-    );
-    if (tab.groupLabel === undefined && label) tab.groupLabel = label;
-    else if (tab.groupLabel !== undefined) tab.groupLabel = label;
     const now = Date.now();
     if (!member) {
       const requestedMemberId = /^tgm-[A-Za-z0-9_-]{1,120}$/.test(String(tab.groupMemberId || ''))
@@ -14627,7 +14749,6 @@ export class BrowserShell {
         id: requestedMemberId,
         url,
         title: document?.name || String(tab.title || url).slice(0, 120),
-        ...(label ? { label } : {}),
         ...(document ? { document } : {}),
         createdAt: now,
         updatedAt: now
@@ -14641,12 +14762,9 @@ export class BrowserShell {
     }
     const title = document?.name || String(tab.title || url).slice(0, 120);
     const documentChanged = JSON.stringify(member.document || null) !== JSON.stringify(document || null);
-    const labelChanged = (member.label || null) !== label;
-    if (member.url !== url || member.title !== title || documentChanged || labelChanged) {
+    if (member.url !== url || member.title !== title || documentChanged) {
       member.url = url;
       member.title = title;
-      if (label) member.label = label;
-      else delete member.label;
       if (document) member.document = document;
       else delete member.document;
       member.updatedAt = now;
@@ -14779,7 +14897,6 @@ export class BrowserShell {
         addMember({
           url: member.url,
           title: member.title,
-          ...(member.label ? { groupLabel: this._sanitizeTabGroupMemberLabel(member.label) } : {}),
           ...(member.document ? { document: member.document, documentRecovery: member.document } : {}),
           group,
           groupMemberId: member.id,
@@ -14792,7 +14909,7 @@ export class BrowserShell {
     return Array.from(groups.values(), ({ _keys, ...group }) => group);
   }
 
-  openTabGroup(groupId) {
+  openTabGroup(groupId, { activeMember = null } = {}) {
     const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
     if (!group || !group.tabs.length) return false;
     const groupData = { ...(group.catalogId ? { id: group.catalogId } : {}), name: group.name, color: group.color };
@@ -14833,7 +14950,6 @@ export class BrowserShell {
       if (ungrouped) {
         ungrouped.group = groupData;
         ungrouped.groupMemberId = saved.groupMemberId || null;
-        ungrouped.groupLabel = this._sanitizeTabGroupMemberLabel(member.groupLabel || saved.label || saved.groupLabel);
         this._rememberDurableTabGroupMember(ungrouped);
         openedMembers.push(ungrouped);
         restoredEntries.push(saved);
@@ -14842,7 +14958,6 @@ export class BrowserShell {
 
       const restored = this.createNewTab(false, { group: groupData, render: false });
       restored.groupMemberId = saved.groupMemberId || null;
-      restored.groupLabel = this._sanitizeTabGroupMemberLabel(member.groupLabel || saved.label || saved.groupLabel);
       const document = this.sanitizeDocumentRecoveryDescriptor(saved.document || saved.documentRecovery);
       if (document) {
         restored.url = this.documentRecoveryUrl(document);
@@ -14876,154 +14991,18 @@ export class BrowserShell {
           && (restoredMemberIds.has(entry.groupMemberId) || restoredUrls.has(entry.url))));
     }
 
-    const target = openedMembers[0];
+    let target = activeMember
+      ? openedMembers.find((tab) => tab.id === activeMember.id
+        || (activeMember.groupMemberId && tab.groupMemberId === activeMember.groupMemberId))
+      : null;
+    if (!target && activeMember?.url) target = openedMembers.find((tab) => tab.url === activeMember.url);
+    target ||= openedMembers[0];
     this.persistDurableTabGroups();
     this.selectTab(target.id);
     if (newlyOpened > 0) {
       this.showTransientNotice(`Opened ${newlyOpened} saved tab${newlyOpened === 1 ? '' : 's'} from “${group.name}”.`);
     }
     return true;
-  }
-
-  openTabGroupMember(groupId, memberId) {
-    const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
-    if (!group) return false;
-    const key = String(memberId || '');
-    const member = group.tabs.find((candidate) =>
-      String(candidate.groupMemberId || '') === key
-      || String(candidate.id || '') === key
-      || String(candidate.url || '') === key);
-    if (!member) return false;
-
-    let target = member.id
-      ? this.state.tabs.find((tab) => tab.id === member.id)
-      : null;
-    if (!target && member.groupMemberId) {
-      target = this.state.tabs.find((tab) => tab.groupMemberId === member.groupMemberId
-        && this.tabGroupIdentity(tab.group, tab.isPrivate) === group.id);
-    }
-    const saved = member._durableGroupMember
-      ? member
-      : [...(this.state.tabGroupRestoreTabs || []), ...(this.state.continueTabs || [])].find((entry) =>
-        (member.groupMemberId && entry.groupMemberId === member.groupMemberId)
-        || (entry.url === member.url && this.tabGroupIdentity(entry.group, false) === group.id));
-    const groupData = { ...(group.catalogId ? { id: group.catalogId } : {}), name: group.name, color: group.color };
-
-    if (!target && saved && this._durableTabGroupUrl(saved.url)) {
-      target = this.state.tabs.find((tab) => !tab.isPrivate
-        && ((saved.groupMemberId && tab.groupMemberId === saved.groupMemberId)
-          || (tab.url === saved.url && this.tabGroupIdentity(tab.group, false) === group.id)));
-      if (!target) {
-        target = this.state.tabs.find((tab) => !tab.isPrivate && tab.url === saved.url
-          && !this.sanitizeTabGroup(tab.group));
-        if (target) {
-          target.group = groupData;
-          target.groupMemberId = saved.groupMemberId || member.groupMemberId || null;
-        }
-      }
-      if (!target) {
-        target = this.createNewTab(false, { group: groupData, render: false });
-        target.groupMemberId = saved.groupMemberId || member.groupMemberId || null;
-        const document = this.sanitizeDocumentRecoveryDescriptor(saved.document || saved.documentRecovery);
-        if (document) {
-          target.url = this.documentRecoveryUrl(document);
-          target.title = document.name;
-          target.isSecure = true;
-          target.isLoading = false;
-          target.isDocumentRecovery = true;
-          target.documentRecovery = document;
-          target.documentRecoveryError = null;
-        } else {
-          target.title = String(saved.title || saved.url).slice(0, 120);
-          this.navigateActiveTab(saved.url);
-        }
-      }
-      target.group = groupData;
-      target.groupMemberId = saved.groupMemberId || member.groupMemberId || target.groupMemberId || null;
-      target.groupLabel = this._sanitizeTabGroupMemberLabel(member.groupLabel || saved.label || saved.groupLabel);
-      if (saved.document || saved.documentRecovery) {
-        target.documentRecovery = this.sanitizeDocumentRecoveryDescriptor(saved.document || saved.documentRecovery);
-        if (target.isDocumentRecovery) void this.retryDocumentRecovery(target.id);
-      }
-      for (const keyName of ['tabGroupRestoreTabs', 'continueTabs']) {
-        this.state[keyName] = (this.state[keyName] || []).filter((entry) => {
-          const selectedEntry = target.groupMemberId
-            ? entry.groupMemberId === target.groupMemberId
-            : entry.url === saved.url && this.tabGroupIdentity(entry.group, false) === group.id;
-          return !selectedEntry;
-        });
-      }
-    }
-
-    if (!target) return false;
-    if (member.groupLabel !== undefined) target.groupLabel = this._sanitizeTabGroupMemberLabel(member.groupLabel);
-    this._rememberDurableTabGroupMember(target);
-    this.persistDurableTabGroups();
-    this.selectTab(target.id);
-    return true;
-  }
-
-  async renameTabGroupMember(groupId, memberId) {
-    const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
-    if (!group) return false;
-    const key = String(memberId || '');
-    const member = group.tabs.find((candidate) =>
-      String(candidate.groupMemberId || '') === key
-      || String(candidate.id || '') === key
-      || String(candidate.url || '') === key);
-    if (!member) return false;
-    const prompted = await this._textPromptDialog({
-      title: 'Name this saved tab',
-      description: 'Choose a short label for this tab in its group. Leave it empty to use the page title.',
-      placeholder: 'e.g. Lecture 3, Budget, Chapter 2',
-      initialValue: member.groupLabel || this.getTabTitle(member),
-      placement: 'tab-groups'
-    });
-    if (prompted === null || prompted === undefined) return false;
-    const label = this._sanitizeTabGroupMemberLabel(prompted);
-    const liveTab = member.id
-      ? this.state.tabs.find((tab) => tab.id === member.id)
-      : this.state.tabs.find((tab) => tab.groupMemberId === member.groupMemberId);
-    const catalog = this._catalogGroupByIdentity(group.catalogId || groupId);
-    const durableMember = catalog?.members?.find((candidate) => candidate.id === member.groupMemberId);
-    const isRestorable = [...(this.state.tabGroupRestoreTabs || []), ...(this.state.continueTabs || [])]
-      .some((entry) => member.groupMemberId
-        ? entry.groupMemberId === member.groupMemberId
-        : entry.url === member.url);
-    if (!liveTab && !durableMember && !isRestorable) return false;
-    if (liveTab) liveTab.groupLabel = label;
-    if (durableMember) {
-      if (label) durableMember.label = label;
-      else delete durableMember.label;
-      durableMember.updatedAt = Date.now();
-      catalog.updatedAt = durableMember.updatedAt;
-    }
-    for (const entry of [...(this.state.tabGroupRestoreTabs || []), ...(this.state.continueTabs || [])]) {
-      if ((member.groupMemberId && entry.groupMemberId === member.groupMemberId)
-        || (!member.groupMemberId && entry.url === member.url)) {
-        if (label) entry.groupLabel = label;
-        else delete entry.groupLabel;
-      }
-    }
-    if (liveTab) this._rememberDurableTabGroupMember(liveTab);
-    this.persistDurableTabGroups();
-    this.render();
-    this.showTransientNotice(label
-      ? `Saved tab label changed to “${label}”.`
-      : 'Saved tab label reset to the page title.');
-    return true;
-  }
-
-  async editTabGroup(groupId) {
-    const group = this.getTabGroups().find((candidate) => candidate.id === groupId);
-    if (!group) return false;
-    // The edit path starts with the group name, then opens the group picker
-    // where every saved member already has its own Rename control. Even if
-    // the user cancels the group-name prompt, the picker still lets them edit
-    // member labels independently.
-    const renamed = await this.renameTabGroup(groupId);
-    this.openModal('tab-groups');
-    return renamed;
   }
 
   async renameTabGroup(groupId) {
@@ -15141,69 +15120,18 @@ export class BrowserShell {
     this.openInternalPage('yayra://settings');
   }
 
-  renderTabGroupContextMenu(x, y, group) {
-    if (!group) return;
-    const previous = document.body.querySelector('.fb-tab-context-menu');
-    const previousScrim = Array.from(document.body.querySelectorAll('.fb-dropdown-scrim') || [])
-      .find((el) => el?.dataset?.tabCtx === 'true');
-    (previous?._yayraDismiss || previousScrim?._yayraDismiss)?.();
-
-    const scrim = document.createElement('button');
-    scrim.type = 'button';
-    scrim.className = 'fb-dropdown-scrim';
-    scrim.dataset.tabCtx = 'true';
-    scrim.setAttribute('aria-label', 'Close menu');
-    const menu = document.createElement('div');
-    menu.className = 'fb-tab-context-menu';
-    menu.setAttribute('role', 'menu');
-    menu.setAttribute('aria-label', `${group.name} tab group`);
-    menu.style.setProperty?.('-webkit-app-region', 'no-drag');
-    menu.style.setProperty?.('pointer-events', 'auto');
-    const stripBottom = Math.max(36, Number(this.tabStripElement?.getBoundingClientRect?.().bottom) || 0);
-    scrim.style.top = `${stripBottom}px`;
-    scrim.style.height = `calc(100% - ${stripBottom}px)`;
-    let dismissed = false;
-    const dismiss = () => {
-      if (dismissed) return;
-      dismissed = true;
-      scrim.remove();
-      menu.remove();
-      clearTimeout(timer);
-      try { this.healStuckPageSurface(); } catch { /* best effort */ }
-    };
-    menu._yayraDismiss = scrim._yayraDismiss = dismiss;
-    scrim.addEventListener('pointerdown', (event) => { event.preventDefault?.(); dismiss(); });
-    scrim.addEventListener('click', dismiss);
-    const timer = setTimeout(dismiss, 30000);
-    timer?.unref?.();
-    for (const item of [
-      { label: 'Edit', action: () => { void this.editTabGroup(group.id); } },
-      { label: `Open “${group.name}”`, action: () => this.openTabGroup(group.id) }
-    ]) {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.className = 'fb-tab-context-menu-item';
-      button.setAttribute('role', 'menuitem');
-      button.textContent = item.label;
-      button.addEventListener('click', (event) => {
-        event.preventDefault?.();
-        event.stopPropagation?.();
-        dismiss();
-        item.action();
-      });
-      menu.appendChild(button);
-    }
-    const left = Math.max(8, Math.min(Number(x) || 8, (window.innerWidth || 1024) - 248));
-    const top = Math.max(stripBottom + 4, Math.min(Number(y) || stripBottom + 4, (window.innerHeight || 768) - 100));
-    menu.style.left = `${left}px`;
-    menu.style.top = `${top}px`;
-    document.body.appendChild(scrim);
-    document.body.appendChild(menu);
-    try { this.setPageObscured(true); } catch { /* no native page */ }
+  dismissTabGroupFlyout() {
+    if (this._tabGroupHoverTimer) clearTimeout(this._tabGroupHoverTimer);
+    this._tabGroupHoverTimer = null;
+    this._activeTabGroupFlyout?.remove?.();
+    this._activeTabGroupFlyout = null;
+    this._activeTabGroupFlyoutButton?.setAttribute?.('aria-expanded', 'false');
+    this._activeTabGroupFlyoutButton = null;
   }
 
   renderTabGroupPickerList(container) {
     if (!container) return;
+    this.dismissTabGroupFlyout();
     container.innerHTML = '';
     container.classList?.add?.('fb-tab-groups-picker');
     const groups = this.getTabGroups();
@@ -15218,23 +15146,24 @@ export class BrowserShell {
     const groupList = document.createElement('div');
     groupList.className = 'fb-tab-groups-picker-groups';
     groupList.setAttribute('aria-label', 'Tab groups');
-    const members = document.createElement('div');
-    members.className = 'fb-tab-group-members';
-    members.id = 'fb-tab-group-members-selected';
-    members.setAttribute('role', 'list');
-    members.setAttribute('aria-label', 'Tabs in selected group');
     container.appendChild(groupList);
-    container.appendChild(members);
 
-    const selectGroup = (group, selectedButton) => {
-      for (const card of groupList.querySelectorAll('.fb-tab-group-picker-card')) {
-        const selected = card.querySelector('.fb-tab-group-picker-item') === selectedButton;
-        card.classList.toggle('is-selected', selected);
-        const button = card.querySelector('.fb-tab-group-picker-item');
-        button?.setAttribute('aria-pressed', selected ? 'true' : 'false');
-        button?.setAttribute('aria-expanded', selected ? 'true' : 'false');
-      }
-      members.innerHTML = '';
+    const scheduleFlyoutDismiss = () => {
+      if (this._tabGroupHoverTimer) clearTimeout(this._tabGroupHoverTimer);
+      this._tabGroupHoverTimer = setTimeout(() => this.dismissTabGroupFlyout(), 140);
+    };
+    const showGroupTabs = (group, button, anchor) => {
+      if (this._tabGroupHoverTimer) clearTimeout(this._tabGroupHoverTimer);
+      this._tabGroupHoverTimer = null;
+      if (this._activeTabGroupFlyoutButton === button && this._activeTabGroupFlyout) return;
+      this.dismissTabGroupFlyout();
+
+      const members = document.createElement('div');
+      members.className = 'fb-tab-group-members fb-tab-group-hover-flyout';
+      members.setAttribute('data-theme', this.resolveEffectiveTheme());
+      members.id = `fb-tab-group-members-${String(group.id).replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+      members.setAttribute('role', 'list');
+      members.setAttribute('aria-label', `Tabs in ${group.name}`);
       const heading = document.createElement('div');
       heading.className = 'fb-tab-group-members-heading';
       const groupTitle = document.createElement('strong');
@@ -15254,6 +15183,7 @@ export class BrowserShell {
         const openTab = document.createElement('button');
         openTab.type = 'button';
         openTab.className = 'fb-tab-group-member-open';
+        openTab.setAttribute('aria-label', `Open ${this.getTabTitle(tab)} from ${group.name}`);
         openTab.title = this.getTabTitle(tab);
         const memberTitle = document.createElement('span');
         memberTitle.className = 'fb-tab-group-member-title';
@@ -15263,30 +15193,60 @@ export class BrowserShell {
         memberUrl.textContent = tab.groupLabel ? this.getTabTitle(tab) : String(tab.url || '').replace(/^https?:\/\//, '').slice(0, 100);
         openTab.appendChild(memberTitle);
         if (memberUrl.textContent && memberUrl.textContent !== memberTitle.textContent) openTab.appendChild(memberUrl);
-        openTab.setAttribute('aria-label', `Open ${memberTitle.textContent} from ${group.name}`);
         openTab.addEventListener('click', () => {
           this.closeModal();
-          this.openTabGroupMember(group.id, memberId);
-        });
-
-        const rename = document.createElement('button');
-        rename.type = 'button';
-        rename.className = 'fb-tab-group-member-rename';
-        rename.setAttribute('aria-label', `Rename ${this.getTabTitle(tab)} in ${group.name}`);
-        rename.title = 'Set a custom tab label';
-        rename.textContent = 'Rename';
-        rename.addEventListener('click', (event) => {
-          event?.preventDefault?.();
-          event?.stopPropagation?.();
-          void this.renameTabGroupMember(group.id, memberId);
+          if (typeof this.openTabGroupMember === 'function') this.openTabGroupMember(group.id, memberId);
+          else this.openTabGroup(group.id, { activeMember: tab });
         });
         row.appendChild(openTab);
-        row.appendChild(rename);
+        if (typeof this.renameTabGroupMember === 'function') {
+          const rename = document.createElement('button');
+          rename.type = 'button';
+          rename.className = 'fb-tab-group-member-rename';
+          rename.setAttribute('aria-label', `Rename ${this.getTabTitle(tab)} in ${group.name}`);
+          rename.title = 'Set a custom tab label';
+          rename.textContent = 'Rename';
+          rename.addEventListener('click', (event) => {
+            event?.preventDefault?.();
+            event?.stopPropagation?.();
+            void this.renameTabGroupMember(group.id, memberId);
+          });
+          row.appendChild(rename);
+        }
         members.appendChild(row);
       }
+
+      const viewportWidth = typeof window !== 'undefined' ? (Number(window.innerWidth) || 1024) : 1024;
+      const viewportHeight = typeof window !== 'undefined' ? (Number(window.innerHeight) || 768) : 768;
+      const flyoutWidth = Math.min(320, Math.max(220, viewportWidth - 16));
+      const rect = anchor?.getBoundingClientRect?.() || {};
+      let left = (Number(rect.right) || 0) + 8;
+      if (left + flyoutWidth > viewportWidth - 8) {
+        left = Math.max(8, (Number(rect.left) || 8) - flyoutWidth - 8);
+      }
+      const top = Math.max(8, Math.min(Number(rect.top) || 8, viewportHeight - 360 - 8));
+      members.style.position = 'fixed';
+      members.style.left = `${left}px`;
+      members.style.top = `${top}px`;
+      members.style.width = `${flyoutWidth}px`;
+      document.body.appendChild(members);
+      this._activeTabGroupFlyout = members;
+      this._activeTabGroupFlyoutButton = button;
+      button?.setAttribute?.('aria-expanded', 'true');
+      button?.setAttribute?.('aria-controls', members.id);
+      members.addEventListener('mouseenter', () => {
+        if (this._tabGroupHoverTimer) clearTimeout(this._tabGroupHoverTimer);
+        this._tabGroupHoverTimer = null;
+      });
+      members.addEventListener('mouseleave', scheduleFlyoutDismiss);
+      members.addEventListener('focusin', () => {
+        if (this._tabGroupHoverTimer) clearTimeout(this._tabGroupHoverTimer);
+        this._tabGroupHoverTimer = null;
+      });
+      members.addEventListener('focusout', scheduleFlyoutDismiss);
     };
 
-    groups.forEach((group, groupIndex) => {
+    for (const group of groups) {
       const card = document.createElement('section');
       card.className = 'fb-tab-group-picker-card';
       const row = document.createElement('div');
@@ -15295,9 +15255,8 @@ export class BrowserShell {
       item.type = 'button';
       item.className = 'fb-tab-group-picker-item';
       item.setAttribute('aria-label', `Show tabs in ${group.name} group`);
-      item.setAttribute('aria-pressed', groupIndex === 0 ? 'true' : 'false');
-      item.setAttribute('aria-expanded', groupIndex === 0 ? 'true' : 'false');
-      item.setAttribute('aria-controls', members.id);
+      item.setAttribute('aria-pressed', 'false');
+      item.setAttribute('aria-expanded', 'false');
       const swatch = document.createElement('span');
       swatch.className = 'fb-tab-group-swatch';
       swatch.style.background = group.color;
@@ -15306,38 +15265,38 @@ export class BrowserShell {
       const title = document.createElement('strong');
       title.textContent = group.name;
       const details = document.createElement('small');
-      details.textContent = `${group.tabs.length} tab${group.tabs.length === 1 ? '' : 's'} · Hover or select to choose a tab`;
-      const open = document.createElement('span');
-      open.className = 'fb-tab-group-picker-open';
-      open.textContent = group.tabs.length > 1 ? 'Open all' : (group.tabs.length === 1 ? 'Open' : 'Empty');
+      details.textContent = `${group.tabs.length} tab${group.tabs.length === 1 ? '' : 's'} · Hover to preview`;
       copy.appendChild(title);
       copy.appendChild(details);
       item.appendChild(swatch);
       item.appendChild(copy);
-      item.addEventListener('click', () => selectGroup(group, item));
+      item.addEventListener('mouseenter', () => showGroupTabs(group, item, card));
+      item.addEventListener('focus', () => showGroupTabs(group, item, card));
+      item.addEventListener('click', () => showGroupTabs(group, item, card));
       row.appendChild(item);
-      const openAll = document.createElement('button');
-      openAll.type = 'button';
-      openAll.className = 'fb-tab-group-picker-open';
-      openAll.textContent = open.textContent;
-      openAll.disabled = group.tabs.length === 0;
-      openAll.setAttribute('aria-label', `Open all tabs in ${group.name}`);
-      openAll.addEventListener('click', () => {
+      const open = document.createElement('button');
+      open.type = 'button';
+      open.className = 'fb-tab-group-picker-open';
+      open.textContent = group.tabs.length > 1 ? 'Open all' : (group.tabs.length === 1 ? 'Open' : 'Empty');
+      open.disabled = group.tabs.length === 0;
+      open.setAttribute('aria-label', `Open all tabs in ${group.name}`);
+      open.addEventListener('click', () => {
         this.closeModal();
         this.openTabGroup(group.id);
       });
-      row.appendChild(openAll);
+      row.appendChild(open);
       card.appendChild(row);
-      card.addEventListener('mouseenter', () => selectGroup(group, item));
-      card.addEventListener('focusin', () => selectGroup(group, item));
+      card.addEventListener('mouseenter', () => showGroupTabs(group, item, card));
+      card.addEventListener('mouseleave', scheduleFlyoutDismiss);
+      card.addEventListener('focusin', () => showGroupTabs(group, item, card));
+      card.addEventListener('focusout', scheduleFlyoutDismiss);
       card.addEventListener('contextmenu', (event) => {
         event.preventDefault?.();
         event.stopPropagation?.();
         this.renderTabGroupContextMenu(event.clientX, event.clientY, group);
       });
       groupList.appendChild(card);
-      if (groupIndex === 0) selectGroup(group, item);
-    });
+    }
   }
 
   renderTabGroupSettingsList(container) {
@@ -15467,7 +15426,7 @@ export class BrowserShell {
         <button class="fb-modal-close-btn" aria-label="Close tab groups">${Icons.close}</button>
       </div>
       <div class="fb-modal-body fb-tab-groups-modal-body">
-        <p class="fb-tab-groups-modal-description">Choose a group, then open one of its tabs on the right or open the whole group.</p>
+        <p class="fb-tab-groups-modal-description">Hover a group to see its tabs, or open the whole group.</p>
         <div class="fb-tab-groups-picker-list"></div>
         <div class="fb-tab-groups-modal-actions">
           <button class="fb-btn fb-btn-primary fb-tab-groups-create-btn">${Icons.plus} New group</button>
@@ -16148,6 +16107,7 @@ export class BrowserShell {
     if (!range || !highlights || !HighlightApi || typeof highlights.set !== 'function') return false;
     try {
       const name = 'yayra-selection-highlight';
+      const safeColor = /^#[0-9a-f]{6}$/i.test(String(color || '')) ? color : '#ffe08a';
       let highlight = highlights.get(name);
       if (!highlight) {
         highlight = new HighlightApi();
@@ -16157,7 +16117,8 @@ export class BrowserShell {
       if (!document.getElementById('yayra-selection-highlight-style')) {
         const style = document.createElement('style');
         style.id = 'yayra-selection-highlight-style';
-        style.textContent = `::highlight(${name}) { background-color: color-mix(in srgb, ${color} 38%, transparent); color: inherit; }`;
+        const channels = safeColor.match(/[0-9a-f]{2}/gi).map((part) => Number.parseInt(part, 16));
+        style.textContent = `::highlight(${name}) { background-color: rgba(${channels.join(', ')}, 0.38); background-color: color-mix(in srgb, ${safeColor} 38%, transparent); color: inherit; }`;
         (document.head || document.documentElement).appendChild(style);
       }
       return true;
@@ -16999,7 +16960,7 @@ export class BrowserShell {
   renderSecurityDropdown(root) {
     this.appendDropdownScrim(root, () => {
       this.state.isSecurityDropdownOpen = false;
-      this.render();
+      this.renderOverlayLayerInPlace();
     });
 
     const dropdown = document.createElement('div');
@@ -17466,7 +17427,6 @@ export class BrowserShell {
   sessionEntryForTab(tab) {
     if (!tab || tab.isPrivate) return null;
     const group = this.sanitizeTabGroup(tab.group);
-    const groupLabel = group ? this._sanitizeTabGroupMemberLabel(tab.groupLabel) : null;
     const isDocumentUrl = /^yayra:\/\/(?:doc|recover-document)\//i.test(String(tab.url || ''));
     const document = isDocumentUrl ? this.documentRecoveryDescriptorForTab(tab) : null;
     if (document) {
@@ -17475,8 +17435,7 @@ export class BrowserShell {
         title: document.name,
         document,
         ...(group ? { group } : {}),
-        ...(group && tab.groupMemberId ? { groupMemberId: tab.groupMemberId } : {}),
-        ...(groupLabel ? { groupLabel } : {})
+        ...(group && tab.groupMemberId ? { groupMemberId: tab.groupMemberId } : {})
       };
     }
     const url = String(tab.url || '');
@@ -17485,15 +17444,13 @@ export class BrowserShell {
       url,
       title: tab.title || url,
       ...(group ? { group } : {}),
-      ...(group && tab.groupMemberId ? { groupMemberId: tab.groupMemberId } : {}),
-      ...(groupLabel ? { groupLabel } : {})
+      ...(group && tab.groupMemberId ? { groupMemberId: tab.groupMemberId } : {})
     };
   }
 
   normalizeSessionEntry(value) {
     if (!value || typeof value !== 'object' || value.isPrivate) return null;
     const group = this.sanitizeTabGroup(value.group);
-    const groupLabel = group ? this._sanitizeTabGroupMemberLabel(value.groupLabel) : null;
     const groupMemberId = /^tgm-[A-Za-z0-9_-]{1,120}$/.test(String(value.groupMemberId || ''))
       ? String(value.groupMemberId)
       : null;
@@ -17504,8 +17461,7 @@ export class BrowserShell {
         title: document.name,
         document,
         ...(group ? { group } : {}),
-        ...(group && groupMemberId ? { groupMemberId } : {}),
-        ...(groupLabel ? { groupLabel } : {})
+        ...(group && groupMemberId ? { groupMemberId } : {})
       };
     }
     const url = String(value.url || '');
@@ -17514,8 +17470,7 @@ export class BrowserShell {
         url,
         title: String(value.title || url).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 120) || url,
         ...(group ? { group } : {}),
-        ...(group && groupMemberId ? { groupMemberId } : {}),
-        ...(groupLabel ? { groupLabel } : {})
+        ...(group && groupMemberId ? { groupMemberId } : {})
       };
     }
     if (!/^https?:\/\//i.test(url) || url.length > 8192) return null;
@@ -17527,8 +17482,7 @@ export class BrowserShell {
       url,
       title: String(value.title || url).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 120) || url,
       ...(group ? { group } : {}),
-      ...(group && groupMemberId ? { groupMemberId } : {}),
-      ...(groupLabel ? { groupLabel } : {})
+      ...(group && groupMemberId ? { groupMemberId } : {})
     };
   }
 
@@ -17590,8 +17544,7 @@ export class BrowserShell {
         documentRecovery: descriptor,
         documentRecoveryError: failureReason,
         ...(normalized.group ? { group: normalized.group } : {}),
-        ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {}),
-        ...(normalized.groupLabel ? { groupLabel: normalized.groupLabel } : {})
+        ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {})
       };
     }
 
@@ -17618,8 +17571,7 @@ export class BrowserShell {
         documentRecovery: descriptor,
         documentRecoveryError: 'invalid-document',
         ...(normalized.group ? { group: normalized.group } : {}),
-        ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {}),
-        ...(normalized.groupLabel ? { groupLabel: normalized.groupLabel } : {})
+        ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {})
       };
     }
     if (source.recoveryId) doc.recoveryId = source.recoveryId;
@@ -17651,8 +17603,7 @@ export class BrowserShell {
       docState,
       documentRecovery: recoveredDescriptor,
       ...(normalized.group ? { group: normalized.group } : {}),
-      ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {}),
-      ...(normalized.groupLabel ? { groupLabel: normalized.groupLabel } : {})
+      ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {})
     };
   }
 
@@ -17674,8 +17625,7 @@ export class BrowserShell {
     const recovered = await this.createRecoveredDocumentTab({
       document: descriptor,
       group: tab.group,
-      groupMemberId: tab.groupMemberId,
-      groupLabel: tab.groupLabel
+      groupMemberId: tab.groupMemberId
     }, { tabId });
     if (!recovered || recovered.isDocumentRecovery) {
       if (recovered) this.state.tabs[index] = recovered;
@@ -17806,8 +17756,7 @@ export class BrowserShell {
       isPrivate: false,
       favicon: null,
       ...(normalized.group ? { group: normalized.group } : {}),
-      ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {}),
-      ...(normalized.groupLabel ? { groupLabel: normalized.groupLabel } : {})
+      ...(normalized.groupMemberId ? { groupMemberId: normalized.groupMemberId } : {})
     };
   }
 
@@ -17845,10 +17794,7 @@ export class BrowserShell {
   }
 
   closeSessionStorageKey() {
-    const miniId = this.options?.miniSessionId;
-    const shellScope = this.options?.isMiniShell
-      ? (miniId ? `mini:${encodeURIComponent(String(miniId))}:` : 'mini:')
-      : '';
+    const shellScope = this.options?.isMiniShell ? 'mini:' : '';
     return `yayra:${shellScope}close-session:${encodeURIComponent(this.currentProfileId())}`;
   }
 
@@ -18071,7 +18017,7 @@ export class BrowserShell {
   renderAccountDropdown(root) {
     this.appendDropdownScrim(root, () => {
       this.state.isAccountMenuOpen = false;
-      this.render();
+      this.renderOverlayLayerInPlace();
     });
 
     const dropdown = document.createElement('div');
@@ -18949,7 +18895,7 @@ export class BrowserShell {
     scrim.setAttribute('aria-label', 'Close Yayra menu');
     const closeDrawer = () => {
       this.state.isSideDrawerOpen = false;
-      this.render();
+      this.renderOverlayLayerInPlace();
     };
     scrim.addEventListener('click', closeDrawer);
     scrim.addEventListener('contextmenu', (e) => {
@@ -19469,7 +19415,6 @@ export class BrowserShell {
 
     drawer.querySelector('.fb-dr-calculator')?.addEventListener('click', () => {
       this.state.isSideDrawerOpen = false;
-      this.render();
       this.openCalculatorFromPreference();
     });
 
@@ -19756,7 +19701,7 @@ export class BrowserShell {
     bar.querySelector('.fb-find-close')?.addEventListener('click', () => {
       this.state.findInPage.isOpen = false;
       this.state.findInPage.query = '';
-      this.render();
+      this.renderOverlayLayerInPlace();
     });
 
     root.appendChild(bar);
@@ -21453,7 +21398,6 @@ export class BrowserShell {
         }))
       }] : []),
       ...(currentGroup ? [
-        { label: `Edit “${currentGroup.name}” group`, action: () => { void this.editTabGroup(currentGroup.id); } },
         { label: `Open “${currentGroup.name}” group`, action: () => this.openTabGroup(currentGroup.id) },
         { label: `Remove from “${currentGroup.name}”`, action: () => this.ungroupTab(tab.id) }
       ] : []),
@@ -21481,56 +21425,40 @@ export class BrowserShell {
       menu.style.top = `${top}px`;
     };
 
-    // Electron/Linux can drop pointerup, mouseup, and click while focus moves
-    // from the native site view to this renderer. These menu commands are
-    // deliberately committed on primary pointerdown, before that focus change
-    // can discard the rest of the physical click. Use mousedown as the mouse
-    // fallback, then click only for keyboard/assistive activation. Suppress the
-    // paired compatibility events so a submenu never toggles twice.
-    const pinMenuHitTarget = (button) => {
-      // Chromium/Electron can treat descendants of frameless chrome as drag
-      // regions even when their body-mounted menu is interactive. Pin each
-      // actual button as well as the menu container: submenu rows are the
-      // primary-action targets, so a visible hover must also receive presses.
-      button.style?.setProperty?.('-webkit-app-region', 'no-drag');
-      button.style?.setProperty?.('pointer-events', 'auto');
-      button.style?.setProperty?.('touch-action', 'manipulation');
-      return button;
-    };
+    // Electron/Linux can occasionally deliver pointer-up while dropping the
+    // compatibility click as focus moves from the native site view to this
+    // renderer. Activate on primary pointer-up, retain click for keyboard and
+    // assistive technology, and suppress only the synthetic click belonging
+    // to the pointer-up we already handled. Commands are exactly-once even if
+    // both events arrive.
     const bindReliablePress = (button, handler) => {
-      pinMenuHitTarget(button);
       let suppressNextClick = false;
       let suppressionTimer = null;
-      let ignoreMouseDownUntil = 0;
+      let pressedPointer = null;
+      const pointerToken = (event) => event?.pointerId ?? 'primary';
       const isPrimaryActivation = (event) => {
         if (event?.isPrimary === false) return false;
         const pointerButton = event?.button == null ? 0 : Number(event.button);
         return pointerButton === 0 || pointerButton === -1;
       };
-      const activatePress = (event) => {
+      button.addEventListener('pointerdown', (event) => {
+        if (isPrimaryActivation(event)) pressedPointer = pointerToken(event);
+      });
+      button.addEventListener('pointercancel', () => { pressedPointer = null; });
+      button.addEventListener('pointerup', (event) => {
+        if (!isPrimaryActivation(event) || pressedPointer !== pointerToken(event)) return;
+        pressedPointer = null;
         suppressNextClick = true;
         if (suppressionTimer) clearTimeout(suppressionTimer);
         // The compatibility click is dispatched in a later browser task, so
         // a zero-delay timer expires before it arrives and lets submenu
-        // toggles run twice. Keep the one-shot guard long enough for that
-        // paired click.
+        // toggles run twice (open on pointerup, then immediately close on
+        // click). Keep the one-shot guard long enough for that paired click.
         suppressionTimer = setTimeout(() => { suppressNextClick = false; suppressionTimer = null; }, 500);
         suppressionTimer?.unref?.();
         event?.preventDefault?.();
         event?.stopPropagation?.();
         handler(event);
-      };
-      button.addEventListener('pointerdown', (event) => {
-        if (!isPrimaryActivation(event)) return;
-        // Chromium emits a compatibility mousedown immediately after a mouse
-        // pointerdown. Ignore that duplicate, but let a later mouse-only press
-        // activate normally if the pointer event was absent.
-        ignoreMouseDownUntil = Date.now() + 250;
-        activatePress(event);
-      });
-      button.addEventListener('mousedown', (event) => {
-        if (Number(event?.button ?? 0) !== 0 || Date.now() < ignoreMouseDownUntil) return;
-        activatePress(event);
       });
       button.addEventListener('click', (event) => {
         // detail > 0 identifies the browser's pointer-generated click. A
@@ -22053,12 +21981,12 @@ export class BrowserShell {
    * reused; otherwise the url opens in a fresh tab - never clobbering
    * a page the user already has open in main.
    */
-  openUrlHandoff(url, { openInNewTab = true } = {}) {
+  openUrlHandoff(url) {
     const target = String(url || '');
     if (!/^(https?:\/\/|yayra:\/\/)/i.test(target)) return false;
     const active = this.getActiveTab();
     const pristine = active && active.url === 'yayra://newtab' && !active.isPrivate;
-    if (!pristine && openInNewTab !== false) this.createNewTab();
+    if (!pristine) this.createNewTab();
     this.navigateActiveTab(target);
     return true;
   }
@@ -22795,12 +22723,11 @@ export class BrowserShell {
       if (mini) { this.openInternalPage('yayra://downloads'); return; }
       this.state.isDownloadsDropdownOpen = !this.state.isDownloadsDropdownOpen;
       if (!this.state.isDownloadsDropdownOpen) this.state.isDownloadsDropdownExpanded = false;
-      this.render();
+      this.renderOverlayLayerInPlace();
       return;
     }
-    if (action === 'tools') { this.state.isToolsDropdownOpen = !this.state.isToolsDropdownOpen; this.render(); return; }
-    if (action === 'calculator') { this.openCalculatorFromPreference(); return; }
-    const routes = { documents: 'yayra://documents', dictionary: 'yayra://dictionary', extensions: 'yayra://extensions', history: 'yayra://history', bookmarks: 'yayra://bookmarks', settings: 'yayra://settings', passwords: 'yayra://passwords' };
+    if (action === 'tools') { this.state.isToolsDropdownOpen = !this.state.isToolsDropdownOpen; this.renderOverlayLayerInPlace(); return; }
+    const routes = { documents: 'yayra://documents', dictionary: 'yayra://dictionary', extensions: 'yayra://extensions', calculator: 'yayra://calculator', history: 'yayra://history', bookmarks: 'yayra://bookmarks', settings: 'yayra://settings', passwords: 'yayra://passwords' };
     if (routes[action]) this.openInternalPage(routes[action]);
   }
 
@@ -22824,7 +22751,7 @@ export class BrowserShell {
     scrim.setAttribute('aria-label', 'Close Tools menu');
     scrim.addEventListener('click', () => {
       this.state.isToolsDropdownOpen = false;
-      this.render();
+      this.renderOverlayLayerInPlace();
     });
     root.appendChild(scrim);
     const dropdown = document.createElement('div');
@@ -22848,11 +22775,6 @@ export class BrowserShell {
       button.addEventListener('click', () => {
         const selected = tools.find((tool) => tool.id === button.dataset.tool);
         this.state.isToolsDropdownOpen = false;
-        if (selected?.id === 'calculator') {
-          this.render();
-          this.openCalculatorFromPreference();
-          return;
-        }
         if (selected?.id === 'settings') {
           this.state.settingsActiveCategory = 'calculator';
           this.state.activeSettingsCategory = 'calculator';
@@ -22870,7 +22792,7 @@ export class BrowserShell {
     this.appendDropdownScrim(root, () => {
       this.state.isDownloadsDropdownOpen = false;
       this.state.isDownloadsDropdownExpanded = false;
-      this.render();
+      this.renderOverlayLayerInPlace();
     });
 
     const dropdown = document.createElement('div');
@@ -23103,6 +23025,7 @@ export class BrowserShell {
   }
 
   openModal(modalName) {
+    this.dismissTabGroupFlyout();
     if (modalName === 'tab-switcher') {
       this.state.tabSwitcherSearchQuery = '';
       this.state.tabSwitcherRecentlyClosedExpanded = false;
@@ -23112,10 +23035,10 @@ export class BrowserShell {
   }
 
   closeModal() {
-    const closingPrintPreview = this.state.activeModal === 'print-preview';
+    this.dismissTabGroupFlyout();
+    if (this._printPreviewState) void this.finishPrintPreview(this._printPreviewState);
     this.state.activeModal = null;
     this.render();
-    if (closingPrintPreview) void this.finishPrintPreview();
   }
 
   toggleModal(modalName) {
@@ -24881,16 +24804,6 @@ export class BrowserShell {
     return null;
   }
 
-  documentViewingZoomBounds(state) {
-    switch (state?.viewer) {
-      case 'pdf': return { min: 0.1, max: 4 };
-      case 'ppt':
-      case 'pptx': return { min: 0.25, max: 6 };
-      case 'image': return { min: 0.1, max: 10 };
-      default: return { min: 0.5, max: 3 };
-    }
-  }
-
   applyDocumentViewingDefaults(tab, state) {
     const settings = this.state.settings || {};
     const mode = settings.documentsDefaultZoom || 'fit-width';
@@ -24906,10 +24819,7 @@ export class BrowserShell {
     const saved = key && settings.documentViewingProgress?.[key];
     if (!saved || typeof saved !== 'object') return state;
     if (Number.isFinite(Number(saved.page)) && Number(saved.page) >= 1) state.page = Math.round(Number(saved.page));
-    if (Number.isFinite(Number(saved.zoom))) {
-      const { min, max } = this.documentViewingZoomBounds(state);
-      state.zoom = Math.max(min, Math.min(max, Number(saved.zoom)));
-    }
+    if (Number.isFinite(Number(saved.zoom))) state.zoom = Math.max(0.5, Math.min(3, Number(saved.zoom)));
     if (['custom', 'fit-width', 'fit-page'].includes(saved.zoomMode)) state.zoomMode = saved.zoomMode;
     if ([0, 90, 180, 270].includes(Number(saved.rotation))) state.rotation = Number(saved.rotation);
     if (typeof saved.night === 'boolean') state.night = saved.night;
@@ -24917,7 +24827,6 @@ export class BrowserShell {
     if (['outline', 'thumbnails'].includes(saved.sidebarTab)) state.sidebarTab = saved.sidebarTab;
     if (typeof saved.showNotes === 'boolean') state.showNotes = saved.showNotes;
     if (Number.isFinite(Number(saved.scrollProgress))) state.scrollProgress = Math.max(0, Math.min(1, Number(saved.scrollProgress)));
-    if (Number.isFinite(Number(saved.rowPage)) && Number(saved.rowPage) >= 1) state.rowPage = Math.round(Number(saved.rowPage));
     return state;
   }
 
@@ -24927,11 +24836,9 @@ export class BrowserShell {
     const key = this.documentViewingProgressKey(tab);
     const state = tab.docState;
     if (!key || !state) return false;
-    const { min: minZoom, max: maxZoom } = this.documentViewingZoomBounds(state);
     const progress = {
       page: Math.max(1, Math.round(Number(state.page) || 1)),
-      rowPage: Math.max(1, Math.round(Number(state.rowPage) || 1)),
-      zoom: Math.max(minZoom, Math.min(maxZoom, Number(state.zoom) || 1)),
+      zoom: Math.max(0.5, Math.min(3, Number(state.zoom) || 1)),
       zoomMode: ['custom', 'fit-width', 'fit-page'].includes(state.zoomMode) ? state.zoomMode : 'custom',
       rotation: [0, 90, 180, 270].includes(Number(state.rotation)) ? Number(state.rotation) : 0,
       night: Boolean(state.night),
@@ -25592,50 +25499,25 @@ export class BrowserShell {
     }
 
     let sidebarStructureKey = '';
-    let lastScrolledThumbPage = null;
-    const syncSelectedThumbnail = () => {
-      if (!state.sidebarOpen || state.sidebarTab !== 'thumbnails') {
-        lastScrolledThumbPage = null;
-        return;
-      }
-      const page = Number(state.page) || 1;
-      const selected = [...sidebarBody.querySelectorAll('.fb-doc-thumb')]
-        .find((thumb) => Number(thumb.dataset.page) === page);
-      if (!selected) return;
-      for (const thumb of sidebarBody.querySelectorAll('.fb-doc-thumb')) {
-        if (Number(thumb.dataset.page) === page) thumb.setAttribute('aria-current', 'page');
-        else thumb.removeAttribute('aria-current');
-      }
-      if (lastScrolledThumbPage === page) return;
-      lastScrolledThumbPage = page;
-      try { selected.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' }); }
-      catch { try { selected.scrollIntoView?.(); } catch { /* unsupported embedder */ } }
-    };
     const renderSidebar = () => {
       try {
         const canShowSidebar = capabilities.outline || capabilities.thumbnails;
         sidebar.style.display = canShowSidebar && state.sidebarOpen ? 'block' : 'none';
         if (!canShowSidebar || !state.sidebarOpen) {
           sidebarStructureKey = '';
-          lastScrolledThumbPage = null;
           sidebarBody.innerHTML = '';
           return;
         }
         const nextStructureKey = `${state.sidebarTab}|${state.numPages}|${state.outline.length}|${documentKind}`;
         if (sidebarStructureKey === nextStructureKey && state.sidebarTab === 'thumbnails') {
           for (const tile of sidebarBody.querySelectorAll('.fb-doc-thumb')) {
-            const isCurrent = Number(tile.dataset.page) === Number(state.page);
-            tile.style.borderColor = isCurrent
+            tile.style.borderColor = Number(tile.dataset.page) === Number(state.page)
               ? 'var(--fb-accent-primary,#6d5df2)'
               : 'var(--fb-border-glass,rgba(255,255,255,0.12))';
-            if (isCurrent) tile.setAttribute('aria-current', 'page');
-            else tile.removeAttribute('aria-current');
           }
-          syncSelectedThumbnail();
           return;
         }
         sidebarStructureKey = nextStructureKey;
-        lastScrolledThumbPage = null;
         sidebarBody.innerHTML = '';
         for (const b of sidebarTabs.querySelectorAll('.fb-doc-sidebar-tab')) {
           b.style.background = 'var(--fb-bg-glass-input,rgba(255,255,255,0.07))';
@@ -25654,7 +25536,6 @@ export class BrowserShell {
             thumb.dataset.page = String(p);
             thumb.setAttribute('role', 'button');
             thumb.setAttribute('aria-label', `Go to ${pageNoun} ${p}`);
-            if (p === Number(state.page)) thumb.setAttribute('aria-current', 'page');
             thumb.style.cssText = `margin:0 auto 10px; width:140px; min-height:44px; padding:4px; border:1px solid ${p === state.page ? 'var(--fb-accent-primary,#6d5df2)' : 'var(--fb-border-glass,rgba(255,255,255,0.12))'}; border-radius:7px; cursor:pointer; text-align:center; background:var(--fb-bg-glass-input,#0e111a); overflow:hidden;`;
             const label = document.createElement('div');
             label.textContent = `${isPowerPointDocument(documentKind) ? 'Slide ' : ''}${p}`;
@@ -25675,7 +25556,6 @@ export class BrowserShell {
               renderPreview();
             }
           }
-          syncSelectedThumbnail();
           return;
         }
         if (!state.outline.length) {
@@ -27124,6 +27004,7 @@ export class BrowserShell {
     // before pointerup. End every renderer-only gesture and release its IPC
     // session/global fallback listeners synchronously.
     this.cancelActivePointerGestures('shell destroy');
+    this.dismissTabGroupFlyout();
     this.retireSearchSuggestionsForNavigation({ restoreSurface: false });
     for (const [target, type, listener, options] of this._topChromeRecoveryBindings || []) {
       try { target.removeEventListener?.(type, listener, options); } catch { /* target already gone */ }
@@ -27132,10 +27013,6 @@ export class BrowserShell {
     this._topChromeRecoveryInstalled = false;
     try { this._unsubscribeTopChromeRecovery?.(); } catch { /* native bridge already gone */ }
     this._unsubscribeTopChromeRecovery = null;
-    try { this._unsubscribeDictionaryLookup?.(); } catch { /* preload already gone */ }
-    this._unsubscribeDictionaryLookup = null;
-    try { this._unsubscribeMiniOpenPreference?.(); } catch { /* preload already gone */ }
-    this._unsubscribeMiniOpenPreference = null;
     if (typeof window !== 'undefined') {
       window.removeEventListener('resize', this.boundResizeHandler);
       window.removeEventListener('keydown', this.boundKeyHandler);

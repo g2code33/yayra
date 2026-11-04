@@ -626,7 +626,7 @@ function buildTextSelectionActionsScript() {
           if (!document.getElementById('yayra-selection-highlight-style')) {
             var style = document.createElement('style');
             style.id = 'yayra-selection-highlight-style';
-            style.textContent = '::highlight(' + name + ') { background-color: color-mix(in srgb, ' + color + ' 38%, transparent); color: inherit; }';
+            style.textContent = '::highlight(' + name + ') { background-color: ' + color + '; color: inherit; }';
             (document.head || document.documentElement).appendChild(style);
           }
           return true;
@@ -1047,6 +1047,22 @@ function buildWebAuthnWatchdogScript() {
  * query itself. If storage is unavailable, the watchdog opts out rather than
  * risk a reload loop.
  */
+function buildPrintRequestBridgeScript() {
+  return `(function () {
+  if (window.__yayraPrintRequestBridge) return;
+  window.__yayraPrintRequestBridge = true;
+  try {
+    Object.defineProperty(window, 'print', {
+      configurable: true,
+      writable: true,
+      value: function () {
+        window.postMessage({ source: 'yayra-print-request', version: 1 }, '*');
+      }
+    });
+  } catch (_err) { /* keyboard printing still routes through the host shortcut */ }
+})();`;
+}
+
 function buildGoogleSearchThinkingWatchdogScript({
   timeoutMs = 120_000,
   pollIntervalMs = 5_000,
@@ -1097,8 +1113,34 @@ function buildGoogleSearchThinkingWatchdogScript({
     return (result >>> 0).toString(36);
   }
   function hasStandaloneThinkingStatus() {
-    var text = document.body && typeof document.body.innerText === 'string' ? document.body.innerText : '';
-    return /(?:^|\\n)\\s*Thinking(?:\\s*(?:\\.{3}|…))?\\s*(?:\\n|$)/i.test(text);
+    // Reading body.innerText forces Chromium to lay out and serialize the
+    // entire Google results page every poll. Long AI threads make that
+    // increasingly expensive and can stall the composer while typing. Only
+    // inspect a bounded set of small live-status nodes, using textContent
+    // (which does not trigger layout), and stop as soon as one matches.
+    var statuses = document.querySelectorAll('[role="status"], [aria-live="polite"], [aria-live="assertive"]');
+    var limit = Math.min(statuses ? statuses.length : 0, 24);
+    function readSmallText(node, budget, depth) {
+      if (!node || budget.nodes <= 0 || budget.chars > 96 || depth > 3) return '';
+      budget.nodes -= 1;
+      if (node.nodeType === 3) {
+        var value = String(node.nodeValue || '');
+        budget.chars += value.length;
+        return budget.chars <= 96 ? value : '';
+      }
+      var children = node.childNodes;
+      if (!children || children.length > 8) return '';
+      var text = '';
+      for (var childIndex = 0; childIndex < children.length && budget.nodes > 0 && budget.chars <= 96; childIndex += 1) {
+        text += readSmallText(children[childIndex], budget, depth + 1);
+      }
+      return text;
+    }
+    for (var i = 0; i < limit; i += 1) {
+      var text = readSmallText(statuses[i], { nodes: 32, chars: 0 }, 0).trim();
+      if (/^Thinking(?:\\s*(?:\\.{3}|…))?$/i.test(text)) return true;
+    }
+    return false;
   }
   function recentlyReloaded(key, now) {
     try {
@@ -1177,6 +1219,12 @@ function buildBrowserUserAgent({ platform = process.platform, chromeVersion = pr
  *   Ctrl/Cmd+Shift+R, Ctrl+F5, Shift+F5 -> 'hard-reload' (cache cleared)
  * Returns null for everything else. Pure - unit tested directly.
  */
+function printActionForInput(input = {}) {
+  if (!input || (input.type && input.type !== 'keyDown')) return false;
+  const key = String(input.key || '').toLowerCase();
+  return key === 'p' && Boolean(input.control || input.meta) && !input.shift && !input.alt;
+}
+
 function reloadActionForInput(input = {}) {
   if (!input || (input.type && input.type !== 'keyDown')) return null;
   const key = String(input.key || '');
@@ -2636,6 +2684,7 @@ function createWebviewBridge({
       injectGoogleServiceAccount(entry);
       if (typeof wc.executeJavaScript === 'function') {
         const watchdogs = [
+          buildPrintRequestBridgeScript(),
           buildWebAuthnWatchdogScript(),
           buildGoogleSearchThinkingWatchdogScript(),
           // Match Firefox-grade media resilience: recover Cloudinary format
@@ -2659,6 +2708,12 @@ function createWebviewBridge({
     // Ctrl+R / Ctrl+Shift+R / F5 / Ctrl+F5 must be caught here. Hard
     // reloads genuinely clear this site's caches first (Chrome parity).
     wc.on('before-input-event', (event, input) => {
+      if (printActionForInput(input)) {
+        if (isAuthSurfaceEntry(entry)) return;
+        event.preventDefault();
+        sendTo(entry, 'print-request');
+        return;
+      }
       const action = reloadActionForInput(input);
       if (!action) return;
       event.preventDefault();
@@ -2935,6 +2990,10 @@ function createWebviewBridge({
       lastDownloadUrl: '',
       pointerTheme: 'system',
       pointerSize: 'normal',
+      bounds: null,
+      lastVisibleBounds: null,
+      visible: false,
+      visibilityGeneration: 0,
       pageUnresponsive: false,
       pageUnresponsiveReloadTimer: null,
       lastPageUnresponsiveReloadAt: 0
@@ -3117,10 +3176,31 @@ function createWebviewBridge({
     return fn(entry.view);
   }
 
+  function sameBounds(a, b) {
+    return Boolean(a && b && a.x === b.x && a.y === b.y
+      && a.width === b.width && a.height === b.height);
+  }
+
+  function applyEntryBounds(entry, bounds) {
+    const next = sanitizePageBounds(bounds);
+    // ResizeObserver and shell renders can report identical geometry hundreds
+    // of times. Avoid forwarding redundant native-surface mutations.
+    if (sameBounds(entry.bounds, next)) return false;
+    entry.view.setBounds(next);
+    entry.bounds = next;
+    entry.visible = next.width > 0 && next.height > 0;
+    if (entry.visible) entry.lastVisibleBounds = next;
+    return true;
+  }
+
   function setBounds(key, bounds) {
+    const entry = views.get(key);
+    if (!entry) return;
+    // A fresh geometry report supersedes an in-flight asynchronous hide.
+    entry.visibilityGeneration += 1;
     // Main-process enforcement: renderer mistakes/races can shrink the page,
     // but can never place a native website surface over the tab/caption row.
-    withView(key, (view) => view.setBounds(sanitizePageBounds(bounds)));
+    applyEntryBounds(entry, bounds);
   }
 
   /**
@@ -3146,9 +3226,14 @@ function createWebviewBridge({
     const entry = views.get(key);
     if (!entry) return undefined;
     const wc = entry.view.webContents;
+    const loadGeneration = entry.loadGeneration;
     if (wc && typeof wc.capturePage === 'function') {
       try {
         const image = await wc.capturePage();
+        // Navigation or teardown may race capturePage(). Never let a previous
+        // document's pixels become the snapshot for the current tab surface.
+        if (views.get(key) !== entry || entry.view.webContents !== wc
+            || wc.isDestroyed?.() || entry.loadGeneration !== loadGeneration) return undefined;
         if (image && typeof image.toDataURL === 'function' && !(typeof image.isEmpty === 'function' && image.isEmpty())) {
           return { snapshot: snapshotDataUrl(image) };
         }
@@ -3159,36 +3244,45 @@ function createWebviewBridge({
     return undefined;
   }
 
-  async function setVisible(key, visible, { capture = false } = {}) {
+  async function setVisible(key, visible, { capture: shouldCapture = false } = {}) {
     const entry = views.get(key);
     if (!entry) return undefined;
-    const view = entry.view;
+    const generation = ++entry.visibilityGeneration;
     if (visible) {
-      // Restoring a previously zeroed-out view just needs its real bounds
-      // back; the caller (renderer ResizeObserver) sends those right after.
+      // Geometry is supplied by the renderer after layout. This call only
+      // invalidates an older asynchronous capture/hide request.
       return undefined;
     }
-    // Overlay-aware hiding: the renderer's own chrome (menu drawer, modals,
-    // dropdowns) are HTML that a native WebContentsView would otherwise
-    // cover, because native views always paint above the page document.
-    // When the renderer asks for a capture, grab a snapshot of the page
-    // BEFORE zeroing the bounds so the renderer can show a pixel-identical
-    // still image underneath its overlay UI - making the chrome truly
-    // overlay the page instead of the page covering the chrome.
+    if (!shouldCapture && !entry.visible) return undefined;
+
+    // Keep the live page visible until the renderer has a snapshot it can
+    // paint. The renderer's image decode callback then asks us to hide without
+    // recapturing, preventing an empty rectangle during asynchronous capture.
     let snapshot = null;
-    if (capture && view.webContents && typeof view.webContents.capturePage === 'function') {
+    if (shouldCapture && entry.visible && entry.view.webContents
+        && typeof entry.view.webContents.capturePage === 'function') {
       try {
-        const image = await view.webContents.capturePage();
+        const image = await entry.view.webContents.capturePage();
+        if (views.get(key) !== entry || generation !== entry.visibilityGeneration) {
+          if (image && typeof image.toDataURL === 'function' && !(typeof image.isEmpty === 'function' && image.isEmpty())) {
+            return { snapshot: snapshotDataUrl(image) };
+          }
+          return undefined;
+        }
         if (image && typeof image.toDataURL === 'function' && !(typeof image.isEmpty === 'function' && image.isEmpty())) {
           snapshot = snapshotDataUrl(image);
         }
       } catch (err) {
         logger.error?.(`[yayra:webview] capturePage failed for ${key}`, err);
       }
+      // If there is no usable image, leave the page visible rather than
+      // replacing it with a blank hole underneath the chrome.
+      if (!snapshot) return undefined;
     }
+    if (views.get(key) !== entry || generation !== entry.visibilityGeneration) return snapshot ? { snapshot } : undefined;
     // Zeroing bounds (rather than removing/re-adding the child view) hides
     // the surface without destroying the guest page or losing its state.
-    view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
+    applyEntryBounds(entry, { x: 0, y: 0, width: 0, height: 0 });
     return snapshot ? { snapshot } : undefined;
   }
 
@@ -4056,6 +4150,14 @@ function createWebviewBridge({
   }
 
   if (typeof ipcMain.on === 'function') {
+    ipcMain.on('yayra:webview-print-request', (event) => {
+      const entry = entryForViewSender(event);
+      if (!entry || isAuthSurfaceEntry(entry)) return;
+      const now = Date.now();
+      if (entry.lastPrintRequestAt && now - entry.lastPrintRequestAt < 1200) return;
+      entry.lastPrintRequestAt = now;
+      sendTo(entry, 'print-request');
+    });
     ipcMain.on('yayra:autofill-captured', (event, payload = {}) => {
       const entry = entryForViewSender(event);
       if (!entry || entry.isPrivate) return;
@@ -4234,6 +4336,7 @@ module.exports = {
   decodeOpenExternalRequest,
   buildWebAuthnWatchdogScript,
   buildGoogleSearchThinkingWatchdogScript,
+  buildPrintRequestBridgeScript,
   buildPointerThemeCss,
   buildPointerThemeScript,
   buildPointerTextCursorScript,
@@ -4246,6 +4349,7 @@ module.exports = {
   buildBrowserUserAgent,
   buildContextMenuTemplate,
   reloadActionForInput,
+  printActionForInput,
   googleAuthParity: GOOGLE_AUTH_PARITY_HELPERS,
   createWebviewBridge
 };
