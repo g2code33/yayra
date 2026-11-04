@@ -182,21 +182,21 @@ function createOverlayBridge({
       if (typeof win.isVisible === 'function' && !win.isVisible()) return;
       const bothVisible = bothOverlaySurfacesVisible();
       if (bothVisible && miniWindows.has(win)) {
-        if (typeof win.isAlwaysOnTop !== 'function' || !win.isAlwaysOnTop()) {
-          win.setAlwaysOnTop(true, 'screen-saver');
-        }
+        const wasAlreadyTopmost = typeof win.isAlwaysOnTop === 'function' && win.isAlwaysOnTop();
+        if (!wasAlreadyTopmost) win.setAlwaysOnTop(true, 'screen-saver');
         if (typeof win.setVisibleOnAllWorkspaces === 'function') {
           win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true });
         }
-        keepBubbleAboveMini();
+        // Re-establish sibling order only when the OS actually dropped the
+        // mini's topmost flag. Heartbeats and blur pings otherwise do no
+        // z-order work, preventing Windows from making the surfaces blink.
+        if (!wasAlreadyTopmost) keepBubbleAboveMini();
         return;
       }
-      // When both surfaces are visible, only the bubble is allowed to
-      // change sibling order. This prevents out-of-phase heartbeats from
-      // making the two windows blink over one another.
-      if (bothVisible && win === overlayWin && typeof win.isAlwaysOnTop === 'function' && win.isAlwaysOnTop()) {
-        if (typeof win.moveTop === 'function') win.moveTop();
-        return;
+      // Creation and explicit handoff paths establish the bubble's sibling
+      // order. Once it is already topmost, periodic checks must not reorder it.
+      if (bothOverlaySurfacesVisible() && typeof win.isAlwaysOnTop === 'function' && win.isAlwaysOnTop()) {
+        if (win === overlayWin) return;
       }
       win.setAlwaysOnTop(true, 'screen-saver');
       if (typeof win.moveTop === 'function') win.moveTop();
