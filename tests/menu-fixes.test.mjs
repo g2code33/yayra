@@ -349,8 +349,8 @@ test('TAB GROUPS: real create / group / ungroup with colour dots in the tab stri
       'tab groups uses a transparent click-away popover layer instead of the dimmed full-screen modal');
     assert.ok(container.querySelector('.fb-tab-groups-popover'),
       'tab groups renders as the compact top-left toolbar panel');
-    const groupChoice = container.querySelector('.fb-tab-group-picker-item');
-    assert.ok(groupChoice, 'the picker lists open groups');
+    const groupChoice = container.querySelector('.fb-tab-group-picker-open');
+    assert.ok(groupChoice, 'the picker lists open groups with an explicit Open all control');
     groupChoice.click();
     assert.ok(shell.getActiveTab().group, 'one tap opens a member tab from that group');
     assert.notEqual(shell.getActiveTab().id, ungrouped.id, 'the ungrouped tab was switched away from');
@@ -410,8 +410,8 @@ test('TAB GROUP PICKER: New group opens a visible, keyboard-ready prompt and pub
     shell.openModal('tab-groups');
     const entry = container.querySelector('.fb-tab-group-picker-item');
     assert.ok(entry, 'the new group appears immediately in the group picker');
-    assert.match(entry.getAttribute('aria-label'), /Open all 2 tabs in Research/);
-    entry.click();
+    assert.match(entry.getAttribute('aria-label'), /Show tabs in Research group/);
+    container.querySelector('.fb-tab-group-picker-open').click();
     assert.equal(shell.state.tabs.filter((tab) => tab.group?.name === 'Research').length, 2, 'opening a group keeps every group tab open');
     assert.ok(shell.getActiveTab().group?.name === 'Research', 'the group click activates one of its member tabs');
   } finally {
@@ -455,10 +455,10 @@ test('TAB GROUP PICKER: hover previews members, opens one tab, and saves custom 
     shell.closeModal();
     shell.openModal('tab-groups');
     card = container.querySelector('.fb-tab-group-picker-card');
-    const memberList = card.querySelector('.fb-tab-group-members');
-    assert.ok(memberList);
+    const memberList = container.querySelector('.fb-tab-group-members');
+    assert.ok(memberList, 'the member list stays visible in the adjacent right-side pane');
     card.dispatchEvent({ type: 'mouseenter' });
-    assert.ok(card.classList.contains('is-expanded'), 'hovering a group reveals its tabs');
+    assert.ok(card.classList.contains('is-selected'), 'hovering a group selects its right-side tab list');
     assert.equal(card.querySelector('.fb-tab-group-picker-item').getAttribute('aria-expanded'), 'true');
     assert.equal(memberList.querySelectorAll('.fb-tab-group-member-row').length, 2);
 
@@ -473,7 +473,7 @@ test('TAB GROUP PICKER: hover previews members, opens one tab, and saves custom 
 
     card = container.querySelector('.fb-tab-group-picker-card');
     card.dispatchEvent({ type: 'mouseenter' });
-    const renamedRow = [...card.querySelectorAll('.fb-tab-group-member-row')]
+    const renamedRow = [...container.querySelectorAll('.fb-tab-group-member-row')]
       .find((row) => row.dataset.memberId === memberId);
     assert.equal(renamedRow.querySelector('.fb-tab-group-member-title').textContent, 'Autonomic lecture — Week 4');
     assert.equal(renamedRow.querySelector('.fb-tab-group-member-rename').textContent, 'Rename');
@@ -486,7 +486,7 @@ test('TAB GROUP PICKER: hover previews members, opens one tab, and saves custom 
     shell.openModal('tab-groups');
     card = container.querySelector('.fb-tab-group-picker-card');
     card.dispatchEvent({ type: 'mouseenter' });
-    const savedRow = [...card.querySelectorAll('.fb-tab-group-member-row')]
+    const savedRow = [...container.querySelectorAll('.fb-tab-group-member-row')]
       .find((row) => row.dataset.memberId === memberId);
     savedRow.querySelector('.fb-tab-group-member-open').click();
     assert.notEqual(shell.getActiveTab().id, closedTabId, 'a closed saved tab is restored on demand');

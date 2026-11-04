@@ -1526,13 +1526,13 @@ test('PPTX NOTES COLOUR: compact responsive styling keeps the native control key
     'the transparent native input gets a visible keyboard focus ring');
   assert.match(css, /\.fb-doc-toolbar-primary\s*\{[\s\S]*?max-height:\s*36px;/,
     'the PowerPoint identity/header row cannot expand into a tall banner');
-  assert.match(css, /\.fb-doc-toolbar2\s*\{[\s\S]*?max-height:\s*36px;[\s\S]*?flex-wrap:\s*nowrap !important;[\s\S]*?overflow-x:\s*auto;/,
-    'the controls stay in one compact scrollable row instead of doubling the toolbar height');
+  assert.match(css, /\.fb-doc-toolbar2\s*\{[\s\S]*?max-height:\s*none;[\s\S]*?flex-wrap:\s*wrap !important;[\s\S]*?overflow-x:\s*hidden;/,
+    'controls wrap within the viewer width so the toolbar cannot shift or clip the app');
   assert.match(css, /\.fb-doc-overflow-menu\s*\{[\s\S]*?color:\s*#f8fafc !important;/,
     'the dark overflow surface always has a readable foreground in every theme');
   const mobile = css.slice(css.indexOf('@media (max-width: 680px)'));
-  assert.match(mobile, /\.fb-doc-toolbar2\s*\{[\s\S]*?overflow-x:\s*auto;/,
-    'the narrow control row scrolls while the primary overflow menu remains unclipped');
+  assert.match(mobile, /\.fb-doc-toolbar2\s*\{[\s\S]*?overflow-x:\s*hidden;/,
+    'the narrow control row wraps within the viewport while the primary overflow menu remains unclipped');
   assert.match(mobile, /\.fb-pptx-notes\s*\{[\s\S]*?width:\s*100% !important;/,
     'the cream notes card fits mobile viewports');
 });

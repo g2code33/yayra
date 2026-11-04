@@ -37,6 +37,45 @@ test('tab-group picker rows are width-safe and cannot create the horizontal scro
   assert.match(item, /min-width:\s*0/, 'long titles may shrink inside the row');
   assert.match(item, /overflow:\s*hidden/, 'long tab details stay inside the rounded row');
   assert.match(popover, /background:\s*#[0-9a-f]{6}/i, 'popover owns an opaque background');
+  const picker = css.match(/\.fb-tab-groups-picker-list\.fb-tab-groups-picker\s*\{([^}]*)\}/)?.[1] || '';
+  assert.match(picker, /display:\s*grid/, 'member tabs are displayed beside their group instead of below it');
+  assert.match(picker, /grid-template-columns:/, 'the group rail and tab panel have separate columns');
+  const docViewer = css.match(/\.fb-doc-viewer\s*\{([^}]*)\}/)?.[1] || '';
+  assert.match(docViewer, /min-width:\s*0/, 'document controls cannot widen and shift the app viewport');
+  assert.match(ruleBody('.fb-doc-toolbar2'), /flex-wrap:\s*wrap !important/,
+    'document controls wrap within the viewport instead of clipping at its left edge');
+});
+
+
+test('tab-group picker opens selected tabs in a right-side pane', async () => {
+  delete globalThis.window.yayra;
+  const container = document.createElement('div');
+  const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+  await shell.initialize();
+  try {
+    shell._textPromptDialog = async () => 'Research';
+    assert.equal(await shell.createTabGroup(), true);
+    const group = shell.getTabGroups().find((candidate) => candidate.name === 'Research');
+    assert.ok(group);
+    assert.equal(group.tabs.length, 2);
+
+    shell.openModal('tab-groups');
+    const picker = container.querySelector('.fb-tab-groups-picker-list');
+    assert.ok(picker?.classList.contains('fb-tab-groups-picker'));
+    assert.ok(picker.querySelector('.fb-tab-groups-picker-groups'), 'group names stay in the left rail');
+    const members = picker.querySelector('.fb-tab-group-members');
+    assert.ok(members, 'member tabs display in the adjacent right-side pane');
+    assert.equal(members.querySelectorAll('.fb-tab-group-member-row').length, 2);
+    assert.equal(members.querySelectorAll('.fb-tab-group-member-rename').length, 2,
+      'custom tab labels stay editable');
+
+    const target = group.tabs[1];
+    members.querySelectorAll('.fb-tab-group-member-open')[1].click();
+    assert.equal(shell.getActiveTab().id, target.id, 'the selected tab opens directly');
+  } finally {
+    shell.destroy();
+    delete globalThis.localStorage;
+  }
 });
 
 test('custom tab hover card replaces the native title tooltip and remains readable', async () => {

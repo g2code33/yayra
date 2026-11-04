@@ -15205,6 +15205,7 @@ export class BrowserShell {
   renderTabGroupPickerList(container) {
     if (!container) return;
     container.innerHTML = '';
+    container.classList?.add?.('fb-tab-groups-picker');
     const groups = this.getTabGroups();
     if (!groups.length) {
       const empty = document.createElement('p');
@@ -15213,48 +15214,37 @@ export class BrowserShell {
       container.appendChild(empty);
       return;
     }
-    groups.forEach((group, groupIndex) => {
-      const card = document.createElement('section');
-      card.className = 'fb-tab-group-picker-card';
-      const item = document.createElement('button');
-      item.type = 'button';
-      item.className = 'fb-tab-group-picker-item';
-      item.setAttribute('aria-label', `Open all ${group.tabs.length} tabs in ${group.name}`);
-      item.setAttribute('aria-expanded', 'false');
-      item.setAttribute('aria-controls', `fb-tab-group-members-${groupIndex}`);
-      const swatch = document.createElement('span');
-      swatch.className = 'fb-tab-group-swatch';
-      swatch.style.background = group.color;
-      const copy = document.createElement('span');
-      copy.className = 'fb-tab-group-picker-copy';
-      const title = document.createElement('strong');
-      title.textContent = group.name;
-      const details = document.createElement('small');
-      details.textContent = `${group.tabs.length} tab${group.tabs.length === 1 ? '' : 's'} · Hover to choose a tab`;
-      const open = document.createElement('span');
-      open.className = 'fb-tab-group-picker-open';
-      open.textContent = group.tabs.length > 1 ? 'Open all' : (group.tabs.length === 1 ? 'Open' : 'Empty');
-      copy.appendChild(title);
-      copy.appendChild(details);
-      item.appendChild(swatch);
-      item.appendChild(copy);
-      item.appendChild(open);
-      item.addEventListener('click', () => {
-        this.closeModal();
-        this.openTabGroup(group.id);
-      });
-      card.appendChild(item);
-      card.addEventListener('contextmenu', (event) => {
-        event.preventDefault?.();
-        event.stopPropagation?.();
-        this.renderTabGroupContextMenu(event.clientX, event.clientY, group);
-      });
 
-      const members = document.createElement('div');
-      members.id = `fb-tab-group-members-${groupIndex}`;
-      members.className = 'fb-tab-group-members';
-      members.setAttribute('role', 'list');
-      members.setAttribute('aria-label', `Tabs in ${group.name}`);
+    const groupList = document.createElement('div');
+    groupList.className = 'fb-tab-groups-picker-groups';
+    groupList.setAttribute('aria-label', 'Tab groups');
+    const members = document.createElement('div');
+    members.className = 'fb-tab-group-members';
+    members.id = 'fb-tab-group-members-selected';
+    members.setAttribute('role', 'list');
+    members.setAttribute('aria-label', 'Tabs in selected group');
+    container.appendChild(groupList);
+    container.appendChild(members);
+
+    const selectGroup = (group, selectedButton) => {
+      for (const card of groupList.querySelectorAll('.fb-tab-group-picker-card')) {
+        const selected = card.querySelector('.fb-tab-group-picker-item') === selectedButton;
+        card.classList.toggle('is-selected', selected);
+        const button = card.querySelector('.fb-tab-group-picker-item');
+        button?.setAttribute('aria-pressed', selected ? 'true' : 'false');
+        button?.setAttribute('aria-expanded', selected ? 'true' : 'false');
+      }
+      members.innerHTML = '';
+      const heading = document.createElement('div');
+      heading.className = 'fb-tab-group-members-heading';
+      const groupTitle = document.createElement('strong');
+      groupTitle.textContent = group.name;
+      const count = document.createElement('small');
+      count.textContent = `${group.tabs.length} tab${group.tabs.length === 1 ? '' : 's'}`;
+      heading.appendChild(groupTitle);
+      heading.appendChild(count);
+      members.appendChild(heading);
+
       for (const tab of group.tabs) {
         const memberId = tab.groupMemberId || tab.id || tab.url;
         const row = document.createElement('div');
@@ -15273,10 +15263,12 @@ export class BrowserShell {
         memberUrl.textContent = tab.groupLabel ? this.getTabTitle(tab) : String(tab.url || '').replace(/^https?:\/\//, '').slice(0, 100);
         openTab.appendChild(memberTitle);
         if (memberUrl.textContent && memberUrl.textContent !== memberTitle.textContent) openTab.appendChild(memberUrl);
+        openTab.setAttribute('aria-label', `Open ${memberTitle.textContent} from ${group.name}`);
         openTab.addEventListener('click', () => {
           this.closeModal();
           this.openTabGroupMember(group.id, memberId);
         });
+
         const rename = document.createElement('button');
         rename.type = 'button';
         rename.className = 'fb-tab-group-member-rename';
@@ -15292,24 +15284,59 @@ export class BrowserShell {
         row.appendChild(rename);
         members.appendChild(row);
       }
-      card.appendChild(members);
-      const reveal = () => {
-        card.classList.add('is-expanded');
-        item.setAttribute('aria-expanded', 'true');
-      };
-      const conceal = () => {
-        card.classList.remove('is-expanded');
-        item.setAttribute('aria-expanded', 'false');
-      };
-      card.addEventListener('mouseenter', reveal);
-      card.addEventListener('mouseleave', () => {
-        if (!card.contains?.(document.activeElement)) conceal();
+    };
+
+    groups.forEach((group, groupIndex) => {
+      const card = document.createElement('section');
+      card.className = 'fb-tab-group-picker-card';
+      const row = document.createElement('div');
+      row.className = 'fb-tab-group-picker-row';
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'fb-tab-group-picker-item';
+      item.setAttribute('aria-label', `Show tabs in ${group.name} group`);
+      item.setAttribute('aria-pressed', groupIndex === 0 ? 'true' : 'false');
+      item.setAttribute('aria-expanded', groupIndex === 0 ? 'true' : 'false');
+      item.setAttribute('aria-controls', members.id);
+      const swatch = document.createElement('span');
+      swatch.className = 'fb-tab-group-swatch';
+      swatch.style.background = group.color;
+      const copy = document.createElement('span');
+      copy.className = 'fb-tab-group-picker-copy';
+      const title = document.createElement('strong');
+      title.textContent = group.name;
+      const details = document.createElement('small');
+      details.textContent = `${group.tabs.length} tab${group.tabs.length === 1 ? '' : 's'} · Hover or select to choose a tab`;
+      const open = document.createElement('span');
+      open.className = 'fb-tab-group-picker-open';
+      open.textContent = group.tabs.length > 1 ? 'Open all' : (group.tabs.length === 1 ? 'Open' : 'Empty');
+      copy.appendChild(title);
+      copy.appendChild(details);
+      item.appendChild(swatch);
+      item.appendChild(copy);
+      item.addEventListener('click', () => selectGroup(group, item));
+      row.appendChild(item);
+      const openAll = document.createElement('button');
+      openAll.type = 'button';
+      openAll.className = 'fb-tab-group-picker-open';
+      openAll.textContent = open.textContent;
+      openAll.disabled = group.tabs.length === 0;
+      openAll.setAttribute('aria-label', `Open all tabs in ${group.name}`);
+      openAll.addEventListener('click', () => {
+        this.closeModal();
+        this.openTabGroup(group.id);
       });
-      card.addEventListener('focusin', reveal);
-      card.addEventListener('focusout', (event) => {
-        if (!card.contains?.(event.relatedTarget)) conceal();
+      row.appendChild(openAll);
+      card.appendChild(row);
+      card.addEventListener('mouseenter', () => selectGroup(group, item));
+      card.addEventListener('focusin', () => selectGroup(group, item));
+      card.addEventListener('contextmenu', (event) => {
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        this.renderTabGroupContextMenu(event.clientX, event.clientY, group);
       });
-      container.appendChild(card);
+      groupList.appendChild(card);
+      if (groupIndex === 0) selectGroup(group, item);
     });
   }
 
@@ -15440,7 +15467,7 @@ export class BrowserShell {
         <button class="fb-modal-close-btn" aria-label="Close tab groups">${Icons.close}</button>
       </div>
       <div class="fb-modal-body fb-tab-groups-modal-body">
-        <p class="fb-tab-groups-modal-description">Choose a group to open all of its tabs. Tabs already open stay open; the first group tab becomes active.</p>
+        <p class="fb-tab-groups-modal-description">Choose a group, then open one of its tabs on the right or open the whole group.</p>
         <div class="fb-tab-groups-picker-list"></div>
         <div class="fb-tab-groups-modal-actions">
           <button class="fb-btn fb-btn-primary fb-tab-groups-create-btn">${Icons.plus} New group</button>
@@ -25144,7 +25171,7 @@ export class BrowserShell {
     }
     const wrap = document.createElement('div');
     wrap.className = 'fb-doc-viewer';
-    wrap.style.cssText = 'flex:1; min-height:0; display:flex; flex-direction:column; background:var(--fb-bg-app,#191c23); outline:none;';
+    wrap.style.cssText = 'flex:1; min-width:0; max-width:100%; min-height:0; display:flex; flex-direction:column; background:var(--fb-bg-app,#191c23); outline:none;';
     // Keyboard shortcuts (see createPdfViewer.handleKeydown) need the
     // viewer itself focusable.
     wrap.setAttribute('tabindex', '0');
