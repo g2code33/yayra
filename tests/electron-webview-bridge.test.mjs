@@ -1643,6 +1643,63 @@ test('autofill: fill-credentials pushes saved credentials into the right page vi
   assert.equal(views[1].webContents.sent.filter((m) => m.channel === 'yayra:autofill-fill').length, 0);
 });
 
+test('autofill: saved-password suggestions are metadata-only, origin-scoped, and withheld from private views', async () => {
+  const { handlers, views } = makeHarness({ autofillPreloadPath: '/fake/p.cjs' });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-password-suggest', url: 'https://site.dev/login' });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-password-suggest-private', url: 'https://site.dev/login', isPrivate: true });
+
+  const result = await handlers.get('yayra:webview-suggest-credentials')(null, {
+    tabId: 'tab-password-suggest',
+    url: 'https://site.dev/login',
+    credentials: [
+      { id: 'pwd-123-abcd1', username: 'ada', password: 'must-not-cross-ipc' },
+      { id: 'not-a-vault-id', username: 'attacker', password: 'ignored' },
+      { id: 'pwd-123-abcd1', username: 'duplicate' },
+      { id: 'pwd-456-efgh2', username: 'lin' }
+    ]
+  });
+  assert.deepEqual(result, { suggested: true, count: 2 });
+  const pushed = views[0].webContents.sent.find((message) => message.channel === 'yayra:autofill-credentials');
+  assert.deepEqual(pushed.payload.credentials, [
+    { id: 'pwd-123-abcd1', username: 'ada' },
+    { id: 'pwd-456-efgh2', username: 'lin' }
+  ]);
+  assert.equal(JSON.stringify(pushed.payload).includes('must-not-cross-ipc'), false, 'password secrets never cross into the page picker');
+
+  const crossOrigin = await handlers.get('yayra:webview-suggest-credentials')(null, {
+    tabId: 'tab-password-suggest', url: 'https://attacker.dev/login', credentials: []
+  });
+  assert.deepEqual(crossOrigin, { suggested: false, count: 0 });
+  const privateResult = await handlers.get('yayra:webview-suggest-credentials')(null, {
+    tabId: 'tab-password-suggest-private', url: 'https://site.dev/login', credentials: []
+  });
+  assert.deepEqual(privateResult, { suggested: false, count: 0 });
+});
+
+test('autofill: selected password IDs are forwarded only from the matching non-private origin', async () => {
+  const { handlers, listeners, sentEvents, views } = makeHarness({ autofillPreloadPath: '/fake/p.cjs' });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-password-select', url: 'https://site.dev/login' });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-password-select-private', url: 'https://site.dev/login', isPrivate: true });
+
+  listeners.get('yayra:autofill-credential-selected')({ sender: views[0].webContents }, {
+    url: 'https://site.dev/login', credentialId: 'pwd-123-abcd1'
+  });
+  listeners.get('yayra:autofill-credential-selected')({ sender: views[0].webContents }, {
+    url: 'https://attacker.dev/login', credentialId: 'pwd-456-efgh2'
+  });
+  listeners.get('yayra:autofill-credential-selected')({ sender: views[0].webContents }, {
+    url: 'https://site.dev/login', credentialId: 'not-a-vault-id'
+  });
+  listeners.get('yayra:autofill-credential-selected')({ sender: views[1].webContents }, {
+    url: 'https://site.dev/login', credentialId: 'pwd-123-abcd1'
+  });
+
+  const selected = sentEvents.map((event) => event.payload).filter((payload) => payload?.type === 'autofill-credential-selected');
+  assert.equal(selected.length, 1);
+  assert.equal(selected[0].credentialId, 'pwd-123-abcd1');
+  assert.equal(selected[0].url, 'https://site.dev/login');
+});
+
 test('email recall: focused and submitted addresses route only from non-private page views', async () => {
   const { handlers, listeners, sentEvents, views } = makeHarness({ autofillPreloadPath: '/fake/p.cjs' });
   await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-email', url: 'https://site.dev/login' });

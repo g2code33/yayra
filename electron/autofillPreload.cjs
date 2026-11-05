@@ -41,6 +41,9 @@ const FILL_CHANNEL = 'yayra:autofill-fill';
 const EMAIL_FIELD_FOCUSED_CHANNEL = 'yayra:email-field-focused';
 const EMAIL_ADDRESS_CAPTURED_CHANNEL = 'yayra:email-address-captured';
 const EMAIL_SUGGESTIONS_CHANNEL = 'yayra:email-suggestions';
+const PASSWORD_SUGGESTIONS_CHANNEL = 'yayra:autofill-credentials';
+const PASSWORD_CREDENTIAL_SELECTED_CHANNEL = 'yayra:autofill-credential-selected';
+const PASSWORD_MANAGE_CHANNEL = 'yayra:autofill-manage-passwords';
 const SITE_PASSKEY_REQUEST_CHANNEL = 'yayra:site-passkey-request';
 const SITE_PASSKEY_CONTROL_CHANNEL = 'yayra:site-passkey-control';
 
@@ -881,6 +884,232 @@ document.addEventListener('keydown', (event) => {
 window.addEventListener('scroll', positionEmailSuggestions, true);
 window.addEventListener('resize', positionEmailSuggestions, true);
 
+// Saved website passwords are presented only when the user focuses a login
+// field. The isolated picker carries opaque vault IDs and usernames only; the
+// secret stays in Yayra's encrypted vault until a selected ID is revalidated
+// by the shell and explicitly filled through the native bridge.
+let savedPasswordCredentials = [];
+let focusedCredentialField = null;
+let passwordSuggestionHost = null;
+let passwordSuggestionRoot = null;
+let passwordSuggestionList = null;
+let visiblePasswordCredentials = [];
+let selectedPasswordCredential = -1;
+
+function isCredentialField(input) {
+  if (!input || String(input.tagName || '').toLowerCase() !== 'input' || input.disabled || input.readOnly) return false;
+  if (String(input.type || '').toLowerCase() === 'password') return true;
+  return Array.from(document.querySelectorAll('input[type="password"]'))
+    .filter((password) => !password.disabled && isVisible(password))
+    .some((password) => findUsernameFor(password) === input);
+}
+
+function ensurePasswordSuggestionMenu() {
+  if (passwordSuggestionHost && passwordSuggestionList) return true;
+  if (!document.documentElement || typeof document.createElement !== 'function') return false;
+  passwordSuggestionHost = document.createElement('div');
+  passwordSuggestionHost.setAttribute('aria-hidden', 'true');
+  passwordSuggestionHost.style.cssText = 'position:fixed;display:none;z-index:2147483647;pointer-events:auto;';
+  passwordSuggestionRoot = passwordSuggestionHost.attachShadow({ mode: 'closed' });
+  passwordSuggestionRoot.innerHTML = `
+    <style>
+      :host { all: initial; font-family: Arial, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .menu { box-sizing: border-box; max-height: min(320px,calc(100vh - 16px)); overflow: auto; padding: 5px; border: 1px solid rgba(255,255,255,.1); border-radius: 12px; background: #2b2b2b; color: #f1f3f4; box-shadow: 0 8px 28px rgba(0,0,0,.48); }
+      .item { all: unset; box-sizing: border-box; display: flex; width: 100%; align-items: center; gap: 12px; padding: 10px 11px; border-radius: 8px; color: inherit; font: 500 14px/1.35 Arial,system-ui,sans-serif; cursor: pointer; text-align: left; }
+      .item:hover, .item[aria-selected="true"] { background: rgba(138,180,248,.16); }
+      .item:focus-visible, .manage:focus-visible { outline: 2px solid #8ab4f8; outline-offset: -2px; }
+      .mark { display: inline-flex; flex: 0 0 22px; width: 22px; height: 22px; align-items: center; justify-content: center; border-radius: 50%; background: #3c4043; color: #8ab4f8; font-size: 13px; }
+      .copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }
+      .username { overflow: hidden; color: #f1f3f4; text-overflow: ellipsis; white-space: nowrap; }
+      .dots { color: #9aa0a6; font-size: 12px; letter-spacing: 1px; }
+      .separator { height: 1px; margin: 4px -5px; background: rgba(255,255,255,.12); }
+      .manage { all: unset; box-sizing: border-box; display: block; width: 100%; padding: 10px 12px; border-radius: 8px; color: #bdc1c6; font: 500 13px/1.35 Arial,system-ui,sans-serif; cursor: pointer; }
+      .manage:hover { background: rgba(255,255,255,.08); color: #fff; }
+      .empty { padding: 12px; color: #bdc1c6; font: 13px/1.4 Arial,system-ui,sans-serif; }
+    </style>
+    <div class="menu" role="listbox" aria-label="Saved passwords"></div>`;
+  passwordSuggestionList = passwordSuggestionRoot.querySelector('.menu');
+  document.documentElement.appendChild(passwordSuggestionHost);
+  return Boolean(passwordSuggestionList);
+}
+
+function hidePasswordSuggestions() {
+  if (passwordSuggestionHost) {
+    passwordSuggestionHost.style.display = 'none';
+    passwordSuggestionHost.setAttribute('aria-hidden', 'true');
+  }
+  visiblePasswordCredentials = [];
+  selectedPasswordCredential = -1;
+}
+
+function positionPasswordSuggestions() {
+  if (!passwordSuggestionHost || passwordSuggestionHost.style.display === 'none' || !focusedCredentialField) return;
+  const rect = focusedCredentialField.getBoundingClientRect?.();
+  if (!rect || !rect.width || !rect.height) { hidePasswordSuggestions(); return; }
+  const viewportWidth = Math.max(240, Number(window.innerWidth) || 1024);
+  const viewportHeight = Math.max(200, Number(window.innerHeight) || 768);
+  const width = Math.max(240, Math.min(360, Math.max(rect.width, 280), viewportWidth - 16));
+  const measuredHeight = passwordSuggestionHost.getBoundingClientRect?.().height || 150;
+  const top = rect.bottom + measuredHeight + 8 > viewportHeight && rect.top > measuredHeight
+    ? rect.top - measuredHeight - 4
+    : rect.bottom + 4;
+  const left = Math.max(8, Math.min(rect.left, viewportWidth - width - 8));
+  passwordSuggestionHost.style.width = `${width}px`;
+  passwordSuggestionHost.style.left = `${left}px`;
+  passwordSuggestionHost.style.top = `${Math.max(8, top)}px`;
+}
+
+function choosePasswordSuggestion(index) {
+  if (!visiblePasswordCredentials.length) return;
+  const chosenIndex = index < 0 ? 0 : Math.min(index, visiblePasswordCredentials.length - 1);
+  const credential = visiblePasswordCredentials[chosenIndex];
+  if (!credential) return;
+  try {
+    ipcRenderer.send(PASSWORD_CREDENTIAL_SELECTED_CHANNEL, {
+      url: String(location.href || ''),
+      credentialId: credential.id
+    });
+  } catch { /* page view closed before selection */ }
+  hidePasswordSuggestions();
+}
+
+function renderPasswordSuggestions() {
+  if (!focusedCredentialField || !isCredentialField(focusedCredentialField)
+      || !isVisible(focusedCredentialField) || !ensurePasswordSuggestionMenu()) {
+    hidePasswordSuggestions();
+    return;
+  }
+  const isPassword = String(focusedCredentialField.type || '').toLowerCase() === 'password';
+  const query = isPassword ? '' : String(focusedCredentialField.value || '').trim().toLocaleLowerCase();
+  visiblePasswordCredentials = savedPasswordCredentials
+    .filter((credential) => !query || credential.username.toLocaleLowerCase().includes(query))
+    .slice(0, 8);
+  if (!visiblePasswordCredentials.length) { hidePasswordSuggestions(); return; }
+  selectedPasswordCredential = -1;
+  passwordSuggestionList.textContent = '';
+  for (const [index, credential] of visiblePasswordCredentials.entries()) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'item';
+    button.setAttribute('role', 'option');
+    button.setAttribute('aria-selected', 'false');
+    const mark = document.createElement('span');
+    mark.className = 'mark';
+    mark.textContent = '🔑';
+    const copy = document.createElement('span');
+    copy.className = 'copy';
+    const username = document.createElement('span');
+    username.className = 'username';
+    username.textContent = credential.username;
+    const dots = document.createElement('span');
+    dots.className = 'dots';
+    dots.textContent = '••••••••••';
+    copy.appendChild(username);
+    copy.appendChild(dots);
+    button.appendChild(mark);
+    button.appendChild(copy);
+    button.addEventListener('pointerdown', (event) => event.preventDefault());
+    button.addEventListener('click', () => choosePasswordSuggestion(index));
+    passwordSuggestionList.appendChild(button);
+  }
+  const separator = document.createElement('div');
+  separator.className = 'separator';
+  separator.setAttribute('role', 'presentation');
+  passwordSuggestionList.appendChild(separator);
+  const manage = document.createElement('button');
+  manage.type = 'button';
+  manage.className = 'manage';
+  manage.textContent = 'Manage passwords…';
+  manage.addEventListener('pointerdown', (event) => event.preventDefault());
+  manage.addEventListener('click', () => {
+    try { ipcRenderer.send(PASSWORD_MANAGE_CHANNEL, { url: String(location.href || '') }); }
+    catch { /* shell closed */ }
+    hidePasswordSuggestions();
+  });
+  passwordSuggestionList.appendChild(manage);
+  passwordSuggestionHost.style.display = 'block';
+  passwordSuggestionHost.setAttribute('aria-hidden', 'false');
+  positionPasswordSuggestions();
+}
+
+ipcRenderer.on(PASSWORD_SUGGESTIONS_CHANNEL, (_event, payload = {}) => {
+  const pageOrigin = String(location.origin || '');
+  if (!pageOrigin || payload.origin !== pageOrigin) {
+    savedPasswordCredentials = [];
+    hidePasswordSuggestions();
+    return;
+  }
+  const seen = new Set();
+  savedPasswordCredentials = (Array.isArray(payload.credentials) ? payload.credentials : [])
+    .map((item) => ({
+      id: typeof item?.id === 'string' ? item.id : '',
+      username: typeof item?.username === 'string' ? item.username.trim().slice(0, 256) : ''
+    }))
+    .filter((item) => /^pwd-[A-Za-z0-9-]{3,100}$/.test(item.id) && item.username && !seen.has(item.id) && seen.add(item.id))
+    .slice(0, 25);
+  if (focusedCredentialField) renderPasswordSuggestions();
+  else hidePasswordSuggestions();
+});
+
+document.addEventListener('focusin', (event) => {
+  const target = event.target;
+  if (!isCredentialField(target) || !isVisible(target)) return;
+  const rect = target.getBoundingClientRect?.();
+  const viewportWidth = Number(window.innerWidth) || 1024;
+  const viewportHeight = Number(window.innerHeight) || 768;
+  if (!rect || rect.right <= 0 || rect.left >= viewportWidth || rect.bottom <= 0 || rect.top >= viewportHeight) return;
+  focusedCredentialField = target;
+  try { ipcRenderer.send(DETECTED_CHANNEL, { url: String(location.href || '') }); } catch { /* detached */ }
+  if (target === focusedEmailField) {
+    focusedEmailField = null;
+    hideEmailSuggestions();
+  }
+  renderPasswordSuggestions();
+}, true);
+
+document.addEventListener('input', (event) => {
+  if (event.target === focusedCredentialField) renderPasswordSuggestions();
+}, true);
+
+document.addEventListener('focusout', (event) => {
+  if (event.target !== focusedCredentialField) return;
+  setTimeout(() => {
+    const active = document.activeElement;
+    if (active !== focusedCredentialField && active !== passwordSuggestionHost) {
+      focusedCredentialField = null;
+      hidePasswordSuggestions();
+    }
+  }, 0);
+}, true);
+
+document.addEventListener('keydown', (event) => {
+  if (!passwordSuggestionHost || passwordSuggestionHost.style.display === 'none') return;
+  if (event.key === 'ArrowDown') {
+    event.preventDefault();
+    selectedPasswordCredential = (selectedPasswordCredential + 1) % visiblePasswordCredentials.length;
+  } else if (event.key === 'ArrowUp') {
+    event.preventDefault();
+    selectedPasswordCredential = selectedPasswordCredential <= 0
+      ? visiblePasswordCredentials.length - 1
+      : selectedPasswordCredential - 1;
+  } else if (event.key === 'Enter') {
+    event.preventDefault();
+    choosePasswordSuggestion(selectedPasswordCredential);
+    return;
+  } else if (event.key === 'Escape') {
+    hidePasswordSuggestions();
+    return;
+  } else {
+    return;
+  }
+  passwordSuggestionList.querySelectorAll('.item').forEach((button, index) => {
+    button.setAttribute('aria-selected', String(index === selectedPasswordCredential));
+  });
+}, true);
+
+window.addEventListener('scroll', positionPasswordSuggestions, true);
+window.addEventListener('resize', positionPasswordSuggestions, true);
+
 ipcRenderer.on(FILL_CHANNEL, (_event, { username, password } = {}) => {
   try {
     const pwdInputs = Array.from(document.querySelectorAll('input[type="password"]')).filter(isVisible);
@@ -888,7 +1117,9 @@ ipcRenderer.on(FILL_CHANNEL, (_event, { username, password } = {}) => {
     if (!pwd) return;
     if (typeof password === 'string' && password) setNativeValue(pwd, password);
     const userInput = findUsernameFor(pwd);
-    if (userInput && typeof username === 'string' && username && !userInput.value) {
+    if (userInput && typeof username === 'string' && username) {
+      // An explicit picker selection replaces any partial username the user
+      // typed; this is not a silent page-load fill.
       setNativeValue(userInput, username);
     }
   } catch { /* never break the page */ }

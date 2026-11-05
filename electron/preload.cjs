@@ -157,6 +157,9 @@ const api = {
     },
     // Autofill saved credentials into the page's login form (Chrome-style).
     fillCredentials: (tabId, { username, password } = {}) => ipcRenderer.invoke('yayra:webview-fill-credentials', { tabId, username, password }),
+    // Send metadata-only, origin-scoped saved-password suggestions to the
+    // isolated page picker. Password bytes remain in the encrypted vault.
+    suggestCredentials: (tabId, { url, credentials } = {}) => ipcRenderer.invoke('yayra:webview-suggest-credentials', { tabId, url, credentials }),
     // Suggest this profile's saved email addresses in a focused email field.
     // The main process rejects private-tab requests and validates the list.
     suggestEmailAddresses: (tabId, emails = []) => ipcRenderer.invoke('yayra:webview-suggest-email-addresses', { tabId, emails }),

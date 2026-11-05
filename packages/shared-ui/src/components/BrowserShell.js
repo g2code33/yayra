@@ -351,7 +351,6 @@ export class BrowserShell {
     // One suggestion per account per session, even before "No thanks".
     this._profileSignalsSeen = new Set();
     // Guards so a page is only auto-filled once per navigation target.
-    this._autofilledFor = new Set();
     // Set after a successful passkey ceremony so one unlock covers the
     // whole passwords-page visit instead of prompting per reveal.
     this._vaultUnlockedAt = 0;
@@ -6884,6 +6883,12 @@ export class BrowserShell {
       case 'autofill-form-detected':
         this.handleAutofillFormDetected(tab, evt);
         break;
+      case 'autofill-credential-selected':
+        this.handleAutofillCredentialSelected(tab, evt);
+        break;
+      case 'autofill-manage-passwords':
+        if (!tab.isPrivate && tabId === this.state.activeTabId) this.navigateActiveTab('yayra://passwords');
+        break;
       case 'email-field-focused':
         this.handleEmailFieldFocused(tab, evt);
         break;
@@ -7078,32 +7083,98 @@ export class BrowserShell {
     this.render();
   }
 
+  async pushPasswordSuggestionsToOpenTabs(originFilter = '') {
+    const native = this.nativeWebview;
+    if (!this.passwordManager || !native || typeof native.suggestCredentials !== 'function') return;
+    let config = this.state.passwordsConfig;
+    if (!config && typeof this.passwordManager.getConfig === 'function') {
+      try { config = await this.passwordManager.getConfig(); } catch { config = null; }
+    }
+    const pending = [];
+    for (const tab of this.state.tabs || []) {
+      if (tab.isPrivate) continue;
+      const url = String(tab.url || '');
+      let origin;
+      try {
+        const parsed = new URL(url);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') continue;
+        origin = parsed.origin;
+      } catch { continue; }
+      if (originFilter && origin !== originFilter) continue;
+      pending.push((async () => {
+        let credentials = [];
+        if (config?.autofillEnabled !== false) {
+          try { credentials = await this.passwordManager.getCredentialsForOrigin(origin); } catch { /* an empty menu is safer */ }
+        }
+        const safeCredentials = credentials
+          .filter((credential) => typeof credential?.id === 'string' && typeof credential?.username === 'string')
+          .map(({ id, username }) => ({ id, username }));
+        try { await native.suggestCredentials(tab.id, { url, credentials: safeCredentials }); }
+        catch { /* the view may have navigated away or closed */ }
+      })());
+    }
+    await Promise.all(pending);
+  }
+
   async handleAutofillFormDetected(tab, evt) {
     if (!this.passwordManager || !tab || tab.isPrivate) return;
-    if (!this.nativeWebview || typeof this.nativeWebview.fillCredentials !== 'function') return;
+    const native = this.nativeWebview;
+    if (!native || typeof native.suggestCredentials !== 'function') return;
     const config = this.state.passwordsConfig || (await this.passwordManager.getConfig());
-    if (!config.autofillEnabled) return;
-    const url = (evt && evt.url) || tab.url;
+    const url = String((evt && evt.url) || tab.url || '');
     let origin;
-    try { origin = new URL(url).origin; } catch { return; }
-    const guardKey = `${tab.id}|${origin}`;
-    if (this._autofilledFor.has(guardKey)) return;
-    const matches = await this.passwordManager.getCredentialsForOrigin(origin);
-    if (matches.length === 0) return;
-    this._autofilledFor.add(guardKey);
-    // Chrome behaviour: a single saved credential fills silently; multiple
-    // matches fill the most recently used one and say so.
-    const chosen = [...matches].sort((a, b) => (b.lastUsedAt || 0) - (a.lastUsedAt || 0))[0];
     try {
-      await this.nativeWebview.fillCredentials(tab.id, {
-        username: chosen.username,
-        password: chosen.password
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return;
+      origin = parsed.origin;
+    } catch { return; }
+    try {
+      const current = new URL(tab.url || '');
+      if ((current.protocol === 'http:' || current.protocol === 'https:') && current.origin !== origin) return;
+    } catch { /* initial load event can arrive before shell URL sync */ }
+    let credentials = [];
+    if (config.autofillEnabled) {
+      try { credentials = await this.passwordManager.getCredentialsForOrigin(origin); } catch { return; }
+    }
+    // Only opaque ids and usernames cross into the isolated page preload.
+    // Password bytes remain in Yayra's encrypted vault until the user chooses
+    // a specific row from the browser-style autofill picker.
+    const safeCredentials = credentials
+      .filter((credential) => typeof credential?.id === 'string' && typeof credential?.username === 'string')
+      .map(({ id, username }) => ({ id, username }));
+    try { await native.suggestCredentials(tab.id, { url, credentials: safeCredentials }); }
+    catch { /* page may have navigated away */ }
+  }
+
+  async handleAutofillCredentialSelected(tab, evt = {}) {
+    if (!this.passwordManager || !tab || tab.isPrivate) return;
+    const native = this.nativeWebview;
+    if (!native || typeof native.fillCredentials !== 'function') return;
+    const url = String(evt.url || tab.url || '');
+    let origin;
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return;
+      origin = parsed.origin;
+      const current = new URL(tab.url || '');
+      if ((current.protocol === 'http:' || current.protocol === 'https:') && current.origin !== origin) return;
+    } catch { return; }
+    if (typeof evt.credentialId !== 'string' || !evt.credentialId.startsWith('pwd-')) return;
+    let matches;
+    try { matches = await this.passwordManager.getCredentialsForOrigin(origin); } catch { return; }
+    const credential = matches.find((item) => item.id === evt.credentialId);
+    if (!credential) return;
+    try {
+      const result = await native.fillCredentials(tab.id, {
+        username: credential.username,
+        password: credential.password
       });
-      const host = origin.replace(/^https?:\/\//, '');
-      this.showTransientNotice(matches.length > 1
-        ? `Filled most recent sign-in for ${host} (${matches.length} saved)`
-        : `Filled saved sign-in for ${host}`);
-    } catch { /* page may have navigated away */ }
+      if (!result?.filled) return;
+      if (typeof this.passwordManager.updateCredential === 'function') {
+        try { await this.passwordManager.updateCredential(credential.id, {}); } catch { /* fill already succeeded */ }
+      }
+      this.showTransientNotice(`Filled saved sign-in for ${origin.replace(/^https?:\/\//, '')}`);
+    } catch { /* the page may have navigated away */ }
   }
 
   async resolvePendingPasswordSave(action, editedCredential = {}) {
@@ -7124,6 +7195,7 @@ export class BrowserShell {
       });
       if (result && result.success) {
         await this.refreshVaultState();
+        await this.pushPasswordSuggestionsToOpenTabs(pending.origin);
         this.showTransientNotice(pending.isUpdate
           ? `Updated password for ${pending.origin.replace(/^https?:\/\//, '')}`
           : `Password saved to your encrypted vault`);
@@ -11650,8 +11722,8 @@ export class BrowserShell {
           </div>
           <div class="fb-setting-toggle-row">
             <div>
-              <strong>Auto Sign-in / Autofill</strong>
-              <p>Fills saved usernames and passwords automatically on matching sites</p>
+              <strong>Offer saved passwords</strong>
+              <p>Show matching sign-ins when you focus a login field; click one to fill it</p>
             </div>
             <input type="checkbox" id="fb-in-toggle-autofill" ${config.autofillEnabled ? 'checked' : ''} />
           </div>
@@ -11734,6 +11806,7 @@ export class BrowserShell {
       if (this.passwordManager) {
         await this.passwordManager.updateConfig({ autofillEnabled: e.target.checked });
         await this.refreshVaultState();
+        await this.pushPasswordSuggestionsToOpenTabs();
       }
     });
 
@@ -11841,6 +11914,7 @@ export class BrowserShell {
         if (this.passwordManager && id) {
           await this.passwordManager.deleteCredential(id);
           await this.refreshVaultState();
+          await this.pushPasswordSuggestionsToOpenTabs();
           this.render();
         }
       });

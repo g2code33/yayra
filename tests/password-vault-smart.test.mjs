@@ -11,7 +11,7 @@
  *  - PasskeyService: register/verify/remove with an injected fake
  *    WebAuthn API; honest failure reasons.
  *  - BrowserShell: captured login -> "Save password?" bar -> Save/Never;
- *    autofill-form-detected -> fillCredentials on the native bridge;
+ *    autofill-form-detected -> metadata-only credential suggestions; explicit selection -> fillCredentials;
  *    passkey gate for revealing vault secrets.
  */
 
@@ -224,6 +224,7 @@ test('PasskeyService: honest failure reasons (decline, unsupported, nothing regi
 
 function installFakeWebviewBridge() {
   const fills = [];
+  const suggestions = [];
   const passkeyContinuations = [];
   const visibility = [];
   window.yayra = window.yayra || {};
@@ -252,10 +253,12 @@ function installFakeWebviewBridge() {
       };
     },
     fillCredentials: async (tabId, creds) => { fills.push({ tabId, ...creds }); return { filled: true }; },
+    suggestCredentials: async (tabId, payload) => { suggestions.push({ tabId, ...payload }); return { suggested: true }; },
     onEvent: () => () => {}
   };
   return {
     fills,
+    suggestions,
     passkeyContinuations,
     visibility,
     uninstall: () => { delete window.yayra.webview; }
@@ -316,6 +319,19 @@ test('Remember prompt: captured login shows Save-password bar; Save stores it en
       password: 'S3cret!Updated'
     });
     assert.equal(shell.state.pendingPasswordSave, null, 'identical credential must not re-prompt');
+
+    await shell.handleAutofillCaptured(tab, {
+      url: 'https://accounts.site.dev/login',
+      username: 'ada+updated@site.dev',
+      password: 'RotatedSecret!'
+    });
+    assert.equal(shell.state.pendingPasswordSave?.isUpdate, true, 'a changed password offers an update for the existing login');
+    const existingId = saved[0].id;
+    await shell.resolvePendingPasswordSave('save');
+    const updated = await pm.getCredentialsForOrigin('https://accounts.site.dev');
+    assert.equal(updated.length, 1, 'updating does not create a duplicate saved login');
+    assert.equal(updated[0].id, existingId);
+    assert.equal(updated[0].password, 'RotatedSecret!');
   } finally {
     fakeBridge.uninstall();
   }
@@ -348,13 +364,13 @@ test('Remember prompt: Never for this site is honoured; private tabs never promp
   }
 });
 
-test('Autofill: detected login form gets saved credentials filled through the native bridge', async () => {
+test('Autofill: login forms show metadata-only suggestions; selecting a saved sign-in fills it', async () => {
   const fakeBridge = installFakeWebviewBridge();
   try {
     const container = document.createElement('div');
     const storage = new MemoryAdapter();
     const pm = new PasswordManager({ storageAdapter: storage });
-    await pm.saveCredential({ origin: 'https://fill.dev', username: 'ada', password: 'fill-me-1' });
+    const saved = await pm.saveCredential({ origin: 'https://fill.dev', username: 'ada', password: 'fill-me-1' });
 
     const shell = new BrowserShell({ container, isMobile: false, passwordManager: pm, storageAdapter: storage });
     await shell.initialize();
@@ -363,20 +379,33 @@ test('Autofill: detected login form gets saved credentials filled through the na
     tab.url = 'https://fill.dev/login';
 
     await shell.handleAutofillFormDetected(tab, { url: 'https://fill.dev/login' });
-    assert.equal(fakeBridge.fills.length, 1, 'credentials must be pushed to the page');
+    assert.equal(fakeBridge.suggestions.length, 1, 'login detection requests an origin-scoped suggestion list');
+    assert.equal(fakeBridge.suggestions[0].url, 'https://fill.dev/login');
+    assert.deepEqual(fakeBridge.suggestions[0].credentials, [{ id: saved.id, username: 'ada' }],
+      'only credential IDs and usernames are sent to the isolated picker');
+    assert.equal(fakeBridge.fills.length, 0, 'detection must never silently autofill');
+
+    await shell.handleAutofillCredentialSelected(tab, {
+      url: 'https://fill.dev/login',
+      credentialId: saved.id
+    });
+    assert.equal(fakeBridge.fills.length, 1, 'an explicit saved-entry selection requests a fill');
     assert.equal(fakeBridge.fills[0].username, 'ada');
     assert.equal(fakeBridge.fills[0].password, 'fill-me-1');
 
-    // Guard: the same tab+origin is not refilled in a loop.
-    await shell.handleAutofillFormDetected(tab, { url: 'https://fill.dev/login' });
-    assert.equal(fakeBridge.fills.length, 1);
-
-    // Autofill disabled => nothing is pushed.
+    // Autofill disabled => the suggestion list is cleared, with no fill.
     await pm.updateConfig({ autofillEnabled: false });
     await shell.refreshVaultState();
-    shell._autofilledFor.clear();
     await shell.handleAutofillFormDetected(tab, { url: 'https://fill.dev/login' });
-    assert.equal(fakeBridge.fills.length, 1, 'disabled autofill must not fill');
+    assert.equal(fakeBridge.suggestions.at(-1).credentials.length, 0, 'disabled autofill clears saved entries from the picker');
+    assert.equal(fakeBridge.fills.length, 1, 'disabled autofill does not fill');
+
+    // A selection from a different origin is rejected before secrets are fetched.
+    await shell.handleAutofillCredentialSelected(tab, {
+      url: 'https://attacker.dev/login',
+      credentialId: saved.id
+    });
+    assert.equal(fakeBridge.fills.length, 1, 'cross-origin selection is rejected');
   } finally {
     fakeBridge.uninstall();
   }

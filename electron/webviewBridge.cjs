@@ -123,6 +123,9 @@ const PAGE_UNRESPONSIVE_RELOAD_COOLDOWN_MS = 60_000;
 const EMAIL_FIELD_FOCUSED_CHANNEL = 'yayra:email-field-focused';
 const EMAIL_ADDRESS_CAPTURED_CHANNEL = 'yayra:email-address-captured';
 const EMAIL_SUGGESTIONS_CHANNEL = 'yayra:email-suggestions';
+const PASSWORD_SUGGESTIONS_CHANNEL = 'yayra:autofill-credentials';
+const PASSWORD_CREDENTIAL_SELECTED_CHANNEL = 'yayra:autofill-credential-selected';
+const PASSWORD_MANAGE_CHANNEL = 'yayra:autofill-manage-passwords';
 // Main-world WebAuthn observer -> isolated page preload -> this bridge.
 // Payloads contain only RP/action/status metadata, never challenges, user
 // handles, credential IDs, authenticator data, or signatures.
@@ -4181,6 +4184,30 @@ function createWebviewBridge({
       }
       sendTo(entry, 'email-field-focused', { url });
     });
+    ipcMain.on(PASSWORD_CREDENTIAL_SELECTED_CHANNEL, (event, payload = {}) => {
+      const entry = entryForViewSender(event);
+      if (!entry || entry.isPrivate) return;
+      const credentialId = typeof payload?.credentialId === 'string' && /^pwd-[A-Za-z0-9-]{3,100}$/.test(payload.credentialId)
+        ? payload.credentialId
+        : '';
+      const url = String(payload?.url || '');
+      if (!credentialId || !isHttpUrl(url)) return;
+      const currentUrl = entry.view?.webContents?.getURL?.() || entry.lastUrl || '';
+      try {
+        if (!isHttpUrl(currentUrl) || new URL(currentUrl).origin !== new URL(url).origin) return;
+      } catch { return; }
+      sendTo(entry, 'autofill-credential-selected', { url, credentialId });
+    });
+    ipcMain.on(PASSWORD_MANAGE_CHANNEL, (event, payload = {}) => {
+      const entry = entryForViewSender(event);
+      if (!entry || entry.isPrivate) return;
+      const url = String(payload?.url || '');
+      const currentUrl = entry.view?.webContents?.getURL?.() || entry.lastUrl || '';
+      try {
+        if (!isHttpUrl(url) || !isHttpUrl(currentUrl) || new URL(currentUrl).origin !== new URL(url).origin) return;
+      } catch { return; }
+      sendTo(entry, 'autofill-manage-passwords', { url });
+    });
     ipcMain.on(EMAIL_ADDRESS_CAPTURED_CHANNEL, (event, payload = {}) => {
       const entry = entryForViewSender(event);
       if (!entry || entry.isPrivate) return;
@@ -4278,6 +4305,36 @@ function createWebviewBridge({
     } catch {
       return { filled: false };
     }
+  });
+
+  ipcMain.handle('yayra:webview-suggest-credentials', (event, { tabId, url, credentials } = {}) => {
+    const entry = views.get(viewKey(event, tabId));
+    if (!entry || entry.isPrivate || !isHttpUrl(url)) return { suggested: false, count: 0 };
+    const currentUrl = entry.view?.webContents?.getURL?.() || entry.lastUrl || '';
+    try {
+      if (!isHttpUrl(currentUrl) || new URL(currentUrl).origin !== new URL(url).origin) {
+        return { suggested: false, count: 0 };
+      }
+    } catch { return { suggested: false, count: 0 }; }
+    const seen = new Set();
+    const safeCredentials = (Array.isArray(credentials) ? credentials : [])
+      .map((item) => ({
+        id: typeof item?.id === 'string' && /^pwd-[A-Za-z0-9-]{3,100}$/.test(item.id) ? item.id : '',
+        username: typeof item?.username === 'string' ? item.username.trim().slice(0, 256) : ''
+      }))
+      .filter((item) => {
+        if (!item.id || !item.username || seen.has(item.id)) return false;
+        seen.add(item.id);
+        return true;
+      })
+      .slice(0, 25);
+    try {
+      entry.view.webContents.send(PASSWORD_SUGGESTIONS_CHANNEL, {
+        origin: new URL(url).origin,
+        credentials: safeCredentials
+      });
+      return { suggested: true, count: safeCredentials.length };
+    } catch { return { suggested: false, count: 0 }; }
   });
 
   ipcMain.handle('yayra:webview-suggest-email-addresses', (event, { tabId, emails } = {}) => {
