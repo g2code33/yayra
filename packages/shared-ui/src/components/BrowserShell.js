@@ -7106,15 +7106,21 @@ export class BrowserShell {
     } catch { /* page may have navigated away */ }
   }
 
-  async resolvePendingPasswordSave(action) {
+  async resolvePendingPasswordSave(action, editedCredential = {}) {
     const pending = this.state.pendingPasswordSave;
-    this.state.pendingPasswordSave = null;
     if (!pending) { this.render(); return; }
+    const username = String(editedCredential.username ?? pending.username).trim();
+    const password = String(editedCredential.password ?? pending.password);
+    if (action === 'save' && (!username || !password)) {
+      this.showTransientNotice('Enter both a username and password before saving.');
+      return;
+    }
+    this.state.pendingPasswordSave = null;
     if (action === 'save' && this.passwordManager) {
       const result = await this.passwordManager.saveCredential({
         origin: pending.origin,
-        username: pending.username,
-        password: pending.password
+        username,
+        password
       });
       if (result && result.success) {
         await this.refreshVaultState();
@@ -7135,27 +7141,109 @@ export class BrowserShell {
 
   renderPasswordSaveBar(root) {
     const pending = this.state.pendingPasswordSave;
-    if (!pending) return;
+    if (!pending || !root) return;
     const host = pending.origin.replace(/^https?:\/\//, '');
-    const bar = document.createElement('div');
+    const bar = document.createElement('section');
     bar.className = 'fb-password-save-bar';
     bar.setAttribute('role', 'dialog');
-    bar.setAttribute('aria-label', 'Save password');
-    bar.innerHTML = `
-      <div class="fb-password-save-icon">${Icons.lock}</div>
-      <div class="fb-password-save-text">
-        <strong>${pending.isUpdate ? 'Update password?' : 'Save password?'}</strong>
-        <span>${pending.username} &middot; ${host}</span>
-      </div>
-      <div class="fb-password-save-actions">
-        <button class="fb-btn fb-btn-primary fb-pwd-save-yes">${pending.isUpdate ? 'Update' : 'Save'}</button>
-        <button class="fb-btn fb-btn-secondary fb-pwd-save-never">Never</button>
-        <button class="fb-action-btn fb-pwd-save-dismiss" title="Not now" aria-label="Not now">${Icons.close}</button>
-      </div>
-    `;
-    bar.querySelector('.fb-pwd-save-yes')?.addEventListener('click', () => this.resolvePendingPasswordSave('save'));
-    bar.querySelector('.fb-pwd-save-never')?.addEventListener('click', () => this.resolvePendingPasswordSave('never'));
-    bar.querySelector('.fb-pwd-save-dismiss')?.addEventListener('click', () => this.resolvePendingPasswordSave('dismiss'));
+    bar.setAttribute('aria-label', pending.isUpdate ? 'Update saved password' : 'Save password');
+
+    const heading = document.createElement('div');
+    heading.className = 'fb-password-save-heading';
+    const icon = document.createElement('span');
+    icon.className = 'fb-password-save-icon';
+    icon.innerHTML = Icons.lock;
+    icon.setAttribute('aria-hidden', 'true');
+    const title = document.createElement('strong');
+    title.textContent = pending.isUpdate ? 'Update password?' : 'Save password?';
+    const dismiss = document.createElement('button');
+    dismiss.type = 'button';
+    dismiss.className = 'fb-password-save-close';
+    dismiss.setAttribute('aria-label', 'No thanks');
+    dismiss.title = 'No thanks';
+    dismiss.innerHTML = Icons.close;
+    dismiss.addEventListener('click', () => this.resolvePendingPasswordSave('dismiss'));
+    heading.appendChild(icon);
+    heading.appendChild(title);
+    heading.appendChild(dismiss);
+    bar.appendChild(heading);
+
+    const makeField = (labelText, type, value, className, autocomplete) => {
+      const row = document.createElement('label');
+      row.className = 'fb-password-save-field-row';
+      const label = document.createElement('span');
+      label.textContent = labelText;
+      const input = document.createElement('input');
+      input.className = className;
+      input.type = type;
+      input.value = value;
+      input.autocomplete = autocomplete;
+      input.setAttribute('aria-label', labelText);
+      input.spellcheck = false;
+      row.appendChild(label);
+      row.appendChild(input);
+      return { row, input };
+    };
+    const { row: usernameRow, input: usernameInput } = makeField(
+      'Username', 'text', pending.username, 'fb-password-save-username', 'username'
+    );
+    const { row: passwordRow, input: passwordInput } = makeField(
+      'Password', 'password', pending.password, 'fb-password-save-password', 'current-password'
+    );
+    const passwordWrap = document.createElement('span');
+    passwordWrap.className = 'fb-password-save-password-wrap';
+    const passwordToggle = document.createElement('button');
+    passwordToggle.type = 'button';
+    passwordToggle.className = 'fb-password-save-reveal';
+    passwordToggle.textContent = 'Show';
+    passwordToggle.setAttribute('aria-label', 'Show password');
+    passwordToggle.addEventListener('click', () => {
+      const reveal = passwordInput.type === 'password';
+      passwordInput.type = reveal ? 'text' : 'password';
+      passwordToggle.textContent = reveal ? 'Hide' : 'Show';
+      passwordToggle.setAttribute('aria-label', reveal ? 'Hide password' : 'Show password');
+    });
+    passwordRow.removeChild(passwordInput);
+    passwordWrap.appendChild(passwordInput);
+    passwordWrap.appendChild(passwordToggle);
+    passwordRow.appendChild(passwordWrap);
+    bar.appendChild(usernameRow);
+    bar.appendChild(passwordRow);
+
+    const site = document.createElement('div');
+    site.className = 'fb-password-save-site';
+    site.textContent = host;
+    bar.appendChild(site);
+
+    const actions = document.createElement('div');
+    actions.className = 'fb-password-save-actions';
+    const never = document.createElement('button');
+    never.type = 'button';
+    never.className = 'fb-password-save-option fb-pwd-save-never';
+    never.textContent = 'Never';
+    never.addEventListener('click', () => this.resolvePendingPasswordSave('never'));
+    const noThanks = document.createElement('button');
+    noThanks.type = 'button';
+    noThanks.className = 'fb-password-save-option fb-pwd-save-dismiss';
+    noThanks.textContent = 'No thanks';
+    noThanks.addEventListener('click', () => this.resolvePendingPasswordSave('dismiss'));
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'fb-password-save-submit fb-pwd-save-yes';
+    save.textContent = pending.isUpdate ? 'Update' : 'Save';
+    save.addEventListener('click', () => this.resolvePendingPasswordSave('save', {
+      username: usernameInput.value,
+      password: passwordInput.value
+    }));
+    actions.appendChild(never);
+    actions.appendChild(noThanks);
+    actions.appendChild(save);
+    bar.appendChild(actions);
+
+    const note = document.createElement('p');
+    note.className = 'fb-password-save-note';
+    note.textContent = 'Saved only in your encrypted Yayra password vault on this device.';
+    bar.appendChild(note);
     root.appendChild(bar);
   }
 

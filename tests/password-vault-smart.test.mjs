@@ -286,21 +286,34 @@ test('Remember prompt: captured login shows Save-password bar; Save stores it en
     shell.render(container);
     const bar = container.querySelector('.fb-password-save-bar');
     assert.ok(bar, 'Save password? bar must render');
-    assert.ok(bar.textContent.includes('ada@site.dev'));
+    assert.equal(bar.querySelector('.fb-password-save-username')?.value, 'ada@site.dev',
+      'the browser-style prompt shows an editable username field');
+    const passwordField = bar.querySelector('.fb-password-save-password');
+    assert.equal(passwordField?.value, 'S3cret!');
+    assert.equal(passwordField?.type, 'password', 'the captured password is masked by default');
+    const reveal = bar.querySelector('.fb-password-save-reveal');
+    reveal.click();
+    assert.equal(passwordField.type, 'text', 'the password can be deliberately revealed');
+    reveal.click();
+    assert.equal(passwordField.type, 'password', 'the password can be masked again');
+    assert.equal(bar.querySelector('.fb-pwd-save-never')?.textContent, 'Never');
+    assert.equal(bar.querySelector('.fb-pwd-save-dismiss')?.textContent, 'No thanks');
     assert.ok(shell.hasBlockingOverlay(), 'bar must count as blocking overlay so it sits above the native page');
+    bar.querySelector('.fb-password-save-username').value = 'ada+updated@site.dev';
+    passwordField.value = 'S3cret!Updated';
 
     bar.querySelector('.fb-pwd-save-yes').click();
     assert.ok(await waitFor(async () => (await pm.getCredentialsForOrigin('https://accounts.site.dev')).length === 1));
     assert.equal(shell.state.pendingPasswordSave, null);
     const saved = await pm.getCredentialsForOrigin('https://accounts.site.dev');
-    assert.equal(saved[0].username, 'ada@site.dev');
-    assert.equal(saved[0].password, 'S3cret!');
+    assert.equal(saved[0].username, 'ada+updated@site.dev', 'the user may correct the username before saving');
+    assert.equal(saved[0].password, 'S3cret!Updated', 'the exact edited password is sealed in the vault');
 
     // Same unchanged login never re-prompts (Chrome behaviour).
     await shell.handleAutofillCaptured(tab, {
       url: 'https://accounts.site.dev/login',
-      username: 'ada@site.dev',
-      password: 'S3cret!'
+      username: 'ada+updated@site.dev',
+      password: 'S3cret!Updated'
     });
     assert.equal(shell.state.pendingPasswordSave, null, 'identical credential must not re-prompt');
   } finally {

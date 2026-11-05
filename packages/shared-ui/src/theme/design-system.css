@@ -7026,64 +7026,177 @@ button.fb-site-passkey-indicator {
 /* =============================================================
    PASSWORD VAULT: save bar, section tabs, keys, passkey, account
    ============================================================= */
-/* Chrome-style "Save password?" bar - anchored under the toolbar. While
-   visible it counts as a blocking overlay, so on Electron the native
-   page view yields (snapshot) and the bar genuinely sits on top. */
+/* Browser-style password-manager prompt. This is a dark anchored popover
+   shown for every eligible captured login, regardless of the page theme. */
 .fb-password-save-bar {
   position: absolute;
   top: 86px;
   right: 16px;
   z-index: 2600;
   display: flex;
+  box-sizing: border-box;
+  width: min(420px, calc(100% - 32px));
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 16px;
+  background: #2b2b2b;
+  color: #f1f3f4;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.48);
+  font-family: Arial, system-ui, sans-serif;
+}
+
+.fb-password-save-heading {
+  display: flex;
+  min-width: 0;
   align-items: center;
   gap: 12px;
-  max-width: min(440px, calc(100% - 32px));
-  padding: 12px 14px;
-  border: 1px solid var(--fb-border-glass);
-  border-radius: 14px;
-  background: var(--fb-bg-surface-elevated);
-  backdrop-filter: blur(24px) saturate(160%);
-  -webkit-backdrop-filter: blur(24px) saturate(160%);
-  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.35), 0 0 0 1px var(--fb-accent-glow);
+}
+
+.fb-password-save-heading > strong {
+  flex: 1;
+  font-size: 1rem;
+  font-weight: 500;
 }
 
 .fb-password-save-icon {
   display: inline-flex;
-  flex: 0 0 34px;
-  width: 34px;
-  height: 34px;
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
   align-items: center;
   justify-content: center;
-  border-radius: 10px;
-  background: rgba(6, 182, 212, 0.16);
-  color: var(--fb-accent-primary);
+  color: #8ab4f8;
 }
 
-.fb-password-save-text {
+.fb-password-save-icon svg { width: 22px; height: 22px; }
+
+.fb-password-save-close {
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #bdc1c6;
+  cursor: pointer;
+}
+
+.fb-password-save-close:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+.fb-password-save-close svg { width: 18px; height: 18px; }
+
+.fb-password-save-field-row {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  color: #bdc1c6;
+  font-size: 0.84rem;
+}
+
+.fb-password-save-field-row > input,
+.fb-password-save-password-wrap > input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  height: 42px;
+  padding: 0 12px;
+  border: 1px solid #5f6368;
+  border-radius: 9px;
+  outline: none;
+  background: #353535;
+  color: #f1f3f4;
+  font: inherit;
+  font-size: 0.9rem;
+}
+
+.fb-password-save-field-row > input:focus,
+.fb-password-save-password-wrap > input:focus {
+  border: 2px solid #8ab4f8;
+  padding-left: 11px;
+}
+
+.fb-password-save-password-wrap {
   display: flex;
   min-width: 0;
-  flex-direction: column;
-  gap: 2px;
+  align-items: center;
+  position: relative;
 }
 
-.fb-password-save-text strong {
-  font-size: 0.9rem;
-  color: var(--fb-text-primary);
+.fb-password-save-password-wrap > input { padding-right: 54px; }
+.fb-password-save-password-wrap > input:focus { padding-right: 53px; }
+
+.fb-password-save-reveal {
+  position: absolute;
+  right: 5px;
+  min-width: 44px;
+  height: 32px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #bdc1c6;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.72rem;
 }
 
-.fb-password-save-text span {
+.fb-password-save-reveal:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+
+.fb-password-save-site {
   overflow: hidden;
-  font-size: 0.78rem;
-  color: var(--fb-text-muted);
+  margin-top: -6px;
+  color: #bdc1c6;
+  font-size: 0.75rem;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .fb-password-save-actions {
   display: flex;
-  flex: 0 0 auto;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.fb-password-save-option,
+.fb-password-save-submit {
+  min-width: 92px;
+  min-height: 40px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 22px;
+  color: #e8eaed;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.84rem;
+  font-weight: 600;
+}
+
+.fb-password-save-option { background: #3c4043; }
+.fb-password-save-option:hover { background: #4a4d50; }
+.fb-password-save-submit { background: #8ab4f8; color: #202124; }
+.fb-password-save-submit:hover { background: #a3c4fb; }
+
+.fb-password-save-note {
+  margin: 0 -18px -18px;
+  padding: 13px 18px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  color: #9aa0a6;
+  font-size: 0.74rem;
+  line-height: 1.45;
+}
+
+@media (max-width: 520px) {
+  .fb-password-save-bar { top: 72px; right: 12px; width: calc(100% - 24px); padding: 15px; }
+  .fb-password-save-actions { justify-content: stretch; }
+  .fb-password-save-option,
+  .fb-password-save-submit { min-width: 0; flex: 1 1 auto; padding: 0 10px; }
+  .fb-password-save-note { margin: 0 -15px -15px; padding: 12px 15px; }
 }
 
 .fb-vault-section-tabs {
