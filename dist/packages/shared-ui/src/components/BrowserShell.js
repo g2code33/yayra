@@ -5874,13 +5874,20 @@ export class BrowserShell {
       }
 
       const wantsCapture = captureActive && tabId === activeTabId;
-      const updatePromptOpen = Boolean(this.state.updatePrompt || this.state.updateInstallPrompt);
-      if (wantsCapture && updatePromptOpen) {
-        // Update prompts must never appear underneath the native page, even
+      const immediateOverlayOpen = Boolean(
+        this.state.updatePrompt
+        || this.state.updateInstallPrompt
+        // This compact toolbar popover straddles the viewport boundary. A
+        // native WebContentsView can paint over its lower portion unless it
+        // is hidden before asynchronous snapshot capture begins.
+        || this.state.activeModal === 'tab-groups'
+      );
+      if (wantsCapture && immediateOverlayOpen) {
+        // These overlays must never appear underneath the native page, even
         // for the duration of an asynchronous capture/decode. Hide the native
         // sibling surface immediately; use the existing snapshot if any and
         // refresh it in the background so the page remains visible behind the
-        // prompt without delaying the prompt itself.
+        // overlay without delaying it.
         this.ensureNativePageSnapshotPlaceholder(tabId);
         const hidden = this.setNativeWebviewVisible(tabId, false);
         if (hidden && typeof hidden.catch === 'function') hidden.catch(() => {});
