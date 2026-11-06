@@ -403,14 +403,18 @@ export const buildPowerPointCompatibilityMathDeck = async ({ omitDiagramDrawing 
 </Relationships>`);
   zip.file('ppt/diagrams/data1.xml', `<?xml version="1.0"?>
 <dgm:dataModel xmlns:dgm="${DGM}" xmlns:a="${A}" xmlns:dsp="http://schemas.microsoft.com/office/drawing/2008/diagram">
-  <dgm:ptLst><dgm:pt modelId="{A}"><dgm:prSet/><dgm:t><a:txBody><a:bodyPr/><a:p><a:r><a:t>Director</a:t></a:r></a:p></a:txBody></dgm:t></dgm:pt></dgm:ptLst>
+  <dgm:ptLst>
+    <dgm:pt modelId="{A}"><dgm:prSet/><dgm:t><a:txBody><a:bodyPr/><a:p><a:r><a:t>Director</a:t></a:r></a:p></a:txBody></dgm:t></dgm:pt>
+    <dgm:pt modelId="{B}"><dgm:prSet/><dgm:t><a:txBody><a:bodyPr/><a:p><a:r><a:t>Operations</a:t></a:r></a:p></a:txBody></dgm:t></dgm:pt>
+  </dgm:ptLst>
+  <dgm:cxnLst><dgm:cxn modelId="{C}" type="parOf" srcId="{A}" destId="{B}" srcOrd="0" destOrd="0"/></dgm:cxnLst>
   <dgm:extLst><a:ext uri="http://schemas.microsoft.com/office/drawing/2008/diagram"><dsp:dataModelExt relId="rId6" minVer="${DGM}"/></a:ext></dgm:extLst>
 </dgm:dataModel>`);
   if (!omitDiagramDrawing) zip.file('ppt/diagrams/drawing1.xml', `<?xml version="1.0"?>
 <dsp:drawing xmlns:dsp="http://schemas.microsoft.com/office/drawing/2008/diagram" xmlns:a="${A}" xmlns:r="${R}"><dsp:spTree>
   <dsp:nvGrpSpPr><dsp:cNvPr id="0" name=""/><dsp:cNvGrpSpPr/></dsp:nvGrpSpPr><dsp:grpSpPr/>
   <dsp:sp modelId="{A}"><dsp:nvSpPr><dsp:cNvPr id="1" name="Director"/><dsp:cNvSpPr/></dsp:nvSpPr><dsp:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1270000" cy="635000"/></a:xfrm><a:prstGeom prst="roundRect"/><a:solidFill><a:srgbClr val="4472C4"/></a:solidFill></dsp:spPr><dsp:txBody><a:bodyPr anchor="ctr"/><a:p><a:pPr algn="ctr"/><a:r><a:rPr sz="1800"/><a:t>Director</a:t></a:r></a:p></dsp:txBody></dsp:sp>
-  <dsp:sp modelId="{B}"><dsp:nvSpPr><dsp:cNvPr id="2" name="Operations"/><dsp:cNvSpPr/></dsp:nvSpPr><dsp:spPr><a:xfrm><a:off x="1905000" y="0"/><a:ext cx="1270000" cy="635000"/></a:xfrm><a:prstGeom prst="roundRect"/><a:solidFill><a:srgbClr val="70AD47"/></a:solidFill></dsp:spPr><dsp:txBody><a:bodyPr anchor="ctr"/><a:p><a:pPr algn="ctr"/><a:r><a:rPr sz="1800"/><a:t>Operations</a:t></a:r></a:p></dsp:txBody></dsp:sp>
+  <dsp:sp modelId="{B}"><dsp:nvSpPr><dsp:cNvPr id="2" name="Operations"/><dsp:cNvSpPr/></dsp:nvSpPr><dsp:spPr><a:xfrm><a:off x="1905000" y="1270000"/><a:ext cx="1270000" cy="635000"/></a:xfrm><a:prstGeom prst="roundRect"/><a:solidFill><a:srgbClr val="70AD47"/></a:solidFill></dsp:spPr><dsp:txBody><a:bodyPr anchor="ctr"/><a:p><a:pPr algn="ctr"/><a:r><a:rPr sz="1800"/><a:t>Operations</a:t></a:r></a:p></dsp:txBody></dsp:sp>
   <dsp:pic><dsp:nvPicPr><dsp:cNvPr id="3" name="SmartArt badge"/><dsp:cNvPicPr/></dsp:nvPicPr><dsp:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></dsp:blipFill><dsp:spPr><a:xfrm><a:off x="1524000" y="190500"/><a:ext cx="190500" cy="190500"/></a:xfrm><a:prstGeom prst="ellipse"/></dsp:spPr></dsp:pic>
 </dsp:spTree></dsp:drawing>`);
   if (!omitDiagramDrawing) zip.file('ppt/diagrams/_rels/drawing1.xml.rels', `<Relationships xmlns="${REL_NS}">

@@ -4955,6 +4955,7 @@ function parseSp(sp, ctx) {
     h: Math.max(b.h, 0),
     rot: b.rot,
     geom: prst || (text ? "rect" : void 0),
+    diagramModelId: diagramShape ? sp.getAttribute("modelId") || void 0 : void 0,
     fill,
     imageUrl: imageRid && !hasTextContent() ? imageUrl : void 0,
     imageUrls: imageRid && !hasTextContent() && imageUrls.length ? imageUrls : void 0,
@@ -5058,6 +5059,73 @@ function diagramModelTexts(model) {
   }
   return values.slice(0, 64);
 }
+function missingDiagramConnectors(parsed, model, ctx) {
+  if (!model || parsed.some((shape) => shape.type === "line")) return [];
+  const nodes = /* @__PURE__ */ new Map();
+  for (const shape of parsed) {
+    if (shape.diagramModelId && shape.w > 0 && shape.h > 0) nodes.set(shape.diagramModelId, shape);
+  }
+  if (nodes.size < 2) return [];
+  const seen = /* @__PURE__ */ new Set();
+  const connectors = [];
+  for (const connection of descendantsByLocalName(model, "cxn")) {
+    if (String(connection.getAttribute("type") || "").toLowerCase() !== "parof") continue;
+    const sourceId = connection.getAttribute("srcId") || "";
+    const destinationId = connection.getAttribute("destId") || "";
+    if (!sourceId || !destinationId || sourceId === destinationId) continue;
+    const first = nodes.get(sourceId);
+    const second = nodes.get(destinationId);
+    if (!first || !second) continue;
+    const edgeKey = [sourceId, destinationId].sort().join("\0");
+    if (seen.has(edgeKey)) continue;
+    seen.add(edgeKey);
+    const firstCenterX = first.x + first.w / 2;
+    const firstCenterY = first.y + first.h / 2;
+    const secondCenterX = second.x + second.w / 2;
+    const secondCenterY = second.y + second.h / 2;
+    const vertical = Math.abs(secondCenterY - firstCenterY) >= Math.abs(secondCenterX - firstCenterX) * 0.55;
+    let startX;
+    let startY;
+    let endX;
+    let endY;
+    if (vertical) {
+      const upper = firstCenterY <= secondCenterY ? first : second;
+      const lower = upper === first ? second : first;
+      startX = upper.x + upper.w / 2;
+      startY = upper.y + upper.h;
+      endX = lower.x + lower.w / 2;
+      endY = lower.y;
+    } else {
+      const left = firstCenterX <= secondCenterX ? first : second;
+      const right = left === first ? second : first;
+      startX = left.x + left.w;
+      startY = left.y + left.h / 2;
+      endX = right.x;
+      endY = right.y + right.h / 2;
+    }
+    const deltaX = endX - startX;
+    const deltaY = endY - startY;
+    const width = Math.max(1, Math.abs(deltaX));
+    const height = Math.max(1, Math.abs(deltaY));
+    connectors.push({
+      id: ctx.nextId(),
+      type: "line",
+      x: Math.min(startX, endX),
+      y: Math.min(startY, endY),
+      w: width,
+      h: height,
+      rot: 0,
+      geom: Math.abs(deltaX) > 2 && Math.abs(deltaY) > 2 ? "bentConnector3" : "line",
+      flipH: deltaX < 0,
+      flipV: deltaY < 0,
+      fill: "#4b5563",
+      borderWidth: 1.5,
+      textScale: 1,
+      isTitle: false
+    });
+  }
+  return connectors;
+}
 function nativeDiagramFallback(gf, model, ctx) {
   const frame = applyT(ctx.t, parseXfrm(gf));
   const labels = diagramModelTexts(model);
@@ -5114,7 +5182,7 @@ function parseDiagramFrame(gf, ctx) {
       push: (shape) => parsed.push(shape)
     };
     for (const node of Array.from(drawingTree.children)) parseShapeNode(node, drawingCtx);
-    if (parsed.length) return parsed;
+    if (parsed.length) return [...missingDiagramConnectors(parsed, part?.model || null, ctx), ...parsed];
   }
   const code = part?.model ? "pptx/smartart-native-fallback" : "pptx/smartart-unresolved";
   const message = part?.model ? `Slide ${ctx.slideNumber}: SmartArt cached drawing is missing; using a simplified local layout.` : `Slide ${ctx.slideNumber}: SmartArt relationships could not be resolved.`;

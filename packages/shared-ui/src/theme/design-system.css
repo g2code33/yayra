@@ -10428,6 +10428,30 @@ button.fb-site-passkey-indicator {
   background: #fff;
 }
 
+.fb-doc-thumb {
+  transform: translateZ(0);
+}
+
+.fb-doc-thumb:hover:not(.is-current) {
+  transform: translateY(-1px);
+  border-color: var(--fb-accent-primary, #6d5df2) !important;
+}
+
+.fb-doc-thumb.is-current {
+  background: rgba(109, 93, 242, 0.12) !important;
+  box-shadow: 0 0 0 1px rgba(139, 124, 255, 0.34), 0 8px 20px rgba(20, 17, 52, 0.22);
+}
+
+.fb-doc-thumb.is-current .fb-doc-thumb-label {
+  color: var(--fb-accent-primary, #a99fff) !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fb-doc-thumb {
+    transition: none !important;
+  }
+}
+
 .fb-doc-thumb .fb-pptx-slide-canvas,
 .fb-doc-thumb .fb-pdf-thumbnail-canvas {
   display: block;

@@ -440,6 +440,7 @@ test('PPTX CONNECTORS: line-only p:sp geometry is retained and painted as an SVG
 test('PPTX COMPATIBILITY: AlternateContent math renders and slide numbers inherit lower-right master geometry', async () => {
   const bytes = await buildPowerPointCompatibilityMathDeck();
   const deck = await pptxEngine.openPptxDeck(new Blob([bytes]), { lazyMedia: true });
+  const diagramHost = mount(1280, 720);
   try {
     const slide = await deck.getSlide(1);
     assert.equal(slide.title, 'Basic Sample Size Formulas');
@@ -477,6 +478,13 @@ test('PPTX COMPATIBILITY: AlternateContent math renders and slide numbers inheri
     assert.ok(Math.abs(director.x - 800) < 0.1 && Math.abs(director.w - 133.33) < 0.1,
       'cached drawing coordinates are mapped into the graphic frame');
     assert.ok(operations.x > director.x + director.w, 'organisation nodes preserve their cached placement');
+    const diagramConnectors = slide.shapes.filter((shape) => shape.type === 'line');
+    assert.equal(diagramConnectors.length, 1, 'missing SmartArt cached connectors are reconstructed from explicit parent-child relationships');
+    assert.equal(diagramConnectors[0].fill, '#4b5563');
+    renderPptxSlide(diagramHost, { slide, width: deck.slideWidth, height: deck.slideHeight });
+    const renderedConnector = diagramHost.querySelector('.fb-pptx-line .fb-pptx-connector-path');
+    assert.ok(renderedConnector, 'the reconstructed relationship is visible as an SVG stroke');
+    assert.equal(renderedConnector.getAttribute('stroke'), '#4b5563');
     const diagramImage = slide.shapes.find((shape) => shape.imagePaths?.includes('ppt/media/smartart-badge.png'));
     assert.ok(diagramImage, 'images related from the cached diagram part survive rId collisions with slide relationships');
     assert.equal(slide.diagnostics, undefined, 'a resolved cached SmartArt drawing does not report a false fidelity warning');
@@ -502,6 +510,7 @@ test('PPTX COMPATIBILITY: AlternateContent math renders and slide numbers inheri
     assert.match(index[0].text, /nₒ = \(Z² × σ²\) ⁄ d²/);
   } finally {
     deck.dispose();
+    removeMount(diagramHost);
   }
 
   const host = mount();

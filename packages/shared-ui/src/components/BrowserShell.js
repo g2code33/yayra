@@ -681,6 +681,8 @@ export class BrowserShell {
 
     // DOM Elements
     this.rootElement = null;
+    this._overlayGroupLayer = null;
+    this._overlayGroups = new Map();
     this.tabStripElement = null;
     this.omniboxInput = null;
     this.viewportElement = null;
@@ -1024,6 +1026,68 @@ export class BrowserShell {
     );
   }
 
+  renderOverlayGroup(layer, key, signature, paint) {
+    if (!layer) return;
+    if (this._overlayGroupLayer !== layer) {
+      this._overlayGroupLayer = layer;
+      this._overlayGroups = new Map();
+    }
+    const previous = this._overlayGroups.get(key);
+    if (signature == null) {
+      previous?.nodes?.forEach((node) => node.remove?.());
+      this._overlayGroups.delete(key);
+      return;
+    }
+    if (previous?.signature === signature
+        && previous.nodes.every((node) => node.parentElement === layer)) return;
+
+    // Paint off-tree first so a rendering error cannot blank the currently
+    // visible overlay. Only replace this logical group; sibling menus/panels
+    // keep their DOM identity, focus, scroll position and entrance animation.
+    const staging = document.createElement('div');
+    paint(staging);
+    const nodes = Array.from(staging.children || []);
+    previous?.nodes?.forEach((node) => node.remove?.());
+    for (const node of nodes) layer.appendChild(node);
+    this._overlayGroups.set(key, { signature, nodes });
+  }
+
+  syncOverlayGroups(layer) {
+    const render = (key, signature, paint) => this.renderOverlayGroup(layer, key, signature, paint);
+    const update = this.state.updateState || {};
+    const profileSuggestion = this.state.profileSuggestion;
+    const pendingPasswordSave = this.state.pendingPasswordSave;
+    const activeModal = this.state.activeModal;
+    render('modal', activeModal || null, (target) => this.renderActiveModal(target));
+    render('side-drawer', this.state.isSideDrawerOpen
+      ? JSON.stringify([this.state.settings.showBookmarksBar, this.state.zoomLevel, update.status, update.progressPercent])
+      : null, (target) => this.renderSideDrawer(target));
+    render('security-dropdown', this.state.isSecurityDropdownOpen
+      ? String(this.state.settings.searchEngine || '') : null, (target) => this.renderSecurityDropdown(target));
+    const account = this.state.googleAccount || {};
+    render('account-dropdown', this.state.isAccountMenuOpen
+      ? JSON.stringify([account.status, account.profile?.email, account.profile?.name, this.state.passkeyInfo?.createdAt,
+        this.profileService?.list?.().map((profile) => [profile.id, profile.name, profile.email]) || []])
+      : null, (target) => this.renderAccountDropdown(target));
+    render('downloads-dropdown', this.state.isDownloadsDropdownOpen
+      ? JSON.stringify([Boolean(this.state.isDownloadsDropdownExpanded), (this.state.downloadsItems || []).map((item) => [item.id, item.state])])
+      : null, (target) => this.renderDownloadsDropdown(target));
+    render('tools-dropdown', this.state.isToolsDropdownOpen && !this.state.isFloatingMiniOpen
+      ? JSON.stringify(this.getToolbarQuickActions()) : null, (target) => this.renderToolsDropdown(target));
+    render('profile-suggestion', profileSuggestion
+      ? JSON.stringify([profileSuggestion.email, profileSuggestion.name, profileSuggestion.reason]) : null,
+    (target) => this.renderProfileSuggestionCard(target));
+    render('close-prompt', this.state.closePrompt ? String(Boolean(this.state.closePromptExitsApp)) : null,
+      (target) => this.renderClosePromptModal(target));
+    render('recent-tabs', this.state.recentTabsOffer?.length
+      ? JSON.stringify(this.state.recentTabsOffer) : null, (target) => this.renderRecentTabsOffer(target));
+    render('find-in-page', this.state.findInPage?.isOpen ? 'open' : null,
+      (target) => this.renderFindInPageBar(target));
+    render('password-save', pendingPasswordSave
+      ? JSON.stringify([pendingPasswordSave.url, pendingPasswordSave.username]) : null,
+    (target) => this.renderPasswordSaveBar(target));
+  }
+
   /**
    * Refresh only the transient overlay subtree for chrome-only toggles. The
    * page, tab strip, toolbar and focused address field stay mounted, avoiding
@@ -1039,18 +1103,7 @@ export class BrowserShell {
       return false;
     }
 
-    layer.innerHTML = '';
-    this.renderActiveModal(layer);
-    if (this.state.isSideDrawerOpen) this.renderSideDrawer(layer);
-    if (this.state.isSecurityDropdownOpen) this.renderSecurityDropdown(layer);
-    if (this.state.isAccountMenuOpen) this.renderAccountDropdown(layer);
-    if (this.state.isDownloadsDropdownOpen) this.renderDownloadsDropdown(layer);
-    if (this.state.isToolsDropdownOpen) this.renderToolsDropdown(layer);
-    if (this.state.profileSuggestion) this.renderProfileSuggestionCard(layer);
-    if (this.state.closePrompt) this.renderClosePromptModal(layer);
-    if (this.state.recentTabsOffer?.length) this.renderRecentTabsOffer(layer);
-    if (this.state.findInPage?.isOpen) this.renderFindInPageBar(layer);
-    if (this.state.pendingPasswordSave) this.renderPasswordSaveBar(layer);
+    this.syncOverlayGroups(layer);
 
     const tab = this.getActiveTab();
     if (tab && this._androidTabWebIds?.has?.(tab.id)) {
@@ -2480,38 +2533,9 @@ export class BrowserShell {
     overlayLayer.style.display = 'contents';
     shell.appendChild(overlayLayer);
     this.overlayLayer = overlayLayer;
-
-    // Modal / Dialog Overlay (Menu, Tab Switcher, etc.)
-    this.renderActiveModal(overlayLayer);
-
-    // Right Side Drawer Menu (No Blur)
-    if (this.state.isSideDrawerOpen) {
-      this.renderSideDrawer(overlayLayer);
-    }
-
-    // Security Dropdown & Search Engine Switcher
-    if (this.state.isSecurityDropdownOpen) {
-      this.renderSecurityDropdown(overlayLayer);
-    }
-
-    // Persistent Account Dropdown (top-right account button)
-    if (this.state.isAccountMenuOpen) {
-      this.renderAccountDropdown(overlayLayer);
-    }
-
-    // Downloads dropdown (latest 5 + state-aware actions) under the
-    // toolbar download button - tracking without leaving the page.
-    if (this.state.isDownloadsDropdownOpen) {
-      this.renderDownloadsDropdown(overlayLayer);
-    }
-    if (this.state.isToolsDropdownOpen && !this.state.isFloatingMiniOpen) {
-      this.renderToolsDropdown(overlayLayer);
-    }
-
-    // Chrome-style "Keep your browsing separate?" profile suggestion
-    if (this.state.profileSuggestion) {
-      this.renderProfileSuggestionCard(overlayLayer);
-    }
+    this._overlayGroupLayer = overlayLayer;
+    this._overlayGroups = new Map();
+    this.syncOverlayGroups(overlayLayer);
 
     // "Update available - now or later?" card (auto background checks)
     // and "Update downloaded - install now / next launch / later" card.
@@ -2522,25 +2546,8 @@ export class BrowserShell {
     this.renderUpdatePromptCard(shell);
     this.renderUpdateInstallPromptCard(shell);
 
-    // "Close Yayra?" prompt (close all tabs / just close / keep all tabs)
-    if (this.state.closePrompt) {
-      this.renderClosePromptModal(overlayLayer);
-    }
-
-    // "Reopen recent tabs?" offer after a plain close last session
-    if (this.state.recentTabsOffer && this.state.recentTabsOffer.length) {
-      this.renderRecentTabsOffer(overlayLayer);
-    }
-
-    // Find in Page Toolbar
-    if (this.state.findInPage.isOpen) {
-      this.renderFindInPageBar(overlayLayer);
-    }
-
-    // Chrome-style "Save password?" bar (captured login submission)
-    if (this.state.pendingPasswordSave) {
-      this.renderPasswordSaveBar(overlayLayer);
-    }
+    // Close/recent-tab/find/password prompts were mounted with the other
+    // keyed overlay groups above; do not create duplicate live surfaces.
 
     // Floating Mini-Browser Window Popup
     if (this.state.isFloatingMiniOpen) {
@@ -25679,6 +25686,16 @@ export class BrowserShell {
     }
 
     let sidebarStructureKey = '';
+    const revealCurrentThumbnail = () => {
+      if (state.sidebarTab !== 'thumbnails' || !state.sidebarOpen) return;
+      const currentPage = Number(state.page) || 1;
+      const activeThumbnail = Array.from(sidebarBody.querySelectorAll('.fb-doc-thumb'))
+        .find((thumbnail) => Number(thumbnail.dataset.page) === currentPage);
+      // Keep the selected page in the rail while navigating by keyboard,
+      // search result, page input, or slideshow controls. `nearest` avoids
+      // moving the rail when the active thumbnail is already visible.
+      activeThumbnail?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+    };
     const renderSidebar = () => {
       try {
         const canShowSidebar = capabilities.outline || capabilities.thumbnails;
@@ -25691,10 +25708,16 @@ export class BrowserShell {
         const nextStructureKey = `${state.sidebarTab}|${state.numPages}|${state.outline.length}|${documentKind}`;
         if (sidebarStructureKey === nextStructureKey && state.sidebarTab === 'thumbnails') {
           for (const tile of sidebarBody.querySelectorAll('.fb-doc-thumb')) {
-            tile.style.borderColor = Number(tile.dataset.page) === Number(state.page)
+            const isCurrent = Number(tile.dataset.page) === Number(state.page);
+            tile.style.borderColor = isCurrent
               ? 'var(--fb-accent-primary,#6d5df2)'
               : 'var(--fb-border-glass,rgba(255,255,255,0.12))';
+            tile.classList.toggle('is-current', isCurrent);
+            tile.setAttribute('aria-label', `Go to ${pageNoun} ${tile.dataset.page}${isCurrent ? ', current' : ''}`);
+            tile.setAttribute('aria-current', isCurrent ? 'page' : 'false');
+            tile.tabIndex = isCurrent ? 0 : -1;
           }
+          revealCurrentThumbnail();
           return;
         }
         sidebarStructureKey = nextStructureKey;
@@ -25705,6 +25728,9 @@ export class BrowserShell {
         const activeTabBtn = sidebarTabs.querySelector(`.fb-doc-sidebar-tab-${state.sidebarTab}`);
         if (activeTabBtn) activeTabBtn.style.background = 'rgba(109,93,242,0.35)';
         if (state.sidebarTab === 'thumbnails') {
+          sidebarBody.setAttribute('role', 'toolbar');
+          sidebarBody.setAttribute('aria-label', `${isPowerPointDocument(documentKind) ? 'Slide' : 'Page'} thumbnails`);
+          sidebarBody.setAttribute('aria-orientation', 'vertical');
           const count = state.numPages || 0;
           if (!count) {
             sidebarBody.innerHTML = `<div style="color:var(--fb-text-secondary,#9aa3b2); padding:8px;">No ${isPowerPointDocument(documentKind) ? 'slides' : 'pages'} yet.</div>`;
@@ -25714,14 +25740,38 @@ export class BrowserShell {
             const thumb = document.createElement('div');
             thumb.className = 'fb-doc-thumb';
             thumb.dataset.page = String(p);
+            const isCurrent = p === Number(state.page);
+            thumb.classList.toggle('is-current', isCurrent);
             thumb.setAttribute('role', 'button');
-            thumb.setAttribute('aria-label', `Go to ${pageNoun} ${p}`);
-            thumb.style.cssText = `margin:0 auto 10px; width:140px; min-height:44px; padding:4px; border:1px solid ${p === state.page ? 'var(--fb-accent-primary,#6d5df2)' : 'var(--fb-border-glass,rgba(255,255,255,0.12))'}; border-radius:7px; cursor:pointer; text-align:center; background:var(--fb-bg-glass-input,#0e111a); overflow:hidden;`;
+            thumb.setAttribute('aria-label', `Go to ${pageNoun} ${p}${isCurrent ? ', current' : ''}`);
+            thumb.setAttribute('aria-current', isCurrent ? 'page' : 'false');
+            thumb.setAttribute('aria-keyshortcuts', 'Enter Space ArrowUp ArrowDown Home End');
+            thumb.tabIndex = isCurrent ? 0 : -1;
+            thumb.style.cssText = `margin:0 auto 10px; width:140px; min-height:44px; padding:4px; border:1px solid ${isCurrent ? 'var(--fb-accent-primary,#6d5df2)' : 'var(--fb-border-glass,rgba(255,255,255,0.12))'}; border-radius:9px; cursor:pointer; text-align:center; background:var(--fb-bg-glass-input,#0e111a); overflow:hidden; transition:border-color 140ms ease, box-shadow 140ms ease, background 140ms ease, transform 140ms ease;`;
             const label = document.createElement('div');
+            label.className = 'fb-doc-thumb-label';
             label.textContent = `${isPowerPointDocument(documentKind) ? 'Slide ' : ''}${p}`;
-            label.style.cssText = 'padding:3px 0; color:var(--fb-text-secondary,#9aa3b2); font-size:0.7rem;';
+            label.style.cssText = 'padding:4px 0; color:var(--fb-text-secondary,#9aa3b2); font-size:0.7rem; font-weight:600;';
             thumb.appendChild(label);
             thumb.addEventListener('click', () => activeViewer()?.setPage?.(p));
+            thumb.addEventListener('keydown', (event) => {
+              const slides = Array.from(sidebarBody.querySelectorAll('.fb-doc-thumb'));
+              let destination = null;
+              if (event.key === 'ArrowUp') destination = Math.max(1, p - 1);
+              else if (event.key === 'ArrowDown') destination = Math.min(count, p + 1);
+              else if (event.key === 'Home') destination = 1;
+              else if (event.key === 'End') destination = count;
+              if (destination !== null) {
+                event.preventDefault();
+                event.stopPropagation();
+                slides[destination - 1]?.focus?.();
+                void activeViewer()?.setPage?.(destination);
+              } else if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                event.stopPropagation();
+                void activeViewer()?.setPage?.(p);
+              }
+            });
             sidebarBody.appendChild(thumb);
             const renderPreview = () => activeViewer()?.renderThumbnail?.(p, thumb);
             if (typeof IntersectionObserver === 'function') {
@@ -25736,8 +25786,12 @@ export class BrowserShell {
               renderPreview();
             }
           }
+          revealCurrentThumbnail();
           return;
         }
+        sidebarBody.removeAttribute('role');
+        sidebarBody.removeAttribute('aria-label');
+        sidebarBody.removeAttribute('aria-orientation');
         if (!state.outline.length) {
           sidebarBody.innerHTML = '<div style="color:var(--fb-text-secondary,#9aa3b2); padding:8px; line-height:1.5;">This PDF has no table of contents. Use the Pages tab to jump between pages.</div>';
           return;
@@ -27300,6 +27354,8 @@ export class BrowserShell {
       this._pdfDropHandlers = null;
     }
     this._pdfDropArmed = false;
+    this._overlayGroups?.clear?.();
+    this._overlayGroupLayer = null;
     if (this.bubbleOverlay) {
       this.bubbleOverlay.remove();
     }

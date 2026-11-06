@@ -90,6 +90,50 @@ test('Web/PWA no-blink fix: re-rendering chrome REUSES the same <iframe> element
   assert.ok(String(frameNav.iframe.src).includes('example.org'), 'src updates on real navigation');
 });
 
+test('Overlay reconciliation preserves open controls and the active webpage during rapid menu interactions', async () => {
+  delete globalThis.window.yayra;
+  const container = document.createElement('div');
+  const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+  await shell.initialize();
+  shell.navigateActiveTab('https://example.com/');
+  shell.render(container);
+
+  const originalRoot = shell.rootElement;
+  const originalFrame = shell.webFrames.get(shell.getActiveTab().id).iframe;
+  container.querySelector('.fb-menu-btn').click();
+  assert.equal(shell.state.isSideDrawerOpen, true, 'the real toolbar menu click opens the drawer');
+  const drawer = container.querySelector('.fb-side-drawer-menu');
+  assert.ok(drawer, 'the first menu opens');
+
+  // An unrelated popup opening/closing and redundant overlay syncs must not
+  // tear down and recreate an already-open animated drawer.
+  shell.state.isToolsDropdownOpen = true;
+  shell.renderOverlayLayerInPlace();
+  assert.equal(container.querySelector('.fb-side-drawer-menu'), drawer, 'opening another menu retains the existing drawer node');
+  const toolsMenu = container.querySelector('.fb-tools-dropdown');
+  assert.ok(toolsMenu, 'the tools menu still opens');
+  shell.renderOverlayLayerInPlace();
+  assert.equal(container.querySelector('.fb-side-drawer-menu'), drawer, 'redundant overlay syncs do not restart the drawer animation');
+  assert.equal(container.querySelector('.fb-tools-dropdown'), toolsMenu, 'the tools menu itself stays mounted on a no-op sync');
+
+  shell.state.isToolsDropdownOpen = false;
+  shell.renderOverlayLayerInPlace();
+  assert.equal(container.querySelector('.fb-side-drawer-menu'), drawer, 'closing a sibling menu retains the drawer');
+  assert.equal(container.querySelector('.fb-tools-dropdown'), null, 'the requested menu closes');
+  container.querySelector('.fb-menu-btn').click();
+  assert.equal(shell.state.isSideDrawerOpen, false, 'the real toolbar menu click closes the drawer');
+  assert.equal(container.querySelector('.fb-side-drawer-menu'), null, 'closed drawer is removed cleanly');
+  const menuButton = container.querySelector('.fb-menu-btn');
+  for (let click = 0; click < 8; click += 1) {
+    menuButton.click();
+    assert.equal(shell.state.isSideDrawerOpen, click % 2 === 0, `rapid click ${click + 1} produces exactly one toggle`);
+  }
+  assert.equal(shell.rootElement, originalRoot, 'chrome-only interactions do not remount the application shell');
+  assert.equal(shell.webFrames.get(shell.getActiveTab().id).iframe, originalFrame, 'the active webpage frame remains the same live element');
+  assert.equal(shell.getActiveTab().url, 'https://example.com/', 'no navigation or reload was requested');
+  shell.destroy();
+});
+
 test('Web/PWA frame layer: hidden on internal pages, pruned when tabs close', async () => {
   delete globalThis.window.yayra;
   const container = document.createElement('div');

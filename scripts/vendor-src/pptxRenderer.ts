@@ -129,6 +129,8 @@ export interface PptxShape {
   rot: number; // degrees
   /** prstGeom name (rect, roundRect, ellipse, line, bentConnector3, …). */
   geom?: string;
+  /** SmartArt model point ID used only to restore missing cached connectors. */
+  diagramModelId?: string;
   /** Connector orientation from a:xfrm. */
   flipH?: boolean;
   flipV?: boolean;
@@ -2035,6 +2037,7 @@ function parseSp(sp: Element, ctx: ShapeCtx): PptxShape | null {
     h: Math.max(b.h, 0),
     rot: b.rot,
     geom: prst || (text ? 'rect' : undefined),
+    diagramModelId: diagramShape ? sp.getAttribute('modelId') || undefined : undefined,
     fill,
     imageUrl: imageRid && !hasTextContent() ? imageUrl : undefined,
     imageUrls: imageRid && !hasTextContent() && imageUrls.length ? imageUrls : undefined,
@@ -2160,6 +2163,82 @@ function diagramModelTexts(model: Element | null): string[] {
   return values.slice(0, 64);
 }
 
+function missingDiagramConnectors(parsed: PptxShape[], model: Element | null, ctx: ShapeCtx): PptxShape[] {
+  // A number of PowerPoint/WPS exports omit connectors from the cached
+  // drawing1.xml even though the SmartArt data model still records its
+  // parent-child graph. In that case the nodes render as isolated boxes. Use
+  // only explicit parOf relationships, and only when the cache has no actual
+  // connector shapes, so this repair cannot invent links for ordinary slides.
+  if (!model || parsed.some((shape) => shape.type === 'line')) return [];
+  const nodes = new Map<string, PptxShape>();
+  for (const shape of parsed) {
+    if (shape.diagramModelId && shape.w > 0 && shape.h > 0) nodes.set(shape.diagramModelId, shape);
+  }
+  if (nodes.size < 2) return [];
+
+  const seen = new Set<string>();
+  const connectors: PptxShape[] = [];
+  for (const connection of descendantsByLocalName(model, 'cxn')) {
+    if (String(connection.getAttribute('type') || '').toLowerCase() !== 'parof') continue;
+    const sourceId = connection.getAttribute('srcId') || '';
+    const destinationId = connection.getAttribute('destId') || '';
+    if (!sourceId || !destinationId || sourceId === destinationId) continue;
+    const first = nodes.get(sourceId);
+    const second = nodes.get(destinationId);
+    if (!first || !second) continue;
+    const edgeKey = [sourceId, destinationId].sort().join('\u0000');
+    if (seen.has(edgeKey)) continue;
+    seen.add(edgeKey);
+
+    const firstCenterX = first.x + first.w / 2;
+    const firstCenterY = first.y + first.h / 2;
+    const secondCenterX = second.x + second.w / 2;
+    const secondCenterY = second.y + second.h / 2;
+    const vertical = Math.abs(secondCenterY - firstCenterY) >= Math.abs(secondCenterX - firstCenterX) * 0.55;
+    let startX;
+    let startY;
+    let endX;
+    let endY;
+    if (vertical) {
+      const upper = firstCenterY <= secondCenterY ? first : second;
+      const lower = upper === first ? second : first;
+      startX = upper.x + upper.w / 2;
+      startY = upper.y + upper.h;
+      endX = lower.x + lower.w / 2;
+      endY = lower.y;
+    } else {
+      const left = firstCenterX <= secondCenterX ? first : second;
+      const right = left === first ? second : first;
+      startX = left.x + left.w;
+      startY = left.y + left.h / 2;
+      endX = right.x;
+      endY = right.y + right.h / 2;
+    }
+
+    const deltaX = endX - startX;
+    const deltaY = endY - startY;
+    const width = Math.max(1, Math.abs(deltaX));
+    const height = Math.max(1, Math.abs(deltaY));
+    connectors.push({
+      id: ctx.nextId(),
+      type: 'line',
+      x: Math.min(startX, endX),
+      y: Math.min(startY, endY),
+      w: width,
+      h: height,
+      rot: 0,
+      geom: Math.abs(deltaX) > 2 && Math.abs(deltaY) > 2 ? 'bentConnector3' : 'line',
+      flipH: deltaX < 0,
+      flipV: deltaY < 0,
+      fill: '#4b5563',
+      borderWidth: 1.5,
+      textScale: 1,
+      isTitle: false,
+    });
+  }
+  return connectors;
+}
+
 function nativeDiagramFallback(gf: Element, model: Element | null, ctx: ShapeCtx): PptxShape[] {
   const frame = applyT(ctx.t, parseXfrm(gf));
   const labels = diagramModelTexts(model);
@@ -2218,7 +2297,7 @@ function parseDiagramFrame(gf: Element, ctx: ShapeCtx): PptxShape[] {
       push: (shape) => parsed.push(shape),
     };
     for (const node of Array.from(drawingTree.children)) parseShapeNode(node, drawingCtx);
-    if (parsed.length) return parsed;
+    if (parsed.length) return [...missingDiagramConnectors(parsed, part?.model || null, ctx), ...parsed];
   }
 
   const code = part?.model ? 'pptx/smartart-native-fallback' : 'pptx/smartart-unresolved';

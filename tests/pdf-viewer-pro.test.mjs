@@ -257,6 +257,29 @@ test('SHELL INTEGRATION: the pro toolbar (jump-to-page, fit, rotate, night, outl
     thumbs[3].click();
     await flush();
     assert.equal(shell.getActiveTab().docState.page, 4, 'thumbnail click jumps');
+    const findThumb = (page) => Array.from(vp.querySelectorAll('.fb-doc-thumb')).find((thumb) => Number(thumb.dataset.page) === page);
+    const currentThumb = findThumb(4);
+    assert.equal(currentThumb.getAttribute('aria-current'), 'page', 'the active thumbnail is announced accessibly');
+    let revealedOptions = null;
+    const nextActiveThumb = findThumb(2);
+    assert.equal(currentThumb.tabIndex, 0, 'only the current thumbnail is in the tab order');
+    assert.equal(nextActiveThumb.tabIndex, -1, 'inactive thumbnails do not create dozens of unnecessary tab stops');
+    nextActiveThumb.scrollIntoView = (options) => { revealedOptions = options; };
+    nextActiveThumb.dispatchEvent({
+      type: 'keydown', key: 'Enter',
+      preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() { this.cancelBubble = true; }
+    });
+    await flush();
+    assert.equal(shell.getActiveTab().docState.page, 2, 'keyboard activation navigates to a slide');
+    assert.deepEqual(revealedOptions, { block: 'nearest', inline: 'nearest' }, 'the active thumbnail is brought into view after keyboard navigation');
+    findThumb(2).dispatchEvent({
+      type: 'keydown', key: 'ArrowDown',
+      preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() { this.cancelBubble = true; }
+    });
+    await flush();
+    assert.equal(shell.getActiveTab().docState.page, 3, 'arrow keys move through the thumbnail rail and update the slide');
 
     const input = vp.querySelector('.fb-doc-page-input');
     input.value = '2';
