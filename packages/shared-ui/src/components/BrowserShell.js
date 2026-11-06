@@ -5874,6 +5874,46 @@ export class BrowserShell {
       }
 
       const wantsCapture = captureActive && tabId === activeTabId;
+      const updatePromptOpen = Boolean(this.state.updatePrompt || this.state.updateInstallPrompt);
+      if (wantsCapture && updatePromptOpen) {
+        // Update prompts must never appear underneath the native page, even
+        // for the duration of an asynchronous capture/decode. Hide the native
+        // sibling surface immediately; use the existing snapshot if any and
+        // refresh it in the background so the page remains visible behind the
+        // prompt without delaying the prompt itself.
+        this.ensureNativePageSnapshotPlaceholder(tabId);
+        const hidden = this.setNativeWebviewVisible(tabId, false);
+        if (hidden && typeof hidden.catch === 'function') hidden.catch(() => {});
+
+        if (typeof this.nativeWebview.capture === 'function') {
+          if (!this._nativeSnapshotCaptures) this._nativeSnapshotCaptures = new Map();
+          let capturePromise = this._nativeSnapshotCaptures.get(tabId);
+          if (!capturePromise) {
+            const requestedUrl = this.state.tabs.find((item) => item.id === tabId)?.url;
+            try {
+              capturePromise = Promise.resolve(this.nativeWebview.capture(tabId)).then((res) => {
+                const current = this.state.tabs.find((item) => item.id === tabId);
+                if (res?.snapshot && current && current.url === requestedUrl
+                    && this.state.activeTabId === tabId && this.hasBlockingOverlay()
+                    && this._nativeWebviewTabIds.has(tabId)) {
+                  this.storePageSnapshot(tabId, res.snapshot);
+                  this.applyPageSnapshot(tabId);
+                  this.refreshTabSwitcherPreviews();
+                  return res.snapshot;
+                }
+                return null;
+              }).catch(() => null).finally(() => {
+                if (this._nativeSnapshotCaptures.get(tabId) === capturePromise) {
+                  this._nativeSnapshotCaptures.delete(tabId);
+                }
+              });
+              this._nativeSnapshotCaptures.set(tabId, capturePromise);
+            } catch { capturePromise = null; }
+          }
+        }
+        continue;
+      }
+
       if (wantsCapture && typeof this.nativeWebview.capture === 'function') {
         if (!this._pendingNativeSnapshotHide) this._pendingNativeSnapshotHide = new Set();
         const requestHideAfterPaint = () => {

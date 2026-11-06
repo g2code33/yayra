@@ -978,6 +978,27 @@ test('webview bridge: setBounds and setVisible(false) manipulate the native view
   assert.equal(views[0].webContents.isDestroyed(), false);
 });
 
+test('webview bridge: stale bounds cannot raise an overlay-hidden page back above Yayra chrome', async () => {
+  const { handlers, views } = makeHarness();
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-overlay-hidden', url: 'https://example.com/' });
+  const native = views[0];
+  const visibleBounds = { x: 0, y: 80, width: 800, height: 600 };
+  await handlers.get('yayra:webview-set-bounds')(null, { tabId: 'tab-overlay-hidden', bounds: visibleBounds });
+  await handlers.get('yayra:webview-set-visible')(null, { tabId: 'tab-overlay-hidden', visible: false });
+  assert.deepEqual(native.bounds, { x: 0, y: 0, width: 0, height: 0 });
+
+  // A ResizeObserver report queued before the overlay opened can arrive after
+  // the zero-bounds hide. It must not resurrect the native surface above the
+  // body-mounted update card.
+  await handlers.get('yayra:webview-set-bounds')(null, { tabId: 'tab-overlay-hidden', bounds: visibleBounds });
+  assert.deepEqual(native.bounds, { x: 0, y: 0, width: 0, height: 0 }, 'stale geometry is suppressed while chrome owns the overlay');
+
+  await handlers.get('yayra:webview-set-visible')(null, { tabId: 'tab-overlay-hidden', visible: true });
+  const reopenedBounds = { x: 0, y: 90, width: 800, height: 590 };
+  await handlers.get('yayra:webview-set-bounds')(null, { tabId: 'tab-overlay-hidden', bounds: reopenedBounds });
+  assert.deepEqual(native.bounds, reopenedBounds, 'fresh geometry is accepted after the overlay closes');
+});
+
 test('webview bridge: identical geometry is a no-op and a new bounds report cancels a stale async hide', async () => {
   const { bridge, handlers, views } = makeHarness();
   await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-bounds', url: 'https://example.com/' });
@@ -1384,6 +1405,7 @@ test('webview bridge: set-visible(false) without capture hides, while a failed o
   assert.equal(plain, undefined);
   assert.deepEqual(views[0].bounds, { x: 0, y: 0, width: 0, height: 0 });
 
+  await handlers.get('yayra:webview-set-visible')(null, { tabId: 'tab-1', visible: true });
   await handlers.get('yayra:webview-set-bounds')(null, { tabId: 'tab-1', bounds: { x: 0, y: 80, width: 800, height: 600 } });
   views[0].webContents.capturePage = async () => { throw new Error('gpu context lost'); };
   const failed = await handlers.get('yayra:webview-set-visible')(null, { tabId: 'tab-1', visible: false, capture: true });

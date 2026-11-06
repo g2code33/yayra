@@ -2996,6 +2996,7 @@ function createWebviewBridge({
       bounds: null,
       lastVisibleBounds: null,
       visible: false,
+      overlayHidden: false,
       visibilityGeneration: 0,
       pageUnresponsive: false,
       pageUnresponsiveReloadTimer: null,
@@ -3199,8 +3200,14 @@ function createWebviewBridge({
   function setBounds(key, bounds) {
     const entry = views.get(key);
     if (!entry) return;
-    // A fresh geometry report supersedes an in-flight asynchronous hide.
+    // A fresh geometry report supersedes an in-flight snapshot-then-hide.
+    // Once an overlay has explicitly hidden this sibling OS surface, however,
+    // stale ResizeObserver IPC must not resurrect it above Yayra's chrome.
     entry.visibilityGeneration += 1;
+    if (entry.overlayHidden) {
+      applyEntryBounds(entry, { x: 0, y: 0, width: 0, height: 0 });
+      return;
+    }
     // Main-process enforcement: renderer mistakes/races can shrink the page,
     // but can never place a native website surface over the tab/caption row.
     applyEntryBounds(entry, bounds);
@@ -3253,10 +3260,18 @@ function createWebviewBridge({
     const generation = ++entry.visibilityGeneration;
     if (visible) {
       // Geometry is supplied by the renderer after layout. This call only
-      // invalidates an older asynchronous capture/hide request.
+      // invalidates an older asynchronous capture/hide request and releases
+      // the main-process guard for the fresh bounds that follow.
+      entry.overlayHidden = false;
       return undefined;
     }
-    if (!shouldCapture && !entry.visible) return undefined;
+    if (!shouldCapture) {
+      // The chrome explicitly owns this layer now. Set the guard before
+      // touching bounds so an already-queued non-zero bounds IPC cannot put
+      // the native page back on top of the overlay.
+      entry.overlayHidden = true;
+      if (!entry.visible) return undefined;
+    }
 
     // Keep the live page visible until the renderer has a snapshot it can
     // paint. The renderer's image decode callback then asks us to hide without
@@ -3283,6 +3298,7 @@ function createWebviewBridge({
       if (!snapshot) return undefined;
     }
     if (views.get(key) !== entry || generation !== entry.visibilityGeneration) return snapshot ? { snapshot } : undefined;
+    entry.overlayHidden = true;
     // Zeroing bounds (rather than removing/re-adding the child view) hides
     // the surface without destroying the guest page or losing its state.
     applyEntryBounds(entry, { x: 0, y: 0, width: 0, height: 0 });

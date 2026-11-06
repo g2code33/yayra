@@ -405,6 +405,33 @@ test('THE update prompt overlays ANYTHING: while it is up the native page surfac
   }
 });
 
+test('THE downloaded-update prompt hides the native page immediately, without waiting for its snapshot', async () => {
+  const { fake, calls, uninstall } = installFakeNativeWebview();
+  let finishCapture;
+  let captureStarted = false;
+  fake.capture = () => {
+    captureStarted = true;
+    return new Promise((resolve) => { finishCapture = resolve; });
+  };
+  try {
+    const { container, shell } = await makeDesktopShellOnExternalPage();
+    const tabId = shell.getActiveTab().id;
+    calls.setVisible.length = 0;
+    shell.state.updateInstallPrompt = { path: '/tmp/yayra.deb', version: '9.9.9' };
+
+    shell.render(container);
+
+    assert.equal(captureStarted, true, 'the existing page snapshot is still refreshed in the background');
+    assert.ok(calls.setVisible.some((call) => call.tabId === tabId && call.visible === false),
+      'the native page is hidden immediately instead of painting over the update choices while capture is pending');
+    assert.ok(document.getElementById('yayra-update-install-card'), 'the install prompt remains mounted above the page');
+    finishCapture?.({ snapshot: 'data:image/png;base64,SNAPSHOT' });
+  } finally {
+    clearUpdateCards();
+    uninstall();
+  }
+});
+
 test('THE update prompt is a window-level card on document.body at the TOP RIGHT CORNER - and "Later" removes it', async () => {
   const { uninstall } = installFakeNativeWebview();
   try {
