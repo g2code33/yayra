@@ -438,7 +438,17 @@ test('PPTX CONNECTORS: line-only p:sp geometry is retained and painted as an SVG
 });
 
 test('PPTX COMPATIBILITY: AlternateContent math renders and slide numbers inherit lower-right master geometry', async () => {
-  const bytes = await buildPowerPointCompatibilityMathDeck();
+  const archive = await JSZip.loadAsync(await buildPowerPointCompatibilityMathDeck());
+  const drawing = await archive.file('ppt/diagrams/drawing1.xml').async('text');
+  // A stray cached connector must not suppress the real model edge. Some
+  // exports cache only a subset of SmartArt connectors (or leave an orphan
+  // connector behind), which previously made every missing link disappear.
+  archive.file('ppt/diagrams/drawing1.xml', drawing.replace('</dsp:spTree>', `
+    <dsp:cxnSp><dsp:nvCxnSpPr><dsp:cNvPr id="44" name="Unrelated cached connector"/><dsp:cNvCxnSpPr/><dsp:nvPr/></dsp:nvCxnSpPr>
+      <dsp:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="500000" cy="0"/></a:xfrm><a:prstGeom prst="line"/><a:noFill/><a:ln w="25400"><a:solidFill><a:srgbClr val="ff0000"/></a:solidFill></a:ln></dsp:spPr>
+    </dsp:cxnSp>
+  </dsp:spTree>`));
+  const bytes = await archive.generateAsync({ type: 'uint8array' });
   const deck = await pptxEngine.openPptxDeck(new Blob([bytes]), { lazyMedia: true });
   const diagramHost = mount(1280, 720);
   try {
@@ -479,12 +489,14 @@ test('PPTX COMPATIBILITY: AlternateContent math renders and slide numbers inheri
       'cached drawing coordinates are mapped into the graphic frame');
     assert.ok(operations.x > director.x + director.w, 'organisation nodes preserve their cached placement');
     const diagramConnectors = slide.shapes.filter((shape) => shape.type === 'line');
-    assert.equal(diagramConnectors.length, 1, 'missing SmartArt cached connectors are reconstructed from explicit parent-child relationships');
-    assert.equal(diagramConnectors[0].fill, '#4b5563');
+    assert.equal(diagramConnectors.length, 2, 'a stray cached line does not suppress reconstruction of a missing SmartArt relationship');
+    const reconstructedConnector = diagramConnectors.find((shape) => shape.fill === '#4b5563');
+    assert.ok(reconstructedConnector, 'missing SmartArt cached connectors are reconstructed from explicit parent-child relationships');
+    assert.ok(diagramConnectors.some((shape) => shape.fill === '#ff0000'), 'the unrelated cached connector remains intact');
     renderPptxSlide(diagramHost, { slide, width: deck.slideWidth, height: deck.slideHeight });
-    const renderedConnector = diagramHost.querySelector('.fb-pptx-line .fb-pptx-connector-path');
+    const renderedConnector = Array.from(diagramHost.querySelectorAll('.fb-pptx-line .fb-pptx-connector-path'))
+      .find((path) => path.getAttribute('stroke') === '#4b5563');
     assert.ok(renderedConnector, 'the reconstructed relationship is visible as an SVG stroke');
-    assert.equal(renderedConnector.getAttribute('stroke'), '#4b5563');
     const diagramImage = slide.shapes.find((shape) => shape.imagePaths?.includes('ppt/media/smartart-badge.png'));
     assert.ok(diagramImage, 'images related from the cached diagram part survive rId collisions with slide relationships');
     assert.equal(slide.diagnostics, undefined, 'a resolved cached SmartArt drawing does not report a false fidelity warning');

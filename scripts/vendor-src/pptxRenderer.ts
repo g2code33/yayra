@@ -2164,12 +2164,11 @@ function diagramModelTexts(model: Element | null): string[] {
 }
 
 function missingDiagramConnectors(parsed: PptxShape[], model: Element | null, ctx: ShapeCtx): PptxShape[] {
-  // A number of PowerPoint/WPS exports omit connectors from the cached
-  // drawing1.xml even though the SmartArt data model still records its
-  // parent-child graph. In that case the nodes render as isolated boxes. Use
-  // only explicit parOf relationships, and only when the cache has no actual
-  // connector shapes, so this repair cannot invent links for ordinary slides.
-  if (!model || parsed.some((shape) => shape.type === 'line')) return [];
+  // A number of PowerPoint/WPS exports omit some or all connectors from the
+  // cached drawing1.xml even though the SmartArt data model still records its
+  // parent-child graph. Use only explicit parOf relationships; preserve any
+  // cached connectors and restore just the model edges that are still absent.
+  if (!model) return [];
   const nodes = new Map<string, PptxShape>();
   for (const shape of parsed) {
     if (shape.diagramModelId && shape.w > 0 && shape.h > 0) nodes.set(shape.diagramModelId, shape);
@@ -2217,8 +2216,28 @@ function missingDiagramConnectors(parsed: PptxShape[], model: Element | null, ct
 
     const deltaX = endX - startX;
     const deltaY = endY - startY;
-    const width = Math.max(1, Math.abs(deltaX));
-    const height = Math.max(1, Math.abs(deltaY));
+    const expected = {
+      x: Math.min(startX, endX),
+      y: Math.min(startY, endY),
+      w: Math.max(1, Math.abs(deltaX)),
+      h: Math.max(1, Math.abs(deltaY)),
+    };
+    const cachedConnectorExists = parsed.some((shape) => {
+      if (shape.type !== 'line' || Math.max(shape.w, shape.h) <= 4) return false;
+      // A useful cached edge has a non-trivial extent and the same endpoints
+      // (to pixel-level tolerance) as this explicit model relationship. A
+      // stray, collapsed or partial cached connector must not suppress the
+      // remaining SmartArt links.
+      const tolerance = Math.max(2, Math.min(expected.w, expected.h) * 0.03);
+      return Math.abs(shape.x - expected.x) <= tolerance
+        && Math.abs(shape.y - expected.y) <= tolerance
+        && Math.abs(shape.w - expected.w) <= tolerance
+        && Math.abs(shape.h - expected.h) <= tolerance;
+    });
+    if (cachedConnectorExists) continue;
+
+    const width = expected.w;
+    const height = expected.h;
     connectors.push({
       id: ctx.nextId(),
       type: 'line',

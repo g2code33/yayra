@@ -5060,7 +5060,7 @@ function diagramModelTexts(model) {
   return values.slice(0, 64);
 }
 function missingDiagramConnectors(parsed, model, ctx) {
-  if (!model || parsed.some((shape) => shape.type === "line")) return [];
+  if (!model) return [];
   const nodes = /* @__PURE__ */ new Map();
   for (const shape of parsed) {
     if (shape.diagramModelId && shape.w > 0 && shape.h > 0) nodes.set(shape.diagramModelId, shape);
@@ -5105,8 +5105,20 @@ function missingDiagramConnectors(parsed, model, ctx) {
     }
     const deltaX = endX - startX;
     const deltaY = endY - startY;
-    const width = Math.max(1, Math.abs(deltaX));
-    const height = Math.max(1, Math.abs(deltaY));
+    const expected = {
+      x: Math.min(startX, endX),
+      y: Math.min(startY, endY),
+      w: Math.max(1, Math.abs(deltaX)),
+      h: Math.max(1, Math.abs(deltaY))
+    };
+    const cachedConnectorExists = parsed.some((shape) => {
+      if (shape.type !== "line" || Math.max(shape.w, shape.h) <= 4) return false;
+      const tolerance = Math.max(2, Math.min(expected.w, expected.h) * 0.03);
+      return Math.abs(shape.x - expected.x) <= tolerance && Math.abs(shape.y - expected.y) <= tolerance && Math.abs(shape.w - expected.w) <= tolerance && Math.abs(shape.h - expected.h) <= tolerance;
+    });
+    if (cachedConnectorExists) continue;
+    const width = expected.w;
+    const height = expected.h;
     connectors.push({
       id: ctx.nextId(),
       type: "line",

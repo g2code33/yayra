@@ -405,6 +405,34 @@ test('THE update prompt overlays ANYTHING: while it is up the native page surfac
   }
 });
 
+test('the Tab groups popover hides the native page immediately, before asynchronous snapshot capture completes', async () => {
+  const { fake, calls, uninstall } = installCaptureCapableWebview();
+  let finishCapture;
+  let captureStarted = false;
+  fake.capture = (tabId) => {
+    captureStarted = true;
+    calls.capture.push(tabId);
+    return new Promise((resolve) => { finishCapture = resolve; });
+  };
+  try {
+    const { container, shell } = await makeDesktopShellOnExternalPage();
+    const tabId = shell.getActiveTab().id;
+    calls.setVisible.length = 0;
+    calls.capture.length = 0;
+    shell.state.activeModal = 'tab-groups';
+
+    shell.render(container);
+
+    assert.equal(captureStarted, true, 'the page snapshot refresh still starts in the background');
+    assert.ok(calls.setVisible.some((call) => call.tabId === tabId && call.visible === false),
+      'the native page is hidden immediately instead of covering the lower part of the toolbar popover');
+    assert.ok(container.querySelector('.fb-tab-groups-popover'), 'the Tab groups popover is rendered above the hidden native surface');
+    finishCapture?.({ snapshot: 'data:image/png;base64,TAB-GROUPS-SNAPSHOT' });
+  } finally {
+    uninstall();
+  }
+});
+
 test('THE downloaded-update prompt hides the native page immediately, without waiting for its snapshot', async () => {
   const { fake, calls, uninstall } = installFakeNativeWebview();
   let finishCapture;
