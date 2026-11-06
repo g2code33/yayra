@@ -25590,9 +25590,21 @@ export class BrowserShell {
       if (searchTimer) clearTimeout(searchTimer);
       searchTimer = setTimeout(() => { activeViewer()?.search?.(searchInput.value); }, 300);
     });
-    const matchLabel = document.createElement('span');
+    searchInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        if (state.matches?.length) navigateMatch(event.shiftKey ? -1 : 1);
+      } else if (event.key === 'Escape' && state.showMatchList) {
+        event.preventDefault();
+        state.showMatchList = false;
+        sync();
+      }
+    });
+    const matchLabel = document.createElement('button');
+    matchLabel.type = 'button';
     matchLabel.className = 'fb-doc-match-label';
     matchLabel.title = 'Show the list of matches';
+    matchLabel.setAttribute('aria-controls', `fb-doc-match-panel-${String(tab.id).replace(/[^a-zA-Z0-9_-]/g, '')}`);
     matchLabel.style.cssText = 'min-width:56px; color:var(--fb-text-secondary,#9aa3b2); font-size:0.72rem; cursor:pointer;';
     if (capabilities.search) {
       bar2.appendChild(searchInput);
@@ -25662,7 +25674,10 @@ export class BrowserShell {
     // ---- Match list panel ----------------------------------------------
     const matchPanel = document.createElement('div');
     matchPanel.className = 'fb-doc-match-panel';
-    matchPanel.style.cssText = 'position:absolute; top:0; right:0; bottom:0; width:260px; max-width:70%; overflow:auto; background:var(--fb-bg-elevated,rgba(17,20,29,0.97)); border-left:1px solid var(--fb-border-glass,rgba(255,255,255,0.1)); padding:8px; display:none; z-index:3; font-size:0.75rem; color:var(--fb-text-primary,#dfe4ee);';
+    matchPanel.id = `fb-doc-match-panel-${String(tab.id).replace(/[^a-zA-Z0-9_-]/g, '')}`;
+    matchPanel.setAttribute('role', 'region');
+    matchPanel.setAttribute('aria-label', 'Document search results');
+    matchPanel.style.cssText = 'position:absolute; top:0; right:0; bottom:0; width:clamp(280px,32vw,400px); max-width:calc(100% - 12px); box-sizing:border-box; overflow:auto; background:var(--fb-bg-elevated,rgba(17,20,29,0.98)); border-left:1px solid var(--fb-border-glass,rgba(255,255,255,0.12)); box-shadow:-16px 0 40px rgba(0,0,0,0.22); padding:10px; display:none; z-index:3; font-size:0.78rem; color:var(--fb-text-primary,#dfe4ee);';
 
     const rel = document.createElement('div');
     rel.style.cssText = 'position:relative; flex:1; min-height:0; display:flex; flex-direction:row;';
@@ -25810,6 +25825,72 @@ export class BrowserShell {
       } catch { /* shim */ }
     };
 
+    const navigateToMatch = (value) => {
+      const matches = state.matches || [];
+      if (!matches.length) return;
+      const index = Math.max(0, Math.min(matches.length - 1, Number(value) || 0));
+      state.showMatchList = true;
+      const viewer = activeViewer();
+      if (typeof viewer?.selectMatch === 'function') {
+        viewer.selectMatch(index);
+        return;
+      }
+      if (typeof viewer?.nextMatch === 'function') {
+        const current = Number.isInteger(viewer.state?.matchIndex) ? viewer.state.matchIndex : -1;
+        const steps = current < 0 ? index + 1 : (index - current + matches.length) % matches.length;
+        for (let step = 0; step < steps; step += 1) viewer.nextMatch();
+        return;
+      }
+      state.matchIndex = index;
+      void viewer?.setPage?.(matches[index].page);
+      sync();
+    };
+    const navigateMatch = (direction) => {
+      const matches = state.matches || [];
+      if (!matches.length) return;
+      const current = Number.isInteger(state.matchIndex) ? state.matchIndex : -1;
+      const target = current < 0
+        ? (direction < 0 ? matches.length - 1 : 0)
+        : (current + direction + matches.length) % matches.length;
+      navigateToMatch(target);
+    };
+    const appendHighlightedSnippet = (target, value, query) => {
+      const text = String(value || '');
+      const needle = String(query || '').trim();
+      if (!needle) { target.textContent = text; return; }
+      const lowerText = text.toLocaleLowerCase();
+      const lowerNeedle = needle.toLocaleLowerCase();
+      const appendText = (part) => {
+        if (!part) return;
+        const span = document.createElement('span');
+        span.textContent = part;
+        target.appendChild(span);
+      };
+      let cursor = 0;
+      let found = lowerText.indexOf(lowerNeedle);
+      while (found >= 0) {
+        if (found > cursor) appendText(text.slice(cursor, found));
+        const mark = document.createElement('mark');
+        mark.className = 'fb-doc-match-highlight';
+        mark.textContent = text.slice(found, found + needle.length);
+        target.appendChild(mark);
+        cursor = found + needle.length;
+        found = lowerText.indexOf(lowerNeedle, cursor);
+      }
+      if (cursor < text.length) appendText(text.slice(cursor));
+      if (cursor === 0) target.textContent = text;
+    };
+    const makeMatchAction = (label, title, onClick, className = '') => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = `fb-doc-match-action ${className}`.trim();
+      button.textContent = label;
+      button.title = title;
+      button.setAttribute('aria-label', title);
+      button.addEventListener('click', onClick);
+      return button;
+    };
+
     const sync = () => {
       try {
         pageInput.value = String(state.page || 1);
@@ -25817,11 +25898,17 @@ export class BrowserShell {
         const sheetName = isSpreadsheetDocument(documentKind) ? state.sheetNames?.[(state.page || 1) - 1] : '';
         pageLabel.textContent = sheetName ? `${sheetName} · ${state.page} / ${state.numPages}` : `/ ${state.numPages || '-'}`;
         zoomLabel.textContent = `${Math.round((state.zoom || 1) * 100)}%`;
+        const currentQuery = String(state.query || searchInput.value || '').trim();
         matchLabel.textContent = state.searchPending
           ? (Number.isFinite(state.searchProgress) ? `Searching ${state.searchProgress}%` : 'Searching…')
-          : state.query
-            ? (state.matches.length ? `${state.matches.length} found \u25be` : '0 found')
+          : currentQuery
+            ? `${state.matches.length} found \u25be`
             : '';
+        matchLabel.disabled = !currentQuery;
+        matchLabel.setAttribute('aria-expanded', String(Boolean(state.showMatchList && currentQuery)));
+        matchLabel.setAttribute('aria-label', state.matches.length
+          ? `${state.matches.length} search results. ${state.showMatchList ? 'Hide' : 'Show'} results list.`
+          : state.searchPending ? 'Search in progress. Show search results.' : 'No search results. Show details.');
         const nightBtn = bar2.querySelector('.fb-doc-btn-night');
         if (nightBtn) nightBtn.style.background = state.night ? 'rgba(109,93,242,0.45)' : 'rgba(255,255,255,0.07)';
         const notesBtn = bar2.querySelector('.fb-doc-btn-notes');
@@ -25863,28 +25950,89 @@ export class BrowserShell {
         progressTrack.style.display = isLoading && Number.isFinite(activeProgress) ? 'block' : 'none';
         progressFill.style.width = `${Math.max(0, Math.min(100, Number(activeProgress) || 0))}%`;
         retryBtn.style.display = state.status === 'error' ? 'inline-flex' : 'none';
-        // Match list panel.
-        if (state.showMatchList && state.matches.length) {
+        // Match list panel. A separate count, query, and current-hit indicator
+        // make large result sets easy to scan without hiding the document by default.
+        if (state.showMatchList && (currentQuery || state.matches.length || state.searchPending)) {
           matchPanel.style.display = 'block';
           matchPanel.innerHTML = '';
           const head = document.createElement('div');
-          head.style.cssText = 'font-weight:600; margin:4px 0 8px; color:var(--fb-text-primary,#dfe4ee);';
-          head.textContent = `${state.matches.length} matches for \u201C${state.query}\u201D`;
+          head.className = 'fb-doc-match-header';
+          const top = document.createElement('div');
+          top.className = 'fb-doc-match-header-top';
+          const heading = document.createElement('div');
+          heading.className = 'fb-doc-match-heading';
+          heading.textContent = 'Search results';
+          const actions = document.createElement('div');
+          actions.className = 'fb-doc-match-actions';
+          const previous = makeMatchAction('\u2039', 'Previous match (Shift+Enter)', () => navigateMatch(-1));
+          const next = makeMatchAction('\u203a', 'Next match (Enter)', () => navigateMatch(1));
+          previous.disabled = next.disabled = state.searchPending || !state.matches.length;
+          actions.appendChild(previous);
+          actions.appendChild(next);
+          actions.appendChild(makeMatchAction('\u00d7', 'Close search results', () => {
+            state.showMatchList = false;
+            sync();
+            matchLabel.focus?.();
+          }, 'fb-doc-match-close'));
+          top.appendChild(heading);
+          top.appendChild(actions);
+          const queryText = document.createElement('div');
+          queryText.className = 'fb-doc-match-query';
+          queryText.textContent = currentQuery ? `For “${currentQuery}”` : 'Search in progress';
+          head.appendChild(top);
+          head.appendChild(queryText);
           matchPanel.appendChild(head);
-          state.matches.forEach((m, i) => {
-            const row = document.createElement('div');
+          const summary = document.createElement('div');
+          summary.className = 'fb-doc-match-summary';
+          if (state.searchPending) {
+            summary.textContent = Number.isFinite(state.searchProgress)
+              ? `Searching the document… ${state.searchProgress}%`
+              : 'Searching the document…';
+          } else if (state.matches.length) {
+            const current = Number.isInteger(state.matchIndex) && state.matchIndex >= 0 ? state.matchIndex + 1 : 0;
+            summary.textContent = `Match ${current} of ${state.matches.length}`;
+          } else {
+            summary.textContent = 'No matches';
+          }
+          matchPanel.appendChild(summary);
+          if (!state.searchPending && !state.matches.length) {
+            const empty = document.createElement('div');
+            empty.className = 'fb-doc-match-empty';
+            empty.textContent = 'Try a different word or phrase. Search is case-insensitive.';
+            matchPanel.appendChild(empty);
+          }
+          state.matches.forEach((match, index) => {
+            const row = document.createElement('button');
+            row.type = 'button';
             row.className = 'fb-doc-match-row';
-            row.style.cssText = `padding:6px 8px; margin-bottom:4px; border-radius:6px; cursor:pointer; background:${i === state.matchIndex ? 'rgba(109,93,242,0.35)' : 'rgba(255,255,255,0.04)'}; line-height:1.4;`;
+            row.dataset.matchIndex = String(index);
+            row.setAttribute('aria-current', String(index === state.matchIndex));
+            const kindLabel = isPowerPointDocument(documentKind) ? 'Slide' : isSpreadsheetDocument(documentKind) ? 'Sheet' : 'Page';
+            const location = `${kindLabel} ${match.page}`;
+            const fullSnippet = String(match.snippet || '');
+            row.title = `${location}: ${fullSnippet}`;
+            row.setAttribute('aria-label', `Result ${index + 1} of ${state.matches.length}, ${location}: ${fullSnippet}`);
+            const meta = document.createElement('span');
+            meta.className = 'fb-doc-match-meta';
+            const number = document.createElement('span');
+            number.textContent = `#${index + 1}`;
             const pageNumber = document.createElement('strong');
-            pageNumber.style.cssText = 'color:var(--fb-text-secondary,#9aa3b2);';
-            pageNumber.textContent = `${isPowerPointDocument(documentKind) ? 'slide' : isSpreadsheetDocument(documentKind) ? 'sheet' : 'p.'}${m.page}`;
+            pageNumber.textContent = `${isPowerPointDocument(documentKind) ? 'slide' : isSpreadsheetDocument(documentKind) ? 'sheet' : 'p.'}${match.page}`;
+            meta.appendChild(number);
+            meta.appendChild(pageNumber);
             const snippet = document.createElement('span');
-            snippet.textContent = ` \u2014 ${String(m.snippet || '').slice(0, 90)}`;
-            row.appendChild(pageNumber);
+            snippet.className = 'fb-doc-match-snippet';
+            appendHighlightedSnippet(snippet, fullSnippet, currentQuery);
+            row.appendChild(meta);
             row.appendChild(snippet);
-            row.addEventListener('click', () => { activeViewer()?.setPage?.(m.page); });
+            row.addEventListener('click', () => navigateToMatch(index));
             matchPanel.appendChild(row);
           });
+          if (state.matchIndex >= 0) {
+            Array.from(matchPanel.querySelectorAll('.fb-doc-match-row'))
+              .find((row) => Number(row.dataset.matchIndex) === state.matchIndex)
+              ?.scrollIntoView?.({ block: 'nearest' });
+          }
         } else {
           matchPanel.style.display = 'none';
         }
@@ -25892,7 +26040,8 @@ export class BrowserShell {
       } catch { /* shim */ }
     };
     matchLabel.addEventListener('click', () => {
-      state.showMatchList = !state.showMatchList && state.matches.length > 0;
+      if (!String(state.query || searchInput.value || '').trim()) return;
+      state.showMatchList = !state.showMatchList;
       sync();
     });
 

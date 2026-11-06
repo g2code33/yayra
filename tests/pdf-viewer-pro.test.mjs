@@ -296,7 +296,25 @@ test('SHELL INTEGRATION: the pro toolbar (jump-to-page, fit, rotate, night, outl
     shell._activeDocViewer.sync();
     const rows = Array.from(vp.querySelectorAll('.fb-doc-match-row'));
     assert.equal(rows.length, 2, 'the match list shows every hit');
+    assert.equal(rows[0].type, 'button', 'each hit is keyboard-accessible');
     assert.match(rows[0].textContent, /p\.1/);
+    assert.equal(rows[0].querySelector('.fb-doc-match-highlight')?.textContent.toLowerCase(), 'report', 'the query is highlighted in its snippet');
+    assert.equal(rows[0].getAttribute('aria-current'), 'true', 'the active hit is announced');
+    assert.match(vp.querySelector('.fb-doc-match-header').textContent, /Search results.*report/s, 'the panel explains what the list contains');
+    assert.match(vp.querySelector('.fb-doc-match-summary').textContent, /Match 1 of 2/);
+
+    rows[1].click();
+    await flush();
+    assert.equal(shell.getActiveTab().docState.matchIndex, 1, 'choosing a result updates the active hit');
+    assert.equal(shell.getActiveTab().docState.page, 4, 'choosing a result jumps to its page');
+    Array.from(vp.querySelectorAll('.fb-doc-match-action'))
+      .find((button) => button.getAttribute('aria-label') === 'Previous match (Shift+Enter)')
+      .click();
+    await flush();
+    assert.equal(shell.getActiveTab().docState.matchIndex, 0, 'previous-match navigation wraps through the result set');
+    search.dispatchEvent({ type: 'keydown', key: 'Enter', preventDefault() { this.defaultPrevented = true; } });
+    await flush();
+    assert.equal(shell.getActiveTab().docState.matchIndex, 1, 'Enter advances to the next hit from the search field');
 
     // PDF text is untrusted input: render snippets as text, never HTML.
     shell.getActiveTab().docState.matches[0].snippet = '<img src=x onerror=alert(1)>';
@@ -304,6 +322,15 @@ test('SHELL INTEGRATION: the pro toolbar (jump-to-page, fit, rotate, night, outl
     const safeRow = vp.querySelector('.fb-doc-match-row');
     assert.equal(safeRow.querySelector('img'), null, 'PDF content cannot inject elements into the browser chrome');
     assert.match(safeRow.textContent, /<img src=x onerror=alert\(1\)>/, 'the snippet remains visible as literal text');
+    assert.match(safeRow.title, /<img src=x onerror=alert\(1\)>/, 'the full snippet remains available on demand');
+
+    search.dispatchEvent({ type: 'keydown', key: 'Escape', preventDefault() { this.defaultPrevented = true; } });
+    assert.equal(shell.getActiveTab().docState.showMatchList, false, 'Escape closes the results panel without clearing the query');
+    shell.getActiveTab().docState.showMatchList = true;
+    shell.getActiveTab().docState.matches = [];
+    shell.getActiveTab().docState.matchIndex = -1;
+    shell._activeDocViewer.sync();
+    assert.match(vp.querySelector('.fb-doc-match-empty').textContent, /Try a different word/);
   } finally {
     window.print = previousPrint;
     shell.destroy();

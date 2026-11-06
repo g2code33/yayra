@@ -680,12 +680,19 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null,
     return viewerState;
   }
 
+  function selectMatch(index) {
+    const matches = viewerState.matches || [];
+    if (!matches.length) return viewerState;
+    const matchIndex = Math.max(0, Math.min(matches.length - 1, Number(index) || 0));
+    setState({ matchIndex });
+    void setPage(matches[matchIndex].page);
+    return viewerState;
+  }
+
   function nextMatch() {
     if (!viewerState.matches?.length) return viewerState;
-    const matchIndex = ((viewerState.matchIndex || 0) + 1) % viewerState.matches.length;
-    setState({ matchIndex });
-    void setPage(viewerState.matches[matchIndex].page);
-    return viewerState;
+    const current = Number.isInteger(viewerState.matchIndex) ? viewerState.matchIndex : -1;
+    return selectMatch((current + 1) % viewerState.matches.length);
   }
 
   async function renderThumbnail(pageNumber, target) {
@@ -823,7 +830,7 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null,
 
   return {
     get state() { return viewerState; },
-    load, attach, setPage, nextPage, prevPage, setZoom, search, nextMatch,
+    load, attach, setPage, nextPage, prevPage, setZoom, search, nextMatch, selectMatch,
     renderCurrent, renderThumbnail, destroy, rotate, setNight, loadOutline,
     fitToWidth, fitToPage, preparePrint, finishPrint, handleKeydown
   };

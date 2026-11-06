@@ -554,12 +554,19 @@ export function createPptxViewer({
     return viewerState;
   }
 
+  function selectMatch(value) {
+    const matches = viewerState.matches || [];
+    if (!matches.length) return viewerState;
+    const index = Math.max(0, Math.min(matches.length - 1, Number(value) || 0));
+    updates.patch({ matchIndex: index });
+    void setPage(matches[index].page);
+    return viewerState;
+  }
+
   function nextMatch() {
     if (!viewerState.matches?.length) return viewerState;
-    const index = ((viewerState.matchIndex || 0) + 1) % viewerState.matches.length;
-    updates.patch({ matchIndex: index });
-    void setPage(viewerState.matches[index].page);
-    return viewerState;
+    const current = Number.isInteger(viewerState.matchIndex) ? viewerState.matchIndex : -1;
+    return selectMatch((current + 1) % viewerState.matches.length);
   }
 
   async function renderThumbnail(page, target) {
@@ -695,7 +702,7 @@ export function createPptxViewer({
 
   const controller = {
     get state() { return viewerState; }, load, attach, destroy, renderCurrent,
-    setPage, nextPage, prevPage, setZoom, fitToWidth, fitToPage, search, nextMatch,
+    setPage, nextPage, prevPage, setZoom, fitToWidth, fitToPage, search, nextMatch, selectMatch,
     toggleNotes, setNotesColor, renderThumbnail, preparePrint, finishPrint,
     loadOutline: async () => [], rotate: async () => viewerState,
     setNight: async () => viewerState,

@@ -10300,6 +10300,166 @@ button.fb-site-passkey-indicator {
   outline-offset: 2px;
 }
 
+.fb-doc-match-label {
+  min-height: 26px;
+  padding: 3px 8px;
+  border: 1px solid var(--fb-border-glass, rgba(255,255,255,.12));
+  border-radius: 7px;
+  background: rgba(255,255,255,.045);
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.fb-doc-match-panel {
+  scrollbar-width: thin;
+  overscroll-behavior: contain;
+  backdrop-filter: blur(18px);
+}
+
+.fb-doc-match-header {
+  position: sticky;
+  z-index: 1;
+  top: -10px;
+  margin: -10px -10px 8px;
+  padding: 12px 12px 10px;
+  border-bottom: 1px solid var(--fb-border-glass, rgba(255,255,255,.1));
+  background: var(--fb-bg-elevated, rgba(17,20,29,.98));
+}
+
+.fb-doc-match-header-top,
+.fb-doc-match-actions,
+.fb-doc-match-meta {
+  display: flex;
+  align-items: center;
+}
+
+.fb-doc-match-header-top {
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.fb-doc-match-heading {
+  min-width: 0;
+  font-size: .9rem;
+  font-weight: 750;
+}
+
+.fb-doc-match-query {
+  overflow: hidden;
+  margin-top: 3px;
+  color: var(--fb-text-secondary, #9aa3b2);
+  font-size: .74rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fb-doc-match-actions { gap: 5px; }
+
+.fb-doc-match-action {
+  min-width: 30px;
+  min-height: 28px;
+  padding: 3px 8px;
+  border: 1px solid var(--fb-border-glass, rgba(255,255,255,.12));
+  border-radius: 7px;
+  background: rgba(255,255,255,.055);
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+}
+
+.fb-doc-match-action:hover:not(:disabled),
+.fb-doc-match-row:hover {
+  background: rgba(109,93,242,.16);
+}
+
+.fb-doc-match-action:disabled {
+  cursor: default;
+  opacity: .45;
+}
+
+.fb-doc-match-summary {
+  margin: 9px 2px 7px;
+  color: var(--fb-text-secondary, #9aa3b2);
+  font-size: .72rem;
+  font-weight: 650;
+}
+
+.fb-doc-match-row {
+  display: block;
+  width: 100%;
+  margin: 0 0 6px;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: rgba(255,255,255,.045);
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+}
+
+.fb-doc-match-row[aria-current="true"] {
+  border-color: rgba(139,124,255,.5);
+  background: rgba(109,93,242,.23);
+  box-shadow: inset 3px 0 0 var(--fb-accent-primary, #8b7cff);
+}
+
+.fb-doc-match-meta {
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+  color: var(--fb-text-secondary, #9aa3b2);
+  font-size: .7rem;
+  font-weight: 700;
+}
+
+.fb-doc-match-snippet {
+  display: -webkit-box;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  color: var(--fb-text-primary, #dfe4ee);
+  line-height: 1.45;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+}
+
+.fb-doc-match-highlight {
+  border-radius: 2px;
+  background: rgba(250,204,21,.34);
+  color: inherit;
+  font-weight: 800;
+}
+
+.fb-doc-match-empty {
+  padding: 20px 12px;
+  color: var(--fb-text-secondary, #9aa3b2);
+  line-height: 1.5;
+  text-align: center;
+}
+
+[data-theme="light"] .fb-doc-match-header {
+  background: var(--fb-bg-elevated, #fff);
+}
+
+[data-theme="light"] .fb-doc-match-row {
+  background: rgba(15,23,42,.035);
+}
+
+[data-theme="light"] .fb-doc-match-row[aria-current="true"] {
+  background: rgba(109,93,242,.1);
+}
+
+@media (max-width: 560px) {
+  .fb-doc-match-panel {
+    width: 100% !important;
+    max-width: 100% !important;
+  }
+
+  .fb-doc-match-header {
+    top: -10px;
+  }
+}
+
 /* Native PPTX notes colour picker. The transparent input covers the visible
    wheel, so mouse/touch and keyboard all invoke the platform picker directly. */
 .fb-doc-notes-color-control {
