@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Yayra Browser Privacy Policy: what information Yayra processes, how optional Google integrations work, and how to manage or delete your data.">
+  <meta name="theme-color" content="#10182c">
+  <title>Privacy Policy · Yayra Browser</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0b1020; color: #e8edf8; }
+    * { box-sizing: border-box; }
+    body { margin: 0; line-height: 1.7; background: radial-gradient(ellipse at 15% 0%, #182c55 0, #0b1020 48%); }
+    main { width: min(900px, calc(100% - 32px)); margin: auto; padding: 30px 0 56px; }
+    header, article, footer { border: 1px solid #293752; background: rgba(18, 27, 47, .95); border-radius: 16px; padding: clamp(20px, 4vw, 38px); margin-bottom: 16px; }
+    .brand, .muted { color: #aab8d1; }
+    .brand { color: #9ec5ff; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; font-size: .8rem; }
+    h1 { font-size: clamp(2rem, 6vw, 3.2rem); letter-spacing: -.04em; line-height: 1.1; margin: 10px 0; }
+    h2 { margin-top: 1.8em; font-size: 1.3rem; letter-spacing: -.02em; }
+    h2:first-child { margin-top: 0; }
+    p, li { color: #d0d9e9; }
+    a { color: #9ec5ff; text-underline-offset: 3px; }
+    nav, footer { font-size: .95rem; }
+    nav a { margin-right: 16px; }
+    code { overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div class="brand">Yayra Browser</div>
+      <h1>Privacy Policy</h1>
+      <p class="muted">Effective date: October 27, 2026</p>
+      <p>This policy explains how Yayra (“Yayra,” “we,” or “us”) processes information when you use the Yayra browser, its website, and optional connected features. It applies to the app and services operated under the Yayra name. It does not replace the privacy policies of websites or third-party services you choose to use.</p>
+      <nav aria-label="Main links"><a href="/">Open Yayra</a><a href="/about/">About</a><a href="/terms/">Terms of Service</a></nav>
+    </header>
+    <article>
+      <h2>1. Information we process</h2>
+      <ul>
+        <li><strong>Browser and device information.</strong> Yayra stores browser settings and, depending on the features you use, items such as browsing history, bookmarks, tabs, cookies and site storage, downloads, local documents, autofill information, and saved passwords in the relevant on-device browser profile. These items are not uploaded to Yayra's Google sign-in service as part of ordinary browsing. Websites you visit receive information needed to load their pages and may set their own cookies or site storage.</li>
+        <li><strong>Google account identity.</strong> If you choose Sign in with Google, Yayra receives a limited profile such as your Google account identifier, name, email address, and profile image. Google handles your password and authentication; Yayra does not receive your Google password.</li>
+        <li><strong>Google service data, only when you request a connected feature.</strong> Separate features can request read-only access to data from Gmail (<code>gmail.readonly</code>), Drive (<code>drive.readonly</code>), Calendar (<code>calendar.readonly</code>), Contacts (<code>contacts.readonly</code>), Photos (<code>photoslibrary.readonly</code>), Tasks (<code>tasks.readonly</code>), Classroom courses (<code>classroom.courses.readonly</code>), or YouTube (<code>youtube.readonly</code>). The exact scopes are shown on Google's consent screen. The Google services hub may request several read-only scopes together; individual Gmail or Drive flows request their respective scope. Depending on the feature, the data returned may include message headers or text, file names and metadata, calendar event details, contact details, task or course information, or channel/media metadata. Yayra uses this data to provide the feature you selected.</li>
+        <li><strong>Search and AI requests.</strong> Search terms are sent to the search or suggestion provider you use. If you use Ask Yayra AI, the prompt and any text or context you include are sent through Yayra's service to its configured AI provider (currently NVIDIA). Do not submit information you are not comfortable sharing with those providers. Yayra does not automatically send Google API data to the AI provider.</li>
+        <li><strong>Service and security information.</strong> When a request reaches Yayra's hosted services, Cloudflare may process technical request information such as IP address, origin, user agent, and request time to deliver the service, enforce origin and rate limits, and protect it from abuse. Cloudflare handles infrastructure-level logging under its own terms and policies.</li>
+      </ul>
+
+      <h2>2. Where information is stored and how long we keep it</h2>
+      <p>Browser information listed above is kept in the app or browser profile on your device until you delete it, remove the profile, or uninstall the app (the operating system or browser may retain backups). Yayra does not provide cloud synchronization of browsing history, bookmarks, passwords, or local documents as part of the Google sign-in feature.</p>
+      <p>For basic web and supported mobile Google sign-in, the authorization code is exchanged by the configured authentication service, which discards the Google tokens after the profile is verified. Desktop keeps Google credentials in the app's protected profile storage for account-session features. The display profile is stored in your Yayra profile until you sign out or clear that profile.</p>
+      <p>When you explicitly authorize a Google API feature, the app keeps the minimum credential material needed to provide that feature. On desktop, credentials are stored in the app's protected profile storage using operating-system encryption when available; they are not persisted in plaintext when that protection is unavailable. For supported web and mobile flows, delegated credentials are encrypted before being stored by the service provider and are time-limited, with a maximum configured lifetime of 30 days unless you revoke them sooner. The app stores an opaque session capability locally, not the raw Google token. API responses are used to render the requested feature; a file you explicitly download is saved through the app's download flow to your device.</p>
+      <p>AI prompts are sent to the configured provider to generate a response. Their handling and retention are governed by the provider's current terms and privacy policy. The app does not promise deletion from a provider's systems simply by closing the conversation.</p>
+
+      <h2>3. How we use and share information</h2>
+      <p>We use information to operate the browser and features you choose, authenticate your Google account, protect the services, respond to support requests, and meet legal obligations. We do not sell personal information, use Google user data for advertising, or use Google user data to train generalized AI or machine-learning models. Yayra does not automatically send Google API responses to the AI feature. If you personally copy Google information into an AI prompt, that prompt is sent to the configured AI provider as described above.</p>
+      <p>We share information only as needed for a user-requested feature or lawful operation: with Google when you authorize a Google feature; with Cloudflare to host and secure the website, API, and encrypted delegated sessions; with NVIDIA when you submit an AI request; with the search provider you select for search or suggestions; and with a website or other third party when you choose to visit, share with, or download from it. Providers process information under their own terms. We may disclose information when legally required or when reasonably necessary to protect users, the service, or the public.</p>
+      <p>Yayra's access to and use of information received from Google APIs follows the <a href="https://developers.google.com/terms/api-services-user-data-policy" rel="noopener noreferrer">Google API Services User Data Policy</a>, including its Limited Use requirements. We do not transfer Google user data to advertising platforms or AI model providers.</p>
+
+      <h2>4. Your choices and deletion</h2>
+      <ul>
+        <li>Use Yayra's browsing-data controls to review or clear history, cookies, site data, downloads, or other locally stored items. Removing an app profile or uninstalling the app removes app-profile data, subject to device backups. Files saved to a separate device download location may remain and should be deleted separately.</li>
+        <li>Sign out or disconnect a Google feature in Yayra to remove its local profile/session capability and request revocation or deletion of the associated server-side delegated session. You can also revoke Yayra's Google access from your <a href="https://myaccount.google.com/permissions" rel="noopener noreferrer">Google Account security settings</a>.</li>
+        <li>Choose not to connect Google or use AI, search suggestions, or other optional online features. You can continue to use ordinary browser functionality without connecting a Google account.</li>
+        <li>For a privacy question or request, email <a href="mailto:support@yayra.app?subject=Yayra%20privacy%20request">support@yayra.app</a>. Tell us which request you are making; do not send passwords, OAuth codes, or access tokens.</li>
+      </ul>
+
+      <h2>5. Security</h2>
+      <p>Yayra uses safeguards appropriate to the feature, including scoped authorization, protected credential storage where supported, encrypted server-side delegated credentials, origin checks, and bounded API responses. No software, device, or internet transmission can be guaranteed completely secure. Protect your device and use its lock and account-security features.</p>
+
+      <h2>6. Children and age requirements</h2>
+      <p>Yayra is a general-purpose browser and is not designed to bypass the age requirements or parental controls of Google or other services. Use of a connected third-party account remains subject to that provider's age requirements and terms.</p>
+
+      <h2>7. International processing and third-party services</h2>
+      <p>Yayra and its service providers may process information in countries other than where you live. When you open a third-party website or connect a third-party account, that provider's own privacy policy governs its independent processing. Yayra is not responsible for the privacy practices of websites you visit.</p>
+
+      <h2>8. Changes and contact</h2>
+      <p>We may update this policy when the service or legal requirements change. We will update the effective date when we do. For questions or privacy requests, contact <a href="mailto:support@yayra.app">support@yayra.app</a>.</p>
+    </article>
+    <footer><a href="/about/">About Yayra</a> · <a href="/terms/">Terms of Service</a> · <a href="/">Open Yayra</a><p class="muted">Yayra is not affiliated with or endorsed by Google.</p></footer>
+  </main>
+</body>
+</html>

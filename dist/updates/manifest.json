@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "channel": "stable",
+  "latest": {
+    "windows": "1.0.129",
+    "linux": "1.0.129",
+    "ios": "1.0.129",
+    "android": "1.0.129",
+    "pwa": "1.0.129"
+  },
+  "minSupported": {
+    "windows": "0.1.0",
+    "linux": "0.1.0",
+    "ios": "0.1.0",
+    "android": "0.1.0",
+    "pwa": "0.1.0"
+  },
+  "downloads": {},
+  "notes": {
+    "en": "Initial yayra release infrastructure."
+  },
+  "rollout": {
+    "percent": 100,
+    "allowlist": []
+  },
+  "publishedAt": "2026-11-06T13:07:52.857Z",
+  "ttlSeconds": 300
+}

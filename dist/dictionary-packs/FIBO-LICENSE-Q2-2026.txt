@@ -1,0 +1,27 @@
+Financial Industry Business Ontology (FIBO) Q2 2026 MIT license notice
+
+Pinned source commit: f59157fe156e3d91b1c045222d0a7dc06b7d78a2
+Source archive SHA-256: 8099df46163681614bf53adb64eaefe729c19a49353c5ee01925c9cef3ca6f13
+
+The MIT License (MIT)
+
+Copyright (c) 2020 Enterprise Data Management Council
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+FIBO is a trademark of the Enterprise Data Management Council. This pack is an independent terminology extraction and is not endorsed by EDM Council.

@@ -1,0 +1,90 @@
+/**
+ * FloatBrowse Icon System (TypeScript definitions)
+ */
+
+export interface IconMap {
+  logoOrb: string;
+  officialOrb: string;
+  officialWordmark: string;
+  globe: string;
+  compass: string;
+  search: string;
+  bookmark: string;
+  star: string;
+  starFilled: string;
+  history: string;
+  download: string;
+  settings: string;
+  shield: string;
+  lock: string;
+  refresh: string;
+  stop: string;
+  arrowLeft: string;
+  arrowRight: string;
+  home: string;
+  close: string;
+  minimize: string;
+  maximize: string;
+  restore: string;
+  chevronDown: string;
+  pin: string;
+  bubble: string;
+  sun: string;
+  moon: string;
+  check: string;
+  alertTriangle: string;
+  info: string;
+  externalLink: string;
+  plus: string;
+  trash: string;
+  folder: string;
+  play: string;
+  pause: string;
+  moreVertical: string;
+  moreHorizontal: string;
+  share: string;
+  tabs: string;
+  tabGroup: string;
+  incognito: string;
+  gemini: string;
+  sparkles: string;
+  chatgpt: string;
+  claude: string;
+  perplexity: string;
+  finderFace: string;
+  edit: string;
+  crop: string;
+  desktopLock: string;
+  mouseTouch: string;
+  smile: string;
+  arrowDown: string;
+  expand: string;
+  listView: string;
+  cardView: string;
+  duckduckgo: string;
+  wikipedia: string;
+  github: string;
+  google: string;
+  chevronRight: string;
+  brush: string;
+  readingMode: string;
+  performance: string;
+  taskManager: string;
+  developerTools: string;
+  cast: string;
+  save: string;
+  copy: string;
+  devices: string;
+  qrCode: string;
+  help: string;
+  report: string;
+  whatNew: string;
+  translate: string;
+  lens: string;
+  print: string;
+  update: string;
+}
+
+// @ts-ignore
+import { Icons as BaseIcons } from './icons.js';
+export const Icons: IconMap = BaseIcons as unknown as IconMap;

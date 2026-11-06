@@ -1,0 +1,162 @@
+/**
+ * Yayra Floating Browser - Glassmorphism Design System
+ * Unified cross-platform Acrylic/Glass visual styling for Android, Windows, and Linux.
+ */
+
+:root {
+  --yayra-glass-bg: rgba(23, 37, 84, 0.72);
+  --yayra-glass-bg-light: rgba(255, 255, 255, 0.65);
+  --yayra-glass-border: rgba(255, 255, 255, 0.18);
+  --yayra-glass-border-light: rgba(0, 0, 0, 0.12);
+  --yayra-glass-shadow: 0 16px 36px 0 rgba(0, 0, 0, 0.38), 0 0 0 1px var(--yayra-glass-border);
+  --yayra-glass-blur: 24px;
+  --yayra-glass-saturation: 180%;
+  --yayra-accent: #38bdf8;
+  --yayra-accent-hover: #0ea5e9;
+  --yayra-text-primary: #f8fafc;
+  --yayra-text-secondary: #94a3b8;
+  --yayra-radius-circle: 50%;
+  --yayra-radius-window: 16px;
+  --yayra-radius-control: 8px;
+  --yayra-transition: all 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Glassmorphism Surface Base */
+.yayra-glass-surface {
+  background: var(--yayra-glass-bg);
+  backdrop-filter: blur(var(--yayra-glass-blur)) saturate(var(--yayra-glass-saturation));
+  -webkit-backdrop-filter: blur(var(--yayra-glass-blur)) saturate(var(--yayra-glass-saturation));
+  border: 1px solid var(--yayra-glass-border);
+  box-shadow: var(--yayra-glass-shadow);
+  color: var(--yayra-text-primary);
+  user-select: none;
+  box-sizing: border-box;
+}
+
+/* Floating Glass Circle */
+.yayra-floating-circle {
+  width: 56px;
+  height: 56px;
+  border-radius: var(--yayra-radius-circle);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: fixed;
+  /* pointer/move are native system cursors on every OS; grab/grabbing are
+     Chromium-drawn fixed-size bitmaps that ignore the Windows pointer-size
+     setting (the cursor visibly shrank over the bubble). */
+  cursor: pointer;
+  z-index: 10000;
+  transition: transform 0.18s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.18s ease;
+  touch-action: none;
+}
+
+.yayra-floating-circle:active {
+  cursor: move;
+  transform: scale(0.94);
+}
+
+.yayra-floating-circle:hover {
+  box-shadow: 0 0 20px rgba(56, 189, 248, 0.45), 0 16px 36px 0 rgba(0, 0, 0, 0.38);
+}
+
+.yayra-circle-icon {
+  width: 28px;
+  height: 28px;
+  fill: currentColor;
+  pointer-events: none;
+}
+
+.yayra-circle-badge {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  background: #ef4444;
+  color: white;
+  font-size: 11px;
+  font-weight: 700;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 9px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+  border: 2px solid rgba(23, 37, 84, 0.85);
+}
+
+/* Floating Window Frame */
+.yayra-floating-window {
+  border-radius: var(--yayra-radius-window);
+  display: flex;
+  flex-direction: column;
+  position: fixed;
+  overflow: hidden;
+  z-index: 9999;
+}
+
+.yayra-window-header {
+  height: 44px;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--yayra-glass-border);
+  gap: 8px;
+  cursor: move;
+}
+
+.yayra-nav-button {
+  background: transparent;
+  border: none;
+  color: var(--yayra-text-primary);
+  width: 28px;
+  height: 28px;
+  border-radius: var(--yayra-radius-control);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: var(--yayra-transition);
+}
+
+.yayra-nav-button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.yayra-nav-button:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.yayra-address-bar {
+  flex: 1;
+  height: 30px;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: var(--yayra-radius-control);
+  padding: 0 10px;
+  color: var(--yayra-text-primary);
+  font-size: 13px;
+  outline: none;
+  transition: var(--yayra-transition);
+}
+
+.yayra-address-bar:focus {
+  border-color: var(--yayra-accent);
+  background: rgba(0, 0, 0, 0.4);
+}
+
+.yayra-window-content {
+  flex: 1;
+  position: relative;
+  background: #ffffff;
+}
+
+.yayra-resize-handle {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  right: 0;
+  bottom: 0;
+  cursor: nwse-resize;
+}

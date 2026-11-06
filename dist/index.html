@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en" data-version="1.0.129">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' yayra:; script-src 'self' yayra:; worker-src 'self' blob: yayra:; style-src 'self' 'unsafe-inline' yayra:; img-src 'self' data: blob: yayra: https://yayra.pages.dev https://icons.duckduckgo.com https://lh3.googleusercontent.com; media-src 'self' blob: yayra:; connect-src 'self' yayra: https://yayra-updates-api.g2code335.workers.dev; frame-src http: https: blob: yayra:; form-action 'self' https://lens.google.com; object-src 'none'; base-uri 'self'">
+    <meta name="theme-color" content="#172554">
+    <!-- Web/PWA "Sign in with Google" (injected by scripts/build-web.mjs;
+         empty when not configured, which disables the feature honestly).
+         A Google OAuth Client ID is public by design; the client SECRET
+         lives only in the Cloudflare Worker. See docs/GOOGLE_SIGNIN.md. -->
+    <meta name="yayra-google-web-client-id" content="">
+    <meta name="yayra-google-auth-exchange-url" content="">
+    <!-- Android/iOS (Capacitor) client IDs - no secret exists for these
+         Google client types (verified by package name + SHA-1 / bundle ID),
+         so shipping them in the bundle is by design. -->
+    <meta name="yayra-google-android-client-id" content="">
+    <meta name="yayra-google-ios-client-id" content="">
+    <link rel="manifest" href="./manifest.webmanifest">
+    <link rel="icon" type="image/png" sizes="1024x1024" href="./assets/brand/logomain1-transparent.png">
+    <link rel="icon" type="image/jpeg" sizes="1024x1024" href="./assets/brand/logomain1.jpg">
+    <link rel="apple-touch-icon" href="./assets/brand/logomain1-transparent.png">
+    <link rel="stylesheet" href="./styles.css">
+    <link rel="stylesheet" href="./packages/shared-ui/src/theme/design-system.css">
+    <link rel="stylesheet" href="./packages/shared-ui/src/glassmorphism.css">
+    <title>yayra</title>
+  </head>
+  <body>
+    <header id="top-header" class="top-header" aria-label="Application header"></header>
+    <main id="app"></main>
+    <script type="module" src="./src/browser/main.js"></script>
+  </body>
+</html>

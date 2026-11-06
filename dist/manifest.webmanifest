@@ -1,0 +1,26 @@
+{
+  "name": "yayra",
+  "short_name": "yayra",
+  "id": "com.yayra.app",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "background_color": "#172554",
+  "theme_color": "#172554",
+  "version": "1.0.129",
+  "cacheVersion": "1.0.129",
+  "icons": [
+    {
+      "src": "assets/brand/logomain1-transparent.png",
+      "sizes": "1024x1024",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "assets/brand/logomain1.jpg",
+      "sizes": "1024x1024",
+      "type": "image/jpeg",
+      "purpose": "any"
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Yayra is a cross-platform browser with local browsing tools and optional, user-authorized Google integrations.">
+  <meta name="theme-color" content="#10182c">
+  <title>About Yayra Browser</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0b1020; color: #e8edf8; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: radial-gradient(ellipse at 20% 0%, #182c55 0, #0b1020 55%); line-height: 1.65; }
+    main { width: min(860px, calc(100% - 32px)); margin: 0 auto; padding: 54px 0 40px; }
+    header, section, footer { border: 1px solid #293752; background: rgba(18, 27, 47, .88); border-radius: 18px; padding: clamp(22px, 5vw, 42px); margin-bottom: 18px; }
+    .brand { color: #9ec5ff; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; font-size: .8rem; }
+    h1 { font-size: clamp(2.25rem, 8vw, 4.4rem); letter-spacing: -.055em; line-height: 1.05; margin: 12px 0 16px; }
+    h2 { margin-top: 0; letter-spacing: -.02em; }
+    p, li { color: #c2cce0; }
+    a { color: #9ec5ff; text-underline-offset: 3px; }
+    .lead { font-size: 1.18rem; max-width: 65ch; }
+    .links { display: flex; flex-wrap: wrap; gap: 18px; }
+    footer { font-size: .94rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div class="brand">Yayra Browser</div>
+      <h1>A browser built around your workspace.</h1>
+      <p class="lead">Yayra is a cross-platform browser for opening websites and working with local browser tools. It includes tab and bookmark organization, downloads and document viewing, and optional Google account integrations.</p>
+      <p><a href="/">Open Yayra</a></p>
+    </header>
+    <section>
+      <h2>How Google integrations work</h2>
+      <p>Google account connection is optional. Basic sign-in requests your Google account identity so Yayra can show which account you connected. Separate Google features ask for additional permission only when you choose them. Those permissions are read-only and are shown on Google's consent screen; you can decline or revoke access.</p>
+      <p>Depending on the feature you choose, requested Google API access can include Gmail, Drive, Calendar, Contacts, Photos, Tasks, Classroom courses, or YouTube. Yayra is not a Google product and is not endorsed by Google. Google services remain subject to Google's terms and privacy policy.</p>
+    </section>
+    <section>
+      <h2>Privacy and terms</h2>
+      <p>Read how Yayra handles information and the terms for using the app:</p>
+      <nav class="links" aria-label="Legal information">
+        <a href="/privacy/">Privacy Policy</a>
+        <a href="/terms/">Terms of Service</a>
+      </nav>
+    </section>
+    <footer>
+      <p>Questions or privacy requests: <a href="mailto:support@yayra.app">support@yayra.app</a>.</p>
+      <p>Yayra Browser · <a href="/privacy/">Privacy</a> · <a href="/terms/">Terms</a></p>
+    </footer>
+  </main>
+</body>
+</html>
