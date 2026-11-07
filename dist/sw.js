@@ -1,5 +1,5 @@
-const BUILD_VERSION = '1.0.130';
-const BUILD_HASH = '15832d280043';
+const BUILD_VERSION = '1.0.131';
+const BUILD_HASH = 'c5e59d5157aa';
 const CACHE_NAME = `yayra-${BUILD_VERSION}-${BUILD_HASH}`;
 const PRECACHE = [
   "./_headers",

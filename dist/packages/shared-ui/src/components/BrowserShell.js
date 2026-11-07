@@ -2437,6 +2437,12 @@ export class BrowserShell {
     }
 
     this.lastRenderTarget = target;
+    // Keep the current shell painted until its replacement is complete. A
+    // full DOM teardown at the start of render creates a blank compositor
+    // frame (especially visible beside Electron's native page surface) and
+    // makes every chrome action feel like a flash. We swap the finished shell
+    // atomically at the end instead.
+    const retainedRoot = this.rootElement?.parentElement === target ? this.rootElement : null;
 
     // FREEZE FIX (stuck update splash): if every one of its dismissal
     // triggers somehow failed (frozen timers, exotic embedders), any
@@ -2474,10 +2480,12 @@ export class BrowserShell {
     // removed and rebuilt as before.
     if (this.webFrameLayer && this.webFrameLayer.parentElement === target) {
       for (const child of [...(target.children || [])]) {
-        if (child !== this.webFrameLayer) child.remove();
+        if (child !== this.webFrameLayer && child !== retainedRoot) child.remove();
       }
     } else {
-      target.innerHTML = '';
+      for (const child of [...(target.children || [])]) {
+        if (child !== retainedRoot) child.remove();
+      }
     }
     // The first truth-check above deliberately runs before teardown so real
     // overlays remain protected. Check once more now: an omnibox dropdown in
@@ -2559,7 +2567,12 @@ export class BrowserShell {
       this.renderRadialLauncher();
     }
 
-    target.appendChild(shell);
+    if (retainedRoot && retainedRoot.parentElement === target && typeof target.replaceChild === 'function') {
+      target.replaceChild(shell, retainedRoot);
+    } else {
+      target.appendChild(shell);
+      if (retainedRoot?.parentElement === target) retainedRoot.remove();
+    }
     this.rootElement = shell;
 
     // A pooled frame can begin a real navigation while this render is being
@@ -21402,6 +21415,11 @@ export class BrowserShell {
     this.state.urlInputValue = this.getDisplayUrl(tab.url);
     this.updateBookmarkState(tab.url);
     this.render();
+    // Tab switches are a native-surface lifecycle boundary. A stale or lost
+    // zero-bounds IPC report can otherwise leave the returned tab looking
+    // blank even though its WebContentsView is still alive. Reassert the
+    // selected page and its fresh viewport bounds after the shell has swapped.
+    this.ensureActiveNativeSurfaceLive(tabId);
     // If a site began a local passkey request in a background tab, bring up
     // Yayra's approval prompt when the user returns to that tab.
     this._queueWebsitePasskeyPrompt(tab, tab.sitePasskeyRequest);
