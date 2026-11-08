@@ -3567,6 +3567,7 @@ export class BrowserShell {
       ];
       for (const { cls, title, icon, action } of buttons) {
         const btn = document.createElement('button');
+        btn.type = 'button';
         btn.className = `fb-wc-btn ${cls}`;
         btn.setAttribute('title', title);
         btn.setAttribute('aria-label', title);
@@ -6627,7 +6628,13 @@ export class BrowserShell {
         // WebAuthn request. Main sends an explicit AbortError settle first;
         // this is a final UI-side stale-indicator guard.
         if (tab.sitePasskeyRequest) delete tab.sitePasskeyRequest;
+        // A redirect can begin a new generation while the previous one still
+        // reports loading. Reset the slow-load clock even when the boolean did
+        // not change, so one old request cannot make the new page look stuck.
+        tab.loadingStartedAt = Date.now();
+        tab.slowLoadNoticeAt = null;
         this.updateTabLoading(tabId, true);
+        this._ensureLoadingWatchdog();
         break;
       case 'loading-stop':
         this.updateTabLoading(tabId, false);
@@ -6639,11 +6646,23 @@ export class BrowserShell {
           try { this.ensureActiveNativeSurfaceLive(tabId); } catch { /* best-effort */ }
         }
         break;
-      case 'load-succeeded':
+      case 'load-succeeded': {
         // Positive main-frame completion (unlike loading-stop, which follows
         // failures too) is the only native signal that retires recovery UI.
         this._siteRecoverySucceeded(tabId, evt.url || tab.url);
+        if (!this._siteFailureFor(tabId)) {
+          // did-stop-loading normally follows this event, but can be lost when
+          // Chromium swaps the error/target document quickly. Treat a proven
+          // successful main-frame load as a final spinner reset and reassert
+          // native visibility/bounds so a completed page cannot stay blank.
+          this.updateTabLoading(tabId, false);
+          if (tabId === this.state.activeTabId) {
+            try { this.healStuckPageSurface(); } catch { /* best-effort */ }
+            try { this.ensureActiveNativeSurfaceLive(tabId); } catch { /* best-effort */ }
+          }
+        }
         break;
+      }
       case 'page-unresponsive':
         if (this.state.settings.performanceIssueAlerts !== false) {
           const name = tab.title || 'This page';
@@ -18021,6 +18040,29 @@ export class BrowserShell {
     return restored;
   }
 
+  requestNativeWindowClose({ exitWholeApp = false } = {}) {
+    const controls = this.windowControls;
+    const action = exitWholeApp && typeof controls?.quit === 'function'
+      ? controls.quit
+      : controls?.close;
+    if (typeof action !== 'function') return false;
+
+    try {
+      const result = action.call(controls);
+      // ipcRenderer.invoke() is asynchronous. A rejected IPC used to leave the
+      // close prompt dismissed with no feedback, making a failed close click
+      // look exactly like a dead button. Keep the renderer alive and explain
+      // that the user can retry if the main process rejects the request.
+      Promise.resolve(result).catch(() => {
+        this.showTransientNotice('Yayra could not close this window. Please try again.');
+      });
+      return true;
+    } catch {
+      this.showTransientNotice('Yayra could not close this window. Please try again.');
+      return false;
+    }
+  }
+
   requestAppClose({ exitWholeApp = false } = {}) {
     // Recoverable websites, safe internal tools/pages, and local documents
     // all warrant the session prompt. Private tabs remain excluded.
@@ -18028,10 +18070,7 @@ export class BrowserShell {
     const controls = this.windowControls;
     const canQuitWholeApp = exitWholeApp && controls && typeof controls.quit === 'function';
     if (!realTabs.length || typeof document === 'undefined') {
-      try {
-        if (canQuitWholeApp) controls.quit();
-        else controls?.close();
-      } catch { /* already closing */ }
+      this.requestNativeWindowClose({ exitWholeApp: canQuitWholeApp });
       this.state.closePromptExitsApp = false;
       return;
     }
@@ -18063,10 +18102,7 @@ export class BrowserShell {
       } catch { /* storage unavailable - closing still works */ }
     }
     const finishClose = () => {
-      try {
-        if (exitWholeApp && typeof this.windowControls?.quit === 'function') this.windowControls.quit();
-        else this.windowControls?.close();
-      } catch { /* already closing */ }
+      this.requestNativeWindowClose({ exitWholeApp });
     };
     const pendingWrites = [...(this._documentRecoveryWrites?.values?.() || [])];
     if (pendingWrites.length) {
@@ -22524,6 +22560,7 @@ export class BrowserShell {
       tab.isLoading = Boolean(isLoading);
       if (changed && tab.isLoading) {
         tab.loadingStartedAt = Date.now();
+        tab.slowLoadNoticeAt = null;
         this._ensureLoadingWatchdog();
       }
       // The loading strip is permanently mounted, so an engine event from a
@@ -22570,12 +22607,34 @@ export class BrowserShell {
       const now = Date.now();
       for (const tab of loadingTabs) {
         // Give real loads breathing room - only reconcile after 2.5s.
-        if (now - (tab.loadingStartedAt || 0) < 2500) continue;
+        const startedAt = Number(tab.loadingStartedAt) || now;
+        const elapsed = now - startedAt;
+        if (elapsed < 2500) continue;
         this.nativeWebview.isLoading(tab.id).then((res) => {
-          if (res && res.isLoading === false) this.updateTabLoading(tab.id, false);
+          const current = this.state.tabs.find((item) => item.id === tab.id);
+          if (!current || current.loadingStartedAt !== startedAt || !current.isLoading) return;
+          if (res && res.isLoading === false) {
+            this.updateTabLoading(tab.id, false);
+            return;
+          }
+          // A genuinely slow site should not be interrupted automatically,
+          // but tell the user why the progress strip remains active and point
+          // to Stop. Emit once per navigation generation, only for the tab
+          // the user is looking at.
+          if (res?.isLoading === true) this._maybeNotifySlowNativeLoad(current, startedAt, Date.now());
         }).catch(() => {});
       }
     }, 2000);
+  }
+
+  _maybeNotifySlowNativeLoad(tab, startedAt, now = Date.now()) {
+    if (!tab || tab.id !== this.state.activeTabId || !tab.isLoading
+      || now - startedAt < 15000 || tab.slowLoadNoticeAt === startedAt) return false;
+    tab.slowLoadNoticeAt = startedAt;
+    if (this.state.settings.performanceIssueAlerts !== false) {
+      this.showTransientNotice('This page is taking longer than usual. You can keep waiting or click Stop to cancel it.');
+    }
+    return true;
   }
 
   /**

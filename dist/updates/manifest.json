@@ -2,11 +2,11 @@
   "schema": 1,
   "channel": "stable",
   "latest": {
-    "windows": "1.0.131",
-    "linux": "1.0.131",
-    "ios": "1.0.131",
-    "android": "1.0.131",
-    "pwa": "1.0.131"
+    "windows": "1.0.132",
+    "linux": "1.0.132",
+    "ios": "1.0.132",
+    "android": "1.0.132",
+    "pwa": "1.0.132"
   },
   "minSupported": {
     "windows": "0.1.0",
@@ -23,6 +23,6 @@
     "percent": 100,
     "allowlist": []
   },
-  "publishedAt": "2026-11-07T10:05:03.998Z",
+  "publishedAt": "2026-11-08T14:43:30.992Z",
   "ttlSeconds": 300
 }
