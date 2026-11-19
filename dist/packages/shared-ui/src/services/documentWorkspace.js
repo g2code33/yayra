@@ -210,7 +210,7 @@ export function createPdfViewer({ pdfjs, container, state, onStateChange = null,
     root.classList?.toggle?.('is-slideshow', isPresentationMode());
     root.style.cssText = isPresentationMode()
       ? 'width:100%;height:100%;min-width:0;min-height:0;display:flex;align-items:center;justify-content:center;box-sizing:border-box;padding:0;overflow:hidden;'
-      : 'width:max-content;min-width:100%;min-height:100%;display:flex;flex-direction:column;align-items:center;box-sizing:border-box;padding:4px 8px 24px;';
+      : 'width:max-content;min-width:100%;min-height:100%;display:flex;flex-direction:column;align-items:center;box-sizing:border-box;padding:0 8px 24px;';
   }
 
   function stylePageShell(shell, pageNumber) {

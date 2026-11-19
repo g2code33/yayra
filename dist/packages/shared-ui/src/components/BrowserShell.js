@@ -45,6 +45,8 @@ import {
   createBookmarksRepo,
   createSettingsRepo,
   createEmailAddressesRepo,
+  createAddressProfilesRepo,
+  createFormFieldValuesRepo,
   DEFAULT_BOOKMARK_GROUPS,
   DEFAULT_BOOKMARK_GROUP_ID,
   createWheelRepo,
@@ -235,6 +237,8 @@ export class BrowserShell {
     this.historyRepo = options.historyRepo || null;
     this.bookmarksRepo = options.bookmarksRepo || null;
     this.emailAddressesRepo = options.emailAddressesRepo || null;
+    this.addressProfilesRepo = options.addressProfilesRepo || null;
+    this.formFieldValuesRepo = options.formFieldValuesRepo || null;
     this.downloadsRepo = options.downloadsRepo || null;
     this.settingsRepo = options.settingsRepo || null;
     this.privacyManager = options.privacyManager || null;
@@ -279,6 +283,8 @@ export class BrowserShell {
       if (!this.historyRepo) this.historyRepo = createHistoryRepo(scoped);
       if (!this.bookmarksRepo) this.bookmarksRepo = createBookmarksRepo(scoped);
       if (!this.emailAddressesRepo) this.emailAddressesRepo = createEmailAddressesRepo(scoped);
+      if (!this.addressProfilesRepo) this.addressProfilesRepo = createAddressProfilesRepo(scoped);
+      if (!this.formFieldValuesRepo) this.formFieldValuesRepo = createFormFieldValuesRepo(scoped);
       if (!this.settingsRepo) this.settingsRepo = createSettingsRepo(scoped);
       if (!this.storageAdapter) this.storageAdapter = scoped;
       this.wheelRepo = options.wheelRepo || createWheelRepo(scoped);
@@ -334,6 +340,14 @@ export class BrowserShell {
     if (!this.emailAddressesRepo && this.storageAdapter
       && typeof this.storageAdapter.get === 'function' && typeof this.storageAdapter.set === 'function') {
       this.emailAddressesRepo = createEmailAddressesRepo(this.storageAdapter);
+    }
+    if (!this.addressProfilesRepo && this.storageAdapter
+      && typeof this.storageAdapter.get === 'function' && typeof this.storageAdapter.set === 'function') {
+      this.addressProfilesRepo = createAddressProfilesRepo(this.storageAdapter);
+    }
+    if (!this.formFieldValuesRepo && this.storageAdapter
+      && typeof this.storageAdapter.get === 'function' && typeof this.storageAdapter.set === 'function') {
+      this.formFieldValuesRepo = createFormFieldValuesRepo(this.storageAdapter);
     }
     this.passwordManager = options.passwordManager || new PasswordManager(this.storageAdapter);
     this.extensionManager = options.extensionManager || new ExtensionManager(this.storageAdapter);
@@ -420,6 +434,8 @@ export class BrowserShell {
       bookmarksActiveGroupId: DEFAULT_BOOKMARK_GROUP_ID,
       // Profile-scoped email addresses saved from submitted web forms.
       rememberedEmails: [],
+      addressProfiles: [],
+      rememberedFormValues: [],
       // Durable profile-scoped tab groups. Unlike the rolling previous-session
       // snapshot below, this catalog is never pruned when tabs close or an
       // update/restart completes; only explicit remove/ungroup/delete actions
@@ -462,6 +478,11 @@ export class BrowserShell {
       // Chrome-style "Save password?" bar (set when a login submission is
       // captured in a page; cleared on save / never / dismiss).
       pendingPasswordSave: null,
+      pendingAddressSave: null,
+      addressDraft: null,
+      editingAddressId: null,
+      addressFormOpen: false,
+      addressFormValue: null,
       // Which vault section is active on yayra://passwords.
       passwordsActiveSection: 'passwords',
       // Registered Yayra account passkey metadata (null = none yet).
@@ -960,7 +981,16 @@ export class BrowserShell {
   }
 
   getSystemTopInset() {
-    if (!this.windowControls || this.options?.isMiniShell || this.state?.isMobile
+    // Prefer Electron's display/work-area result. Chromium's Screen values can
+    // be zeroed or stale under Wayland even when the GNOME panel covers the
+    // top of a maximized frameless window.
+    if (Number.isFinite(this._nativeSystemTopInset)) return this._nativeSystemTopInset;
+    // The work-area correction is for desktop environments whose panels can
+    // overlap frameless windows (notably GNOME). On Windows, availTop may
+    // reflect the taskbar even when the window content already starts at the
+    // correct client-area edge; applying it there inserts a visible blank band
+    // above every document, most noticeably in the PDF reader.
+    if (this.platform !== 'linux' || !this.windowControls || this.options?.isMiniShell || this.state?.isMobile
       || typeof window === 'undefined' || !window.screen) return 0;
     const availableTop = Number(window.screen.availTop);
     const windowTop = Number(window.screenY);
@@ -969,6 +999,34 @@ export class BrowserShell {
     // a desktop panel. Align the renderer chrome with the OS work-area edge
     // when the window itself starts above it (e.g. a top GNOME panel).
     return Math.max(0, Math.min(96, Math.ceil(availableTop - windowTop)));
+  }
+
+  refreshNativeSystemTopInset(shell = this.rootElement) {
+    const bridge = this.windowControls;
+    if (this.platform !== 'linux' || this.options?.isMiniShell || this.state?.isMobile
+      || typeof bridge?.getTopInset !== 'function') return false;
+    if (!this._systemTopInsetResizeHandler && typeof window !== 'undefined') {
+      this._systemTopInsetResizeHandler = () => {
+        this._systemTopInsetRequest = null;
+        this.refreshNativeSystemTopInset(this.rootElement);
+      };
+      window.addEventListener?.('resize', this._systemTopInsetResizeHandler);
+    }
+    if (this._systemTopInsetRequest) return true;
+    const request = Promise.resolve().then(() => bridge.getTopInset());
+    this._systemTopInsetRequest = request;
+    request.then((rawInset) => {
+      if (this._systemTopInsetRequest !== request) return;
+      const value = Number(rawInset);
+      this._nativeSystemTopInset = Number.isFinite(value) ? Math.max(0, Math.min(96, Math.ceil(value))) : 0;
+      const target = this.rootElement || shell;
+      if (target?.style?.setProperty) {
+        target.style.setProperty('--fb-window-system-top-inset', `${this._nativeSystemTopInset}px`);
+      }
+    }).catch(() => {
+      if (this._systemTopInsetRequest === request) this._systemTopInsetRequest = null;
+    });
+    return true;
   }
 
   // window.yayra.updates (exposed by electron/preload.cjs, backed by
@@ -1086,6 +1144,9 @@ export class BrowserShell {
     render('password-save', pendingPasswordSave
       ? JSON.stringify([pendingPasswordSave.url, pendingPasswordSave.username]) : null,
     (target) => this.renderPasswordSaveBar(target));
+    render('address-save', this.state.pendingAddressSave
+      ? JSON.stringify([this.state.pendingAddressSave.url, this.state.pendingAddressSave.address]) : null,
+    (target) => this.renderAddressSaveBar(target));
   }
 
   /**
@@ -2105,6 +2166,16 @@ export class BrowserShell {
         console.warn('Failed to load saved email addresses in BrowserShell:', err);
       }
     }
+    if (this.addressProfilesRepo && typeof this.addressProfilesRepo.getAllAddresses === 'function') {
+      try { await this.refreshAddressProfilesState(); } catch (err) {
+        console.warn('Failed to load saved addresses in BrowserShell:', err);
+      }
+    }
+    if (this.formFieldValuesRepo && typeof this.formFieldValuesRepo.getAllValues === 'function') {
+      try { await this.refreshFormFieldValuesState(); } catch (err) {
+        console.warn('Failed to load saved form values in BrowserShell:', err);
+      }
+    }
 
     // New-tab shortcut tiles (Chrome's "Add shortcut" row).
     if (this.shortcutsRepo && typeof this.shortcutsRepo.getShortcuts === 'function') {
@@ -2494,6 +2565,13 @@ export class BrowserShell {
     try { this.healStuckPageSurface(); } catch { /* best-effort heal */ }
 
     const activeTab = this.getActiveTab();
+    // Connectivity feedback is meaningful on a website but must never sit on
+    // top of Yayra's own document/library surfaces. The failed-site card is
+    // rendered in the website viewport; this also retires any stale toast
+    // when the user switches back to an internal document page.
+    if (!this._isWebsiteUrl(activeTab?.url) && this._transientNoticeKind === 'connectivity') {
+      this.clearTransientNotice();
+    }
     const activeTabWasLoading = Boolean(activeTab?.isLoading);
     const isPrivate = activeTab?.isPrivate;
 
@@ -2574,6 +2652,7 @@ export class BrowserShell {
       if (retainedRoot?.parentElement === target) retainedRoot.remove();
     }
     this.rootElement = shell;
+    this.refreshNativeSystemTopInset(shell);
 
     // A pooled frame can begin a real navigation while this render is being
     // assembled. Reconcile only when that state actually changed; ordinary
@@ -5845,7 +5924,7 @@ export class BrowserShell {
     if (!force && this._nativeWebviewBoundsByTab?.get(tabId) === key) return false;
     this._nativeWebviewBoundsByTab?.set(tabId, key);
     try {
-      const result = this.nativeWebview.setBounds(tabId, next);
+      const result = this.nativeWebview.setBounds(tabId, next, { force });
       if (result && typeof result.catch === 'function') {
         result.catch(() => {
           if (this._nativeWebviewBoundsByTab?.get(tabId) === key) this._nativeWebviewBoundsByTab.delete(tabId);
@@ -6271,6 +6350,14 @@ export class BrowserShell {
         if (shown && typeof shown.catch === 'function') shown.catch(() => {});
       } catch { /* bridge unavailable during teardown */ }
       this.restoreActiveNativeBounds(tabId, { force: true });
+      // A WebContentsView can retain a stale compositor surface even after it
+      // has valid bounds again (the symptom is a blank page that repaints when
+      // switching tabs). Ask Chromium to invalidate and repaint only when the
+      // user returns to this live tab; this does not reload or change the site.
+      try {
+        const repaint = this.nativeWebview.invalidate?.(tabId);
+        if (repaint && typeof repaint.catch === 'function') repaint.catch(() => {});
+      } catch { /* older Electron builds can still recover via fresh bounds */ }
     }
     if (this._androidTabWebIds?.has?.(tabId)) this.syncAndroidTabWebVisibility(tabId, true);
     return true;
@@ -6981,6 +7068,30 @@ export class BrowserShell {
       case 'email-address-captured':
         this.rememberEmailAddress(evt.email, tab, evt.url).catch(() => {});
         break;
+      case 'address-captured':
+        this.handleAddressCaptured(tab, evt).catch(() => {});
+        break;
+      case 'form-field-captured':
+        this.handleFormFieldCaptured(tab, evt).catch(() => {});
+        break;
+      case 'form-field-focused':
+        this.handleFormFieldFocused(tab, evt).catch(() => {});
+        break;
+      case 'form-value-selected':
+        this.handleFormValueSelected(tab, evt).catch(() => {});
+        break;
+      case 'address-field-focused':
+        this.handleAddressFieldFocused(tab, evt).catch(() => {});
+        break;
+      case 'address-profile-selected':
+        this.handleAddressProfileSelected(tab, evt).catch(() => {});
+        break;
+      case 'address-autofill-manage':
+        this.handleAddressAutofillManage(tab);
+        break;
+      case 'form-autofill-manage':
+        this.handleAddressAutofillManage(tab);
+        break;
       case 'popup-blocked':
         this.showTransientNotice('Yayra blocked a website pop-up. Allow pop-ups in Privacy & Security > Site settings if you trust this site.');
         break;
@@ -7098,6 +7209,160 @@ export class BrowserShell {
       .map((item) => typeof item === 'string' ? item : item?.email)
       .filter((value) => typeof value === 'string');
     try { await native.suggestEmailAddresses(tab.id, values); } catch { /* page may have navigated away */ }
+  }
+
+  async handleAddressCaptured(tab, evt = {}) {
+    if (!tab || tab.isPrivate || !this.addressProfilesRepo || !evt.address || typeof evt.address !== 'object') return;
+    const url = String(evt.url || tab.url || '');
+    try {
+      const page = new URL(url);
+      const current = new URL(tab.url || '');
+      if (!['http:', 'https:'].includes(page.protocol) || current.origin !== page.origin) return;
+    } catch { return; }
+    const address = evt.address;
+    if (!address.fullName && !address.firstName && !address.lastName && !address.addressLine1 && !address.postalCode) return;
+    const profiles = await this.addressProfilesRepo.getAllAddresses().catch(() => []);
+    if (this.state.pendingAddressSave) return;
+    const signature = (item) => [item.fullName, item.firstName, item.lastName, item.addressLine1, item.postalCode, item.country]
+      .map((value) => String(value || '').trim().toLocaleLowerCase()).join('|');
+    if (profiles.some((item) => signature(item) === signature(address))) return;
+    this.state.pendingAddressSave = { tabId: tab.id, url, address: { ...address } };
+    this.requestRender();
+  }
+
+  async savePendingAddressProfile() {
+    const pending = this.state.pendingAddressSave;
+    this.state.pendingAddressSave = null;
+    if (!pending || !this.addressProfilesRepo || !this.state.tabs.some((tab) => tab.id === pending.tabId && !tab.isPrivate)) {
+      this.requestRender();
+      return;
+    }
+    const profiles = await this.addressProfilesRepo.getAllAddresses().catch(() => []);
+    const saved = await this.addressProfilesRepo.addAddress({
+      ...pending.address,
+      label: this.state.addressDraft?.label || (profiles.length ? 'Address' : 'Home'),
+      isDefault: profiles.length === 0
+    });
+    this.state.addressDraft = null;
+    if (saved) {
+      await this.refreshAddressProfilesState();
+      await Promise.all(this.state.tabs.filter((tab) => !tab.isPrivate).map((tab) => this.pushAddressSuggestionsToTab(tab)));
+      this.showTransientNotice('Address saved to this profile for checkout autofill.');
+    }
+    this.requestRender();
+  }
+
+  dismissPendingAddressSave() {
+    this.state.pendingAddressSave = null;
+    this.state.addressDraft = null;
+    this.requestRender();
+  }
+
+  async refreshFormFieldValuesState() {
+    if (!this.formFieldValuesRepo || typeof this.formFieldValuesRepo.getAllValues !== 'function') return [];
+    this.state.rememberedFormValues = await this.formFieldValuesRepo.getAllValues() || [];
+    return this.state.rememberedFormValues;
+  }
+
+  async handleFormFieldCaptured(tab, evt = {}) {
+    if (!tab || tab.isPrivate || !this.formFieldValuesRepo || typeof this.formFieldValuesRepo.addValue !== 'function') return;
+    const url = String(evt.url || tab.url || '');
+    try {
+      const page = new URL(url);
+      const current = new URL(tab.url || '');
+      if (!['http:', 'https:'].includes(page.protocol) || current.origin !== page.origin) return;
+    } catch { return; }
+    const saved = await this.formFieldValuesRepo.addValue({
+      fieldKey: evt.fieldKey,
+      label: evt.label,
+      value: evt.value
+    });
+    if (!saved) return;
+    try { await this.refreshFormFieldValuesState(); } catch { /* saved value remains stored */ }
+    if (this.getActiveTab()?.url === 'yayra://passwords' && this.state.passwordsActiveSection === 'addresses') this.requestRender();
+  }
+
+  async handleFormFieldFocused(tab, evt = {}) {
+    if (!tab || tab.isPrivate || !this.formFieldValuesRepo) return;
+    const native = this.nativeWebview;
+    if (!native || typeof native.suggestFormFieldValues !== 'function') return;
+    const url = String(evt.url || tab.url || '');
+    let pageOrigin;
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return;
+      pageOrigin = parsed.origin;
+      const current = new URL(tab.url || '');
+      if (['http:', 'https:'].includes(current.protocol) && current.origin !== pageOrigin) return;
+    } catch { return; }
+    let values = [];
+    try { values = await this.formFieldValuesRepo.getValuesForField(evt.fieldKey); } catch { return; }
+    try { await native.suggestFormFieldValues(tab.id, { url, fieldKey: evt.fieldKey, values }); }
+    catch { /* tab may have navigated or closed */ }
+  }
+
+  async handleFormValueSelected(tab, evt = {}) {
+    if (!tab || tab.isPrivate || !this.formFieldValuesRepo || !/^formval-[A-Za-z0-9-]{3,100}$/.test(String(evt.valueId || ''))) return;
+    try {
+      await this.formFieldValuesRepo.touchValue(evt.valueId);
+      await this.refreshFormFieldValuesState();
+    } catch { /* the page fill already completed */ }
+  }
+
+  async refreshAddressProfilesState() {
+    if (!this.addressProfilesRepo || typeof this.addressProfilesRepo.getAllAddresses !== 'function') return [];
+    this.state.addressProfiles = await this.addressProfilesRepo.getAllAddresses() || [];
+    return this.state.addressProfiles;
+  }
+
+  async pushAddressSuggestionsToTab(tab, focusedField = '') {
+    if (!tab || tab.isPrivate || !this.addressProfilesRepo) return false;
+    const native = this.nativeWebview;
+    if (!native || typeof native.suggestAutofillAddresses !== 'function') return false;
+    let addresses = [];
+    let values = [];
+    try { addresses = await this.addressProfilesRepo.getAllAddresses(); } catch { return false; }
+    if (focusedField && this.formFieldValuesRepo?.getValuesForField) {
+      try { values = await this.formFieldValuesRepo.getValuesForField(`address:${focusedField}`); } catch { values = []; }
+    }
+    try {
+      await native.suggestAutofillAddresses(tab.id, {
+        url: String(tab.url || ''), addresses, values, fieldKey: focusedField ? `address:${focusedField}` : ''
+      });
+      return true;
+    } catch { return false; }
+  }
+
+  async handleAddressFieldFocused(tab, evt = {}) {
+    if (!tab || tab.isPrivate || !this.addressProfilesRepo) return;
+    const native = this.nativeWebview;
+    if (!native || typeof native.suggestAutofillAddresses !== 'function') return;
+    const url = String(evt.url || tab.url || '');
+    let pageOrigin;
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return;
+      pageOrigin = parsed.origin;
+    } catch { return; }
+    try {
+      const current = new URL(tab.url || '');
+      if ((current.protocol === 'http:' || current.protocol === 'https:') && current.origin !== pageOrigin) return;
+    } catch { /* the navigation event may not have reached the shell yet */ }
+    await this.pushAddressSuggestionsToTab(tab, String(evt.field || ''));
+  }
+
+  async handleAddressProfileSelected(tab, evt = {}) {
+    if (!tab || tab.isPrivate || !this.addressProfilesRepo || !evt.addressId) return;
+    try {
+      await this.addressProfilesRepo.touchAddress?.(String(evt.addressId));
+      await this.refreshAddressProfilesState();
+    } catch { /* autofill already completed in the page */ }
+  }
+
+  handleAddressAutofillManage(tab) {
+    if (!tab || tab.isPrivate || tab.id !== this.state.activeTabId) return;
+    this.state.passwordsActiveSection = 'addresses';
+    this.navigateActiveTab('yayra://passwords');
   }
 
   async refreshVaultState() {
@@ -7295,6 +7560,34 @@ export class BrowserShell {
       this.showTransientNotice(`Yayra won't offer to save passwords for ${pending.origin.replace(/^https?:\/\//, '')}`);
     }
     this.render();
+  }
+
+  renderAddressSaveBar(root) {
+    const pending = this.state.pendingAddressSave;
+    if (!pending || !root) return;
+    const address = pending.address || {};
+    const bar = document.createElement('section');
+    bar.setAttribute('role', 'dialog');
+    bar.setAttribute('aria-label', 'Save address profile');
+    bar.style.cssText = 'position:fixed;z-index:2147483000;left:50%;bottom:24px;transform:translateX(-50%);width:min(560px,calc(100vw - 32px));padding:16px;border:1px solid var(--fb-border,#353947);border-radius:16px;background:var(--fb-surface,#171a22);color:var(--fb-text,#f5f6fa);box-shadow:0 18px 60px rgba(0,0,0,.48);';
+    const title = document.createElement('strong');
+    title.textContent = 'Save this address for checkout?';
+    const detail = document.createElement('p');
+    detail.style.cssText = 'margin:7px 0 12px;color:var(--fb-text-secondary,#a8adbd);font-size:13px;';
+    detail.textContent = [address.fullName, address.addressLine1, address.city, address.region].filter(Boolean).join(' · ');
+    const label = document.createElement('input');
+    label.type = 'text'; label.maxLength = 40; label.placeholder = 'Profile name (Home, Work)';
+    label.value = this.state.addressDraft?.label || (this.state.addressProfiles?.length ? 'Address' : 'Home');
+    label.setAttribute('aria-label', 'Address profile name');
+    label.style.cssText = 'box-sizing:border-box;width:100%;margin:0 0 12px;padding:9px 11px;border:1px solid var(--fb-border,#353947);border-radius:9px;background:var(--fb-surface-alt,#20232e);color:inherit;';
+    label.addEventListener('input', () => { this.state.addressDraft = { label: label.value }; });
+    const actions = document.createElement('div');
+    actions.style.cssText = 'display:flex;justify-content:flex-end;gap:8px;';
+    const dismiss = document.createElement('button'); dismiss.type = 'button'; dismiss.className = 'fb-btn fb-btn-secondary'; dismiss.textContent = 'Not now';
+    dismiss.addEventListener('click', () => this.dismissPendingAddressSave());
+    const save = document.createElement('button'); save.type = 'button'; save.className = 'fb-btn fb-btn-primary'; save.textContent = 'Save address';
+    save.addEventListener('click', () => this.savePendingAddressProfile());
+    actions.append(dismiss, save); bar.append(title, detail, label, actions); root.appendChild(bar);
   }
 
   renderPasswordSaveBar(root) {
@@ -7797,19 +8090,42 @@ export class BrowserShell {
     this.nativeWebview?.destroy(tabId).catch(() => {});
   }
 
-  showTransientNotice(message) {
-    if (typeof document === 'undefined') return;
-    const notice = document.createElement('div');
-    notice.className = 'fb-transient-notice';
-    notice.textContent = message;
-    notice.style.cssText = 'position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:#1f2430; color:#e7eaf0; padding:10px 18px; border-radius:10px; font-size:0.85rem; box-shadow:0 8px 24px rgba(0,0,0,0.35); z-index:999999; opacity:0; transition:opacity 0.2s ease;';
-    document.body.appendChild(notice);
+  clearTransientNotice() {
+    if (this._transientNoticeTimer) clearTimeout(this._transientNoticeTimer);
+    this._transientNoticeTimer = null;
+    this._transientNoticeElement?.remove?.();
+    this._transientNoticeElement = null;
+    this._transientNoticeKind = null;
+  }
+
+  showTransientNotice(message, { kind = 'general' } = {}) {
+    if (typeof document === 'undefined' || !document.body) return;
+    let notice = this._transientNoticeElement;
+    if (!notice || !notice.parentElement) {
+      notice = document.createElement('div');
+      notice.className = 'fb-transient-notice';
+      notice.setAttribute('role', 'status');
+      notice.setAttribute('aria-live', 'polite');
+      notice.style.cssText = 'position:fixed; bottom:24px; left:50%; transform:translateX(-50%); max-width:min(90vw,760px); box-sizing:border-box; background:#1f2430; color:#e7eaf0; padding:10px 18px; border-radius:10px; font-size:0.85rem; box-shadow:0 8px 24px rgba(0,0,0,0.35); z-index:999999; opacity:0; transition:opacity 0.2s ease; pointer-events:none;';
+      document.body.appendChild(notice);
+      this._transientNoticeElement = notice;
+    }
+    if (this._transientNoticeTimer) clearTimeout(this._transientNoticeTimer);
+    this._transientNoticeKind = kind;
+    notice.textContent = String(message || '');
+    notice.style.opacity = '0';
     const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (cb) => setTimeout(cb, 16);
-    raf(() => { notice.style.opacity = '1'; });
-    setTimeout(() => {
+    raf(() => {
+      if (this._transientNoticeElement === notice) notice.style.opacity = '1';
+    });
+    this._transientNoticeTimer = setTimeout(() => {
+      if (this._transientNoticeElement !== notice) return;
       notice.style.opacity = '0';
-      setTimeout(() => notice.remove(), 250);
+      this._transientNoticeTimer = setTimeout(() => {
+        if (this._transientNoticeElement === notice) this.clearTransientNotice();
+      }, 250);
     }, 4000);
+    this._transientNoticeTimer?.unref?.();
   }
 
   /** Build a first-party Google AI Mode URL, optionally carrying real tabs
@@ -11680,7 +11996,7 @@ export class BrowserShell {
     const page = document.createElement('div');
     page.className = 'fb-internal-page fb-passwords-inpage-layout';
 
-    const section = this.state.passwordsActiveSection === 'keys' ? 'keys' : 'passwords';
+    const section = ['keys', 'addresses'].includes(this.state.passwordsActiveSection) ? this.state.passwordsActiveSection : 'passwords';
     const q = (this.state.passwordsSearchQuery || '').toLowerCase().trim();
     const match = (p) => !q
       || (p.origin && p.origin.toLowerCase().includes(q))
@@ -11691,6 +12007,14 @@ export class BrowserShell {
     const rememberedEmails = (Array.isArray(this.state.rememberedEmails) ? this.state.rememberedEmails : [])
       .map((item) => typeof item === 'string' ? { email: item, id: item } : item)
       .filter((item) => item && typeof item.email === 'string');
+    const addressProfiles = Array.isArray(this.state.addressProfiles) ? this.state.addressProfiles : [];
+    const addressItems = addressProfiles.filter((item) => !q
+      || [item.label, item.fullName, item.firstName, item.lastName, item.company, item.addressLine1, item.city, item.region, item.postalCode, item.country, item.email]
+        .some((value) => String(value || '').toLowerCase().includes(q)));
+    const addressValue = this.state.addressFormValue || {};
+    const rememberedFormValues = Array.isArray(this.state.rememberedFormValues) ? this.state.rememberedFormValues : [];
+    const visibleFormValues = rememberedFormValues.filter((item) => !q
+      || `${item.label} ${item.fieldKey} ${item.value}`.toLowerCase().includes(q));
     const escapeText = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
     })[character]);
@@ -11730,14 +12054,16 @@ export class BrowserShell {
         <header class="fb-internal-header">
           <div class="fb-internal-title-group">
             <span class="fb-internal-icon">${Icons.lock}</span>
-            <h1 class="fb-internal-title">Passwords &amp; Keys</h1>
+            <h1 class="fb-internal-title">${section === 'addresses' ? 'Addresses &amp; Autofill' : 'Passwords &amp; Keys'}</h1>
           </div>
           <div style="display:flex; align-items:center; gap:12px;">
             <div class="fb-internal-search">
               <span class="fb-internal-search-icon">${Icons.search}</span>
-              <input type="text" id="fb-in-pwd-search" placeholder="Search vault" value="${this.state.passwordsSearchQuery || ''}" />
+              <input type="text" id="fb-in-pwd-search" placeholder="${section === 'addresses' ? 'Search addresses' : 'Search vault'}" value="${this.state.passwordsSearchQuery || ''}" />
             </div>
-            <button class="fb-btn fb-btn-primary fb-in-add-pwd-btn">${Icons.plus} ${section === 'keys' ? 'Add Key' : 'Add Password'}</button>
+            ${section === 'addresses'
+              ? '<button class="fb-btn fb-btn-primary fb-in-add-address-btn">＋ Add address</button>'
+              : `<button class="fb-btn fb-btn-primary fb-in-add-pwd-btn">${Icons.plus} ${section === 'keys' ? 'Add Key' : 'Add Password'}</button>`}
           </div>
         </header>
 
@@ -11748,8 +12074,12 @@ export class BrowserShell {
           <button class="fb-vault-tab ${section === 'keys' ? 'active' : ''}" data-section="keys" role="tab" aria-selected="${section === 'keys'}">
             ${Icons.shield} Keys &amp; Tokens <span class="fb-vault-count">${this.state.vaultKeysItems.length}</span>
           </button>
+          <button class="fb-vault-tab ${section === 'addresses' ? 'active' : ''}" data-section="addresses" role="tab" aria-selected="${section === 'addresses'}">
+            ▣ Addresses <span class="fb-vault-count">${this.state.addressProfiles.length}</span>
+          </button>
         </div>
 
+        <div style="display:${section === 'addresses' ? 'none' : 'block'};">
         <div class="fb-settings-group-card fb-vault-security-card" style="margin-bottom:12px;">
           <h3 class="fb-settings-group-title">${Icons.shield} Account Passkey</h3>
           <p style="margin:0; font-size:0.82rem; color:var(--fb-text-secondary);">
@@ -11842,6 +12172,70 @@ export class BrowserShell {
                 : '<div class="fb-empty-state">No saved email addresses yet. Use an email on a submitted form and Yayra will remember it for this profile.</div>'}
             </div>
           </div>` : ''}
+        </div>
+
+        ${section === 'addresses' ? `
+          <section class="fb-settings-group-card fb-address-profiles-card" aria-label="Saved address profiles">
+            <div class="fb-saved-emails-header">
+              <div><strong>Saved address profiles</strong>
+                <p>Stored locally in this Yayra profile. Suggestions appear only when you focus a recognized checkout address field; Yayra never fills until you choose a profile.</p>
+              </div>
+              <button type="button" class="fb-btn fb-btn-secondary fb-address-clear" ${addressProfiles.length ? '' : 'disabled'}>Clear all</button>
+            </div>
+            ${this.state.addressFormOpen ? `
+              <form class="fb-address-form" id="fb-address-form" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin:14px 0;">
+                <input class="fb-input" name="label" placeholder="Profile label (Home, Work)" value="${escapeAttr(addressValue.label || '')}" />
+                <input class="fb-input" name="fullName" autocomplete="name" placeholder="Full name" value="${escapeAttr(addressValue.fullName || '')}" />
+                <input class="fb-input" name="firstName" autocomplete="given-name" placeholder="First / given name" value="${escapeAttr(addressValue.firstName || '')}" />
+                <input class="fb-input" name="lastName" autocomplete="family-name" placeholder="Last / family name" value="${escapeAttr(addressValue.lastName || '')}" />
+                <input class="fb-input" name="company" autocomplete="organization" placeholder="Company (optional)" value="${escapeAttr(addressValue.company || '')}" />
+                <input class="fb-input" name="addressLine1" autocomplete="address-line1" placeholder="Street address" value="${escapeAttr(addressValue.addressLine1 || '')}" />
+                <input class="fb-input" name="addressLine2" autocomplete="address-line2" placeholder="Apartment, suite, unit" value="${escapeAttr(addressValue.addressLine2 || '')}" />
+                <input class="fb-input" name="city" autocomplete="address-level2" placeholder="City / town" value="${escapeAttr(addressValue.city || '')}" />
+                <input class="fb-input" name="region" autocomplete="address-level1" placeholder="Region / state" value="${escapeAttr(addressValue.region || '')}" />
+                <input class="fb-input" name="postalCode" autocomplete="postal-code" placeholder="Postal code" value="${escapeAttr(addressValue.postalCode || '')}" />
+                <input class="fb-input" name="country" autocomplete="country-name" placeholder="Country" value="${escapeAttr(addressValue.country || '')}" />
+                <input class="fb-input" name="phone" autocomplete="tel" placeholder="Phone" value="${escapeAttr(addressValue.phone || '')}" />
+                <input class="fb-input" name="email" autocomplete="email" placeholder="Email (optional)" value="${escapeAttr(addressValue.email || '')}" />
+                <div style="display:flex;gap:8px;align-items:center;grid-column:1/-1;">
+                  <button type="submit" class="fb-btn fb-btn-primary">${this.state.editingAddressId ? 'Save changes' : 'Save address'}</button>
+                  <button type="button" class="fb-btn fb-btn-secondary fb-address-cancel">Cancel</button>
+                </div>
+              </form>` : ''}
+            <div class="fb-saved-email-list">
+              ${addressItems.length ? addressItems.map((item) => `
+                <article class="fb-saved-email-row" style="align-items:flex-start;gap:12px;">
+                  <div style="min-width:0;flex:1;">
+                    <strong>${escapeText(item.label)} ${item.isDefault ? '<span class="fb-vault-count">Default</span>' : ''}</strong>
+                    <div style="color:var(--fb-text-secondary);font-size:.82rem;margin-top:4px;">${escapeText([item.fullName || [item.firstName, item.lastName].filter(Boolean).join(' '),item.addressLine1,item.addressLine2,item.city,item.region,item.postalCode,item.country].filter(Boolean).join(' · '))}</div>
+                    <div style="color:var(--fb-text-secondary);font-size:.78rem;margin-top:3px;">${escapeText([item.phone,item.email].filter(Boolean).join(' · '))}</div>
+                  </div>
+                  <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;">
+                    ${item.isDefault ? '' : `<button type="button" class="fb-btn fb-btn-secondary fb-address-default" data-address-id="${escapeAttr(item.id)}">Make default</button>`}
+                    <button type="button" class="fb-btn fb-btn-secondary fb-address-edit" data-address-id="${escapeAttr(item.id)}">Edit</button>
+                    <button type="button" class="fb-btn fb-btn-secondary fb-address-remove" data-address-id="${escapeAttr(item.id)}">Remove</button>
+                  </div>
+                </article>`).join('') : `<div class="fb-empty-state">${addressProfiles.length ? 'No address profiles match your search.' : 'No saved address profiles yet. Add one, or submit a checkout form and choose Save when Yayra offers.'}</div>`}
+            </div>
+          </section>
+          <section class="fb-settings-group-card fb-form-values-card" style="margin-top:12px;" aria-label="Previously entered form information">
+            <div class="fb-saved-emails-header">
+              <div><strong>Previously entered form info</strong>
+                <p>Yayra remembers non-sensitive text you leave in form fields on regular tabs. Focus the same kind of field to reuse a value. Passwords, payment details, one-time codes, and private-tab data are never stored here.</p>
+              </div>
+              <button type="button" class="fb-btn fb-btn-secondary fb-form-values-clear" ${rememberedFormValues.length ? '' : 'disabled'}>Clear all</button>
+            </div>
+            <div class="fb-saved-email-list">
+              ${visibleFormValues.length ? visibleFormValues.map((item) => `
+                <article class="fb-saved-email-row" style="gap:12px;">
+                  <div style="min-width:0;flex:1;">
+                    <strong>${escapeText(item.label)}</strong>
+                    <div style="color:var(--fb-text-secondary);font-size:.78rem;margin-top:3px;">${escapeText(item.value)}</div>
+                  </div>
+                  <button type="button" class="fb-btn fb-btn-secondary fb-form-value-remove" data-value-id="${escapeAttr(item.id)}">Remove</button>
+                </article>`).join('') : `<div class="fb-empty-state">${rememberedFormValues.length ? 'No saved form values match your search.' : 'Values you enter in non-sensitive form fields will appear here after you leave the field.'}</div>`}
+            </div>
+          </section>` : ''}
 
         <form class="fb-vault-add-form" id="fb-vault-add-form" style="display:none;">
           ${section === 'keys' ? `
@@ -11856,7 +12250,7 @@ export class BrowserShell {
           <button type="submit" class="fb-btn fb-btn-primary">Save</button>
         </form>
 
-        <div class="fb-vault-rows" style="display:flex; flex-direction:column; gap:10px;">
+        <div class="fb-vault-rows" style="display:${section === 'addresses' ? 'none' : 'flex'}; flex-direction:column; gap:10px;">
           ${items.length > 0
             ? items.map(rowHtml).join('')
             : `<div class="fb-empty-state">${section === 'keys'
@@ -11877,6 +12271,68 @@ export class BrowserShell {
         this.state.passwordsActiveSection = tab.dataset.section;
         this.render();
       });
+    });
+    page.querySelector('.fb-in-add-address-btn')?.addEventListener('click', () => {
+      this.state.addressFormOpen = true;
+      this.state.editingAddressId = null;
+      this.state.addressFormValue = {};
+      this.render();
+    });
+    page.querySelector('.fb-address-cancel')?.addEventListener('click', () => {
+      this.state.addressFormOpen = false;
+      this.state.editingAddressId = null;
+      this.state.addressFormValue = null;
+      this.render();
+    });
+    page.querySelector('#fb-address-form')?.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const data = Object.fromEntries(new FormData(form).entries());
+      const saved = this.state.editingAddressId
+        ? await this.addressProfilesRepo?.updateAddress(this.state.editingAddressId, data)
+        : await this.addressProfilesRepo?.addAddress({ ...data, isDefault: addressProfiles.length === 0 });
+      if (!saved) { this.showTransientNotice('Add a valid email address or at least one address detail.'); return; }
+      this.state.addressFormOpen = false;
+      this.state.editingAddressId = null;
+      this.state.addressFormValue = null;
+      await this.refreshAddressProfilesState();
+      await Promise.all(this.state.tabs.filter((tab) => !tab.isPrivate).map((tab) => this.pushAddressSuggestionsToTab(tab)));
+      this.render();
+    });
+    page.querySelectorAll('.fb-address-edit').forEach((button) => button.addEventListener('click', () => {
+      const item = addressProfiles.find((address) => address.id === button.dataset.addressId);
+      if (!item) return;
+      this.state.editingAddressId = item.id;
+      this.state.addressFormValue = { ...item };
+      this.state.addressFormOpen = true;
+      this.render();
+    }));
+    page.querySelectorAll('.fb-address-default').forEach((button) => button.addEventListener('click', async () => {
+      await this.addressProfilesRepo?.setDefaultAddress(button.dataset.addressId);
+      await this.refreshAddressProfilesState();
+      this.render();
+    }));
+    page.querySelectorAll('.fb-address-remove').forEach((button) => button.addEventListener('click', async () => {
+      await this.addressProfilesRepo?.removeAddress(button.dataset.addressId);
+      await this.refreshAddressProfilesState();
+      await Promise.all(this.state.tabs.filter((tab) => !tab.isPrivate).map((tab) => this.pushAddressSuggestionsToTab(tab)));
+      this.render();
+    }));
+    page.querySelector('.fb-address-clear')?.addEventListener('click', async () => {
+      await this.addressProfilesRepo?.clearAddresses();
+      await this.refreshAddressProfilesState();
+      await Promise.all(this.state.tabs.filter((tab) => !tab.isPrivate).map((tab) => this.pushAddressSuggestionsToTab(tab)));
+      this.render();
+    });
+    page.querySelectorAll('.fb-form-value-remove').forEach((button) => button.addEventListener('click', async () => {
+      await this.formFieldValuesRepo?.removeValue(button.dataset.valueId);
+      await this.refreshFormFieldValuesState();
+      this.render();
+    }));
+    page.querySelector('.fb-form-values-clear')?.addEventListener('click', async () => {
+      await this.formFieldValuesRepo?.clearValues();
+      await this.refreshFormFieldValuesState();
+      this.render();
     });
 
     page.querySelector('#fb-in-toggle-savepwd')?.addEventListener('change', async (e) => {
@@ -13786,7 +14242,13 @@ export class BrowserShell {
     };
     this._siteFailures.set(tabId, failure);
     this.updateTabLoading(tabId, false);
-    if (tabId === this.state.activeTabId) this._scheduleSiteRecovery(tabId);
+    if (tabId === this.state.activeTabId) {
+      // Chromium's generic ERR_FAILED often represents a short-lived transport
+      // failure (rather than a stable DNS/offline condition). Probe the same
+      // retained URL immediately once; repeated failures still fall back to
+      // the normal capped backoff in _scheduleSiteRecovery.
+      this._scheduleSiteRecovery(tabId, { immediate: numericCode === -2 });
+    }
     return failure;
   }
 
@@ -13951,18 +14413,22 @@ export class BrowserShell {
         activeFailure.errorDescription = 'net::ERR_INTERNET_DISCONNECTED';
         this.requestRender();
       }
-      this.showTransientNotice('You\u2019re offline - new pages can\u2019t load until the connection is back. Pages you already opened stay available.');
+      if (this._isWebsiteUrl(activeTab?.url)) {
+        this.showTransientNotice('You\u2019re offline - new pages can\u2019t load until the connection is back. Pages you already opened stay available.', { kind: 'connectivity' });
+      }
     };
     const onOnline = () => {
       // Exactly the requested scope: immediately reload the active site only
       // when it is in a failed recovery state. Healthy tabs remain untouched.
       const activeFailure = this._siteFailureFor(this.state.activeTabId);
+      const activeTab = this.getActiveTab();
+      const websiteActive = this._isWebsiteUrl(activeTab?.url);
       if (activeFailure) {
-        this.showTransientNotice('Back online - retrying this page now.');
+        if (websiteActive) this.showTransientNotice('Back online - retrying this page now.', { kind: 'connectivity' });
         activeFailure.offline = false;
         this._retrySiteRecovery(activeFailure.tabId, { reason: 'online' });
       } else {
-        this.showTransientNotice('Back online.');
+        if (websiteActive) this.showTransientNotice('Back online.', { kind: 'connectivity' });
         try { this.render(); } catch { /* best-effort connectivity repaint */ }
       }
     };
@@ -17494,6 +17960,9 @@ export class BrowserShell {
     this.state.activeTabId = this.state.tabs[0].id;
     this.state.urlInputValue = '';
     this.state.isBookmarked = false;
+    this.state.rememberedEmails = [];
+    this.state.addressProfiles = [];
+    this.state.rememberedFormValues = [];
     // profileService already points at the destination profile. Block the
     // render-time catalog writer until that profile's own groups are loaded,
     // otherwise the previous profile's groups could leak into the new scope.
@@ -17563,6 +18032,12 @@ export class BrowserShell {
         await this.refreshEmailAddressesState();
         await this.pushEmailSuggestionsToOpenTabs();
       } catch { /* keep current */ }
+    }
+    if (this.addressProfilesRepo?.getAllAddresses) {
+      try { await this.refreshAddressProfilesState(); } catch { this.state.addressProfiles = []; }
+    }
+    if (this.formFieldValuesRepo?.getAllValues) {
+      try { await this.refreshFormFieldValuesState(); } catch { this.state.rememberedFormValues = []; }
     }
     if (this.wheelRepo?.getItems) {
       try {
@@ -22003,6 +22478,19 @@ export class BrowserShell {
       }
     }
 
+    // A native view can still be loading while the renderer receives several
+    // address/history updates. Send explicit user navigation through a
+    // distinct IPC intent; passive ensure calls during render must not replay
+    // an older URL over a redirect or SPA history change.
+    if (this.nativeWebview && this._nativeWebviewTabIds.has(activeTab.id)
+      && /^https?:\/\//i.test(targetUrl) && typeof this.nativeWebview.navigate === 'function') {
+      const activeProfileId = this.profileService ? this.profileService.current().id : 'default';
+      Promise.resolve(this.nativeWebview.navigate(activeTab.id, targetUrl, activeTab.isPrivate, activeProfileId, {
+        theme: this.state.settings.pointerTheme || 'system',
+        size: this.state.settings.pointerSize || 'normal'
+      })).catch((error) => console.warn('[yayra] explicit native navigation failed:', error));
+    }
+
     this.render();
 
     // Auto-complete loading for internal pages
@@ -25770,7 +26258,11 @@ export class BrowserShell {
     // ---- Host + status --------------------------------------------------
     const host = document.createElement('div');
     host.className = `fb-doc-host fb-doc-host-${documentKind}`;
-    host.style.cssText = 'flex:1; min-height:0; overflow:auto; display:flex; flex-direction:column; align-items:center; gap:12px; padding:16px;';
+    // PDF pages should begin close to the toolbar, not float in a large
+    // top gutter (which is especially apparent in the Windows frameless
+    // viewport). Keep comfortable side/bottom breathing room while removing
+    // the redundant top padding; the PDF page shadow provides separation.
+    host.style.cssText = `flex:1; min-height:0; overflow:auto; display:flex; flex-direction:column; align-items:center; gap:12px; padding:${documentKind === 'pdf' ? '0 16px 16px' : '16px'};`;
     const statusEl = document.createElement('div');
     statusEl.className = 'fb-doc-status';
     statusEl.setAttribute('role', 'status');
@@ -27484,6 +27976,12 @@ export class BrowserShell {
       this.persistSettings();
     }
     this._destroyed = true;
+    if (this._systemTopInsetResizeHandler && typeof window !== 'undefined') {
+      try { window.removeEventListener?.('resize', this._systemTopInsetResizeHandler); } catch { /* already closed */ }
+    }
+    this._systemTopInsetResizeHandler = null;
+    this._systemTopInsetRequest = null;
+    this.clearTransientNotice();
     for (const [target, type, listener, options] of this._selectionActionBindings || []) {
       try { target.removeEventListener?.(type, listener, options); } catch { /* target already gone */ }
     }
