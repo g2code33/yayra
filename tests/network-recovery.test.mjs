@@ -108,6 +108,28 @@ test('NETWORK RECOVERY: online immediately reloads only the active failed tab, w
   }
 });
 
+test('NETWORK RECOVERY: generic native ERR_FAILED gets one immediate retry of the retained URL', async () => {
+  const { shell, calls } = await makeNativeShell('https://transient.example/search?q=kept');
+  try {
+    const tab = shell.getActiveTab();
+    shell.handleNativeWebviewEvent({
+      tabId: tab.id,
+      type: 'fail-load',
+      url: tab.url,
+      errorCode: -2,
+      errorDescription: 'net::ERR_FAILED'
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.ok(calls.some((call) => call[0] === 'reload' && call[1] === tab.id && call[2] === tab.url),
+      'transient ERR_FAILED retries immediately without losing the exact target URL');
+    assert.equal(shell._siteFailureFor(tab.id)?.inFlight, true,
+      'normal attempt watchdog/backoff still owns the retry until a positive load event');
+  } finally {
+    shell.destroy();
+    delete window.yayra;
+  }
+});
+
 test('NETWORK RECOVERY: connectivity changes never reload a healthy page or a failed background tab', async () => {
   const { shell, calls } = await makeNativeShell('https://healthy.example/');
   try {

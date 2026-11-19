@@ -725,7 +725,7 @@ test('Vault page: Passwords and Keys sections render with counts, vault-unlock p
   assert.match(sitePasskeys.textContent, /Always active/);
   assert.match(sitePasskeys.textContent, /system-browser fallback/);
   const tabs = container.querySelectorAll('.fb-vault-tab');
-  assert.equal(tabs.length, 2);
+  assert.equal(tabs.length, 3, 'Passwords, Keys & Tokens, and Addresses sections render');
   assert.ok(container.querySelector('.fb-pwd-row'), 'password row renders');
 
   // Switch to Keys & Tokens section.

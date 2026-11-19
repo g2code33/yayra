@@ -7,12 +7,13 @@ setupDomShim();
 import { BrowserShell } from '../packages/shared-ui/src/components/BrowserShell.js';
 
 function installNativeWebview() {
-  const calls = { ensure: [], visible: [], bounds: [] };
+  const calls = { ensure: [], visible: [], bounds: [], invalidate: [] };
   globalThis.window.yayra = {
     webview: {
       ensure: async (tabId, url) => { calls.ensure.push({ tabId, url }); return {}; },
       setVisible: async (tabId, visible) => { calls.visible.push({ tabId, visible }); },
-      setBounds: async (tabId, bounds) => { calls.bounds.push({ tabId, bounds }); },
+      setBounds: async (tabId, bounds, options) => { calls.bounds.push({ tabId, bounds, options }); },
+      invalidate: async (tabId) => { calls.invalidate.push(tabId); },
       capture: async () => ({ snapshot: 'data:image/png;base64,tab-preview' }),
       destroy: async () => {},
       onEvent: () => () => {}
@@ -83,6 +84,9 @@ test('returning to a native tab force-restores visibility and fresh nonzero view
     assert.ok(calls.bounds.some((call) => call.tabId === first.id
       && call.bounds.width === 1200 && call.bounds.height === 700),
     'the returned page receives fresh viewport bounds instead of remaining at the hidden 0×0 rectangle');
+    assert.ok(calls.bounds.some((call) => call.tabId === first.id && call.options?.force === true),
+      'the same viewport geometry is re-applied to trigger a native compositor layout');
+    assert.ok(calls.invalidate.includes(first.id), 'Chromium gets a repaint request after returning to the tab');
   } finally {
     shell.destroy();
     uninstall();

@@ -41,6 +41,14 @@ const FILL_CHANNEL = 'yayra:autofill-fill';
 const EMAIL_FIELD_FOCUSED_CHANNEL = 'yayra:email-field-focused';
 const EMAIL_ADDRESS_CAPTURED_CHANNEL = 'yayra:email-address-captured';
 const EMAIL_SUGGESTIONS_CHANNEL = 'yayra:email-suggestions';
+const ADDRESS_FIELD_FOCUSED_CHANNEL = 'yayra:address-field-focused';
+const ADDRESS_CAPTURED_CHANNEL = 'yayra:address-captured';
+const ADDRESS_SUGGESTIONS_CHANNEL = 'yayra:address-suggestions';
+const FORM_FIELD_FOCUSED_CHANNEL = 'yayra:form-field-focused';
+const FORM_FIELD_CAPTURED_CHANNEL = 'yayra:form-field-captured';
+const FORM_SUGGESTIONS_CHANNEL = 'yayra:form-suggestions';
+const FORM_VALUE_SELECTED_CHANNEL = 'yayra:form-value-selected';
+const FORM_AUTOFILL_MANAGE_CHANNEL = 'yayra:form-autofill-manage';
 const PASSWORD_SUGGESTIONS_CHANNEL = 'yayra:autofill-credentials';
 const PASSWORD_CREDENTIAL_SELECTED_CHANNEL = 'yayra:autofill-credential-selected';
 const PASSWORD_MANAGE_CHANNEL = 'yayra:autofill-manage-passwords';
@@ -714,7 +722,8 @@ const announceTimer = setInterval(() => {
 function setNativeValue(input, value) {
   const proto = Object.getPrototypeOf(input);
   const desc = Object.getOwnPropertyDescriptor(proto, 'value')
-    || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+    || Object.getOwnPropertyDescriptor(input.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype
+      : input.tagName === 'SELECT' ? HTMLSelectElement.prototype : HTMLInputElement.prototype, 'value');
   if (desc && desc.set) desc.set.call(input, value);
   else input.value = value;
   input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -883,6 +892,452 @@ document.addEventListener('keydown', (event) => {
 
 window.addEventListener('scroll', positionEmailSuggestions, true);
 window.addEventListener('resize', positionEmailSuggestions, true);
+
+// Address profiles are shown only after focusing a recognized address field.
+// The closed-shadow picker exposes no data to the site and filling always
+// requires an explicit profile selection by the user.
+const ADDRESS_FIELD_HINTS = {
+  firstName: /given.?name|first.?name/,
+  lastName: /family.?name|last.?name/,
+  fullName: /(?:^|[^a-z])(?:name|full.?name)(?:$|[^a-z])/,
+  company: /company|organization|organisation|business/,
+  addressLine2: /address.?line.?2|address2|apartment|suite|unit/,
+  addressLine1: /address.?line.?1|address1|street.?address|street|billing.?address|shipping.?address/,
+  city: /city|town|locality/,
+  region: /state|province|region|county/,
+  postalCode: /postal|zip.?code|postcode/,
+  country: /country|country.?code/,
+  phone: /phone|tel(?:ephone)?/,
+  email: /e-?mail/
+};
+function addressFieldKey(field) {
+  if (!field || field.disabled || field.readOnly) return '';
+  const type = String(field.type || '').toLowerCase();
+  if (['password', 'hidden', 'button', 'submit', 'reset', 'checkbox', 'radio', 'file'].includes(type)) return '';
+  const auto = String(field.getAttribute?.('autocomplete') || '').toLowerCase().trim();
+  const autoToken = auto.split(/\s+/).pop();
+  const autoMap = {
+    name: 'fullName', 'given-name': 'firstName', 'family-name': 'lastName', organization: 'company',
+    'street-address': 'addressLine1', 'address-line1': 'addressLine1', 'address-line2': 'addressLine2',
+    address: 'addressLine1', 'address-level2': 'city', 'address-level1': 'region',
+    'postal-code': 'postalCode', country: 'country', 'country-name': 'country',
+    tel: 'phone', email: 'email'
+  };
+  if (autoMap[autoToken]) return autoMap[autoToken];
+  if (type === 'email') return 'email';
+  if (type === 'tel') return 'phone';
+  const hint = [field.name, field.id, field.placeholder, field.getAttribute?.('aria-label')]
+    .filter(Boolean).join(' ').toLowerCase().replace(/[_-]+/g, ' ');
+  for (const [key, pattern] of Object.entries(ADDRESS_FIELD_HINTS)) if (pattern.test(hint)) return key;
+  return '';
+}
+function recognizedAddressFields(scope) {
+  return Array.from((scope || document).querySelectorAll('input, textarea, select'))
+    .filter((field) => addressFieldKey(field) && isVisible(field));
+}
+function extractAddressProfile(scope) {
+  const result = {};
+  for (const field of recognizedAddressFields(scope)) {
+    const key = addressFieldKey(field);
+    const value = String(field.value || '').trim();
+    if (value && !result[key]) result[key] = value;
+  }
+  return result;
+}
+function reportAddressProfile(scope) {
+  const address = extractAddressProfile(scope);
+  if (!address.fullName && !address.firstName && !address.lastName && !address.addressLine1 && !address.postalCode) return;
+  try { ipcRenderer.send(ADDRESS_CAPTURED_CHANNEL, { url: String(location.href || ''), address }); } catch { /* detached */ }
+}
+document.addEventListener('submit', (event) => reportAddressProfile(event.target), true);
+document.addEventListener('click', (event) => {
+  const button = event.target?.closest?.('button, input[type="submit"], [role="button"]');
+  if (!button) return;
+  const label = `${button.textContent || ''} ${button.value || ''} ${button.getAttribute?.('aria-label') || ''}`;
+  if (!/checkout|place order|submit|save address|continue|pay|purchase/i.test(label)
+      && String(button.type || '').toLowerCase() !== 'submit') return;
+  reportAddressProfile(button.form || document);
+}, true);
+
+let savedAddressProfiles = [];
+let focusedAddressField = null;
+let addressSuggestionHost = null;
+let addressSuggestionList = null;
+let visibleAddressProfiles = [];
+let savedAddressFormValues = [];
+let visibleAddressFormValues = [];
+let selectedAddressSuggestion = -1;
+function ensureAddressMenu() {
+  if (addressSuggestionHost && addressSuggestionList) return true;
+  if (!document.documentElement) return false;
+  addressSuggestionHost = document.createElement('div');
+  addressSuggestionHost.setAttribute('aria-hidden', 'true');
+  addressSuggestionHost.style.cssText = 'position:fixed;display:none;z-index:2147483647;pointer-events:auto;';
+  const root = addressSuggestionHost.attachShadow({ mode: 'closed' });
+  root.innerHTML = `<style>
+    :host{all:initial;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    .menu{box-sizing:border-box;max-height:300px;overflow:auto;padding:5px;border:1px solid rgba(255,255,255,.16);border-radius:12px;background:#171a22;color:#f5f6fa;box-shadow:0 12px 36px rgba(0,0,0,.42)}
+    .heading{padding:7px 10px 5px;color:#a8adbd;font:600 10px/1.2 system-ui,sans-serif;text-transform:uppercase;letter-spacing:.08em}
+    button{all:unset;box-sizing:border-box;display:block;width:100%;padding:9px 10px;border-radius:8px;color:inherit;font:500 13px/1.35 system-ui,sans-serif;cursor:pointer}
+    button:hover,button:focus,button[aria-selected="true"]{background:rgba(109,93,242,.24);outline:none}.name{display:block;font-weight:650}.detail{display:block;margin-top:2px;color:#a8adbd;font-size:11px}
+    .manage{border-top:1px solid rgba(255,255,255,.1);margin-top:4px;padding-top:8px;color:#c5c9ff}
+  </style><div class="menu" role="listbox" aria-label="Saved address profiles"></div>`;
+  addressSuggestionList = root.querySelector('.menu');
+  document.documentElement.appendChild(addressSuggestionHost);
+  return true;
+}
+function hideAddressSuggestions() {
+  if (addressSuggestionHost) { addressSuggestionHost.style.display = 'none'; addressSuggestionHost.setAttribute('aria-hidden', 'true'); }
+  visibleAddressProfiles = [];
+  visibleAddressFormValues = [];
+  selectedAddressSuggestion = -1;
+}
+function positionAddressSuggestions() {
+  if (!addressSuggestionHost || addressSuggestionHost.style.display === 'none' || !focusedAddressField) return;
+  const rect = focusedAddressField.getBoundingClientRect?.();
+  if (!rect || !rect.width || !rect.height) { hideAddressSuggestions(); return; }
+  const vw = Math.max(240, Number(window.innerWidth) || 1024);
+  const vh = Math.max(200, Number(window.innerHeight) || 768);
+  const width = Math.max(220, Math.min(380, Math.max(rect.width, 260), vw - 16));
+  const height = addressSuggestionHost.getBoundingClientRect?.().height || 220;
+  const top = rect.bottom + height + 8 > vh && rect.top > height ? rect.top - height - 4 : rect.bottom + 4;
+  addressSuggestionHost.style.width = `${width}px`;
+  addressSuggestionHost.style.left = `${Math.max(8, Math.min(rect.left, vw - width - 8))}px`;
+  addressSuggestionHost.style.top = `${Math.max(8, top)}px`;
+}
+function fillAddressProfile(profile) {
+  if (!focusedAddressField || !profile) return;
+  const scope = focusedAddressField.form || document;
+  const fields = recognizedAddressFields(scope);
+  for (const field of fields) {
+    const key = addressFieldKey(field);
+    let value = profile[key];
+    if (value === undefined && key === 'fullName' && (profile.firstName || profile.lastName)) {
+      value = [profile.firstName, profile.lastName].filter(Boolean).join(' ');
+    }
+    if (value === undefined && (key === 'firstName' || key === 'lastName') && profile.fullName) {
+      const parts = String(profile.fullName).trim().split(/\s+/);
+      value = key === 'firstName' ? parts.shift() : parts.slice(1).join(' ');
+    }
+    if (value === undefined || value === null || String(value) === '') continue;
+    if (String(field.tagName || '').toLowerCase() === 'select') {
+      const normalized = String(value).trim().toLocaleLowerCase();
+      const option = Array.from(field.options || []).find((candidate) =>
+        String(candidate.value || '').trim().toLocaleLowerCase() === normalized
+        || String(candidate.textContent || '').trim().toLocaleLowerCase() === normalized);
+      if (option) value = option.value;
+    }
+    setNativeValue(field, String(value));
+  }
+  try { ipcRenderer.send('yayra:address-profile-selected', { addressId: profile.id, url: String(location.href || '') }); } catch { /* detached */ }
+  hideAddressSuggestions();
+}
+function fillRememberedAddressFieldValue(item) {
+  if (!focusedAddressField || !item) return;
+  setNativeValue(focusedAddressField, item.value);
+  try { ipcRenderer.send(FORM_VALUE_SELECTED_CHANNEL, { valueId: item.id, url: String(location.href || '') }); } catch { /* detached */ }
+  hideAddressSuggestions();
+}
+function renderAddressSuggestions() {
+  if (!focusedAddressField || !addressFieldKey(focusedAddressField) || !ensureAddressMenu()) { hideAddressSuggestions(); return; }
+  const query = String(focusedAddressField.value || '').trim().toLocaleLowerCase();
+  visibleAddressProfiles = savedAddressProfiles.filter((profile) => !query
+    || `${profile.label} ${profile.fullName} ${profile.firstName} ${profile.lastName} ${profile.addressLine1} ${profile.city} ${profile.postalCode}`.toLocaleLowerCase().includes(query)).slice(0, 8);
+  visibleAddressFormValues = savedAddressFormValues.filter((item) => !query
+    || item.value.toLocaleLowerCase().startsWith(query)).slice(0, 8);
+  if (!visibleAddressProfiles.length && !visibleAddressFormValues.length) { hideAddressSuggestions(); return; }
+  selectedAddressSuggestion = -1;
+  addressSuggestionList.textContent = '';
+  let optionIndex = 0;
+  if (visibleAddressProfiles.length) {
+    const heading = document.createElement('div'); heading.className = 'heading'; heading.textContent = 'Saved addresses'; addressSuggestionList.appendChild(heading);
+    for (const profile of visibleAddressProfiles) {
+      const button = document.createElement('button');
+      button.type = 'button'; button.className = 'address-option'; button.setAttribute('role', 'option');
+      button.setAttribute('aria-selected', 'false'); button.dataset.optionIndex = String(optionIndex++);
+      const name = document.createElement('span'); name.className = 'name'; name.textContent = `${profile.label || 'Address'}${profile.isDefault ? ' · Default' : ''}`;
+      const detail = document.createElement('span'); detail.className = 'detail';
+      detail.textContent = [profile.fullName || [profile.firstName, profile.lastName].filter(Boolean).join(' '), profile.addressLine1, profile.city, profile.region].filter(Boolean).join(' · ');
+      button.append(name, detail);
+      button.addEventListener('pointerdown', (event) => event.preventDefault());
+      button.addEventListener('click', () => fillAddressProfile(profile));
+      addressSuggestionList.appendChild(button);
+    }
+  }
+  if (visibleAddressFormValues.length) {
+    const heading = document.createElement('div'); heading.className = 'heading'; heading.textContent = 'Previously entered in this field'; addressSuggestionList.appendChild(heading);
+    for (const item of visibleAddressFormValues) {
+      const button = document.createElement('button');
+      button.type = 'button'; button.className = 'address-option'; button.setAttribute('role', 'option');
+      button.setAttribute('aria-selected', 'false'); button.dataset.optionIndex = String(optionIndex++);
+      button.textContent = item.value;
+      button.addEventListener('pointerdown', (event) => event.preventDefault());
+      button.addEventListener('click', () => fillRememberedAddressFieldValue(item));
+      addressSuggestionList.appendChild(button);
+    }
+  }
+  const manage = document.createElement('button'); manage.type = 'button'; manage.className = 'manage'; manage.textContent = 'Manage addresses…';
+  manage.addEventListener('pointerdown', (event) => event.preventDefault());
+  manage.addEventListener('click', () => {
+    hideAddressSuggestions();
+    try { ipcRenderer.send('yayra:address-autofill-manage', { url: String(location.href || '') }); } catch { /* detached */ }
+  });
+  addressSuggestionList.appendChild(manage);
+  const manageValues = document.createElement('button'); manageValues.type = 'button'; manageValues.className = 'manage'; manageValues.textContent = 'Manage saved form info…';
+  manageValues.addEventListener('pointerdown', (event) => event.preventDefault());
+  manageValues.addEventListener('click', () => {
+    hideAddressSuggestions();
+    try { ipcRenderer.send(FORM_AUTOFILL_MANAGE_CHANNEL, { url: String(location.href || '') }); } catch { /* detached */ }
+  });
+  addressSuggestionList.appendChild(manageValues);
+  addressSuggestionHost.style.display = 'block'; addressSuggestionHost.setAttribute('aria-hidden', 'false'); positionAddressSuggestions();
+}
+ipcRenderer.on(ADDRESS_SUGGESTIONS_CHANNEL, (_event, payload = {}) => {
+  savedAddressProfiles = (Array.isArray(payload?.addresses) ? payload.addresses : []).slice(0, 25)
+    .filter((item) => item && /^addr-[A-Za-z0-9-]{3,100}$/.test(String(item.id || '')))
+    .map((item) => ({ ...item }));
+  const expectedFieldKey = focusedAddressField && addressFieldKey(focusedAddressField)
+    ? `address:${addressFieldKey(focusedAddressField)}`.toLowerCase() : '';
+  savedAddressFormValues = payload?.fieldKey === expectedFieldKey
+    ? (Array.isArray(payload?.values) ? payload.values : []).slice(0, 12)
+      .filter((item) => item && /^formval-[A-Za-z0-9-]{3,100}$/.test(String(item.id || ''))
+        && typeof item.value === 'string' && !FORM_FIELD_SENSITIVE_HINT.test(`${item.fieldKey || ''} ${item.label || ''}`))
+      .map((item) => ({ id: item.id, value: item.value }))
+    : [];
+  if (focusedAddressField) renderAddressSuggestions(); else hideAddressSuggestions();
+});
+document.addEventListener('focusin', (event) => {
+  const target = event.target;
+  const fieldKey = addressFieldKey(target);
+  if (!fieldKey || fieldKey === 'email' || !isVisible(target)) return;
+  focusedAddressField = target; savedAddressProfiles = []; savedAddressFormValues = []; hideAddressSuggestions();
+  try { ipcRenderer.send(ADDRESS_FIELD_FOCUSED_CHANNEL, { url: String(location.href || ''), field: addressFieldKey(target) }); } catch { /* detached */ }
+}, true);
+document.addEventListener('input', (event) => { if (event.target === focusedAddressField) renderAddressSuggestions(); }, true);
+document.addEventListener('focusout', (event) => {
+  if (event.target !== focusedAddressField) return;
+  setTimeout(() => { if (document.activeElement !== focusedAddressField && document.activeElement !== addressSuggestionHost) { focusedAddressField = null; hideAddressSuggestions(); } }, 0);
+}, true);
+document.addEventListener('keydown', (event) => {
+  if (!addressSuggestionHost || addressSuggestionHost.style.display === 'none' || !focusedAddressField) return;
+  if (event.key === 'Escape') { hideAddressSuggestions(); return; }
+  const optionCount = visibleAddressProfiles.length + visibleAddressFormValues.length;
+  if (!optionCount) return;
+  if (event.key === 'ArrowDown') selectedAddressSuggestion = (selectedAddressSuggestion + 1) % optionCount;
+  else if (event.key === 'ArrowUp') selectedAddressSuggestion = selectedAddressSuggestion <= 0
+    ? optionCount - 1 : selectedAddressSuggestion - 1;
+  else if (event.key === 'Enter') {
+    event.preventDefault();
+    const chosen = selectedAddressSuggestion < 0 ? 0 : selectedAddressSuggestion;
+    if (chosen < visibleAddressProfiles.length) fillAddressProfile(visibleAddressProfiles[chosen]);
+    else fillRememberedAddressFieldValue(visibleAddressFormValues[chosen - visibleAddressProfiles.length]);
+    return;
+  } else return;
+  event.preventDefault();
+  addressSuggestionList.querySelectorAll('.address-option').forEach((button, index) => {
+    button.setAttribute('aria-selected', String(index === selectedAddressSuggestion));
+  });
+}, true);
+window.addEventListener('scroll', positionAddressSuggestions, true);
+window.addEventListener('resize', positionAddressSuggestions, true);
+
+// Cross-site recall for ordinary, non-sensitive form fields. Values are
+// captured only after the user leaves a field or submits its form; private
+// tabs, passwords, payment/security fields, and email are excluded. Address
+// fields are remembered too, while the richer saved-address profile picker remains available.
+const FORM_FIELD_SENSITIVE_HINT = /password|passcode|one.?time|otp|verification|security.?code|cvv|cvc|card|credit|debit|payment|billing.?number|account.?number|routing|social.?security|\bssn\b|secret|token|\bpin\b|auth(?:entication|orization|.?token|.?code)/i;
+function isRecallableFormField(field) {
+  if (!field || field.disabled || field.readOnly) return false;
+  const tag = String(field.tagName || '').toLowerCase();
+  if (!['input', 'textarea', 'select'].includes(tag)) return false;
+  const type = String(field.type || '').toLowerCase();
+  if (tag === 'input' && !['', 'text', 'search', 'url', 'tel', 'number', 'date', 'time', 'month', 'week'].includes(type)) return false;
+  const autocomplete = String(field.getAttribute?.('autocomplete') || '').toLowerCase();
+  const hints = [field.name, field.id, field.placeholder, field.getAttribute?.('aria-label'), autocomplete]
+    .filter(Boolean).join(' ').toLowerCase();
+  if (FORM_FIELD_SENSITIVE_HINT.test(hints) || /(?:^|\s)(?:cc-|one-time-code|current-password|new-password)/.test(autocomplete)) return false;
+  if (addressFieldKey(field) === 'email' || isEmailField(field)) return false;
+  return true;
+}
+function formFieldDescriptor(field) {
+  const autocomplete = String(field.getAttribute?.('autocomplete') || '').toLowerCase().trim();
+  const token = autocomplete.split(/\s+/).pop();
+  const metadata = [field.getAttribute?.('aria-label'), field.placeholder, field.name, field.id]
+    .map((value) => String(value || '').trim()).filter(Boolean);
+  const label = (metadata[0] || String(field.labels?.[0]?.textContent || '') || field.name || field.id || 'Form field')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 100);
+  const source = metadata[0] || String(field.labels?.[0]?.textContent || '').trim();
+  const addressKey = addressFieldKey(field);
+  if (addressKey && addressKey !== 'email') return { fieldKey: `address:${addressKey}`, label: label || 'Address field' };
+  if (!source) return null;
+  let key = token && !['on', 'off'].includes(token) ? `autocomplete:${token}` : '';
+  const lower = `${source} ${metadata.join(' ')}`.toLowerCase();
+  if (!key) {
+    const categories = [
+      ['company', /company|organization|organisation|business/],
+      ['job-title', /job.?title|occupation|position/],
+      ['website', /website|homepage|web.?url/],
+      ['message', /message|comment|description|feedback/],
+      ['note', /note|special.?instruction/],
+      ['reference', /reference|order.?number|invoice.?number/]
+    ];
+    key = categories.find(([, pattern]) => pattern.test(lower))?.[0]
+      || `field:${source.toLowerCase().replace(/\[\d+\]/g, '').replace(/[^a-z0-9]+/g, ' ').trim().slice(0, 120)}`;
+  }
+  return { fieldKey: String(key).slice(0, 160), label: label || 'Form field' };
+}
+const recentFormFieldReports = new Map();
+function reportFormField(field) {
+  if (!isRecallableFormField(field) || !isVisible(field)) return;
+  const descriptor = formFieldDescriptor(field);
+  const value = String(field.value || '').trim();
+  if (!descriptor || !value || value.length > 1200) return;
+  const dedupeKey = `${descriptor.fieldKey}\u0000${value.toLocaleLowerCase()}`;
+  const now = Date.now();
+  if (now - (recentFormFieldReports.get(dedupeKey) || 0) < 2500) return;
+  recentFormFieldReports.set(dedupeKey, now);
+  if (recentFormFieldReports.size > 128) recentFormFieldReports.delete(recentFormFieldReports.keys().next().value);
+  try {
+    ipcRenderer.send(FORM_FIELD_CAPTURED_CHANNEL, {
+      url: String(location.href || ''), fieldKey: descriptor.fieldKey, label: descriptor.label, value
+    });
+  } catch { /* detached */ }
+}
+function reportFormFields(scope) {
+  if (!scope || typeof scope.querySelectorAll !== 'function') return;
+  for (const field of Array.from(scope.querySelectorAll('input, textarea, select'))) reportFormField(field);
+}
+document.addEventListener('focusout', (event) => reportFormField(event.target), true);
+document.addEventListener('submit', (event) => reportFormFields(event.target), true);
+let savedFormFieldValues = [];
+let focusedRecallField = null;
+let focusedRecallDescriptor = null;
+let formSuggestionHost = null;
+let formSuggestionList = null;
+let visibleFormFieldValues = [];
+let selectedFormFieldValue = -1;
+function ensureFormSuggestionMenu() {
+  if (formSuggestionHost && formSuggestionList) return true;
+  if (!document.documentElement) return false;
+  formSuggestionHost = document.createElement('div');
+  formSuggestionHost.setAttribute('aria-hidden', 'true');
+  formSuggestionHost.style.cssText = 'position:fixed;display:none;z-index:2147483647;pointer-events:auto;';
+  const root = formSuggestionHost.attachShadow({ mode: 'closed' });
+  root.innerHTML = `<style>
+    :host{all:initial;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    .menu{box-sizing:border-box;max-height:280px;overflow:auto;padding:5px;border:1px solid rgba(255,255,255,.16);border-radius:12px;background:#171a22;color:#f5f6fa;box-shadow:0 12px 36px rgba(0,0,0,.42)}
+    .heading{padding:7px 10px 5px;color:#a8adbd;font:600 10px/1.2 system-ui,sans-serif;text-transform:uppercase;letter-spacing:.08em}
+    button{all:unset;box-sizing:border-box;display:block;width:100%;padding:9px 10px;border-radius:8px;color:inherit;font:500 13px/1.35 system-ui,sans-serif;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    button:hover,button[aria-selected="true"]{background:rgba(109,93,242,.24)}.detail{display:block;margin-top:2px;color:#a8adbd;font-size:11px}
+    .manage{border-top:1px solid rgba(255,255,255,.1);margin-top:4px;padding-top:8px;color:#c5c9ff}
+  </style><div class="menu" role="listbox" aria-label="Previously entered form information"></div>`;
+  formSuggestionList = root.querySelector('.menu');
+  document.documentElement.appendChild(formSuggestionHost);
+  return Boolean(formSuggestionList);
+}
+function hideFormFieldSuggestions() {
+  if (formSuggestionHost) { formSuggestionHost.style.display = 'none'; formSuggestionHost.setAttribute('aria-hidden', 'true'); }
+  visibleFormFieldValues = [];
+  selectedFormFieldValue = -1;
+}
+function positionFormFieldSuggestions() {
+  if (!formSuggestionHost || formSuggestionHost.style.display === 'none' || !focusedRecallField) return;
+  const rect = focusedRecallField.getBoundingClientRect?.();
+  if (!rect || !rect.width || !rect.height) { hideFormFieldSuggestions(); return; }
+  const vw = Math.max(240, Number(window.innerWidth) || 1024);
+  const vh = Math.max(200, Number(window.innerHeight) || 768);
+  const width = Math.max(220, Math.min(380, Math.max(rect.width, 260), vw - 16));
+  const height = formSuggestionHost.getBoundingClientRect?.().height || 210;
+  const top = rect.bottom + height + 8 > vh && rect.top > height ? rect.top - height - 4 : rect.bottom + 4;
+  formSuggestionHost.style.width = `${width}px`;
+  formSuggestionHost.style.left = `${Math.max(8, Math.min(rect.left, vw - width - 8))}px`;
+  formSuggestionHost.style.top = `${Math.max(8, top)}px`;
+}
+function fillRememberedFormValue(item) {
+  if (!focusedRecallField || !item) return;
+  if (String(focusedRecallField.tagName || '').toLowerCase() === 'select') {
+    const normalized = String(item.value).trim().toLocaleLowerCase();
+    const option = Array.from(focusedRecallField.options || []).find((candidate) =>
+      String(candidate.value || '').trim().toLocaleLowerCase() === normalized
+      || String(candidate.textContent || '').trim().toLocaleLowerCase() === normalized);
+    if (option) setNativeValue(focusedRecallField, option.value);
+    else return;
+  } else setNativeValue(focusedRecallField, item.value);
+  try { ipcRenderer.send(FORM_VALUE_SELECTED_CHANNEL, { valueId: item.id, url: String(location.href || '') }); } catch { /* detached */ }
+  hideFormFieldSuggestions();
+}
+function renderFormFieldSuggestions() {
+  if (!focusedRecallField || !isRecallableFormField(focusedRecallField) || !ensureFormSuggestionMenu()) {
+    hideFormFieldSuggestions(); return;
+  }
+  const query = String(focusedRecallField.value || '').trim().toLocaleLowerCase();
+  visibleFormFieldValues = savedFormFieldValues.filter((item) => item.fieldKey === focusedRecallDescriptor?.fieldKey
+    && (!query || item.value.toLocaleLowerCase().startsWith(query))).slice(0, 10);
+  if (!visibleFormFieldValues.length) { hideFormFieldSuggestions(); return; }
+  selectedFormFieldValue = -1;
+  formSuggestionList.textContent = '';
+  const heading = document.createElement('div'); heading.className = 'heading'; heading.textContent = 'Previously entered'; formSuggestionList.appendChild(heading);
+  for (const item of visibleFormFieldValues) {
+    const button = document.createElement('button');
+    button.type = 'button'; button.setAttribute('role', 'option'); button.setAttribute('aria-selected', 'false');
+    button.textContent = item.value;
+    button.addEventListener('pointerdown', (event) => event.preventDefault());
+    button.addEventListener('click', () => fillRememberedFormValue(item));
+    formSuggestionList.appendChild(button);
+  }
+  const manage = document.createElement('button'); manage.type = 'button'; manage.className = 'manage'; manage.textContent = 'Manage saved form info…';
+  manage.addEventListener('pointerdown', (event) => event.preventDefault());
+  manage.addEventListener('click', () => {
+    hideFormFieldSuggestions();
+    try { ipcRenderer.send(FORM_AUTOFILL_MANAGE_CHANNEL, { url: String(location.href || '') }); } catch { /* detached */ }
+  });
+  formSuggestionList.appendChild(manage);
+  formSuggestionHost.style.display = 'block'; formSuggestionHost.setAttribute('aria-hidden', 'false'); positionFormFieldSuggestions();
+}
+ipcRenderer.on(FORM_SUGGESTIONS_CHANNEL, (_event, payload = {}) => {
+  if (!focusedRecallDescriptor || String(payload?.fieldKey || '') !== focusedRecallDescriptor.fieldKey) return;
+  savedFormFieldValues = (Array.isArray(payload?.values) ? payload.values : []).slice(0, 12)
+    .filter((item) => item && /^formval-[A-Za-z0-9-]{3,100}$/.test(String(item.id || ''))
+      && typeof item.value === 'string' && item.value.length <= 1200
+      && !FORM_FIELD_SENSITIVE_HINT.test(`${item.fieldKey || ''} ${item.label || ''}`))
+    .map((item) => ({ id: item.id, fieldKey: String(item.fieldKey || ''), label: String(item.label || ''), value: item.value }));
+  renderFormFieldSuggestions();
+});
+document.addEventListener('focusin', (event) => {
+  const field = event.target;
+  if (!isRecallableFormField(field) || !isVisible(field) || addressFieldKey(field)) return;
+  const descriptor = formFieldDescriptor(field);
+  if (!descriptor) return;
+  focusedRecallField = field; focusedRecallDescriptor = descriptor; savedFormFieldValues = []; hideFormFieldSuggestions();
+  try { ipcRenderer.send(FORM_FIELD_FOCUSED_CHANNEL, { url: String(location.href || ''), ...descriptor }); } catch { /* detached */ }
+}, true);
+document.addEventListener('input', (event) => { if (event.target === focusedRecallField) renderFormFieldSuggestions(); }, true);
+document.addEventListener('focusout', (event) => {
+  if (event.target !== focusedRecallField) return;
+  setTimeout(() => {
+    if (document.activeElement !== focusedRecallField && document.activeElement !== formSuggestionHost) {
+      focusedRecallField = null; focusedRecallDescriptor = null; hideFormFieldSuggestions();
+    }
+  }, 0);
+}, true);
+document.addEventListener('keydown', (event) => {
+  if (!formSuggestionHost || formSuggestionHost.style.display === 'none' || !focusedRecallField) return;
+  if (event.key === 'Escape') { hideFormFieldSuggestions(); return; }
+  if (event.key === 'ArrowDown') selectedFormFieldValue = (selectedFormFieldValue + 1) % visibleFormFieldValues.length;
+  else if (event.key === 'ArrowUp') selectedFormFieldValue = selectedFormFieldValue <= 0
+    ? visibleFormFieldValues.length - 1 : selectedFormFieldValue - 1;
+  else if (event.key === 'Enter') {
+    event.preventDefault();
+    fillRememberedFormValue(visibleFormFieldValues[selectedFormFieldValue < 0 ? 0 : selectedFormFieldValue]);
+    return;
+  } else return;
+  event.preventDefault();
+  formSuggestionList.querySelectorAll('button[role="option"]').forEach((button, index) => {
+    button.setAttribute('aria-selected', String(index === selectedFormFieldValue));
+  });
+}, true);
+window.addEventListener('scroll', positionFormFieldSuggestions, true);
+window.addEventListener('resize', positionFormFieldSuggestions, true);
 
 // Saved website passwords are presented only when the user focuses a login
 // field. The isolated picker carries opaque vault IDs and usernames only; the

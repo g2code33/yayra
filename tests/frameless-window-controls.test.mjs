@@ -19,19 +19,19 @@ import { BrowserShell } from '../packages/shared-ui/src/components/BrowserShell.
  * never render there.
  */
 
-function installFakeWindowControls() {
+function installFakeWindowControls({ topInset } = {}) {
   const calls = { minimize: 0, toggleMaximize: 0, close: 0, dragStart: [], dragMove: [], dragEnd: 0 };
-  globalThis.window.yayra = {
-    windowControls: {
-      minimize: () => { calls.minimize += 1; return Promise.resolve(); },
-      toggleMaximize: () => { calls.toggleMaximize += 1; return Promise.resolve(true); },
-      isMaximized: () => Promise.resolve(false),
-      close: () => { calls.close += 1; return Promise.resolve(); },
-      dragStart: (point) => { calls.dragStart.push(point); },
-      dragMove: (point) => { calls.dragMove.push(point); },
-      dragEnd: () => { calls.dragEnd += 1; }
-    }
+  const windowControls = {
+    minimize: () => { calls.minimize += 1; return Promise.resolve(); },
+    toggleMaximize: () => { calls.toggleMaximize += 1; return Promise.resolve(true); },
+    isMaximized: () => Promise.resolve(false),
+    close: () => { calls.close += 1; return Promise.resolve(); },
+    dragStart: (point) => { calls.dragStart.push(point); },
+    dragMove: (point) => { calls.dragMove.push(point); },
+    dragEnd: () => { calls.dragEnd += 1; }
   };
+  if (Number.isFinite(topInset)) windowControls.getTopInset = () => Promise.resolve(topInset);
+  globalThis.window.yayra = { windowControls };
   return { calls, uninstall: () => { delete globalThis.window.yayra; } };
 }
 
@@ -61,6 +61,50 @@ test('web/PWA (no bridge): no window-control buttons - the browser owns the wind
   assert.equal(el.querySelector('.fb-window-controls'), null);
   assert.equal(el.querySelector('.fb-window-controls-safe-gap'), null, 'web/PWA does not reserve space for controls it does not own');
   assert.equal(el.querySelector('.fb-tabstrip-drag-handle'), null, 'web/PWA has no desktop window drag handle');
+});
+
+test('Windows frameless chrome never inherits a taskbar work-area offset as a blank top band', async () => {
+  const { uninstall } = installFakeWindowControls();
+  const previousScreen = window.screen;
+  const previousScreenY = window.screenY;
+  window.screen = { availTop: 48 };
+  window.screenY = 0;
+  const shell = new BrowserShell({ container: document.createElement('div'), platform: 'win32', isMobile: false });
+  try {
+    assert.equal(shell.getSystemTopInset(), 0,
+      'the Linux panel-overlap compensation is not applied to Windows PDF/document layouts');
+  } finally {
+    shell.destroy();
+    uninstall();
+    if (previousScreen === undefined) delete window.screen;
+    else window.screen = previousScreen;
+    if (previousScreenY === undefined) delete window.screenY;
+    else window.screenY = previousScreenY;
+  }
+});
+
+test('native Linux work-area inset corrects unreliable Wayland renderer screen coordinates', async () => {
+  const { uninstall } = installFakeWindowControls({ topInset: 32 });
+  const previousScreen = window.screen;
+  const previousScreenY = window.screenY;
+  window.screen = { availTop: 0 };
+  window.screenY = 0;
+  const container = document.createElement('div');
+  const shell = new BrowserShell({ container, platform: 'linux', isMobile: false });
+  try {
+    await shell.initialize();
+    const el = shell.render(container);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(el.style.getPropertyValue('--fb-window-system-top-inset'), '32px',
+      'the main-process work area moves all chrome and document viewers below the GNOME panel');
+  } finally {
+    shell.destroy();
+    uninstall();
+    if (previousScreen === undefined) delete window.screen;
+    else window.screen = previousScreen;
+    if (previousScreenY === undefined) delete window.screenY;
+    else window.screenY = previousScreenY;
+  }
 });
 
 test('frameless desktop chrome clears the OS top-panel work-area inset when overlapped', async () => {

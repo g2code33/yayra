@@ -19,10 +19,11 @@ import { BrowserShell } from '../packages/shared-ui/src/components/BrowserShell.
  */
 
 function installFakeNativeWebview({ auth = null } = {}) {
-  const calls = { ensure: [], setBounds: [], setVisible: [], capture: [], destroy: [], goBack: [], goForward: [], reload: [], stop: [] };
+  const calls = { ensure: [], navigate: [], setBounds: [], setVisible: [], capture: [], destroy: [], goBack: [], goForward: [], reload: [], stop: [] };
   let eventListener = null;
   const fake = {
     ensure: (tabId, url, isPrivate) => { calls.ensure.push({ tabId, url, isPrivate }); return Promise.resolve({ handedOffToSystemBrowser: false }); },
+    navigate: (tabId, url, isPrivate) => { calls.navigate.push({ tabId, url, isPrivate }); return Promise.resolve({ handedOffToSystemBrowser: false }); },
     setBounds: (tabId, bounds) => { calls.setBounds.push({ tabId, bounds }); return Promise.resolve(); },
     setVisible: (tabId, visible) => { calls.setVisible.push({ tabId, visible }); return Promise.resolve(); },
     capture: (tabId) => { calls.capture.push(tabId); return Promise.resolve({ snapshot: `data:image/png;base64,${tabId}` }); },
@@ -169,6 +170,13 @@ test('Native engine PRESENT (Electron desktop): external navigation NEVER create
     const lastCall = calls.ensure[calls.ensure.length - 1];
     assert.equal(lastCall.tabId, activeTab.id);
     assert.equal(lastCall.url, 'https://www.google.com/search?q=ghana');
+
+    shell.navigateActiveTab('https://www.google.com/search?q=refresh-target');
+    assert.deepEqual(calls.navigate.at(-1), {
+      tabId: activeTab.id,
+      url: 'https://www.google.com/search?q=refresh-target',
+      isPrivate: false
+    }, 'a deliberate address-bar change uses the explicit navigation channel instead of render-time ensure');
   } finally {
     uninstall();
   }

@@ -368,6 +368,222 @@ export function createEmailAddressesRepo(storage) {
   return repo;
 }
 
+const ADDRESS_PROFILES_KEY = 'autofill-addresses';
+const ADDRESS_PROFILE_LIMIT = 100;
+let addressProfileSequence = 0;
+const ADDRESS_PROFILE_FIELDS = [
+  'fullName', 'firstName', 'lastName', 'company', 'addressLine1', 'addressLine2', 'city', 'region',
+  'postalCode', 'country', 'phone', 'email'
+];
+
+function cleanAddressText(value, max = 180) {
+  return String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+export function normalizeAddressProfile(value, { id } = {}) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const profile = {};
+  for (const field of ADDRESS_PROFILE_FIELDS) profile[field] = cleanAddressText(value[field], field === 'addressLine1' || field === 'addressLine2' ? 240 : 180);
+  if (profile.email && !normalizeEmailAddress(profile.email)) return null;
+  if (!ADDRESS_PROFILE_FIELDS.some((field) => profile[field])) return null;
+  const now = Date.now();
+  const sourceId = String(id || value.id || '');
+  return {
+    id: /^addr-[A-Za-z0-9-]{3,100}$/.test(sourceId)
+      ? sourceId
+      : `addr-${now}-${++addressProfileSequence}-${Math.random().toString(36).slice(2, 9)}`,
+    label: cleanAddressText(value.label || 'Home', 40) || 'Home',
+    ...profile,
+    isDefault: value.isDefault === true,
+    addedAt: Math.max(0, Number(value.addedAt) || now),
+    lastUsedAt: Math.max(0, Number(value.lastUsedAt) || Number(value.addedAt) || now)
+  };
+}
+
+/** Profile-scoped local address books for explicit website autofill. */
+export function createAddressProfilesRepo(storage) {
+  const persist = async (items) => {
+    const normalized = items.map((item) => normalizeAddressProfile(item)).filter(Boolean).slice(0, ADDRESS_PROFILE_LIMIT);
+    const defaults = normalized.filter((item) => item.isDefault);
+    if (defaults.length > 1) {
+      const keep = defaults.sort((a, b) => b.lastUsedAt - a.lastUsedAt)[0]?.id;
+      for (const item of normalized) item.isDefault = item.id === keep;
+    }
+    normalized.sort((a, b) => Number(b.isDefault) - Number(a.isDefault) || b.lastUsedAt - a.lastUsedAt);
+    await storage.set(ADDRESS_PROFILES_KEY, normalized);
+    return normalized;
+  };
+  const repo = {
+    async getAllAddresses() {
+      const stored = await storage.get(ADDRESS_PROFILES_KEY);
+      const seen = new Set();
+      let changed = !Array.isArray(stored);
+      const items = [];
+      for (const source of Array.isArray(stored) ? stored : []) {
+        const item = normalizeAddressProfile(source);
+        if (!item || seen.has(item.id)) { changed = true; continue; }
+        seen.add(item.id);
+        items.push(item);
+      }
+      if (items.length > ADDRESS_PROFILE_LIMIT) changed = true;
+      const sorted = items.slice(0, ADDRESS_PROFILE_LIMIT)
+        .sort((a, b) => Number(b.isDefault) - Number(a.isDefault) || b.lastUsedAt - a.lastUsedAt);
+      if (changed) await storage.set(ADDRESS_PROFILES_KEY, sorted);
+      return sorted;
+    },
+    async addAddress(value) {
+      const candidate = normalizeAddressProfile(value);
+      if (!candidate) return null;
+      const items = await repo.getAllAddresses();
+      const now = Date.now();
+      const existingIndex = items.findIndex((item) => item.id === candidate.id);
+      candidate.addedAt = existingIndex >= 0 ? items[existingIndex].addedAt : now;
+      candidate.lastUsedAt = now;
+      if (candidate.isDefault) for (const item of items) item.isDefault = false;
+      if (existingIndex >= 0) items.splice(existingIndex, 1);
+      const saved = await persist([candidate, ...items]);
+      return saved.find((item) => item.id === candidate.id) || candidate;
+    },
+    async updateAddress(id, changes = {}) {
+      const items = await repo.getAllAddresses();
+      const index = items.findIndex((item) => item.id === String(id || ''));
+      if (index < 0) return null;
+      const updated = normalizeAddressProfile({ ...items[index], ...(changes || {}), id: items[index].id });
+      if (!updated) return null;
+      if (updated.isDefault) for (const item of items) item.isDefault = false;
+      items.splice(index, 1, updated);
+      await persist(items);
+      return updated;
+    },
+    async setDefaultAddress(id) {
+      const items = await repo.getAllAddresses();
+      let found = false;
+      const updated = items.map((item) => {
+        const isDefault = item.id === String(id || '');
+        if (isDefault) found = true;
+        return { ...item, isDefault };
+      });
+      if (!found) return false;
+      await persist(updated);
+      return true;
+    },
+    async touchAddress(id) {
+      const items = await repo.getAllAddresses();
+      const item = items.find((address) => address.id === String(id || ''));
+      if (!item) return null;
+      item.lastUsedAt = Date.now();
+      await persist(items);
+      return item;
+    },
+    async removeAddress(id) {
+      const items = await repo.getAllAddresses();
+      await persist(items.filter((item) => item.id !== String(id || '')));
+      return true;
+    },
+    async clearAddresses() {
+      if (typeof storage.delete === 'function') await storage.delete(ADDRESS_PROFILES_KEY);
+      else await storage.set(ADDRESS_PROFILES_KEY, []);
+    }
+  };
+  return repo;
+}
+
+const FORM_FIELD_VALUES_KEY = 'autofill-form-values';
+const FORM_FIELD_VALUE_LIMIT = 200;
+let formFieldValueSequence = 0;
+
+export function normalizeFormFieldKey(value) {
+  return String(value || '').toLowerCase()
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ').trim().slice(0, 160);
+}
+
+export function normalizeFormFieldValue(value, { id } = {}) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const fieldKey = normalizeFormFieldKey(value.fieldKey);
+  const text = String(value.value ?? '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ').trim().slice(0, 1200);
+  if (!fieldKey || !text) return null;
+  const sourceId = String(id || value.id || '');
+  const now = Date.now();
+  return {
+    id: /^formval-[A-Za-z0-9-]{3,100}$/.test(sourceId)
+      ? sourceId
+      : `formval-${now}-${++formFieldValueSequence}-${Math.random().toString(36).slice(2, 8)}`,
+    fieldKey,
+    label: String(value.label || 'Form field').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 100) || 'Form field',
+    value: text,
+    lastUsedAt: Math.max(0, Number(value.lastUsedAt) || now)
+  };
+}
+
+/** Profile-local recall for non-sensitive values entered into web forms. */
+export function createFormFieldValuesRepo(storage) {
+  const sanitize = (values) => {
+    const items = [];
+    const seenIds = new Set();
+    const seenValues = new Set();
+    for (const source of Array.isArray(values) ? values : []) {
+      const item = normalizeFormFieldValue(source);
+      if (!item || seenIds.has(item.id)) continue;
+      const key = `${item.fieldKey}\u0000${item.value.toLocaleLowerCase()}`;
+      if (seenValues.has(key)) continue;
+      seenIds.add(item.id);
+      seenValues.add(key);
+      items.push(item);
+    }
+    return items.sort((a, b) => b.lastUsedAt - a.lastUsedAt).slice(0, FORM_FIELD_VALUE_LIMIT);
+  };
+  const persist = async (items) => {
+    const safe = sanitize(items);
+    await storage.set(FORM_FIELD_VALUES_KEY, safe);
+    return safe;
+  };
+  const repo = {
+    async getAllValues() {
+      const stored = await storage.get(FORM_FIELD_VALUES_KEY);
+      const safe = sanitize(stored);
+      if (!Array.isArray(stored) || safe.length !== stored.length) await storage.set(FORM_FIELD_VALUES_KEY, safe);
+      return safe;
+    },
+    async getValuesForField(fieldKey) {
+      const key = normalizeFormFieldKey(fieldKey);
+      if (!key) return [];
+      return (await repo.getAllValues()).filter((item) => item.fieldKey === key).slice(0, 12);
+    },
+    async addValue(value) {
+      const candidate = normalizeFormFieldValue(value);
+      if (!candidate) return null;
+      const items = await repo.getAllValues();
+      const same = items.find((item) => item.fieldKey === candidate.fieldKey
+        && item.value.toLocaleLowerCase() === candidate.value.toLocaleLowerCase());
+      candidate.id = same?.id || candidate.id;
+      candidate.lastUsedAt = Date.now();
+      const next = [candidate, ...items.filter((item) => item.id !== candidate.id)];
+      const saved = await persist(next);
+      return saved.find((item) => item.id === candidate.id) || null;
+    },
+    async touchValue(id) {
+      const items = await repo.getAllValues();
+      const item = items.find((record) => record.id === String(id || ''));
+      if (!item) return null;
+      item.lastUsedAt = Date.now();
+      await persist(items);
+      return item;
+    },
+    async removeValue(id) {
+      const items = await repo.getAllValues();
+      await persist(items.filter((item) => item.id !== String(id || '')));
+      return true;
+    },
+    async clearValues() {
+      if (typeof storage.delete === 'function') await storage.delete(FORM_FIELD_VALUES_KEY);
+      else await storage.set(FORM_FIELD_VALUES_KEY, []);
+    }
+  };
+  return repo;
+}
+
 const SETTINGS_KEY = 'settings';
 
 export function createSettingsRepo(storage) {

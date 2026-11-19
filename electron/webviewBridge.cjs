@@ -122,6 +122,16 @@ const PAGE_UNRESPONSIVE_RELOAD_DELAY_MS = 15_000;
 const PAGE_UNRESPONSIVE_RELOAD_COOLDOWN_MS = 60_000;
 const EMAIL_FIELD_FOCUSED_CHANNEL = 'yayra:email-field-focused';
 const EMAIL_ADDRESS_CAPTURED_CHANNEL = 'yayra:email-address-captured';
+const ADDRESS_FIELD_FOCUSED_CHANNEL = 'yayra:address-field-focused';
+const ADDRESS_CAPTURED_CHANNEL = 'yayra:address-captured';
+const ADDRESS_PROFILE_SELECTED_CHANNEL = 'yayra:address-profile-selected';
+const ADDRESS_AUTOFILL_MANAGE_CHANNEL = 'yayra:address-autofill-manage';
+const ADDRESS_SUGGESTIONS_CHANNEL = 'yayra:address-suggestions';
+const FORM_FIELD_FOCUSED_CHANNEL = 'yayra:form-field-focused';
+const FORM_FIELD_CAPTURED_CHANNEL = 'yayra:form-field-captured';
+const FORM_VALUE_SELECTED_CHANNEL = 'yayra:form-value-selected';
+const FORM_AUTOFILL_MANAGE_CHANNEL = 'yayra:form-autofill-manage';
+const FORM_SUGGESTIONS_CHANNEL = 'yayra:form-suggestions';
 const EMAIL_SUGGESTIONS_CHANNEL = 'yayra:email-suggestions';
 const PASSWORD_SUGGESTIONS_CHANNEL = 'yayra:autofill-credentials';
 const PASSWORD_CREDENTIAL_SELECTED_CHANNEL = 'yayra:autofill-credential-selected';
@@ -156,6 +166,26 @@ function isHttpUrl(value) {
     const url = new URL(String(value || ''));
     return url.protocol === 'http:' || url.protocol === 'https:';
   } catch { return false; }
+}
+
+const FORM_FIELD_SENSITIVE_HINT = /password|passcode|one.?time|otp|verification|security.?code|cvv|cvc|card|credit|debit|payment|billing.?number|account.?number|routing|social.?security|\bssn\b|secret|token|\bpin\b|auth(?:entication|orization|.?token|.?code)/i;
+function safeFormFieldDescriptor(fieldKey, label = '') {
+  const key = String(fieldKey || '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160).toLowerCase();
+  const safeLabel = String(label || '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 100);
+  if (!/^[a-z0-9:_ -]{1,160}$/.test(key) || FORM_FIELD_SENSITIVE_HINT.test(`${key} ${safeLabel}`)) return null;
+  return { fieldKey: key, label: safeLabel || 'Form field' };
+}
+function sanitizeFormFieldValues(values, fieldKey) {
+  const expectedKey = String(fieldKey || '').toLowerCase();
+  const seen = new Set();
+  return (Array.isArray(values) ? values : []).slice(0, 12).map((item) => {
+    const id = typeof item?.id === 'string' && /^formval-[A-Za-z0-9-]{3,100}$/.test(item.id) ? item.id : '';
+    const safeMeta = safeFormFieldDescriptor(item?.fieldKey, item?.label);
+    const value = String(item?.value || '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 1200);
+    if (!id || !safeMeta || safeMeta.fieldKey !== expectedKey || !value || seen.has(id)) return null;
+    seen.add(id);
+    return { id, ...safeMeta, value };
+  }).filter(Boolean);
 }
 
 // Sentinel pseudo-scheme the in-page WebAuthn helper uses to ask the main
@@ -3052,7 +3082,8 @@ function createWebviewBridge({
     hostWin = null,
     profileId = 'default',
     pointerTheme = 'system',
-    pointerSize = 'normal'
+    pointerSize = 'normal',
+    navigate = false
   } = {}) {
     const win = (hostWin && !hostWin.isDestroyed?.()) ? hostWin : getMainWindow();
     if (!win || win.isDestroyed() || !tabId || !url) return { handedOffToSystemBrowser: false };
@@ -3091,6 +3122,7 @@ function createWebviewBridge({
       destroyView(key);
       entry = undefined;
     }
+    const createdEntry = !entry;
     if (!entry) {
       entry = createView(key, tabId, isPrivate, hostWc, win, profileId, url);
       const configuredBackgroundThrottling = hostWc ? backgroundThrottlingByHost.get(hostWc) : undefined;
@@ -3113,6 +3145,13 @@ function createWebviewBridge({
     entry.pointerTheme = nextPointerTheme;
     entry.pointerSize = nextPointerSize;
     if (pointerChanged && entry.lastUrl) applyPointerThemeToPage(entry);
+
+    // `ensure` is called on ordinary shell renders, so an existing page's
+    // live URL may legitimately differ while it redirects or updates its SPA
+    // history. Passive ensures must never navigate it back to a stale URL from
+    // an earlier render. Only first creation or an explicit shell navigation
+    // may call loadURL on an existing WebContentsView.
+    if (!createdEntry && navigate !== true) return { handedOffToSystemBrowser: false, retainedCurrentPage: true };
 
     // The virtual authenticator must exist before any page JavaScript runs.
     // Loading first creates a race where an early navigator.credentials call
@@ -3140,7 +3179,7 @@ function createWebviewBridge({
     }
     if (entry.requestedUrl !== url) return { handedOffToSystemBrowser: false };
 
-    if (entry.lastUrl !== url) {
+    if (navigate === true || entry.lastUrl !== url) {
       entry.lastUrl = url;
       entry.mainFrameFailed = false;
       entry.view.webContents.loadURL(url).catch((err) => {
@@ -3197,7 +3236,7 @@ function createWebviewBridge({
     return true;
   }
 
-  function setBounds(key, bounds) {
+  function setBounds(key, bounds, { force = false } = {}) {
     const entry = views.get(key);
     if (!entry) return;
     // A fresh geometry report supersedes an in-flight snapshot-then-hide.
@@ -3210,6 +3249,9 @@ function createWebviewBridge({
     }
     // Main-process enforcement: renderer mistakes/races can shrink the page,
     // but can never place a native website surface over the tab/caption row.
+    // Explicit return-to-tab recovery may force the same geometry through to
+    // Electron so the native compositor re-lays out a stale/blank surface.
+    if (force) entry.bounds = null;
     applyEntryBounds(entry, bounds);
   }
 
@@ -3609,13 +3651,13 @@ function createWebviewBridge({
     return { ok: true, removed };
   });
 
-  ipcMain.handle('yayra:webview-ensure', (event, { tabId, url, isPrivate, profileId, pointerTheme, pointerSize } = {}) => {
+  ipcMain.handle('yayra:webview-ensure', (event, { tabId, url, isPrivate, profileId, pointerTheme, pointerSize, navigate } = {}) => {
     const { hostWc, hostWin } = resolveHost(event);
     const trustedProfileId = typeof getProfileIdForWebContents === 'function'
       ? trustedProfileIdForSender(hostWc)
       : profileId;
     return ensureView(viewKey(event, tabId), tabId, url, {
-      isPrivate, hostWc, hostWin, profileId: trustedProfileId, pointerTheme, pointerSize
+      isPrivate, hostWc, hostWin, profileId: trustedProfileId, pointerTheme, pointerSize, navigate: navigate === true
     });
   });
   ipcMain.handle('yayra:webview-continue-passkey', async (event, {
@@ -3767,8 +3809,15 @@ function createWebviewBridge({
     return { ok: true, tabs };
   });
   ipcMain.handle('yayra:webview-set-pointer-theme', (event, { tabId, theme, size } = {}) => setPointerTheme(viewKey(event, tabId), theme, size));
-  ipcMain.handle('yayra:webview-set-bounds', (event, { tabId, bounds } = {}) => setBounds(viewKey(event, tabId), bounds));
+  ipcMain.handle('yayra:webview-set-bounds', (event, { tabId, bounds, force } = {}) => setBounds(viewKey(event, tabId), bounds, { force: force === true }));
   ipcMain.handle('yayra:webview-set-visible', (event, { tabId, visible, capture } = {}) => setVisible(viewKey(event, tabId), visible, { capture }));
+  ipcMain.handle('yayra:webview-invalidate', (event, { tabId } = {}) => {
+    const entry = views.get(viewKey(event, tabId));
+    const wc = entry?.view?.webContents;
+    if (!wc || wc.isDestroyed?.() || typeof wc.invalidate !== 'function') return { ok: false, reason: 'unavailable' };
+    try { wc.invalidate(); return { ok: true }; }
+    catch { return { ok: false, reason: 'failed' }; }
+  });
   ipcMain.handle('yayra:webview-capture', (event, { tabId } = {}) => capture(viewKey(event, tabId)));
   ipcMain.handle('yayra:webview-go-back', (event, { tabId } = {}) => goBack(viewKey(event, tabId)));
   ipcMain.handle('yayra:webview-go-forward', (event, { tabId } = {}) => goForward(viewKey(event, tabId)));
@@ -4232,6 +4281,71 @@ function createWebviewBridge({
       if (!email || !isHttpUrl(url)) return;
       sendTo(entry, 'email-address-captured', { email, url });
     });
+    const addressPageMatches = (entry, value) => {
+      const url = String(value || '');
+      const currentUrl = entry?.view?.webContents?.getURL?.() || entry?.lastUrl || '';
+      try { return isHttpUrl(url) && isHttpUrl(currentUrl) && new URL(url).origin === new URL(currentUrl).origin; }
+      catch { return false; }
+    };
+    ipcMain.on(ADDRESS_FIELD_FOCUSED_CHANNEL, (event, payload = {}) => {
+      const entry = entryForViewSender(event);
+      const field = String(payload?.field || '');
+      if (!entry || entry.isPrivate || !/^(?:fullName|firstName|lastName|company|addressLine1|addressLine2|city|region|postalCode|country|phone)$/.test(field)
+          || !addressPageMatches(entry, payload?.url)) return;
+      sendTo(entry, 'address-field-focused', { field, url: String(payload.url) });
+    });
+    ipcMain.on(ADDRESS_CAPTURED_CHANNEL, (event, payload = {}) => {
+      const entry = entryForViewSender(event);
+      if (!entry || entry.isPrivate || !addressPageMatches(entry, payload?.url)) return;
+      const source = payload?.address && typeof payload.address === 'object' ? payload.address : {};
+      const fields = ['fullName', 'firstName', 'lastName', 'company', 'addressLine1', 'addressLine2', 'city', 'region', 'postalCode', 'country', 'phone', 'email'];
+      const address = {};
+      for (const key of fields) {
+        let value = String(source[key] || '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
+        if (key === 'email') value = sanitizeEmailAddress(value) || '';
+        address[key] = value.slice(0, key === 'addressLine1' || key === 'addressLine2' ? 240 : 180);
+      }
+      if (!address.fullName && !address.firstName && !address.lastName && !address.addressLine1 && !address.postalCode) return;
+      sendTo(entry, 'address-captured', { address, url: String(payload.url) });
+    });
+    ipcMain.on(ADDRESS_PROFILE_SELECTED_CHANNEL, (event, payload = {}) => {
+      const entry = entryForViewSender(event);
+      const addressId = String(payload?.addressId || '');
+      if (!entry || entry.isPrivate || !/^addr-[A-Za-z0-9-]{3,100}$/.test(addressId) || !addressPageMatches(entry, payload?.url)) return;
+      sendTo(entry, 'address-profile-selected', { addressId, url: String(payload.url) });
+    });
+    ipcMain.on(ADDRESS_AUTOFILL_MANAGE_CHANNEL, (event, payload = {}) => {
+      const entry = entryForViewSender(event);
+      if (!entry || entry.isPrivate || !addressPageMatches(entry, payload?.url)) return;
+      sendTo(entry, 'address-autofill-manage', { url: String(payload.url) });
+    });
+    ipcMain.on(FORM_FIELD_FOCUSED_CHANNEL, (event, payload = {}) => {
+      const entry = entryForViewSender(event);
+      const descriptor = safeFormFieldDescriptor(payload?.fieldKey, payload?.label);
+      if (!entry || entry.isPrivate || !descriptor || !addressPageMatches(entry, payload?.url)) return;
+      sendTo(entry, 'form-field-focused', { ...descriptor, url: String(payload.url) });
+    });
+    ipcMain.on(FORM_FIELD_CAPTURED_CHANNEL, (event, payload = {}) => {
+      const entry = entryForViewSender(event);
+      const descriptor = safeFormFieldDescriptor(payload?.fieldKey, payload?.label);
+      const value = String(payload?.value || '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 1200);
+      if (!entry || entry.isPrivate || !descriptor || !value
+          || FORM_FIELD_SENSITIVE_HINT.test(`${descriptor.fieldKey} ${descriptor.label}`)
+          || !addressPageMatches(entry, payload?.url)) return;
+      sendTo(entry, 'form-field-captured', { ...descriptor, value, url: String(payload.url) });
+    });
+    ipcMain.on(FORM_VALUE_SELECTED_CHANNEL, (event, payload = {}) => {
+      const entry = entryForViewSender(event);
+      const valueId = typeof payload?.valueId === 'string' && /^formval-[A-Za-z0-9-]{3,100}$/.test(payload.valueId)
+        ? payload.valueId : '';
+      if (!entry || entry.isPrivate || !valueId || !addressPageMatches(entry, payload?.url)) return;
+      sendTo(entry, 'form-value-selected', { valueId, url: String(payload.url) });
+    });
+    ipcMain.on(FORM_AUTOFILL_MANAGE_CHANNEL, (event, payload = {}) => {
+      const entry = entryForViewSender(event);
+      if (!entry || entry.isPrivate || !addressPageMatches(entry, payload?.url)) return;
+      sendTo(entry, 'form-autofill-manage', { url: String(payload.url) });
+    });
     ipcMain.on(SITE_PASSKEY_REQUEST_CHANNEL, (event, payload = {}) => {
       const entry = entryForViewSender(event);
       if (!entry) return;
@@ -4350,6 +4464,52 @@ function createWebviewBridge({
         credentials: safeCredentials
       });
       return { suggested: true, count: safeCredentials.length };
+    } catch { return { suggested: false, count: 0 }; }
+  });
+
+  ipcMain.handle('yayra:webview-suggest-addresses', (event, { tabId, url, addresses, values, fieldKey } = {}) => {
+    const entry = views.get(viewKey(event, tabId));
+    if (!entry || entry.isPrivate || !isHttpUrl(url)) return { suggested: false, count: 0 };
+    const currentUrl = entry.view?.webContents?.getURL?.() || entry.lastUrl || '';
+    try {
+      if (!isHttpUrl(currentUrl) || new URL(currentUrl).origin !== new URL(url).origin) return { suggested: false, count: 0 };
+    } catch { return { suggested: false, count: 0 }; }
+    const fields = ['fullName', 'firstName', 'lastName', 'company', 'addressLine1', 'addressLine2', 'city', 'region', 'postalCode', 'country', 'phone', 'email'];
+    const seen = new Set();
+    const safeAddresses = (Array.isArray(addresses) ? addresses : []).slice(0, 25).map((item) => {
+      const id = typeof item?.id === 'string' && /^addr-[A-Za-z0-9-]{3,100}$/.test(item.id) ? item.id : '';
+      if (!id) return null;
+      const address = { id, label: String(item.label || 'Address').slice(0, 40), isDefault: item.isDefault === true };
+      for (const key of fields) {
+        const value = String(item[key] || '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
+        address[key] = key === 'email' ? (sanitizeEmailAddress(value) || '')
+          : value.slice(0, key === 'addressLine1' || key === 'addressLine2' ? 240 : 180);
+      }
+      if (seen.has(id)) return null;
+      seen.add(id);
+      return address;
+    }).filter(Boolean);
+    const safeAddressField = fieldKey ? safeFormFieldDescriptor(fieldKey, '') : null;
+    const safeValues = safeAddressField ? sanitizeFormFieldValues(values, safeAddressField.fieldKey) : [];
+    try {
+      entry.view.webContents.send(ADDRESS_SUGGESTIONS_CHANNEL, { addresses: safeAddresses, values: safeValues, fieldKey: safeAddressField?.fieldKey || '' });
+      return { suggested: true, count: safeAddresses.length + safeValues.length };
+    } catch { return { suggested: false, count: 0 }; }
+  });
+
+  ipcMain.handle('yayra:webview-suggest-form-values', (event, { tabId, url, fieldKey, values } = {}) => {
+    const entry = views.get(viewKey(event, tabId));
+    if (!entry || entry.isPrivate || !isHttpUrl(url)) return { suggested: false, count: 0 };
+    const currentUrl = entry.view?.webContents?.getURL?.() || entry.lastUrl || '';
+    try {
+      if (!isHttpUrl(currentUrl) || new URL(currentUrl).origin !== new URL(url).origin) return { suggested: false, count: 0 };
+    } catch { return { suggested: false, count: 0 }; }
+    const descriptor = safeFormFieldDescriptor(fieldKey, 'Form field');
+    if (!descriptor) return { suggested: false, count: 0 };
+    const safeValues = sanitizeFormFieldValues(values, descriptor.fieldKey);
+    try {
+      entry.view.webContents.send(FORM_SUGGESTIONS_CHANNEL, { fieldKey: descriptor.fieldKey, values: safeValues });
+      return { suggested: true, count: safeValues.length };
     } catch { return { suggested: false, count: 0 }; }
   });
 

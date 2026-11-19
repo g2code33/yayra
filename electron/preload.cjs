@@ -54,6 +54,7 @@ const api = {
   // (electron/main.cjs createWindow), so the renderer's tab strip renders
   // real minimize/maximize/close buttons through these.
   windowControls: {
+    getTopInset: () => ipcRenderer.invoke('yayra:window-top-inset'),
     minimize: () => ipcRenderer.invoke('yayra:window-minimize'),
     toggleMaximize: () => ipcRenderer.invoke('yayra:window-maximize-toggle'),
     isMaximized: () => ipcRenderer.invoke('yayra:window-is-maximized'),
@@ -109,6 +110,14 @@ const api = {
       pointerTheme: pointer && pointer.theme,
       pointerSize: pointer && pointer.size
     }),
+    // Explicit address-bar navigation is separate from passive render-time
+    // ensure calls, so an old shell render can never reload a newer redirect
+    // or SPA URL back to its stale address.
+    navigate: (tabId, url, isPrivate = false, profileId = 'default', pointer = {}) => ipcRenderer.invoke('yayra:webview-ensure', {
+      tabId, url, isPrivate, profileId, navigate: true,
+      pointerTheme: pointer && pointer.theme,
+      pointerSize: pointer && pointer.size
+    }),
     setPointerTheme: (tabId, theme, size) => ipcRenderer.invoke('yayra:webview-set-pointer-theme', { tabId, theme, size }),
     setBackgroundThrottling: (enabled) => ipcRenderer.invoke('yayra:webview-set-background-throttling', { enabled }),
     setPrivacySettings: (settings = {}) => ipcRenderer.invoke('yayra:webview-privacy-set', settings),
@@ -121,8 +130,9 @@ const api = {
     listSiteData: () => ipcRenderer.invoke('yayra:webview-site-data-list'),
     removeSiteData: (host) => ipcRenderer.invoke('yayra:webview-site-data-remove', { host }),
     taskTabs: () => ipcRenderer.invoke('yayra:webview-list-task-tabs'),
-    setBounds: (tabId, bounds) => ipcRenderer.invoke('yayra:webview-set-bounds', { tabId, bounds }),
+    setBounds: (tabId, bounds, options = {}) => ipcRenderer.invoke('yayra:webview-set-bounds', { tabId, bounds, force: options.force === true }),
     setVisible: (tabId, visible, options = {}) => ipcRenderer.invoke('yayra:webview-set-visible', { tabId, visible, capture: Boolean(options && options.capture) }),
+    invalidate: (tabId) => ipcRenderer.invoke('yayra:webview-invalidate', { tabId }),
     // Snapshot the live page WITHOUT hiding it - lets the renderer paint
     // the still image first and only then hide the native surface, so
     // opening the menu/modals never flashes a blank frame.
@@ -163,6 +173,8 @@ const api = {
     // Suggest this profile's saved email addresses in a focused email field.
     // The main process rejects private-tab requests and validates the list.
     suggestEmailAddresses: (tabId, emails = []) => ipcRenderer.invoke('yayra:webview-suggest-email-addresses', { tabId, emails }),
+    suggestAutofillAddresses: (tabId, { url, addresses = [], values = [], fieldKey = '' } = {}) => ipcRenderer.invoke('yayra:webview-suggest-addresses', { tabId, url, addresses, values, fieldKey }),
+    suggestFormFieldValues: (tabId, { url, fieldKey, values = [] } = {}) => ipcRenderer.invoke('yayra:webview-suggest-form-values', { tabId, url, fieldKey, values }),
     // Menu > More tools: REAL page-level actions on the native engine.
     openDevTools: (tabId) => ipcRenderer.invoke('yayra:webview-open-devtools', { tabId }),
     printPreview: (tabId, settings = {}) => ipcRenderer.invoke('yayra:webview-print-preview', { tabId, settings }),

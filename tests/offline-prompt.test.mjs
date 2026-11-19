@@ -109,7 +109,7 @@ test('OFFLINE -> ONLINE: the failed page retries immediately and stays covered u
   }
 });
 
-test('OFFLINE EVENTS: dropping offline and coming back are announced to the user', async () => {
+test('OFFLINE EVENTS: connectivity notices are limited to website tabs and never cover Yayra document pages', async () => {
   setOnline(true);
   const listeners = {};
   const origAdd = globalThis.window.addEventListener;
@@ -122,13 +122,34 @@ test('OFFLINE EVENTS: dropping offline and coming back are announced to the user
     shell.showTransientNotice = (msg) => notices.push(String(msg));
     assert.ok(listeners.offline && listeners.online, 'both connectivity listeners armed');
 
+    const activeTab = shell.getActiveTab();
+    activeTab.url = 'yayra://documents';
+    activeTab.isDocument = false;
     listeners.offline();
-    assert.ok(notices.some((n) => /offline/i.test(n)), 'going offline is announced');
     listeners.online();
-    assert.ok(notices.some((n) => /back online/i.test(n)), 'coming back is announced');
+    assert.equal(notices.length, 0, 'the offline/online toast never overlays Yayra document-management content');
+
+    activeTab.url = 'https://example.test/article';
+    listeners.offline();
+    assert.ok(notices.some((n) => /offline/i.test(n)), 'website tabs still receive offline feedback');
+    listeners.online();
+    assert.ok(notices.some((n) => /back online/i.test(n)), 'website tabs still receive recovery feedback');
     shell.destroy();
   } finally {
     globalThis.window.addEventListener = origAdd;
+  }
+});
+
+test('TRANSIENT NOTICES: repeated messages replace one toast instead of stacking over document content', () => {
+  const shell = new BrowserShell({ container: document.createElement('div'), platform: 'linux', isMobile: false });
+  try {
+    shell.showTransientNotice('You are offline', { kind: 'connectivity' });
+    shell.showTransientNotice('Back online', { kind: 'connectivity' });
+    const notices = document.body.querySelectorAll('.fb-transient-notice');
+    assert.equal(notices.length, 1, 'only one toast can occupy the viewport');
+    assert.equal(notices[0].textContent, 'Back online', 'the newest message replaces stale connectivity feedback');
+  } finally {
+    shell.destroy();
   }
 });
 

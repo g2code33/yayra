@@ -6,7 +6,9 @@ import { BrowserShell } from '../packages/shared-ui/src/components/BrowserShell.
 import {
   createProfileScopedStorage,
   createBookmarksRepo,
-  createEmailAddressesRepo
+  createEmailAddressesRepo,
+  createAddressProfilesRepo,
+  createFormFieldValuesRepo
 } from '../packages/shared-ui/src/services/profileStorage.js';
 import { setupDomShim } from './dom-shim.mjs';
 
@@ -31,6 +33,55 @@ function nextTurn() {
 
 setupDomShim();
 
+test('address profiles are normalized, profile-scoped, defaulted, editable and removable', async () => {
+  const { storage, setProfile } = makeStorage();
+  const repo = createAddressProfilesRepo(storage);
+  const home = await repo.addAddress({
+    label: '  Home  ', fullName: ' Ama Mensah ', addressLine1: '  12 Lake Road ', city: 'Kumasi',
+    country: 'Ghana', postalCode: 'AK-039-5028', phone: '+233 24 000 0000', email: 'ama@example.com', isDefault: true
+  });
+  assert.match(home.id, /^addr-/);
+  assert.equal(home.label, 'Home');
+  assert.equal(home.fullName, 'Ama Mensah');
+  assert.equal((await repo.getAllAddresses())[0].isDefault, true);
+
+  const work = await repo.addAddress({ label: 'Work', addressLine1: '2 Market Street', city: 'Accra' });
+  assert.equal((await repo.setDefaultAddress(work.id)), true);
+  assert.equal((await repo.getAllAddresses()).find((item) => item.id === work.id).isDefault, true);
+  assert.equal((await repo.getAllAddresses()).find((item) => item.id === home.id).isDefault, false);
+  assert.equal(await repo.addAddress({ addressLine1: 'Bad', email: 'not-an-email' }), null);
+  assert.deepEqual(await repo.touchAddress(home.id), (await repo.getAllAddresses()).find((item) => item.id === home.id));
+
+  setProfile('work-profile');
+  assert.deepEqual(await repo.getAllAddresses(), []);
+  const profileRepo = createAddressProfilesRepo(storage);
+  await profileRepo.addAddress({ label: 'Office', addressLine1: '4 High Street' });
+  setProfile('personal');
+  assert.equal((await repo.getAllAddresses()).length, 2);
+  await repo.removeAddress(home.id);
+  assert.equal((await repo.getAllAddresses()).length, 1);
+  await repo.clearAddresses();
+  assert.deepEqual(await repo.getAllAddresses(), []);
+});
+
+
+test('previously entered form values are deduplicated, field-matched, removable and profile-scoped', async () => {
+  const { storage, setProfile } = makeStorage();
+  const repo = createFormFieldValuesRepo(storage);
+  const first = await repo.addValue({ fieldKey: 'field:referralcode', label: 'Referral code', value: ' YAYRA-123 ' });
+  const duplicate = await repo.addValue({ fieldKey: 'FIELD:REFERRALCODE', label: 'Referral code', value: 'yayra-123' });
+  await repo.addValue({ fieldKey: 'field:companyname', label: 'Company', value: 'Yayra' });
+  assert.equal(duplicate.id, first.id);
+  assert.deepEqual((await repo.getValuesForField('field:referralcode')).map((item) => item.value), ['yayra-123']);
+  assert.equal(await repo.addValue({ fieldKey: '', value: 'orphan' }), null);
+  setProfile('other-profile');
+  assert.deepEqual(await repo.getAllValues(), []);
+  setProfile('personal');
+  await repo.removeValue(first.id);
+  assert.deepEqual((await repo.getValuesForField('field:referralcode')), []);
+  await repo.clearValues();
+  assert.deepEqual(await repo.getAllValues(), []);
+});
 
 test('Bookmarks page creates/selects groups, sets the default and moves bookmarks', async () => {
   const { storage } = makeStorage();
@@ -179,12 +230,66 @@ test('Passwords & Keys page lists saved emails and lets the user remove or clear
   shell.destroy();
 });
 
+test('address profiles stay profile-scoped, avoid private tabs, and render management controls', async () => {
+  const { storage } = makeStorage();
+  const repo = createAddressProfilesRepo(storage);
+  const formValuesRepo = createFormFieldValuesRepo(storage);
+  const saved = await repo.addAddress({ label: 'Home', fullName: 'Ama Mensah', addressLine1: '12 Lake Road', city: 'Kumasi', country: 'Ghana', isDefault: true });
+  const suggestions = [];
+  const shell = new BrowserShell({
+    container: document.createElement('div'),
+    addressProfilesRepo: repo,
+    formFieldValuesRepo: formValuesRepo,
+    tabs: [
+      { id: 'checkout', url: 'https://shop.example/checkout' },
+      { id: 'private-checkout', url: 'https://shop.example/checkout', isPrivate: true }
+    ]
+  });
+  Object.defineProperty(shell, 'nativeWebview', {
+    configurable: true,
+    value: {
+      suggestAutofillAddresses: async (tabId, payload) => suggestions.push({ tabId, payload }),
+      suggestFormFieldValues: async (tabId, payload) => suggestions.push({ tabId, payload, generic: true })
+    }
+  });
+  shell.state.addressProfiles = await repo.getAllAddresses();
+  shell.state.passwordsActiveSection = 'addresses';
+  shell.render = () => {};
+  shell.showTransientNotice = () => {};
+  await shell.handleAddressFieldFocused(shell.state.tabs[0], { url: 'https://shop.example/checkout', field: 'addressLine1' });
+  await shell.handleAddressFieldFocused(shell.state.tabs[1], { url: 'https://shop.example/checkout', field: 'addressLine1' });
+  assert.equal(suggestions.length, 1);
+  assert.equal(suggestions[0].payload.addresses[0].id, saved.id);
+  await shell.handleFormFieldCaptured(shell.state.tabs[0], {
+    url: 'https://shop.example/checkout', fieldKey: 'field:referralcode', label: 'Referral code', value: 'YAYRA-123'
+  });
+  await shell.handleFormFieldCaptured(shell.state.tabs[1], {
+    url: 'https://shop.example/checkout', fieldKey: 'field:referralcode', label: 'Referral code', value: 'PRIVATE'
+  });
+  await shell.handleFormFieldFocused(shell.state.tabs[0], {
+    url: 'https://shop.example/checkout', fieldKey: 'field:referralcode'
+  });
+  assert.equal(suggestions.filter((item) => item.generic).length, 1);
+  assert.equal(suggestions.find((item) => item.generic).payload.values[0].value, 'YAYRA-123');
+
+  const viewport = document.createElement('div');
+  shell.renderInternalPasswordsPage(viewport);
+  assert.match(viewport.textContent, /Addresses &amp; Autofill/);
+  assert.match(viewport.textContent, /12 Lake Road/);
+  assert.equal(viewport.querySelectorAll('.fb-address-edit').length, 1);
+  assert.equal(viewport.querySelectorAll('.fb-address-remove').length, 1);
+  viewport.querySelector('.fb-in-add-address-btn').click();
+  assert.ok(shell.state.addressFormOpen);
+  shell.destroy();
+});
+
 class IsolatedPageElement {
   constructor(tagName = 'div') {
     this.tagName = String(tagName).toUpperCase();
     this.children = [];
     this.listeners = new Map();
     this.attributes = new Map();
+    this.dataset = {};
     this.style = { cssText: '', display: '', width: '', left: '', top: '' };
     this.className = '';
     this.type = '';
@@ -212,6 +317,7 @@ class IsolatedPageElement {
   get textContent() { return this.children.length ? this.children.map((child) => child.textContent).join('') : this._text; }
   set textContent(value) { this._text = String(value); this.children = []; }
   appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
+  append(...children) { children.forEach((child) => this.appendChild(child)); }
   addEventListener(type, listener) {
     if (!this.listeners.has(type)) this.listeners.set(type, []);
     this.listeners.get(type).push(listener);
@@ -245,8 +351,10 @@ class IsolatedPageElement {
     const results = [];
     const visit = (element) => {
       const matches = selector === 'input' ? element.tagName === 'INPUT'
-        : selector === '.item' ? element.className.split(' ').includes('item')
-          : false;
+        : selector === 'input, textarea, select' ? ['INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName)
+          : selector === '.item' ? element.className.split(' ').includes('item')
+            : selector === '.address-option' ? element.className.split(' ').includes('address-option')
+              : false;
       if (matches) results.push(element);
       element.children.forEach(visit);
     };
@@ -260,6 +368,89 @@ class IsolatedPageElement {
   }
 }
 
+
+test('address autofill preload requires a picker choice before filling matching checkout fields', () => {
+  const source = readFileSync(new URL('../electron/autofillPreload.cjs', import.meta.url), 'utf8');
+  const pageEvents = new Map();
+  const ipcEvents = new Map();
+  const sent = [];
+  const html = new IsolatedPageElement('html');
+  const document = {
+    documentElement: html,
+    readyState: 'complete',
+    addEventListener(type, listener) {
+      if (!pageEvents.has(type)) pageEvents.set(type, []);
+      pageEvents.get(type).push(listener);
+    },
+    createElement: (tagName) => new IsolatedPageElement(tagName),
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    activeElement: null
+  };
+  const form = new IsolatedPageElement('form');
+  const makeField = (name, value = '') => {
+    const field = new IsolatedPageElement('input');
+    field.type = 'text'; field.name = name; field.value = value; field.form = form;
+    form.appendChild(field);
+    return field;
+  };
+  const street = makeField('addressLine1');
+  const city = makeField('city');
+  const fullName = makeField('fullName');
+  const ipcRenderer = {
+    send: (channel, payload) => sent.push({ channel, payload }),
+    on(channel, listener) {
+      if (!ipcEvents.has(channel)) ipcEvents.set(channel, []);
+      ipcEvents.get(channel).push(listener);
+    },
+    emit(channel, payload) { for (const listener of ipcEvents.get(channel) || []) listener({}, payload); }
+  };
+  const window = { innerWidth: 1024, innerHeight: 768, addEventListener: () => {} };
+  runInNewContext(source, {
+    require: (name) => name === 'electron' ? { ipcRenderer } : {}, document, window,
+    location: { href: 'https://shop.example/checkout', origin: 'https://shop.example' },
+    HTMLInputElement: IsolatedPageElement, HTMLTextAreaElement: IsolatedPageElement, HTMLSelectElement: IsolatedPageElement,
+    Node: { DOCUMENT_POSITION_FOLLOWING: 4 },
+    Event: class { constructor(type, options = {}) { this.type = type; this.bubbles = options.bubbles; } },
+    setTimeout: () => 1, setInterval: () => 1, clearInterval: () => {}, console
+  });
+
+  for (const listener of pageEvents.get('focusin') || []) listener({ target: street });
+  assert.equal(street.value, '', 'focusing a checkout field never fills it automatically');
+  assert.ok(sent.some((message) => message.channel === 'yayra:address-field-focused'));
+  ipcRenderer.emit('yayra:address-suggestions', { addresses: [{
+    id: 'addr-123-saved', label: 'Home', fullName: 'Ama Mensah', addressLine1: '12 Lake Road', city: 'Kumasi', isDefault: true
+  }] });
+  const host = html.children[0];
+  assert.equal(host.shadowMode, 'closed');
+  const picker = host._shadowRoot.children[0];
+  const choice = picker.children.find((child) => child.className.includes('address-option'));
+  assert.ok(choice, 'the browser-owned menu offers a saved profile');
+  choice.dispatchEvent({ type: 'click', target: choice });
+  assert.equal(street.value, '12 Lake Road');
+  assert.equal(city.value, 'Kumasi');
+  assert.equal(fullName.value, 'Ama Mensah');
+  assert.equal(host.style.display, 'none');
+  assert.ok(sent.some((message) => message.channel === 'yayra:address-profile-selected'
+    && message.payload.addressId === 'addr-123-saved'));
+
+  const referral = makeField('referralCode');
+  for (const listener of pageEvents.get('focusin') || []) listener({ target: referral });
+  assert.ok(sent.some((message) => message.channel === 'yayra:form-field-focused'
+    && message.payload.fieldKey === 'field:referralcode'));
+  ipcRenderer.emit('yayra:form-suggestions', { fieldKey: 'field:referralcode', values: [
+    { id: 'formval-123-saved', fieldKey: 'field:referralcode', label: 'Referral code', value: 'YAYRA-123' }
+  ] });
+  const formHost = html.children.find((child) => child !== host);
+  assert.equal(formHost.shadowMode, 'closed');
+  const formMenu = formHost._shadowRoot.children[0];
+  const remembered = formMenu.children.find((child) => child.tagName === 'BUTTON' && child.textContent === 'YAYRA-123');
+  assert.ok(remembered);
+  remembered.dispatchEvent({ type: 'click', target: remembered });
+  assert.equal(referral.value, 'YAYRA-123');
+  assert.ok(sent.some((message) => message.channel === 'yayra:form-value-selected'
+    && message.payload.valueId === 'formval-123-saved'));
+});
 
 test('autofill preload shows saved email suggestions in a closed picker and captures submitted addresses', () => {
   const source = readFileSync(new URL('../electron/autofillPreload.cjs', import.meta.url), 'utf8');

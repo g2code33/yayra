@@ -366,6 +366,8 @@ test('TAB INTEGRATION: a document opens in its OWN tab - never the web frame or 
     const viewport = shell.viewportElement;
     assert.ok(viewport.querySelector('.fb-doc-viewer'), 'the integrated viewer renders');
     assert.ok(viewport.querySelector('.fb-doc-toolbar'), 'with its toolbar');
+    assert.match(viewport.querySelector('.fb-doc-host-pdf')?.style.cssText || '', /padding:0 16px 16px/,
+      'the PDF page starts directly below the toolbar instead of inheriting an oversized top gutter');
     assert.equal(viewport.querySelector('.fb-doc-notes-color-input'), null,
       'the speaker-notes colour picker never leaks into non-PPTX viewers');
     assert.equal(viewport.querySelector('iframe'), null, 'no web iframe is created for a document');
@@ -373,6 +375,9 @@ test('TAB INTEGRATION: a document opens in its OWN tab - never the web frame or 
     // The engine promise resolves async; give it a tick then check the ready state.
     await new Promise((r) => setTimeout(r, 20));
     assert.ok(['loading', 'ready'].includes(tab.docState.status), 'the viewer state is tracked on the tab');
+    const pdfPages = viewport.querySelector('.fb-pdf-continuous-pages');
+    if (pdfPages) assert.match(pdfPages.style.cssText || '', /padding:0 8px 24px/,
+      'the PDF page stack does not add a second top gutter of its own');
   } finally {
     shell.destroy();
   }

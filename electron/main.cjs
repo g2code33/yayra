@@ -1073,6 +1073,20 @@ function registerIpcBridges() {
     const win = BrowserWindow.fromWebContents(event.sender);
     return win && !win.isDestroyed() ? win : null;
   };
+  const systemTopInsetForWindow = (win) => {
+    // Renderer Screen coordinates are unreliable in Wayland/Electron and can
+    // report availTop === 0 even while GNOME's top panel covers a frameless
+    // maximized window. Resolve the real work-area edge from Electron's main
+    // process display geometry instead.
+    if (process.platform !== 'linux' || !win || win.isDestroyed?.()) return 0;
+    try {
+      const bounds = win.getBounds?.();
+      const workArea = screen.getDisplayMatching(bounds).workArea;
+      const inset = Math.ceil(Number(workArea?.y || 0) - Number(bounds?.y || 0));
+      return Number.isFinite(inset) ? Math.max(0, Math.min(96, inset)) : 0;
+    } catch { return 0; }
+  };
+  ipcMain.handle('yayra:window-top-inset', (event) => systemTopInsetForWindow(senderWindow(event)));
   ipcMain.handle('yayra:window-minimize', (event) => {
     senderWindow(event)?.minimize();
   });

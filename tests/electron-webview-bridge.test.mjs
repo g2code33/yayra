@@ -276,9 +276,11 @@ function createFakeWebContents() {
   let userAgent = null;
   let currentUrl = '';
   const calls = [];
+  const loadedUrls = [];
   return {
-    loadURL: async (url) => { currentUrl = String(url || ''); },
+    loadURL: async (url) => { currentUrl = String(url || ''); loadedUrls.push(currentUrl); },
     getURL: () => currentUrl,
+    invalidate: () => { calls.push('invalidate'); },
     reload: () => { calls.push('reload'); },
     stop: () => {},
     close: () => { destroyed = true; },
@@ -306,6 +308,8 @@ function createFakeWebContents() {
     _backStack: backStack,
     _forwardStack: forwardStack,
     _calls: calls,
+    _loadedUrls: loadedUrls,
+    _setCurrentUrl: (url) => { currentUrl = String(url || ''); },
     // Right-click menu actions (Chrome parity) - see buildContextMenuTemplate.
     copy: () => calls.push('copy'),
     cut: () => calls.push('cut'),
@@ -684,16 +688,29 @@ test('webview bridge: user-origin pointer styles bypass site CSP, style child fr
   assert.ok(frameScripts.some((script) => script.includes('__yayraSelectableTextCursorState') && script.includes('cleanup')), 'System removes page text-cursor listeners and markers too');
 });
 
-test('webview bridge: re-ensuring the same tab with the same URL does not reload', async () => {
-  const { handlers, views } = makeHarness();
-  let loadCount = 0;
+test('webview bridge: passive ensure preserves a live SPA URL; explicit navigation alone can replace it', async () => {
+  const { handlers, views, sentEvents } = makeHarness();
   const ensure = handlers.get('yayra:webview-ensure');
-  await ensure(null, { tabId: 'tab-1', url: 'https://example.com/' });
-  views[0].webContents.loadURL = async () => { loadCount += 1; };
-  await ensure(null, { tabId: 'tab-1', url: 'https://example.com/' });
-  assert.equal(loadCount, 0, 'no second load for an unchanged URL');
-  await ensure(null, { tabId: 'tab-1', url: 'https://example.com/other' });
-  assert.equal(loadCount, 1, 'navigates when the URL actually changes');
+  const initialUrl = 'https://example.com/class-groups?class=2';
+  const liveUrl = 'https://example.com/class-groups?class=3';
+  const destinationUrl = 'https://example.com/help';
+  await ensure(null, { tabId: 'tab-1', url: initialUrl });
+  const wc = views[0].webContents;
+  const initialLoadCount = wc._loadedUrls.length;
+
+  // Model an in-page history update that reaches Chromium before an older
+  // renderer ensure IPC is serviced.
+  wc._setCurrentUrl?.(liveUrl);
+  wc.emit('did-navigate-in-page', {}, liveUrl);
+  await ensure(null, { tabId: 'tab-1', url: initialUrl });
+  assert.equal(wc._loadedUrls.length, initialLoadCount,
+    'an old passive render cannot navigate the live page back to class=2');
+  assert.equal(wc.getURL(), liveUrl);
+  assert.ok(sentEvents.some((event) => event.payload.type === 'navigated' && event.payload.url === liveUrl));
+
+  await ensure(null, { tabId: 'tab-1', url: destinationUrl, navigate: true });
+  assert.equal(wc.getURL(), destinationUrl, 'the explicit address-bar intent still navigates');
+  assert.equal(wc._loadedUrls.at(-1), destinationUrl);
 });
 
 test('webview bridge: existing Apple/Microsoft system-browser handoff behavior remains unchanged', async () => {
@@ -976,6 +993,31 @@ test('webview bridge: setBounds and setVisible(false) manipulate the native view
   await handlers.get('yayra:webview-set-visible')(null, { tabId: 'tab-1', visible: false });
   assert.deepEqual(views[0].bounds, { x: 0, y: 0, width: 0, height: 0 }, 'hidden by zeroing bounds, not by destroying the guest page');
   assert.equal(views[0].webContents.isDestroyed(), false);
+});
+
+test('webview bridge: forced return bounds repaint bypasses geometry dedupe but cannot raise an overlay-hidden page', async () => {
+  const { handlers, views } = makeHarness();
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'force-bounds-tab', url: 'https://paint.example/' });
+  let calls = 0;
+  const apply = views[0].setBounds.bind(views[0]);
+  views[0].setBounds = (bounds) => { calls += 1; apply(bounds); };
+  const bounds = { x: 4, y: 40, width: 800, height: 600 };
+  await handlers.get('yayra:webview-set-bounds')(null, { tabId: 'force-bounds-tab', bounds });
+  await handlers.get('yayra:webview-set-bounds')(null, { tabId: 'force-bounds-tab', bounds });
+  assert.equal(calls, 1, 'identical ordinary geometry is still deduplicated');
+  await handlers.get('yayra:webview-set-bounds')(null, { tabId: 'force-bounds-tab', bounds, force: true });
+  assert.equal(calls, 2, 'the recovery path re-applies identical geometry to refresh the compositor');
+  await handlers.get('yayra:webview-set-visible')(null, { tabId: 'force-bounds-tab', visible: false });
+  await handlers.get('yayra:webview-set-bounds')(null, { tabId: 'force-bounds-tab', bounds, force: true });
+  assert.equal(views[0].bounds.width, 0, 'forced repaint cannot lift an overlay-hidden native page');
+});
+
+test('webview bridge: invalidate requests a repaint for the owning live view only', async () => {
+  const { handlers, views } = makeHarness();
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'paint-tab', url: 'https://paint.example/' });
+  assert.deepEqual(await handlers.get('yayra:webview-invalidate')(null, { tabId: 'paint-tab' }), { ok: true });
+  assert.ok(views[0].webContents._calls.includes('invalidate'));
+  assert.deepEqual(await handlers.get('yayra:webview-invalidate')(null, { tabId: 'missing-tab' }), { ok: false, reason: 'unavailable' });
 });
 
 test('webview bridge: stale bounds cannot raise an overlay-hidden page back above Yayra chrome', async () => {
@@ -1745,6 +1787,82 @@ test('email recall: focused and submitted addresses route only from non-private 
   assert.equal(routed[1].type, 'email-address-captured');
   assert.equal(routed[1].email, 'ada@example.com');
   assert.ok(routed.every((payload) => payload.tabId === 'tab-email'));
+});
+
+test('address autofill: capture, focus and selected-profile events are origin-checked; only normal tabs get suggestions', async () => {
+  const { handlers, listeners, sentEvents, views } = makeHarness({ autofillPreloadPath: '/fake/p.cjs' });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-address', url: 'https://shop.dev/checkout' });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-address-private', url: 'https://shop.dev/checkout', isPrivate: true });
+
+  listeners.get('yayra:address-field-focused')({ sender: views[0].webContents }, {
+    url: 'https://shop.dev/checkout', field: 'addressLine1'
+  });
+  listeners.get('yayra:address-captured')({ sender: views[0].webContents }, {
+    url: 'https://shop.dev/checkout', address: { fullName: 'Ama Mensah', addressLine1: '12 Lake Road', city: 'Kumasi', email: 'invalid' }
+  });
+  listeners.get('yayra:address-captured')({ sender: views[0].webContents }, {
+    url: 'https://other.dev/checkout', address: { fullName: 'Wrong Origin', addressLine1: '1 Main' }
+  });
+  listeners.get('yayra:address-profile-selected')({ sender: views[0].webContents }, {
+    url: 'https://shop.dev/checkout', addressId: 'addr-123-valid'
+  });
+  listeners.get('yayra:address-field-focused')({ sender: views[1].webContents }, {
+    url: 'https://shop.dev/checkout', field: 'addressLine1'
+  });
+
+  const routed = sentEvents.map((event) => event.payload).filter((payload) => payload?.type?.startsWith('address-'));
+  assert.deepEqual(routed.map((payload) => payload.type), ['address-field-focused', 'address-captured', 'address-profile-selected']);
+  assert.equal(routed[1].address.email, '');
+  assert.equal(routed[2].addressId, 'addr-123-valid');
+
+  const result = await handlers.get('yayra:webview-suggest-addresses')(null, {
+    tabId: 'tab-address', url: 'https://shop.dev/checkout', addresses: [
+      { id: 'addr-123-valid', label: 'Home', addressLine1: '12 Lake Road', isDefault: true },
+      { id: 'addr-123-valid', label: 'Duplicate', addressLine1: 'Injected' },
+      { id: 'invalid', addressLine1: 'Rejected' }
+    ]
+  });
+  assert.deepEqual(result, { suggested: true, count: 1 });
+  const pushed = views[0].webContents.sent.find((message) => message.channel === 'yayra:address-suggestions');
+  assert.equal(pushed.payload.addresses[0].addressLine1, '12 Lake Road');
+  assert.deepEqual(await handlers.get('yayra:webview-suggest-addresses')(null, {
+    tabId: 'tab-address-private', url: 'https://shop.dev/checkout', addresses: []
+  }), { suggested: false, count: 0 });
+  assert.equal(views[1].webContents.sent.length, 0);
+});
+
+test('form recall: generic values are origin-checked, sensitive keys rejected, and suggestions stay tab/profile scoped', async () => {
+  const { handlers, listeners, sentEvents, views } = makeHarness({ autofillPreloadPath: '/fake/p.cjs' });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-form', url: 'https://forms.example/profile' });
+  await handlers.get('yayra:webview-ensure')(null, { tabId: 'tab-form-private', url: 'https://forms.example/profile', isPrivate: true });
+  listeners.get('yayra:form-field-focused')({ sender: views[0].webContents }, {
+    url: 'https://forms.example/profile', fieldKey: 'field:referralcode', label: 'Referral code'
+  });
+  listeners.get('yayra:form-field-captured')({ sender: views[0].webContents }, {
+    url: 'https://forms.example/profile', fieldKey: 'field:referralcode', label: 'Referral code', value: 'YAYRA-123'
+  });
+  listeners.get('yayra:form-field-captured')({ sender: views[0].webContents }, {
+    url: 'https://forms.example/profile', fieldKey: 'field:creditcard', label: 'Credit card', value: '4111111111111111'
+  });
+  listeners.get('yayra:form-field-captured')({ sender: views[0].webContents }, {
+    url: 'https://evil.example/profile', fieldKey: 'field:referralcode', label: 'Referral code', value: 'cross-origin'
+  });
+  const routed = sentEvents.map((event) => event.payload).filter((payload) => payload?.type?.startsWith('form-field-'));
+  assert.deepEqual(routed.map((payload) => payload.type), ['form-field-focused', 'form-field-captured']);
+  assert.equal(routed[1].value, 'YAYRA-123');
+
+  const result = await handlers.get('yayra:webview-suggest-form-values')(null, {
+    tabId: 'tab-form', url: 'https://forms.example/profile', fieldKey: 'field:referralcode', values: [
+      { id: 'formval-123-saved', fieldKey: 'field:referralcode', label: 'Referral code', value: 'YAYRA-123' },
+      { id: 'formval-456-secret', fieldKey: 'field:creditcard', label: 'Credit card', value: '4111111111111111' }
+    ]
+  });
+  assert.deepEqual(result, { suggested: true, count: 1 });
+  const pushed = views[0].webContents.sent.find((message) => message.channel === 'yayra:form-suggestions');
+  assert.deepEqual(pushed.payload.values.map((item) => item.value), ['YAYRA-123']);
+  assert.deepEqual(await handlers.get('yayra:webview-suggest-form-values')(null, {
+    tabId: 'tab-form-private', url: 'https://forms.example/profile', fieldKey: 'field:referralcode', values: []
+  }), { suggested: false, count: 0 });
 });
 
 test('email recall: suggestions are sanitized, deduplicated, and never sent to a private view', async () => {
